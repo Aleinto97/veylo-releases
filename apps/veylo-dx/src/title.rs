@@ -26,6 +26,16 @@ pub fn TitlePage(media: Media) -> Element {
     let mut seen = use_signal(std::collections::HashSet::<String>::new);
     let for_seen = media.clone();
     use_hook(move || { spawn(async move { seen.set(backend::watched_episodes(&for_seen).await); }); });
+    // A title opened from a shelf, Search or Picks carries the add-on's data only: what you did
+    // with it (saved, watched, liked) comes from the store.
+    let for_store = media.clone();
+    use_hook(move || { spawn(async move {
+        if let Some(m) = backend::stored(&for_store).await {
+            saved.set(m.saved);
+            liked.set(m.liked);
+            if !episodic(&m) { watched.set(backend::film_watched(&m)); }
+        }
+    }); });
     let mut chooser = use_signal(|| None::<Chooser>);
     let mut logo_failed = use_signal(|| false);
     let mut busy = use_signal(|| None::<String>);

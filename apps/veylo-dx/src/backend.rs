@@ -78,15 +78,11 @@ pub fn init() -> Result<()> {
         .timeout(Duration::from_secs(8))
         .build()?;
     let proxy = { let _inside = runtime.enter(); rustmedia_media_proxy::MediaProxy::new() };
-    let better = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["better_posters"].as_bool()).unwrap_or(true);
-    BETTER_POSTERS.store(better, std::sync::atomic::Ordering::Relaxed);
-    let language = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["stream_language"].as_str().map(str::to_owned)).filter(|l| crate::addons::language(l).is_some());
-    set_stream_language(language);
-    let tmdb = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
-    set_tmdb_key(tmdb);
+    // The settings the backend keeps in memory, read once.
+    let saved: Value = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    BETTER_POSTERS.store(saved["better_posters"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+    set_stream_language(saved["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned));
+    set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     RUNTIME.set(runtime).map_err(|_| anyhow!("Backend already started"))?;
     BACKEND
         .set(Backend { core, proxy, data_dir: dir, http, accents: Mutex::new(HashMap::new()) })
@@ -359,13 +355,12 @@ pub fn resume_context(m: &Media) -> String {
 }
 
 static PROGRESS: OnceLock<tokio::sync::mpsc::UnboundedSender<Value>> = OnceLock::new();
-/// Titles whose metadata was already stored this session: later reports send none.
-static PROGRESS_META: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Save where playback is and how much was really played since the last report (`watched_ms`):
 /// the core marks a film or episode watched from that (80% played and 90% reached), never from
-/// a seek. Reports are written one after another, in order, on the core runtime.
-pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64, duration_ms: i64, watched_ms: i64) {
+/// a seek. Reports are written one after another, in order, on the core runtime. `with_meta`
+/// sends the title's metadata (the player's first and last report); the others only merge.
+pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64, duration_ms: i64, watched_ms: i64, with_meta: bool) {
     let Some(runtime) = RUNTIME.get() else { return };
     if duration_ms <= 0 { return; }
     let queue = PROGRESS.get_or_init(|| {
@@ -373,10 +368,9 @@ pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64,
         runtime.spawn(async move { while let Some(req) = rx.recv().await { let _ = backend().core.execute(req).await; } });
         tx
     });
-    let first = PROGRESS_META.lock().map(|mut s| s.get_or_insert_with(HashSet::new).insert(media.key())).unwrap_or(true);
     let mut req = json!({"op":"progress","type":media.kind,"id":media.id,"addon_url":media.addon_url,
         "position_ms":position_ms.max(0),"duration_ms":duration_ms,"watched_add_ms":watched_ms.clamp(0, duration_ms),
-        "meta": if first { media.raw.clone() } else { json!({}) }});
+        "meta": if with_meta { media.raw.clone() } else { json!({}) }});
     if let Some(v) = &video_id { req["video_id"] = json!(v); }
     let _ = queue.send(req);
 }
@@ -410,7 +404,7 @@ pub fn episode_label(video_id: &str) -> Option<String> {
     let parts: Vec<&str> = video_id.split(':').collect();
     match parts.as_slice() {
         ["kitsu", _, e] => e.parse::<i64>().ok().map(|e| format!("E{e}")),
-        [.., s, e] if parts.len() >= 3 => match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None },
+        [series, s, e] if series.starts_with("tt") => match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None },
         _ => None,
     }
 }
@@ -522,6 +516,12 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
 }
 
 /// Save or remove from the library, and mark watched: the core's own mutations.
+/// What the store knows about a title opened from anywhere (a catalog shelf, Search, Picks):
+/// saved, watched, liked and progress come from there, the rest from the add-on.
+pub async fn stored(media: &Media) -> Option<Media> {
+    library().await.ok()?.into_iter().find(|m| m.kind == media.kind && m.id == media.id)
+}
+
 /// Save a title to the Library, or take it out (its history stays).
 pub async fn set_saved(media: &Media, saved: bool) -> Result<()> {
     exec(json!({"op":"set_library","type":media.kind,"id":media.id,"addon_url":media.addon_url,"saved":saved,"meta":media.raw})).await?;
@@ -1661,6 +1661,7 @@ mod review_tests {
         assert_eq!(episode_label("kitsu:12345:5").as_deref(), Some("E5"));
         assert_eq!(episode_label("tt123"), None);
         assert_eq!(episode_label("custom:abc:x"), None);
+        assert_eq!(episode_label("mal:5114:3"), None);
     }
 
     #[test]

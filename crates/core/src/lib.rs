@@ -81,45 +81,24 @@ impl Core {
         f(&mut db)
     }
     fn installed(&self) -> Result<Vec<Addon>> {
-        if let Some(cached) = self.inner.addons.lock().ok().and_then(|a| a.clone()) {
-            return Ok(cached);
-        }
-        let addons = self.read_installed()?;
-        if let Ok(mut cache) = self.inner.addons.lock() {
-            *cache = Some(addons.clone());
-        }
-        Ok(addons)
+        // Read and fill the cache under the storage lock, so a write to the addons table (made
+        // under the same lock, then `addons_changed`) can't slip between the read and the fill.
+        self.with_db(|db| {
+            if let Some(cached) = self.inner.addons.lock().ok().and_then(|a| a.clone()) {
+                return Ok(cached);
+            }
+            let addons = read_installed(db)?;
+            if let Ok(mut cache) = self.inner.addons.lock() {
+                *cache = Some(addons.clone());
+            }
+            Ok(addons)
+        })
     }
     /// Forget the parsed manifests after any write to the addons table.
     fn addons_changed(&self) {
         if let Ok(mut cache) = self.inner.addons.lock() {
             *cache = None;
         }
-    }
-    fn read_installed(&self) -> Result<Vec<Addon>> {
-        self.with_db(|db| {
-            let mut s =
-                db.prepare("SELECT url,manifest,allow_http,generation FROM addons ORDER BY rowid")?;
-            let items = s.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, bool>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut addons = Vec::new();
-            for item in items {
-                let (url, manifest, allow_http, generation) = item?;
-                addons.push(Addon {
-                    url,
-                    manifest: serde_json::from_str(&manifest)?,
-                    allow_http,
-                    generation,
-                });
-            }
-            Ok(addons)
-        })
     }
     /// Records the manifest URL of the embedded metadata addon this process is
     /// serving (None when it failed to start). Older loopback registrations stay
@@ -838,7 +817,14 @@ impl Core {
                     tx.execute("UPDATE media SET saved=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"saved",false)?,db::now()])?;
                 },
                 "mark_watched"=>{
-                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"watched",true)?,db::now()])?;
+                    let watched=boolean(req,"watched",true)?;
+                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,db::now()])?;
+                    if !watched {
+                        // A film watched through is unmarked to watch again: its own playback record
+                        // starts over too, or the next report would mark it watched straight away.
+                        tx.execute("UPDATE playback SET watched=0,watched_ms=0 WHERE media_key=?1 AND video_id=?2",params![key,id])?;
+                        tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1) WHERE key=?1",params![key])?;
+                    }
                 },
                 "mark_videos"=>{
                     // Episodes you say you watched (or not), without touching where you are.
@@ -897,7 +883,7 @@ impl Core {
                     // Use retained measured time, including when the incoming report omits
                     // it or comes from a fresh player session with a smaller counter.
                     tx.execute(
-                        "UPDATE playback SET watched=MAX(watched,duration_ms>0 AND watched_ms*5>=duration_ms*4 AND position_ms*10>=duration_ms*9)
+                        "UPDATE playback SET watched=MAX(watched,duration_ms>0 AND watched_ms*5>=duration_ms*4 AND position_ms*5>=duration_ms*4)
                          WHERE media_key=?1 AND video_id=?2", params![key,video],
                     )?;
                     let total:i64=tx.query_row("SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1",[&key],|r|r.get(0))?;
@@ -1213,6 +1199,30 @@ fn extras(v: &Value) -> Result<Map<String, Value>> {
         _ => bail!("extra must be an object"),
     }
 }
+fn read_installed(db: &rusqlite::Connection) -> Result<Vec<Addon>> {
+    let mut s =
+        db.prepare("SELECT url,manifest,allow_http,generation FROM addons ORDER BY rowid")?;
+    let items = s.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut addons = Vec::new();
+    for item in items {
+        let (url, manifest, allow_http, generation) = item?;
+        addons.push(Addon {
+            url,
+            manifest: serde_json::from_str(&manifest)?,
+            allow_http,
+            generation,
+        });
+    }
+    Ok(addons)
+}
+
 fn nonnegative(v: &Value, key: &str, default: Option<i64>) -> Result<i64> {
     let n = v
         .get(key)

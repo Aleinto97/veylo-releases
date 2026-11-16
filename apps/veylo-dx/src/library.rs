@@ -8,6 +8,8 @@ pub fn Library() -> Element {
     let mut lamp = use_context::<Shell>().lamp_source;
     use_hook(move || lamp.set(String::new()));
     let history = use_resource(|| async { backend::viewing_history().await });
+    // Saved to watch (S or the bookmark on a title page), newest first as the store keeps them.
+    let saved = use_resource(|| async { backend::library().await.map(|l| l.into_iter().filter(|m| m.saved).collect::<Vec<_>>()).unwrap_or_default() });
     // Titles removed this visit vanish at once; the store already forgot them.
     let gone = use_signal(std::collections::HashSet::<String>::new);
     use_context_provider(|| Gone(gone));
@@ -15,9 +17,21 @@ pub fn Library() -> Element {
     rsx! {
         div { class: "library",
             h1 { class: "display title", "Library" }
+            if let Some(list) = saved() {
+                if !list.is_empty() {
+                    section { class: "lib-section",
+                        div { class: "group-head", span { class: "group-icon", icons::Bookmark {} } span { class: "group-name", "Saved" }
+                            span { class: "tnum dim", "{list.len()}" } }
+                        div { class: "lib-grid",
+                            for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } } }
+                        }
+                    }
+                }
+            }
             match &*history.read() {
                 None => rsx! { div { class: "week-strip", for i in 0..3 { div { key: "{i}", class: "week-card skeleton-card" } } } },
                 Some(Err(e)) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
+                Some(Ok(list)) if list.is_empty() && saved().is_some_and(|s| !s.is_empty()) => rsx! {},
                 Some(Ok(list)) if list.is_empty() => rsx! {
                     div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Stack {} } p { "Nothing watched yet" } } }
                 },

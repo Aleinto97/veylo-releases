@@ -310,16 +310,20 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
     // Time actually played since the last report (seeks don't count), so "watched" means watched.
-    let (mut last_tick, mut measured) = (None::<f64>, 0.0f64);
-    let record = |position: f64, duration: f64, measured: &mut f64| if let Some((media, video)) = &live.request.record {
+    let (mut last_tick, mut measured, mut speed) = (None::<f64>, 0.0f64, 1.0f64);
+    // The title's metadata goes with this session's first report and its last one.
+    let mut sent_meta = false;
+    let record = |position: f64, duration: f64, measured: &mut f64, sent_meta: &mut bool, last: bool| if let Some((media, video)) = &live.request.record {
         if position > 0.0 && duration > 0.0 {
-            backend::record_progress(media.clone(), video.clone(), (position * 1000.0) as i64, (duration * 1000.0) as i64, (*measured * 1000.0) as i64);
+            backend::record_progress(media.clone(), video.clone(), (position * 1000.0) as i64, (duration * 1000.0) as i64,
+                (*measured * 1000.0) as i64, !*sent_meta || last);
             *measured = 0.0;
+            *sent_meta = true;
         }
     };
     loop {
         if stop.stopped() && !quitting { quitting = true; live.finish(Finish::Close); }
-        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured); }
+        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured, &mut sent_meta, false); }
         let Some(event) = mpv.wait_event(0.25) else { continue };
         match event {
             Ok(Event::FileLoaded) => {
@@ -355,7 +359,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
             }
             Ok(Event::PropertyChange { name, change, .. }) => match (name, change) {
                 ("time-pos", PropertyData::Double(v)) => {
-                    if let Some(prev) = last_tick { measured += played_between(prev, v, live.state().speed); }
+                    if let Some(prev) = last_tick { measured += played_between(prev, v, speed); }
                     last_tick = Some(v);
                     position = v;
                     if v > 1.0 { played = true; }
@@ -373,7 +377,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 }
                 ("eof-reached", PropertyData::Flag(false)) => live.update(|s| { let c = s.ended; s.ended = false; c }),
                 ("frame-drop-count", PropertyData::Int64(v)) => live.update(|s| { let c = s.dropped != v; s.dropped = v; c }),
-                ("speed", PropertyData::Double(v)) => live.update(|s| { s.speed = v; true }),
+                ("speed", PropertyData::Double(v)) => { speed = v; live.update(|s| { s.speed = v; true }) }
                 ("volume", PropertyData::Double(v)) => live.update(|s| { s.volume = v; true }),
                 ("mute", PropertyData::Flag(v)) => live.update(|s| { s.muted = v; true }),
                 ("sub-text", PropertyData::Str(t)) => { let t = t.to_owned(); live.update(|s| { let c = s.subtitle != t; s.subtitle = t; c }) }
@@ -392,7 +396,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         }
         if live.finish.lock().map(|f| f.is_some()).unwrap_or(false) { quitting = true; }
     }
-    record(position, duration, &mut measured);
+    record(position, duration, &mut measured, &mut sent_meta, true);
     if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
     let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
     let _ = events.send(PlayerEvent::Finished {

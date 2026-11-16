@@ -19,7 +19,6 @@ rustmedia-core = { path = "../../crates/core" }
 # The same one-byte source check the Android app uses before Play (debrid clips, header scoping).
 rustmedia-media-proxy = { path = "../../crates/media-proxy" }
 regex = "1"
-# Read-only access to the app's own store for viewing history (same build as the core's).
 anyhow = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

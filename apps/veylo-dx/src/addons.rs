@@ -298,14 +298,17 @@ pub async fn install(c: Curated) -> Result<()> {
     let settings = backend::load_settings();
     let language = settings.stream_language.as_deref().and_then(language);
     let mut store = load();
-    let previous = store.managed.get(c.id()).cloned();
+    // An AIOStreams login made by an install that then failed is reused first.
+    let pending = format!("{}:pending", c.id());
+    let previous = store.managed.get(&pending).or_else(|| store.managed.get(c.id())).cloned();
     let (url, record) = match c {
         Curated::Torrentio => { let url = torrentio_url(&key, language); (url.clone(), json!({"url": url})) }
         Curated::AioStreams => {
             let link = aiostreams_link(&key, language, previous.as_ref()).await?;
-            // Keep the login before installing: if the install fails, a retry updates this
-            // configuration instead of making another one on the server.
-            store.managed.insert(c.id().into(), link.1.clone());
+            // Keep the new login aside before installing: if the install fails, a retry updates
+            // this configuration instead of making another, and the add-on still installed keeps
+            // its record (so it stays Veylo's, and Remove key still finds it).
+            store.managed.insert(pending.clone(), link.1.clone());
             save(&store);
             link
         }
@@ -322,6 +325,7 @@ pub async fn install(c: Curated) -> Result<()> {
     let mut record = record;
     record["url"] = json!(new_url);
     store.managed.insert(c.id().into(), record);
+    store.managed.remove(&pending);
     mark_seen(&mut store, &addon);
     save(&store);
     Ok(())
@@ -357,14 +361,14 @@ pub async fn reconfigure() -> Result<()> {
 /// "Remove key": forget the Real-Debrid key, and take out the add-ons Veylo set up with it
 /// (their links carry the key). Add-ons you installed yourself stay.
 pub async fn remove_rd_key() -> Result<()> {
+    // The add-ons go first: if one can't be removed, the key stays so Remove key can be tried again.
+    for row in overview().await.curated.into_iter().filter_map(|(_, row)| row) {
+        exec(json!({"op":"remove_addon","url":row.url})).await
+            .map_err(|_| anyhow::anyhow!("{} couldn't be removed, so the key was kept. Try again.", row.name))?;
+    }
     let settings = backend::Settings { rd_key: None, rd_key_removed: true, ..backend::load_settings() };
     backend::save_settings(&settings);
-    let ov = overview().await;
-    let mut first_error = None;
-    for row in ov.curated.into_iter().filter_map(|(_, row)| row) {
-        if let Err(e) = exec(json!({"op":"remove_addon","url":row.url})).await { first_error.get_or_insert(e); }
-    }
-    first_error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 /// Real-Debrid account check for a pasted key: "Premium until 2027-03-12".
