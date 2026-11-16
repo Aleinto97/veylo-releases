@@ -765,11 +765,6 @@ pub async fn fetch_subtitle(url: &str) -> String {
     }
 }
 
-/// Sizes within about 10% count as equal so the other criteria decide.
-fn size_bucket(bytes: Option<u64>) -> i64 {
-    match bytes { Some(b) if b > 0 => ((b as f64).ln() / 1.1f64.ln()).floor() as i64, _ => i64::MIN }
-}
-
 /// Size of the one file that plays: a season pack's size is split per episode. Some add-ons
 /// (AIOStreams) declare the whole torrent's size as the file's; a declared size that matches
 /// the labelled pack size (or has no label to compare with) is split too, a different one is
@@ -785,9 +780,9 @@ fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option<u64> {
     Some(size / n as u64)
 }
 
-/// Play order: direct sources only; HDR10+ > HDR > SDR, then 4K > 1080p > ..., then remux >
-/// WEB-DL > WEBRip > other, then the biggest file (per episode for season packs, ~10% buckets),
-/// then AV1 > H.265 > H.264. Blu-ray re-encodes and Dolby-Vision-only files (usually profile 5,
+/// Play order: direct sources only; biggest file first (per episode for season packs),
+/// then 4K > 1080p > ..., remux > WEB-DL > WEBRip > other, HDR10+ > HDR > SDR,
+/// then AV1 > H.265 > H.264. Dolby-Vision-only files (usually profile 5,
 /// wrong colours without a DV decoder) come last. Torrents and external links never.
 pub fn play_order(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
     let language = stream_language();
@@ -854,10 +849,10 @@ fn other_language_only(label: &str, key: &str) -> bool {
 fn play_order_any(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
     // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
     let hdr = |s: &Source| match hdr_tier(&s.label) { 1 => 0, 0 => 1, t => t };
-    let key = |s: &Source| std::cmp::Reverse((hdr(s), 5 - quality_rank(s.quality), source_tier(&s.label).map_or(-1, i16::from),
-        size_bucket(episode_size(s, pack_episodes)), codec_tier(&s.label)));
+    let key = |s: &Source| std::cmp::Reverse((episode_size(s, pack_episodes).unwrap_or(0),
+        5 - quality_rank(s.quality), source_tier(&s.label).map_or(-1, i16::from), hdr(s), codec_tier(&s.label)));
     let (mut preferred, mut demoted): (Vec<Source>, Vec<Source>) = sources.iter().filter(|s| s.kind == SourceKind::Direct).cloned()
-        .partition(|s| source_tier(&s.label).is_some() && hdr_tier(&s.label) != 1);
+        .partition(|s| hdr_tier(&s.label) != 1);
     preferred.sort_by_key(key);
     demoted.sort_by_key(key);
     preferred.extend(demoted);
@@ -1845,10 +1840,10 @@ mod tests {
         assert_eq!(episode_size(&own, Some(10)), Some(9_000_000_000));
         let single = source_of("A", &json!({"url":"https://x.invalid/e","title":"Show.S01E01.2160p.WEB-DL\n💾 9 GB"}));
         assert!(!single.pack);
-        // The 4K HDR10+ episode plays before the bigger-looking 1080p SDR remux pack.
+        // Compare per-episode sizes, not whole packs: the larger remux episode wins.
         let hdr = source_of("A", &json!({"url":"https://x.invalid/h","behaviorHints":{"filename":"Show.S01E01.2160p.WEB.DL.DV.HDR10P.H.265-GRP.mkv","videoSize":100813874330u64},
             "description":"Show.S01.2160p.WEB.DL.DV.HDR10P.H.265-GRP\nShow.S01E01.2160p.WEB.DL.DV.HDR10P.H.265-GRP.mkv\n💾93.89 GiB","name":"[RD+] MediaFusion 2160p\nHDR10+ | DV"}));
-        assert_eq!(play_order_for(&[pack.clone(), hdr.clone()], Some(10), None)[0].url, hdr.url);
+        assert_eq!(play_order_for(&[pack.clone(), hdr.clone()], Some(10), None)[0].url, pack.url);
     }
 
     #[test]
@@ -1882,12 +1877,22 @@ mod tests {
             src("Film.1080p.BluRay.x264 💾 40 GB"), src("Film.2160p.HDR.REMUX 💾 20.5 GB"),
             source_of("B", &json!({"title": "Film 4K 💾 90 GB", "infoHash": "abc"}))];
         let order: Vec<String> = play_order(&list, None).into_iter().map(|s| s.label.trim().to_owned()).collect();
-        // HDR10+ first, then HDR; Blu-ray encodes and DV-only last; torrents never.
-        assert_eq!(order, ["Film.2160p.HDR10+.WEB-DL.HEVC 💾 20 GB", "Film.2160p.HDR.REMUX 💾 20.5 GB",
-            "Film.1080p.BluRay.x264 💾 40 GB", "Film.2160p.DV.WEB-DL 💾 30 GB"]);
+        // File size first, including Blu-ray encodes; DV-only stays last; torrents never.
+        assert_eq!(order, ["Film.1080p.BluRay.x264 💾 40 GB", "Film.2160p.HDR.REMUX 💾 20.5 GB",
+            "Film.2160p.HDR10+.WEB-DL.HEVC 💾 20 GB", "Film.2160p.DV.WEB-DL 💾 30 GB"]);
         let pack = source_of("C", &json!({"title": "Show S01 COMPLETE 1080p 💾 40 GB", "url": "https://x.invalid/p"}));
         assert_eq!(episode_size(&pack, Some(10)), Some(4_000_000_000));
         assert_eq!(date_label("2014-11-05T00:00:00.000Z"), "5 Nov 2014");
+    }
+
+    #[test]
+    fn size_beats_hdr_tags_and_unknown_sizes() {
+        let src = |title: &str| source_of("A", &json!({"title": title, "url": "https://x.invalid/a"}));
+        let list = [src("Film 2160p HDR10+ WEB-DL 20 GB"), src("Film 2160p REMUX 60 GB"),
+            src("Film 2160p HDR10+ WEB-DL"), src("Film 2160p HDR10+ REMUX 60 GB")];
+        let order: Vec<_> = play_order_for(&list, None, None).into_iter().map(|s| s.label.trim().to_owned()).collect();
+        assert_eq!(order, ["Film 2160p HDR10+ REMUX 60 GB", "Film 2160p REMUX 60 GB",
+            "Film 2160p HDR10+ WEB-DL 20 GB", "Film 2160p HDR10+ WEB-DL"]);
     }
 
     #[test]

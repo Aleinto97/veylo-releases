@@ -439,10 +439,16 @@ pub fn start_playback(shell: Shell, request: player::PlayRequest, on_next: Optio
 pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<Box<dyn Fn(Shell, i64)>>) {
     if request.accent.is_empty() { request.accent = try_consume_context::<Accent>().map(|a| a.0.peek().clone()).unwrap_or_default(); }
     let title = request.title.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     shell.player_status.set(Some(PlayerStatus::Opening(title.clone())));
     player::play(request, tx);
-    spawn(async move {
+    follow_playback_events(shell, title, rx, on_next, on_another);
+}
+
+fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<player::PlayerEvent>,
+    on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<Box<dyn Fn(Shell, i64)>>) {
+    // Playback belongs to the app, even when its source chooser closes immediately.
+    dioxus::core::spawn_forever(async move {
         // This playback's in-app session: only it may take the player off screen.
         let mut mine: Option<engine::LiveRef> = None;
         let mut clear = move |mine: &Option<engine::LiveRef>| if mine.is_some() && *shell.player.peek() == *mine { shell.player.set(None); };
@@ -544,5 +550,67 @@ fn TrailerSheet(id: String, more: bool) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod playback_lifetime_tests {
+    use super::*;
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+
+    #[derive(Clone, Default)]
+    struct Probe {
+        show: Rc<Cell<Option<Signal<bool>>>>,
+        status: Rc<Cell<Option<Signal<Option<PlayerStatus>>>>>,
+        sender: Rc<RefCell<Option<tokio::sync::mpsc::UnboundedSender<player::PlayerEvent>>>>,
+    }
+
+    fn harness(probe: Probe) -> Element {
+        let show = use_signal(|| true);
+        probe.show.set(Some(show));
+        use_context_provider(|| probe.clone());
+        use_context_provider(|| {
+            let status = Signal::new(None);
+            probe.status.set(Some(status));
+            Shell {
+                tab: Signal::new(Tab::Home), player_status: status,
+                search_open: Signal::new(false), trailer: Signal::new(None), shortcuts_open: Signal::new(false),
+                title_command: Signal::new(None), search_query: Signal::new(None), opened: Signal::new(None),
+                lamp_source: Signal::new(String::new()), pick_command: Signal::new(None),
+                history: Signal::new(backend::History::default()), picks_dirty: Signal::new(0), addon_updates: Signal::new(0),
+                player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0),
+            }
+        });
+        rsx! { if show() { TestSourceChooser {} } }
+    }
+
+    #[component]
+    fn TestSourceChooser() -> Element {
+        let shell = use_context::<Shell>();
+        let probe = use_context::<Probe>();
+        use_hook(move || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            *probe.sender.borrow_mut() = Some(tx);
+            follow_playback_events(shell, "Test film".into(), rx, None, None);
+        });
+        rsx! { div {} }
+    }
+
+    #[test]
+    fn playback_events_survive_closing_the_source_chooser() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let probe = Probe::default();
+            let mut dom = VirtualDom::new_with_props(harness, probe.clone());
+            dom.rebuild_in_place();
+            probe.show.get().unwrap().set(false);
+            dom.render_immediate_to_vec();
+            // The real event receiver must remain alive after the chooser is unmounted.
+            probe.sender.borrow().as_ref().unwrap().send(player::PlayerEvent::Started {
+                decoder: None, codec: "HEVC".into(), facts: Default::default(),
+            }).expect("closing the chooser must not cancel playback");
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), dom.wait_for_work()).await;
+            assert!(matches!(&*probe.status.get().unwrap().peek(), Some(PlayerStatus::Playing { title, .. }) if title == "Test film"));
+        });
     }
 }
