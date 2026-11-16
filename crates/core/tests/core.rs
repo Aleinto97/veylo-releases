@@ -915,7 +915,7 @@ async fn completion_is_per_video_uses_retained_evidence_and_keeps_movie_behavior
     for kind in ["series", "anime", "movie"] {
         // First retain measured viewing without reaching the end. The next report
         // omits watched_ms and must still complete using the retained evidence.
-        let mut progress = json!({"op":"progress","type":kind,"id":"opaque","addon_url":addon,"video_id":"ep1","position_ms":80000,"duration_ms":100000,"watched_ms":85000});
+        let mut progress = json!({"op":"progress","type":kind,"id":"opaque","addon_url":addon,"video_id":"ep1","position_ms":70000,"duration_ms":100000,"watched_ms":85000});
         let first = core.execute(progress.clone()).await.unwrap();
         assert_eq!(first["item"]["video_watched"], false);
         progress["position_ms"] = json!(95000);
@@ -1020,7 +1020,7 @@ async fn v1_migration_preserves_history_manual_marks_cache_and_addons() {
     for _ in 0..2 {
         let core = d.core();
         let diagnostics = core.execute(json!({"op":"diagnostics"})).await.unwrap();
-        assert_eq!(diagnostics["schema_version"], 2);
+        assert_eq!(diagnostics["schema_version"], 3);
         assert_eq!(diagnostics["addons"], 1);
         assert_eq!(diagnostics["cache_entries"], 1);
         assert_eq!(diagnostics["playback_entries"], 3);
@@ -1030,7 +1030,8 @@ async fn v1_migration_preserves_history_manual_marks_cache_and_addons() {
             assert_eq!(m["library"], true);
             assert_eq!(m["liked"], 1);
             assert_eq!(m["name"], "Retained");
-            assert_eq!(m["video_watched"], m["type"] != "anime");
+            // v3 keeps what the app showed: an episode played past 80% (no measured time) is watched.
+            assert_eq!(m["video_watched"], true);
             // Old manual/automatic marks are indistinguishable; don't erase either.
             assert_eq!(m["watched"], m["type"] != "anime");
             assert_eq!(core.execute(json!({"op":"playback","type":m["type"],"id":m["id"],"addon_url":addon,"video_id":m["video_id"]})).await.unwrap()["watched"],m["video_watched"]);
@@ -1480,4 +1481,202 @@ async fn large_metadata_replacement_fits_the_resulting_row_budget() {
     assert_eq!(result["item"]["description"], "B".repeat(600_000));
     let oversized = core.execute(request(&"C".repeat(1_100_000))).await.unwrap();
     assert_eq!(oversized["item"]["description"], "B".repeat(600_000));
+}
+
+#[tokio::test]
+async fn measured_time_adds_up_across_sessions_and_unmarking_resets_the_total() {
+    let d = Data::new();
+    let core = d.core();
+    let a = "https://a.test/manifest.json";
+    let film = |position: i64, add: i64| json!({"op":"progress","type":"movie","id":"tt9","addon_url":a,"position_ms":position,"duration_ms":100000,"watched_add_ms":add,"meta":{"name":"F"}});
+    // Two sittings of 45%: neither alone counts, together they do once the end is reached.
+    let first = core.execute(film(45000, 45000)).await.unwrap();
+    assert_eq!(first["item"]["watched"], false);
+    core.execute(film(50000, 0)).await.unwrap();
+    let done = core.execute(film(95000, 45000)).await.unwrap();
+    assert_eq!(done["item"]["watched_ms"], 90000);
+    assert_eq!(done["item"]["watched"], true);
+    // A jump to the end with little playback is not watching.
+    let skip = core.execute(json!({"op":"progress","type":"movie","id":"tt8","addon_url":a,"position_ms":99000,"duration_ms":100000,"watched_add_ms":3000})).await.unwrap();
+    assert_eq!(skip["item"]["watched"], false);
+    // Never more than the whole video.
+    let big = core.execute(json!({"op":"progress","type":"movie","id":"tt7","addon_url":a,"position_ms":10,"duration_ms":1000,"watched_add_ms":999999})).await.unwrap();
+    assert_eq!(big["item"]["watched_ms"], 1000);
+
+    let ep = |video: &str| json!({"op":"progress","type":"series","id":"tt5","video_id":video,"addon_url":a,"position_ms":95000,"duration_ms":100000,"watched_add_ms":90000});
+    core.execute(ep("tt5:1:1")).await.unwrap();
+    core.execute(ep("tt5:1:2")).await.unwrap();
+    let watched = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt5"}))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = watched["video_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["tt5:1:1", "tt5:1:2"]);
+    let after = core.execute(json!({"op":"mark_videos","type":"series","id":"tt5","addon_url":a,"watched":false,"video_ids":["tt5:1:1"]})).await.unwrap();
+    assert_eq!(after["item"]["watched_ms"], 90000);
+    let watched = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt5"}))
+        .await
+        .unwrap();
+    assert_eq!(watched["video_ids"], json!(["tt5:1:2"]));
+
+    let history = core.execute(json!({"op":"history"})).await.unwrap();
+    let items = history["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert!(items
+        .iter()
+        .all(|i| i["seen"].as_i64().unwrap() > 0 && i["type"].is_string()));
+}
+
+#[tokio::test]
+async fn removing_an_addon_drops_its_cached_responses() {
+    let s = Server::new(|p| {
+        if p.contains("manifest.json") {
+            Reply::ok(manifest())
+        } else {
+            Reply::ok(json!({"metas":[{"id":"tt1","type":"movie","name":"A"}]}))
+        }
+    });
+    let d = Data::new();
+    let core = d.core();
+    empty(&core).await;
+    install(&core, &s).await;
+    core.execute(json!({"op":"catalog","addon_url":s.url(),"type":"movie","id":"top"}))
+        .await
+        .unwrap();
+    let cached = |core: Core| async move {
+        core.execute(json!({"op":"diagnostics"})).await.unwrap()["cache_entries"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(cached(core.clone()).await, 1);
+    core.execute(json!({"op":"remove_addon","url":s.url()}))
+        .await
+        .unwrap();
+    assert_eq!(cached(core.clone()).await, 0);
+    assert_eq!(
+        core.execute(json!({"op":"addons"})).await.unwrap()["addons"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn an_unmarked_film_is_not_marked_again_by_the_next_report() {
+    let d = Data::new();
+    let core = d.core();
+    let a = "https://a.test/manifest.json";
+    let report = |position: i64, add: i64| json!({"op":"progress","type":"movie","id":"tt3","addon_url":a,"position_ms":position,"duration_ms":100000,"watched_add_ms":add});
+    // Stopped at the credits (85%) after watching it all: watched.
+    assert_eq!(
+        core.execute(report(85000, 84000)).await.unwrap()["item"]["watched"],
+        true
+    );
+    let unmarked = core
+        .execute(
+            json!({"op":"mark_watched","type":"movie","id":"tt3","addon_url":a,"watched":false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unmarked["item"]["watched"], false);
+    assert_eq!(unmarked["item"]["watched_ms"], 0);
+    // Watching it again: ten seconds in, it stays unwatched.
+    assert_eq!(
+        core.execute(report(10000, 10000)).await.unwrap()["item"]["watched"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn old_history_played_past_80_percent_stays_watched_after_the_upgrade() {
+    let d = Data::new();
+    drop(d.core());
+    let db = rusqlite::Connection::open(d.0.join("core.sqlite3")).unwrap();
+    let addon = "https://example.test/manifest.json";
+    for (kind, id, video, position, measured) in [
+        ("movie", "tt1", "tt1", 85000, 0),
+        ("series", "tt2", "tt2:1:1", 82000, 0),
+        ("movie", "tt3", "tt3", 50000, 0),
+        ("movie", "tt4", "tt4", 85000, 10000),
+    ] {
+        let key = json!([kind, id, ""]).to_string();
+        db.execute("INSERT INTO media(key,type,raw_id,addon_url,meta,position_ms,duration_ms,watched_ms,video_id,updated) VALUES(?1,?2,?3,?4,'{}',?5,100000,?7,?6,1)",
+            rusqlite::params![key, kind, id, addon, position, video, measured]).unwrap();
+        db.execute("INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated) VALUES(?1,?2,?3,100000,?4,1)",
+            rusqlite::params![key, video, position, measured]).unwrap();
+    }
+    db.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(db);
+    let core = d.core();
+    let item = |id: &'static str, kind: &'static str| {
+        let core = core.clone();
+        async move {
+            core.execute(json!({"op":"item","type":kind,"id":id,"addon_url":addon}))
+                .await
+                .unwrap()["item"]
+                .clone()
+        }
+    };
+    assert_eq!(item("tt1", "movie").await["watched"], true);
+    assert_eq!(item("tt3", "movie").await["watched"], false);
+    // Measured time already decides; the upgrade doesn't second-guess it.
+    assert_eq!(item("tt4", "movie").await["watched"], false);
+    let videos = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt2"}))
+        .await
+        .unwrap();
+    assert_eq!(videos["video_ids"], json!(["tt2:1:1"]));
+    assert_eq!(
+        core.execute(json!({"op":"item","type":"movie","id":"tt9","addon_url":addon}))
+            .await
+            .unwrap()["item"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn removing_an_addon_keeps_its_neighbours_cache() {
+    let d = Data::new();
+    drop(d.core());
+    let gone = "https://host.test/manifest.json?key=a";
+    d.install(gone, &manifest());
+    let db = d.db();
+    for key in [
+        "https://host.test/catalog/movie/top.json?key=a", // the removed addon's
+        "https://host.test/catalog/movie/top.json?key=b", // same path, another query
+        "https://host.test/sort=x|rd=K/catalog/movie/top.json", // a configured addon on the host
+        "https://other.test/catalog/movie/top.json?key=a",
+    ] {
+        db.execute(
+            "INSERT INTO cache(key,body,expires,updated) VALUES(?1,'{}',9999999999,1)",
+            [key],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let core = d.core();
+    core.execute(json!({"op":"remove_addon","url":gone}))
+        .await
+        .unwrap();
+    let left: Vec<String> = d
+        .db()
+        .prepare("SELECT key FROM cache ORDER BY key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "https://host.test/catalog/movie/top.json?key=b",
+            "https://host.test/sort=x|rd=K/catalog/movie/top.json",
+            "https://other.test/catalog/movie/top.json?key=a",
+        ]
+    );
 }

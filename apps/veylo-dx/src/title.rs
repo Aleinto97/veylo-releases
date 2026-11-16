@@ -20,11 +20,25 @@ pub fn TitlePage(media: Media) -> Element {
     let mut meta = use_signal(|| Load::<TitleMeta>::Loading);
     let mut season = use_signal(|| None::<i64>);
     let mut liked = use_signal(|| media.liked);
-    // Films: one "Already watched" switch (marked, or played to 80%). Series: per episode.
+    let mut saved = use_signal(|| media.saved);
+    // Films: one "Already watched" switch (marked, or played through). Series: per episode.
     let mut watched = use_signal(|| backend::film_watched(&media));
     let mut seen = use_signal(std::collections::HashSet::<String>::new);
     let for_seen = media.clone();
     use_hook(move || { spawn(async move { seen.set(backend::watched_episodes(&for_seen).await); }); });
+    // A title opened from a shelf, Search or Picks carries the add-on's data only: what you did
+    // with it (saved, watched, liked) comes from the store.
+    // A choice made before the answer arrives wins (`touched`).
+    let mut touched = use_signal(|| false);
+    let for_store = media.clone();
+    use_hook(move || { spawn(async move {
+        if let Some(m) = backend::stored(&for_store).await {
+            if *touched.peek() { return; }
+            saved.set(m.saved);
+            liked.set(m.liked);
+            if !episodic(&m) { watched.set(backend::film_watched(&m)); }
+        }
+    }); });
     let mut chooser = use_signal(|| None::<Chooser>);
     let mut logo_failed = use_signal(|| false);
     let mut busy = use_signal(|| None::<String>);
@@ -81,27 +95,49 @@ pub fn TitlePage(media: Media) -> Element {
         });
     });
 
-    let (m1, m3, m4) = (media.clone(), media.clone(), media.clone());
+    let (m1, m4) = (media.clone(), media.clone());
     let rate = move |value: i64| {
         let media = m1.clone();
-        let next = if liked() == value { 0 } else { value };
+        touched.set(true);
+        let before = liked();
+        let next = if before == value { 0 } else { value };
         liked.set(next);
-        spawn(async move { if backend::feedback(&media, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(media.liked); } });
+        spawn(async move { if backend::feedback(&media, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } });
     };
     let (mut rate_like, mut rate_hide) = (rate.clone(), rate);
+    // Save to the Library (S), and the "Already watched" switch (W): the button and the key alike.
+    let for_save = media.clone();
+    let toggle_save = use_callback(move |_: ()| {
+        touched.set(true);
+        let next = !*saved.peek();
+        saved.set(next);
+        let m = for_save.clone();
+        spawn(async move { if backend::set_saved(&m, next).await.is_err() { saved.set(!next); } });
+    });
+    let for_watched = media.clone();
+    let toggle_watched = use_callback(move |_: ()| {
+        touched.set(true);
+        let next = !*watched.peek();
+        watched.set(next);
+        let m = for_watched.clone();
+        spawn(async move { if backend::set_watched(&m, next).await.is_err() { watched.set(!next); } else { *shell.picks_dirty.write() += 1; } });
+    });
 
-    // Keys from the app root: P play/resume, L like, D not for me, W already watched, T trailer, O sources.
-    let (k_media, k_m2, k_m3) = (media.clone(), media.clone(), media.clone());
+    // Keys from the app root: P play/resume, L like, D not for me, S save, W already watched, T trailer, O sources.
+    let (k_media, k_m2) = (media.clone(), media.clone());
     use_effect(move || {
         let Some(key) = (shell.title_command)() else { return };
         shell.title_command.set(None);
         let film = !episodic(&k_media);
         match key {
             'p' => if film { autoplay.call((k_media.id.clone(), None)) }
-                   else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()) { autoplay.call((id.clone(), episode_label_from_id(&id))) },
-            'l' => { let next = if *liked.peek() == 1 { 0 } else { 1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
-            'd' => { let next = if *liked.peek() == -1 { 0 } else { -1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
-            'w' if film => { let next = !*watched.peek(); watched.set(next); let m = k_m3.clone(); spawn(async move { let _ = backend::set_watched(&m, next).await; }); }
+                   else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()) { autoplay.call((id.clone(), backend::episode_label(&id))) },
+            'l' => { touched.set(true); let before = *liked.peek(); let next = if before == 1 { 0 } else { 1 }; liked.set(next); let m = k_m2.clone();
+                spawn(async move { if backend::feedback(&m, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } }); }
+            'd' => { touched.set(true); let before = *liked.peek(); let next = if before == -1 { 0 } else { -1 }; liked.set(next); let m = k_m2.clone();
+                spawn(async move { if backend::feedback(&m, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } }); }
+            's' => toggle_save.call(()),
+            'w' if film => toggle_watched.call(()),
             't' => if let Load::Ready(m) = &*meta.peek() { if !m.trailers.is_empty() { crate::play_trailers(shell, m.trailers.clone()); } },
             'o' if film => chooser.set(Some(Chooser { video: k_media.id.clone(), label: None })),
             _ => {}
@@ -150,11 +186,11 @@ pub fn TitlePage(media: Media) -> Element {
                         if !film {
                             if let Some(next) = up_next(&episodes(), &media, &seen()) {
                                 button { class: "pill accent play-big", disabled: busy().is_some(),
-                                    onclick: { let l = next.clone(); move |_| autoplay.call((l.clone(), episode_label_from_id(&l))) },
+                                    onclick: { let l = next.clone(); move |_| autoplay.call((l.clone(), backend::episode_label(&l))) },
                                     if busy().is_some() { span { class: "spinner", aria_hidden: "true" } span { "Finding source" } }
                                     else { icons::Play {} span { {
                                         let verb = if media.last_video_id.as_deref() == Some(next.as_str()) && backend::in_progress(&media) { "Resume" } else { "Play" };
-                                        match episode_label_from_id(&next) { Some(l) => format!("{verb} {l}"), None => verb.into() }
+                                        match backend::episode_label(&next) { Some(l) => format!("{verb} {l}"), None => verb.into() }
                                     } } }
                                 }
                             }
@@ -166,6 +202,8 @@ pub fn TitlePage(media: Media) -> Element {
                                 else { icons::Play {} span { if backend::in_progress(&media) { "Resume" } else { "Play" } } }
                             }
                         }
+                        icons::IconButton { label: if saved() { "Saved to Library (S)" } else { "Save to Library (S)" }, class: if saved() { "glass on" } else { "glass" },
+                            pressed: saved(), onclick: move |_| toggle_save.call(()), icons::Bookmark {} }
                         icons::IconButton { label: if liked() > 0 { "Liked" } else { "Like" }, class: if liked() > 0 { "glass on" } else { "glass" },
                             pressed: liked() > 0, onclick: move |_| rate_like(1), icons::ThumbUp {} }
                         icons::IconButton { label: "Not for me", class: if liked() < 0 { "glass on" } else { "glass" },
@@ -173,10 +211,7 @@ pub fn TitlePage(media: Media) -> Element {
                         if film {
                             button { class: if watched() { "pill glass watched-switch on" } else { "pill glass watched-switch" }, role: "switch", aria_checked: "{watched()}",
                                 title: "Already watched (W)",
-                                onclick: move |_| {
-                                    let next = !watched(); watched.set(next); let m = m3.clone();
-                                    spawn(async move { if backend::set_watched(&m, next).await.is_err() { watched.set(!next); } else { *shell.picks_dirty.write() += 1; } });
-                                },
+                                onclick: move |_| toggle_watched.call(()),
                                 if watched() { icons::Check {} } else { icons::EyeOff {} }
                                 span { "Already watched" }
                             }
@@ -280,19 +315,10 @@ pub fn resume_now(mut shell: Shell, media: Media) {
     match media.last_video_id.clone() {
         Some(video) => {
             // The label comes from the video id's own season/episode numbers (series:season:episode).
-            let label = episode_label_from_id(&video);
+            let label = backend::episode_label(&video);
             play_next(shell, media, video, label);
         }
         None => shell.opened.set(Some(media)),
-    }
-}
-
-/// "tt123:2:5" -> "S2 E5"; other id schemes get their label once the episode list is loaded.
-fn episode_label_from_id(id: &str) -> Option<String> {
-    let parts: Vec<&str> = id.rsplitn(3, ':').collect();
-    match parts.as_slice() {
-        [e, s, _] => match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None },
-        _ => None,
     }
 }
 

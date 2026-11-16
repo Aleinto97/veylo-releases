@@ -58,6 +58,8 @@ fn data_dir() -> PathBuf {
 }
 
 pub fn init() -> Result<()> {
+    // Android can launch the UI again in the same process (activity recreated): keep the backend.
+    if BACKEND.get().is_some() { return Ok(()); }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -76,12 +78,11 @@ pub fn init() -> Result<()> {
         .timeout(Duration::from_secs(8))
         .build()?;
     let proxy = { let _inside = runtime.enter(); rustmedia_media_proxy::MediaProxy::new() };
-    let better = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["better_posters"].as_bool()).unwrap_or(true);
-    BETTER_POSTERS.store(better, std::sync::atomic::Ordering::Relaxed);
-    let language = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v["stream_language"].as_str().map(str::to_owned)).filter(|l| crate::addons::language(l).is_some());
-    set_stream_language(language);
+    // The settings the backend keeps in memory, read once.
+    let saved: Value = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    BETTER_POSTERS.store(saved["better_posters"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+    set_stream_language(saved["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned));
+    set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     RUNTIME.set(runtime).map_err(|_| anyhow!("Backend already started"))?;
     BACKEND
         .set(Backend { core, proxy, data_dir: dir, http, accents: Mutex::new(HashMap::new()) })
@@ -124,6 +125,8 @@ pub struct Media {
     pub reason: String,
     pub liked: i64,
     pub watched: bool,
+    /// Saved to the Library by hand.
+    pub saved: bool,
     pub video_watched: bool,
     pub position_ms: i64,
     pub duration_ms: i64,
@@ -158,6 +161,7 @@ impl Media {
             reason: s(v, "reason"),
             liked: v.get("liked").and_then(Value::as_i64).unwrap_or(0),
             watched: v.get("watched").and_then(Value::as_bool).unwrap_or(false),
+            saved: ["saved", "library"].iter().any(|k| v.get(*k).and_then(Value::as_bool).unwrap_or(false)),
             video_watched: v.get("video_watched").and_then(Value::as_bool).unwrap_or(false),
             position_ms: v.get("position_ms").and_then(Value::as_i64).unwrap_or(0),
             duration_ms: v.get("duration_ms").and_then(Value::as_i64).unwrap_or(0),
@@ -253,6 +257,13 @@ pub struct CatalogRow {
 
 struct RawRow { key: String, title: String, addon_id: String, addon_name: String, addon_url: String, kind: String, id: String, extra: Option<(String, String)> }
 
+/// A catalog that can't be listed without an extra (search-only and the like): the current
+/// `extra[].isRequired`, or the legacy `extraRequired` list.
+fn catalog_needs_extra(c: &Value) -> bool {
+    c["extra"].as_array().into_iter().flatten().any(|e| e["isRequired"] == true)
+        || c["extraRequired"].as_array().is_some_and(|r| !r.is_empty())
+}
+
 fn options_contain(extra: &Value, name: &str, option: &str) -> bool {
     extra["name"] == name && extra["options"].as_array().is_some_and(|o| o.iter().any(|x| x == option))
 }
@@ -261,15 +272,14 @@ fn options_contain(extra: &Value, name: &str, option: &str) -> bool {
 /// add-on without required extras, Cinemeta's animation shelf, and titles that
 /// disambiguate repeated catalog names.
 pub async fn home_rows() -> Result<Vec<CatalogRow>> {
-    // Fresh manifests carry the genre options; failure keeps the stored ones.
-    let _ = exec(json!({"op":"refresh_addons"})).await;
+    // Manifests are refreshed once per launch (addons::startup), not on every visit to Home.
     let v = exec(json!({"op":"addons"})).await?;
     let mut raw = Vec::new();
     for addon in v["addons"].as_array().into_iter().flatten() {
         let url = s(addon, "manifest_url");
         let (aid, aname) = (s(addon, "id"), s(addon, "name"));
         let catalogs: Vec<&Value> = addon["catalogs"].as_array().into_iter().flatten().collect();
-        let free = catalogs.iter().filter(|c| !c["extra"].as_array().into_iter().flatten().any(|e| e["isRequired"] == true));
+        let free = catalogs.iter().filter(|c| !catalog_needs_extra(c));
         for c in free.take(3) {
             let (kind, id) = (s(c, "type"), s(c, "id"));
             let name = Some(s(c, "name")).filter(|n| !n.is_empty()).unwrap_or_else(|| kind.clone());
@@ -344,28 +354,29 @@ pub fn resume_context(m: &Media) -> String {
     } else { "In progress".into() }
 }
 
-/// Save measured progress after playback (fire-and-forget on the core runtime).
-pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64, duration_ms: i64) {
+static PROGRESS: OnceLock<tokio::sync::mpsc::UnboundedSender<Value>> = OnceLock::new();
+
+/// Save where playback is and how much was really played since the last report (`watched_ms`):
+/// the core marks a film or episode watched from that (80% played and 90% reached), never from
+/// a seek. Reports are written one after another, in order, on the core runtime. `with_meta`
+/// sends the title's metadata (the player's first and last report); the others only merge.
+pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64, duration_ms: i64, watched_ms: i64, with_meta: bool) {
     let Some(runtime) = RUNTIME.get() else { return };
     if duration_ms <= 0 { return; }
-    runtime.spawn(async move {
-        let mut req = json!({"op":"progress","type":media.kind,"id":media.id,"addon_url":media.addon_url,
-            "position_ms":position_ms.max(0),"duration_ms":duration_ms,"meta":media.raw});
-        if let Some(v) = &video_id { req["video_id"] = json!(v); }
-        let _ = backend().core.execute(req).await;
-        // 80% of a film or episode counts as watched.
-        if position_ms * 5 >= duration_ms * 4 {
-            let mark = match &video_id {
-                Some(v) if *v != media.id => json!({"op":"mark_videos","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":true,"video_ids":[v],"meta":media.raw}),
-                _ => json!({"op":"mark_watched","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":true,"meta":media.raw}),
-            };
-            let _ = backend().core.execute(mark).await;
-        }
+    let queue = PROGRESS.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        runtime.spawn(async move { while let Some(req) = rx.recv().await { let _ = backend().core.execute(req).await; } });
+        tx
     });
+    let mut req = json!({"op":"progress","type":media.kind,"id":media.id,"addon_url":media.addon_url,
+        "position_ms":position_ms.max(0),"duration_ms":duration_ms,"watched_add_ms":watched_ms.clamp(0, duration_ms),
+        "meta": if with_meta { media.raw.clone() } else { json!({}) }});
+    if let Some(v) = &video_id { req["video_id"] = json!(v); }
+    let _ = queue.send(req);
 }
 
-/// A film counts as watched when marked, or played to 80%.
-pub fn film_watched(m: &Media) -> bool { m.watched || (m.duration_ms > 0 && m.position_ms * 5 >= m.duration_ms * 4) }
+/// A film is watched when you marked it, or the core saw you play it through.
+pub fn film_watched(m: &Media) -> bool { m.watched }
 
 /// Mark episodes watched or not (without moving where you are in the series).
 pub async fn set_episodes_watched(media: &Media, video_ids: Vec<String>, watched: bool) -> Result<()> {
@@ -380,17 +391,25 @@ pub async fn forget(media: &Media) -> Result<()> {
     Ok(())
 }
 
-/// Episodes of a series you watched: marked, or played to 80%. Read-only on the app's store.
+/// Episodes of a series you watched: marked, or played through.
 pub async fn watched_episodes(media: &Media) -> HashSet<String> {
-    let path = backend().data_dir.join("core.sqlite3");
-    let (kind, id) = (media.kind.clone(), media.id.clone());
-    on_runtime(async move {
-        let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        let mut q = db.prepare("SELECT p.video_id FROM playback p JOIN media m ON m.key = p.media_key
-            WHERE m.type = ?1 AND m.raw_id = ?2 AND (p.watched <> 0 OR (p.duration_ms > 0 AND p.position_ms * 5 >= p.duration_ms * 4))")?;
-        let ids = q.query_map([kind, id], |r| r.get::<_, String>(0))?.flatten().collect::<HashSet<_>>();
-        anyhow::Ok(ids)
-    }).await.ok().and_then(Result::ok).unwrap_or_default()
+    exec(json!({"op":"watched_videos","type":media.kind,"id":media.id})).await.ok()
+        .and_then(|v| v["video_ids"].as_array().map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_owned).collect()))
+        .unwrap_or_default()
+}
+
+/// "S2 E5" for "tt123:2:5" and "tmdb:123:2:5" (scheme, id, season, episode), "E5" for Kitsu's
+/// "kitsu:123:5"; None for anything else, such as "mal:5114:3" (its label comes from the
+/// episode list).
+pub fn episode_label(video_id: &str) -> Option<String> {
+    let parts: Vec<&str> = video_id.split(':').collect();
+    let se = |s: &str, e: &str| match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None };
+    match parts.as_slice() {
+        ["kitsu", _, e] => e.parse::<i64>().ok().map(|e| format!("E{e}")),
+        [series, s, e] if series.starts_with("tt") => se(s, e),
+        [_, _, s, e] => se(s, e),
+        _ => None,
+    }
 }
 
 /// The packaged legal player test (same title and stream as demoMedia() in Models.kt).
@@ -499,7 +518,20 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
     })
 }
 
-/// Save or remove from the library, and mark watched: the core's own mutations.
+/// What the store knows about a title opened from anywhere (a catalog shelf, Search, Picks):
+/// saved, watched, liked and progress come from there, the rest from the add-on.
+pub async fn stored(media: &Media) -> Option<Media> {
+    let v = exec(json!({"op":"item","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await.ok()?;
+    Media::from_json(&v["item"], &media.addon_url)
+}
+
+/// Save a title to the Library, or take it out (its history stays).
+pub async fn set_saved(media: &Media, saved: bool) -> Result<()> {
+    exec(json!({"op":"set_library","type":media.kind,"id":media.id,"addon_url":media.addon_url,"saved":saved,"meta":media.raw})).await?;
+    Ok(())
+}
+
+/// Mark a film watched or not: the core's own mutation.
 pub async fn set_watched(media: &Media, watched: bool) -> Result<()> {
     exec(json!({"op":"mark_watched","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":watched,"meta":media.raw})).await?;
     Ok(())
@@ -570,6 +602,7 @@ static_re!(hevc, r"(?i)\b(?:HEVC|[HX][ ._-]?265)\b");
 static_re!(avc, r"(?i)\b(?:AVC|[HX][ ._-]?264)\b");
 static_re!(episode_mark, r"(?i)\bS\d{1,2}[ ._-]?E\d{1,3}\b|\b\d{1,2}x\d{2,3}\b|\bEP?[ ._-]?\d{2,3}\b");
 static_re!(season_pack, r"(?i)\bS\d{1,2}\b|\bSEASONS?[ ._-]?\d|\bCOMPLETE\b");
+static_re!(html_tag, "<[^>]+>");
 static_re!(size_label, r"(?i)(?:💾\s*)?(\d[\d.,]*)\s*([KMGT]i?B)\b");
 
 /// HDR10+ (3), HDR10/HDR/HLG (2), Dolby Vision alone (1), SDR (0); "DV HDR10" counts as HDR10.
@@ -666,8 +699,8 @@ pub async fn online_subtitles(kind: &str, video_id: &str) -> Result<Vec<OnlineSu
     if list.is_empty() && video_id.starts_with("tt") {
         list = opensubtitles(kind, video_id).await.unwrap_or_default();
     }
-    let preferred = STREAM_LANGUAGE.lock().ok().and_then(|l| l.clone()).and_then(|k| crate::addons::language(&k)).map(|l| l.label);
-    Ok(rank_subtitles(list.iter().filter_map(subtitle_of).collect(), preferred))
+    let preferred = STREAM_LANGUAGE.lock().ok().and_then(|l| l.clone()).map(|k| subtitle_language_of(&k));
+    Ok(rank_subtitles(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref()))
 }
 
 async fn opensubtitles(kind: &str, video_id: &str) -> Result<Vec<Value>> {
@@ -677,6 +710,15 @@ async fn opensubtitles(kind: &str, video_id: &str) -> Result<Vec<Value>> {
         backend_http().get(url).send().await?.error_for_status()?.json::<Value>().await
     }).await?.context("Subtitle add-on unavailable")?;
     Ok(body["subtitles"].as_array().cloned().unwrap_or_default())
+}
+
+/// The subtitle-list name of an audio-language setting (`crate::addons::LANGUAGES` key): the two
+/// lists name a few languages differently.
+pub fn subtitle_language_of(key: &str) -> String {
+    match key {
+        "latino" => "Spanish (Latin America)".into(),
+        other => crate::addons::language(other).map(|l| l.label.to_owned()).unwrap_or_default(),
+    }
 }
 
 fn subtitle_of(v: &Value) -> Option<OnlineSubtitle> {
@@ -707,6 +749,8 @@ pub fn subtitle_matches(s: &OnlineSubtitle, query: &str) -> bool {
 /// Download one subtitle into the cache and return the local file for the player; a file the
 /// server says not to keep (or one Veylo can't read, like ASS) is handed to the player as a link.
 pub async fn fetch_subtitle(url: &str) -> String {
+    // Plain http needs consent the core doesn't have for subtitle links: such a link isn't
+    // cached, and goes to the player as offered.
     match exec(json!({"op":"subtitle_file","url":url})).await {
         Ok(v) => v["cache_path"].as_str().map(str::to_owned).unwrap_or_else(|| url.to_owned()),
         Err(_) => url.to_owned(),
@@ -832,11 +876,13 @@ pub async fn earlier_part(m: &Media, watched: &HashSet<String>) -> Option<Media>
     parts.sort_by_key(|p| p["release_date"].as_str().unwrap_or_default().to_owned());
     let at = parts.iter().position(|p| p["id"].as_i64() == Some(own))?;
     for p in parts.iter().take(at) {
-        let id = p["id"].as_i64()?;
-        let imdb = tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(str::to_owned)).filter(|i| i.starts_with("tt"))?;
+        // A part TMDB can't place (no id, no IMDb id) is skipped, not the end of the search.
+        let Some(id) = p["id"].as_i64() else { continue };
+        let Some(imdb) = tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(str::to_owned)).filter(|i| i.starts_with("tt")) else { continue };
         let name = p["title"].as_str().unwrap_or("Untitled");
         let year = p["release_date"].as_str().and_then(|d| d.get(..4)).unwrap_or_default();
-        let key = crate::picks_rules::title_key(&Media::from_json(&json!({"id": imdb, "name": name, "releaseInfo": year}), CINEMETA)?);
+        let Some(probe) = Media::from_json(&json!({"id": imdb, "name": name, "releaseInfo": year}), CINEMETA) else { continue };
+        let key = crate::picks_rules::title_key(&probe);
         if watched.contains(&imdb) || watched.contains(&key) { continue; }
         let genres = tmdb_genre_list("movie").await;
         let genre_names: Vec<String> = p["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64)
@@ -920,46 +966,17 @@ pub fn rank_search_results(query: &str, mut results: Vec<(String, Media)>) -> Ve
 #[derive(Clone, Debug, PartialEq)]
 pub struct Seen { pub media: Media, pub at: i64, pub episode: Option<String> }
 
-/// Everything watched or started, latest first. Read-only on the app's own store: the core's
-/// library answer has no "when", and the shared core stays untouched.
+/// Everything watched or started, latest first (the core's history, with when you last watched).
 pub async fn viewing_history() -> Result<Vec<Seen>> {
-    let path = backend().data_dir.join("core.sqlite3");
-    on_runtime(async move {
-        let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        let mut q = db.prepare(
-            "SELECT m.type, m.raw_id, m.addon_url, m.meta, m.watched, m.position_ms, m.duration_ms, m.video_id, m.saved, m.liked,
-                    COALESCE((SELECT MAX(p.updated) FROM playback p WHERE p.media_key = m.key), m.updated) AS seen
-             FROM media m
-             WHERE m.watched <> 0 OR m.position_ms > 0 OR m.watched_ms > 0 OR EXISTS (SELECT 1 FROM playback p WHERE p.media_key = m.key)
-             ORDER BY seen DESC LIMIT 600")?;
-        let rows = q.query_map([], |r| {
-            let mut meta: Value = serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_else(|_| json!({}));
-            if !meta.is_object() { meta = json!({}); }
-            let o = meta.as_object_mut().expect("object");
-            o.insert("type".into(), json!(r.get::<_, String>(0)?));
-            o.insert("id".into(), json!(r.get::<_, String>(1)?));
-            o.insert("addon_url".into(), json!(r.get::<_, String>(2)?));
-            o.insert("watched".into(), json!(r.get::<_, i64>(4)? != 0));
-            o.insert("position_ms".into(), json!(r.get::<_, i64>(5)?));
-            o.insert("duration_ms".into(), json!(r.get::<_, i64>(6)?));
-            if let Some(v) = r.get::<_, Option<String>>(7)? { o.insert("video_id".into(), json!(v)); }
-            o.insert("library".into(), json!(r.get::<_, i64>(8)? != 0));
-            o.insert("liked".into(), json!(r.get::<_, i64>(9)?));
-            Ok((meta, r.get::<_, i64>(10)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows.flatten() {
-            if let Some(media) = Media::from_json(&row.0, "") {
-                if media.kind == "other" { continue; } // add-on bookkeeping rows (e.g. a debrid "Downloads" folder)
-                let episode = media.last_video_id.as_deref().and_then(|v| {
-                    let parts: Vec<&str> = v.rsplitn(3, ':').collect();
-                    match parts.as_slice() { [e, s, _] => Some(format!("S{s} E{e}")), _ => None }
-                }).filter(|_| media.kind != "movie");
-                out.push(Seen { media, at: row.1, episode });
-            }
-        }
-        anyhow::Ok(out)
-    }).await?
+    let v = exec(json!({"op":"history","limit":600})).await?;
+    let mut out = Vec::new();
+    for item in v["items"].as_array().into_iter().flatten() {
+        let Some(media) = Media::from_json(item, "") else { continue };
+        if media.kind == "other" { continue; } // add-on bookkeeping rows (e.g. a debrid "Downloads" folder)
+        let episode = media.last_video_id.as_deref().and_then(episode_label).filter(|_| media.kind != "movie");
+        out.push(Seen { at: item["seen"].as_i64().unwrap_or(0), media, episode });
+    }
+    Ok(out)
 }
 
 /// A small random number (xorshift seeded from the clock): for shuffling picks, not security.
@@ -1022,9 +1039,11 @@ pub struct Settings {
     pub rd_key: Option<String>,
     /// Preferred audio language for streams (a key of `crate::addons::LANGUAGES`); None plays any.
     pub stream_language: Option<String>,
+    /// You removed the Real-Debrid key: it is not adopted again from an add-on's link.
+    pub rd_key_removed: bool,
 }
 
-impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None } } }
+impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None, rd_key_removed: false } } }
 
 pub fn load_settings() -> Settings {
     let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
@@ -1036,13 +1055,15 @@ pub fn load_settings() -> Settings {
         picks_hide_watched: v["picks_hide_watched"].as_bool().unwrap_or(true),
         rd_key: v["rd_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         stream_language: v["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned),
+        rd_key_removed: v["rd_key_removed"].as_bool().unwrap_or(false),
     }
 }
 
 pub fn save_settings(settings: &Settings) {
-    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language}).to_string());
+    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed}).to_string());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     set_stream_language(settings.stream_language.clone());
+    set_tmdb_key(settings.tmdb_key.clone());
 }
 
 // ---------------------------------------------------------------- posters
@@ -1092,9 +1113,13 @@ fn imdb_of(m: &Media) -> Option<String> {
         .map(|id| id.split(':').next().unwrap_or(id).to_owned())
 }
 
+static TMDB_KEY: Mutex<Option<String>> = Mutex::new(None);
+fn set_tmdb_key(key: Option<String>) { if let Ok(mut k) = TMDB_KEY.lock() { *k = key; } }
+fn tmdb_key() -> Option<String> { TMDB_KEY.lock().ok().and_then(|k| k.clone()) }
+
 /// GET a TMDB v3 endpoint. The key travels as a query parameter and is never logged.
 async fn tmdb(path: String, query: Vec<(&'static str, String)>) -> Option<Value> {
-    let key = load_settings().tmdb_key?;
+    let key = tmdb_key()?;
     on_runtime(async move {
         let response = backend().http.get(format!("https://api.themoviedb.org/3/{path}"))
             .query(&[("api_key", key)]).query(&query).send().await.ok()?.error_for_status().ok()?;
@@ -1150,7 +1175,7 @@ pub async fn artwork(m: &Media) -> Option<Artwork> {
 }
 
 /// Whether TMDB can be asked (a key is set).
-pub fn tmdb_ready() -> bool { load_settings().tmdb_key.is_some() }
+pub fn tmdb_ready() -> bool { tmdb_key().is_some() }
 
 static TMDB_GENRES: OnceLock<Mutex<HashMap<String, Vec<(i64, String)>>>> = OnceLock::new();
 
@@ -1220,9 +1245,13 @@ pub async fn tmdb_candidates(genre: Option<String>, kind: Option<String>, style:
         let kind_path = tk.to_owned();
         let found: HashMap<i64, (String, String)> = on_runtime(async move {
             let mut set = tokio::task::JoinSet::new();
+            // At most eight TMDB requests at a time (it rate-limits bursts).
+            let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             for id in ids {
                 let kp = kind_path.clone();
+                let gate = gate.clone();
                 set.spawn(async move {
+                    let _permit = gate.acquire_owned().await;
                     if kp == "tv" {
                         let d = tmdb(format!("tv/{id}"), vec![("append_to_response", "external_ids".into())]).await;
                         (id, d.and_then(|d| {
@@ -1275,7 +1304,8 @@ static TVMAZE: OnceLock<tokio::sync::OnceCell<Vec<Value>>> = OnceLock::new();
 /// its index once per session, as Cinemeta titles so they open and play like any other.
 pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option<i32>, to: Option<i32>) -> Vec<Media> {
     let cell = TVMAZE.get_or_init(tokio::sync::OnceCell::new);
-    let shows = cell.get_or_init(|| async {
+    // An empty answer (offline, TVmaze down) is not kept: the next visit asks again.
+    let shows = cell.get_or_try_init(|| async {
         let mut all = Vec::new();
         for page in [0u32, 4, 8, 12, 16, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] {
             let fetched = on_runtime(async move {
@@ -1287,8 +1317,9 @@ pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option
                     && s["rating"]["average"].as_f64().unwrap_or(0.0) >= 6.8));
             }
         }
-        all
+        if all.is_empty() { Err(()) } else { Ok(all) }
     }).await;
+    let Ok(shows) = shows else { return Vec::new() };
     let wanted = genre.as_deref().map(|g| match g.to_lowercase().as_str() { "sci-fi" | "science fiction" => "science-fiction".to_owned(), x => x.to_owned() });
     let mut out: Vec<(f64, Media)> = shows.iter().filter_map(|s| {
         let genres: Vec<String> = s["genres"].as_array().into_iter().flatten().filter_map(Value::as_str)
@@ -1302,7 +1333,7 @@ pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option
         let ended: Option<i32> = s["ended"].as_str().and_then(|d| d.get(..4)).and_then(|y| y.parse().ok());
         let last = ended.unwrap_or(9999);
         if from.is_some_and(|f| year == 0 || last < f) || to.is_some_and(|t| year == 0 || year > t) { return None; }
-        let summary = regex::Regex::new("<[^>]+>").ok()?.replace_all(s["summary"].as_str().unwrap_or_default(), "").to_string();
+        let summary = html_tag().replace_all(s["summary"].as_str().unwrap_or_default(), "").to_string();
         let meta = json!({
             "id": s["externals"]["imdb"], "type": "series", "name": s["name"], "description": summary,
             "releaseInfo": match (year, ended) { (0, _) => String::new(), (y, Some(e)) if e != y => format!("{y}–{e}"), (y, Some(_)) => y.to_string(), (y, None) => format!("{y}–") },
@@ -1572,10 +1603,22 @@ pub async fn accent(url: String) -> Option<String> {
     if let Some(hit) = backend().accents.lock().ok()?.get(&url).cloned() { return hit; }
     let key = url.clone();
     let computed = on_runtime(async move {
-        let response = backend().http.get(&url).send().await.ok()?.error_for_status().ok()?;
-        if response.content_length().is_some_and(|n| n > 12_000_000) { return None; }
-        let bytes = response.bytes().await.ok()?;
-        let img = image::load_from_memory(&bytes).ok()?.thumbnail(48, 48).to_rgba8();
+        const LIMIT: usize = 12_000_000;
+        let mut response = backend().http.get(&url).send().await.ok()?.error_for_status().ok()?;
+        if response.content_length().is_some_and(|n| n > LIMIT as u64) { return None; }
+        // Read at most LIMIT bytes whatever the server says, and decode within a memory budget.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if bytes.len() + chunk.len() > LIMIT { return None; }
+            bytes.extend_from_slice(&chunk);
+        }
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(256 * 1024 * 1024);
+        limits.max_image_width = Some(12_000);
+        limits.max_image_height = Some(12_000);
+        reader.limits(limits);
+        let img = reader.decode().ok()?.thumbnail(48, 48).to_rgba8();
         let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
         artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
     }).await.ok().flatten();
@@ -1611,6 +1654,35 @@ pub fn artwork_accent(pixels: &[[u8; 4]]) -> Option<(u8, u8, u8)> {
 fn luminance(r: f64, g: f64, b: f64) -> f64 {
     let c = |x: f64| if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
     0.2126 * c(r) + 0.7152 * c(g) + 0.0722 * c(b)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn episode_labels_for_series_and_kitsu() {
+        assert_eq!(episode_label("tt123:2:5").as_deref(), Some("S2 E5"));
+        assert_eq!(episode_label("kitsu:12345:5").as_deref(), Some("E5"));
+        assert_eq!(episode_label("tt123"), None);
+        assert_eq!(episode_label("custom:abc:x"), None);
+        assert_eq!(episode_label("mal:5114:3"), None);
+        assert_eq!(episode_label("tmdb:123:1:2").as_deref(), Some("S1 E2"));
+    }
+
+    #[test]
+    fn catalogs_needing_an_extra_are_not_shelves() {
+        assert!(catalog_needs_extra(&json!({"extra":[{"name":"genre","isRequired":true}]})));
+        assert!(catalog_needs_extra(&json!({"extraRequired":["search"]})));
+        assert!(!catalog_needs_extra(&json!({"extra":[{"name":"skip"}],"extraRequired":[]})));
+    }
+
+    #[test]
+    fn audio_language_names_its_subtitles() {
+        assert_eq!(subtitle_language_of("latino"), "Spanish (Latin America)");
+        assert_eq!(subtitle_language_of("italian"), "Italian");
+        assert_eq!(subtitle_language_of("nope"), "");
+    }
 }
 
 #[cfg(test)]

@@ -53,6 +53,8 @@ struct Inner {
     streams: Mutex<HashMap<String, (Instant, Value, usize)>>,
     subtitles: subtitle_cache::SubtitleCache,
     local_addon: Mutex<LocalAddon>,
+    /// Parsed installed manifests, dropped whenever the addons table changes.
+    addons: Mutex<Option<Vec<Addon>>>,
 }
 impl Core {
     /// Creates/migrates local storage synchronously. No network requests occur here.
@@ -66,6 +68,7 @@ impl Core {
                 streams: Mutex::new(HashMap::new()),
                 subtitles: subtitle_cache::SubtitleCache::new(&data_dir),
                 local_addon: Mutex::new(LocalAddon::Unknown),
+                addons: Mutex::new(None),
             }),
         })
     }
@@ -78,29 +81,24 @@ impl Core {
         f(&mut db)
     }
     fn installed(&self) -> Result<Vec<Addon>> {
+        // Read and fill the cache under the storage lock; every write to the addons table clears
+        // it under the same lock, so a reader never sees a list older than the table.
         self.with_db(|db| {
-            let mut s =
-                db.prepare("SELECT url,manifest,allow_http,generation FROM addons ORDER BY rowid")?;
-            let items = s.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, bool>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut addons = Vec::new();
-            for item in items {
-                let (url, manifest, allow_http, generation) = item?;
-                addons.push(Addon {
-                    url,
-                    manifest: serde_json::from_str(&manifest)?,
-                    allow_http,
-                    generation,
-                });
+            if let Some(cached) = self.inner.addons.lock().ok().and_then(|a| a.clone()) {
+                return Ok(cached);
+            }
+            let addons = read_installed(db)?;
+            if let Ok(mut cache) = self.inner.addons.lock() {
+                *cache = Some(addons.clone());
             }
             Ok(addons)
         })
+    }
+    /// Forget the parsed manifests after any write to the addons table.
+    fn addons_changed(&self) {
+        if let Ok(mut cache) = self.inner.addons.lock() {
+            *cache = None;
+        }
     }
     /// Records the manifest URL of the embedded metadata addon this process is
     /// serving (None when it failed to start). Older loopback registrations stay
@@ -127,6 +125,32 @@ impl Core {
                 "DELETE FROM cache WHERE key LIKE ?1 || '%' ESCAPE '\\'",
                 [escaped],
             )?)
+        })
+    }
+    /// Delete the cached responses of one addon: keys are its base path, a resource, then (for
+    /// an addon whose manifest URL has a query) that same query. Other addons on the same host,
+    /// or the same path with another query, keep theirs.
+    fn purge_addon_responses(&self, manifest_url: &str) -> Result<usize> {
+        let mut base = url::Url::parse(manifest_url).map_err(|_| anyhow!("Invalid addon URL"))?;
+        let query = base.query().map(|q| format!("?{q}")).unwrap_or_default();
+        base.set_query(None);
+        base.set_fragment(None);
+        let prefix = base
+            .as_str()
+            .strip_suffix("manifest.json")
+            .context("Expected manifest.json URL")?
+            .to_owned();
+        self.with_db(|db| {
+            let mut removed = 0;
+            for resource in ["catalog", "meta", "stream", "subtitles"] {
+                let start = format!("{prefix}{resource}/");
+                removed += db.execute(
+                    "DELETE FROM cache WHERE substr(key,1,length(?1))=?1
+                     AND (CASE WHEN ?2='' THEN instr(key,'?')=0 ELSE substr(key,-length(?2))=?2 END)",
+                    params![start, query],
+                )?;
+            }
+            Ok(removed)
         })
     }
     /// Embedded-addon revision (`?v=`) for a loopback registration of it.
@@ -226,11 +250,12 @@ impl Core {
                  ON CONFLICT(url) DO UPDATE SET manifest=excluded.manifest,allow_http=excluded.allow_http,generation=excluded.generation",
                 params![url,manifest.to_string(),allow_http],
             )?;
+            self.addons_changed();
             Ok(())
         })?;
         Ok(Addon {
             url,
-            manifest,
+            manifest: manifest.into(),
             allow_http,
             generation: String::new(),
         }
@@ -252,13 +277,21 @@ impl Core {
             }
             "remove_addon" => {
                 let url = addon::normalize(text(&request, "url")?, true)?;
-                let removed = self
-                    .with_db(|db| Ok(db.execute("DELETE FROM addons WHERE url=?1", [&url])? > 0))?;
+                let removed = self.with_db(|db| {
+                    let removed = db.execute("DELETE FROM addons WHERE url=?1", [&url])? > 0;
+                    self.addons_changed();
+                    Ok(removed)
+                })?;
                 self.inner
                     .streams
                     .lock()
                     .map_err(|_| anyhow!("Stream lock poisoned"))?
                     .clear();
+                // Cached responses are keyed by the addon's (possibly secret-bearing) URL. The
+                // addon is already gone: a failed purge leaves them to normal eviction.
+                if removed {
+                    let _ = self.purge_addon_responses(&url);
+                }
                 Ok(json!({"removed":removed}))
             }
             "refresh_addons" => self.refresh().await,
@@ -300,6 +333,17 @@ impl Core {
             }
             "migrate_local_history" => self.migrate_local_history(&request),
             "playback" => self.playback(&request),
+            "watched_videos" => self.watched_videos(&request),
+            "item" => {
+                // One title as the store has it (saved, watched, liked, progress), or null.
+                let kind = text(&request, "type")?;
+                let id = text(&request, "id")?;
+                let addon = addon::normalize(text(&request, "addon_url")?, true)?;
+                let key = db::identity(kind, id, &addon);
+                let item = self.with_db(|db| db::media_item(db, &key))?;
+                Ok(json!({ "item": item.map(|m| m.value()) }))
+            }
+            "history" => self.history(&request),
             "set_library" | "progress" | "mark_watched" | "mark_videos" | "feedback" | "forget" => {
                 self.mutate(&request)
             }
@@ -329,17 +373,19 @@ impl Core {
         let fetched = self.fetch(&a.url, a.allow_http, 3600, 86400).await?;
         let manifest = addon::validate_manifest(fetched.body)?;
         let updated = self.with_db(|db| {
-            Ok(db.execute(
+            let updated = db.execute(
                 "UPDATE addons SET manifest=?2,generation=lower(hex(randomblob(16))) WHERE url=?1 AND generation=?3",
                 params![a.url,manifest.to_string(),a.generation],
-            )? > 0)
+            )? > 0;
+            self.addons_changed();
+            Ok(updated)
         })?;
         ensure!(
             updated,
             "Addon changed or was removed during refresh; stale response ignored"
         );
         let mut refreshed = a.clone();
-        refreshed.manifest = manifest;
+        refreshed.manifest = manifest.into();
         Ok(refreshed.descriptor())
     }
     async fn refresh(&self) -> Result<Value> {
@@ -737,6 +783,58 @@ impl Core {
             Ok(json!({"video_id":video,"position_ms":position,"duration_ms":duration,"watched_ms":watched_ms,"watched":watched}))
         })
     }
+    /// Videos of a title marked watched (by hand, or by measured playback), under any addon.
+    fn watched_videos(&self, req: &Value) -> Result<Value> {
+        let kind = text(req, "type")?.to_owned();
+        let id = text(req, "id")?.to_owned();
+        self.with_db(|db| {
+            let mut q = db.prepare(
+                "SELECT p.video_id FROM playback p JOIN media m ON m.key=p.media_key
+                 WHERE m.type=?1 AND m.raw_id=?2 AND p.watched<>0",
+            )?;
+            let ids = q
+                .query_map(params![kind, id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(json!({ "video_ids": ids }))
+        })
+    }
+    /// Everything watched or started, latest first, with when it was last seen (unix seconds).
+    fn history(&self, req: &Value) -> Result<Value> {
+        let limit = req["limit"].as_u64().unwrap_or(600).clamp(1, 2000) as i64;
+        self.with_db(|db| {
+            let mut q = db.prepare(
+                "SELECT m.type,m.raw_id,m.addon_url,m.meta,m.watched,m.position_ms,m.duration_ms,m.video_id,m.saved,m.liked,
+                        COALESCE((SELECT MAX(p.updated) FROM playback p WHERE p.media_key=m.key),m.updated) AS seen
+                 FROM media m
+                 WHERE m.watched<>0 OR m.position_ms>0 OR m.watched_ms>0 OR EXISTS (SELECT 1 FROM playback p WHERE p.media_key=m.key)
+                 ORDER BY seen DESC LIMIT ?1",
+            )?;
+            let rows = q.query_map([limit], |r| {
+                let mut meta: Value =
+                    serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_else(|_| json!({}));
+                if !meta.is_object() {
+                    meta = json!({});
+                }
+                if let Some(o) = meta.as_object_mut() {
+                    o.insert("type".into(), json!(r.get::<_, String>(0)?));
+                    o.insert("id".into(), json!(r.get::<_, String>(1)?));
+                    o.insert("addon_url".into(), json!(r.get::<_, String>(2)?));
+                    o.insert("watched".into(), json!(r.get::<_, i64>(4)? != 0));
+                    o.insert("position_ms".into(), json!(r.get::<_, i64>(5)?));
+                    o.insert("duration_ms".into(), json!(r.get::<_, i64>(6)?));
+                    if let Some(v) = r.get::<_, Option<String>>(7)? {
+                        o.insert("video_id".into(), json!(v));
+                    }
+                    o.insert("library".into(), json!(r.get::<_, i64>(8)? != 0));
+                    o.insert("liked".into(), json!(r.get::<_, i64>(9)?));
+                    o.insert("seen".into(), json!(r.get::<_, i64>(10)?));
+                }
+                Ok(meta)
+            })?;
+            // A row that can't be read is left out, not the whole history.
+            Ok(json!({ "items": rows.filter_map(rusqlite::Result::ok).collect::<Vec<_>>() }))
+        })
+    }
     fn mutate(&self, req: &Value) -> Result<Value> {
         let op = text(req, "op")?;
         let kind = text(req, "type")?;
@@ -753,7 +851,14 @@ impl Core {
                     tx.execute("UPDATE media SET saved=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"saved",false)?,db::now()])?;
                 },
                 "mark_watched"=>{
-                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"watched",true)?,db::now()])?;
+                    let watched=boolean(req,"watched",true)?;
+                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,db::now()])?;
+                    if !watched {
+                        // A film watched through is unmarked to watch again: its own playback record
+                        // starts over too, or the next report would mark it watched straight away.
+                        tx.execute("UPDATE playback SET watched=0,watched_ms=0 WHERE media_key=?1 AND video_id=?2",params![key,id])?;
+                        tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1) WHERE key=?1",params![key])?;
+                    }
                 },
                 "mark_videos"=>{
                     // Episodes you say you watched (or not), without touching where you are.
@@ -775,7 +880,8 @@ impl Core {
                             tx.execute("DELETE FROM playback WHERE media_key=?1 AND video_id=?2 AND position_ms=0",params![key,v])?;
                         }
                     }
-                    tx.execute("UPDATE media SET updated=?2 WHERE key=?1",params![key,now])?;
+                    // The title's measured total follows its episodes.
+                    tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1),updated=?2 WHERE key=?1",params![key,now])?;
                 },
                 "forget"=>{
                     // Stop tracking a title: its history, progress, marks and rating all go.
@@ -791,6 +897,9 @@ impl Core {
                     let position=nonnegative(req,"position_ms",None)?;
                     let duration=nonnegative(req,"duration_ms",None)?;
                     let watched=nonnegative(req,"watched_ms",Some(0))?;
+                    // Measured playback since the player's previous report, added to what is stored,
+                    // so a film watched over several sessions adds up.
+                    let added=nonnegative(req,"watched_add_ms",Some(0))?;
                     let video=if req.get("video_id").is_some() { text(req,"video_id")? } else { id };
                     // Cumulative measured playback per video, never inferred from seeking.
                     tx.execute(
@@ -799,10 +908,16 @@ impl Core {
                          watched_ms=MAX(playback.watched_ms,excluded.watched_ms),updated=excluded.updated",
                         params![key,video,position,duration,watched,db::now()],
                     )?;
+                    if added>0 {
+                        tx.execute(
+                            "UPDATE playback SET watched_ms=MIN(watched_ms+?3,MAX(duration_ms,?4)) WHERE media_key=?1 AND video_id=?2",
+                            params![key,video,added,duration],
+                        )?;
+                    }
                     // Use retained measured time, including when the incoming report omits
                     // it or comes from a fresh player session with a smaller counter.
                     tx.execute(
-                        "UPDATE playback SET watched=MAX(watched,duration_ms>0 AND watched_ms*5>=duration_ms*4 AND position_ms*10>=duration_ms*9)
+                        "UPDATE playback SET watched=MAX(watched,duration_ms>0 AND watched_ms*5>=duration_ms*4 AND position_ms*5>=duration_ms*4)
                          WHERE media_key=?1 AND video_id=?2", params![key,video],
                     )?;
                     let total:i64=tx.query_row("SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1",[&key],|r|r.get(0))?;
@@ -826,7 +941,7 @@ impl Core {
                 Ok(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
             };
             Ok(json!({
-                "schema_version":2,"addons":count("addons")?,"cache_entries":count("cache")?,
+                "schema_version":3,"addons":count("addons")?,"cache_entries":count("cache")?,
                 "items":count("media")?,"playback_entries":count("playback")?,
                 "network_concurrency":8,"stream_urls_persisted":false
             }))
@@ -1118,6 +1233,30 @@ fn extras(v: &Value) -> Result<Map<String, Value>> {
         _ => bail!("extra must be an object"),
     }
 }
+fn read_installed(db: &rusqlite::Connection) -> Result<Vec<Addon>> {
+    let mut s =
+        db.prepare("SELECT url,manifest,allow_http,generation FROM addons ORDER BY rowid")?;
+    let items = s.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut addons = Vec::new();
+    for item in items {
+        let (url, manifest, allow_http, generation) = item?;
+        addons.push(Addon {
+            url,
+            manifest: std::sync::Arc::new(serde_json::from_str(&manifest)?),
+            allow_http,
+            generation,
+        });
+    }
+    Ok(addons)
+}
+
 fn nonnegative(v: &Value, key: &str, default: Option<i64>) -> Result<i64> {
     let n = v
         .get(key)

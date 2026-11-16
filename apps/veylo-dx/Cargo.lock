@@ -5228,12 +5228,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veylo-dx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "dioxus",
  "embed-resource",
+ "getrandom 0.3.4",
  "gtk",
  "image",
  "jni 0.21.1",
@@ -5243,7 +5244,6 @@ dependencies = [
  "ndk-context",
  "regex",
  "reqwest",
- "rusqlite",
  "rustmedia-core",
  "rustmedia-media-proxy",
  "serde_json",
