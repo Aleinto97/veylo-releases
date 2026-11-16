@@ -366,6 +366,19 @@ pub async fn remove_rd_key() -> Result<()> {
         exec(json!({"op":"remove_addon","url":row.url})).await
             .map_err(|_| anyhow::anyhow!("{} couldn't be removed, so the key was kept. Try again.", row.name))?;
     }
+    // Veylo's own records of those add-ons hold the key too (Torrentio's link, the AIOStreams
+    // login of a configuration that has the key): delete the AIOStreams configuration on its
+    // server where it still answers, and forget all of them.
+    let mut store = load();
+    for c in Curated::ALL {
+        for record in [store.managed.remove(c.id()), store.managed.remove(&format!("{}:pending", c.id()))].into_iter().flatten() {
+            let (uuid, password) = (s(&record, "uuid"), s(&record, "password"));
+            if c == Curated::AioStreams && !uuid.is_empty() && !password.is_empty() {
+                let _ = aiostreams_call(reqwest::Method::DELETE, json!({}), Some((uuid, password))).await;
+            }
+        }
+    }
+    save(&store);
     let settings = backend::Settings { rd_key: None, rd_key_removed: true, ..backend::load_settings() };
     backend::save_settings(&settings);
     Ok(())

@@ -247,11 +247,7 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         // Certificates are checked everywhere (mpv's default is not to): Android with mpv-android's CA
         // bundle below, Linux with the system's, Windows through Schannel and the Windows store.
         o.set_property("tls-verify", "yes")?;
-        // One header per append: the plain list option splits on commas, which header values may hold.
-        for (k, v) in &req.headers {
-            if k.is_empty() || k.contains([':', '\r', '\n']) || v.contains(['\r', '\n']) { continue; }
-            o.set_property("http-header-fields-append", format!("{k}: {v}").as_str())?;
-        }
+        // Request headers are added once mpv runs (add_headers): one list entry each.
         // Windows: mpv draws into its own child window of the app window (video.rs) with Direct3D 11.
         #[cfg(target_os = "windows")]
         {
@@ -286,7 +282,18 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
             o.set_property("keepaspect", "no")?;
         }
         Ok(())
-    }).map_err(|e| anyhow::anyhow!("mpv couldn't start: {e}"))
+    }).map_err(|e| anyhow::anyhow!("mpv couldn't start: {e}")).and_then(|mpv| { add_headers(&mpv, &req.headers)?; Ok(mpv) })
+}
+
+/// The source's request headers, one `http-header-fields` entry each through `change-list
+/// append`: setting the list as a whole splits on commas, which header values (cookies) hold.
+fn add_headers(mpv: &Mpv, headers: &[(String, String)]) -> anyhow::Result<()> {
+    for (k, v) in headers {
+        if k.is_empty() || k.contains([':', '\r', '\n']) || v.contains(['\r', '\n']) { continue; }
+        mpv.command("change-list", &["http-header-fields", "append", &format!("{k}: {v}")])
+            .map_err(|e| anyhow::anyhow!("mpv refused a request header: {e}"))?;
+    }
+    Ok(())
 }
 
 const OBSERVED: [(&str, Format); 18] = [
@@ -530,6 +537,20 @@ pub fn facts(live: &Live, s: &State) -> Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against the real libmpv: a header with a comma stays one entry.
+    #[test]
+    fn headers_with_commas_reach_mpv_whole() {
+        unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
+        let mpv = Mpv::with_initializer(|o| { o.set_property("config", false)?; o.set_property("vo", "null")?; o.set_property("ao", "null")?; Ok(()) }).unwrap();
+        add_headers(&mpv, &[("Cookie".into(), "a=1, b=2".into()), ("X-Token".into(), "t".into()), ("Bad:Name".into(), "x".into())]).unwrap();
+        let list: String = mpv.get_property("http-header-fields").unwrap();
+        assert!(list.contains("Cookie: a=1, b=2") && list.contains("X-Token: t") && !list.contains("Bad:Name"), "{list}");
+        // mpv prints a list joined by commas; removing the cookie as one entry proves it is one.
+        mpv.command("change-list", &["http-header-fields", "remove", "Cookie: a=1, b=2"]).unwrap();
+        let rest: String = mpv.get_property("http-header-fields").unwrap();
+        assert_eq!(rest, "X-Token: t");
+    }
     #[test]
     fn only_small_forward_steps_count_as_watching() {
         assert_eq!(super::played_between(10.0, 10.5, 1.0), 0.5);

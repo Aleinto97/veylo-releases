@@ -398,13 +398,16 @@ pub async fn watched_episodes(media: &Media) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// "S2 E5" for "tt123:2:5", "E5" for Kitsu's "kitsu:123:5"; None for other id schemes
-/// (their label comes from the episode list).
+/// "S2 E5" for "tt123:2:5" and "tmdb:123:2:5" (scheme, id, season, episode), "E5" for Kitsu's
+/// "kitsu:123:5"; None for anything else, such as "mal:5114:3" (its label comes from the
+/// episode list).
 pub fn episode_label(video_id: &str) -> Option<String> {
     let parts: Vec<&str> = video_id.split(':').collect();
+    let se = |s: &str, e: &str| match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None };
     match parts.as_slice() {
         ["kitsu", _, e] => e.parse::<i64>().ok().map(|e| format!("E{e}")),
-        [series, s, e] if series.starts_with("tt") => match (s.parse::<i64>(), e.parse::<i64>()) { (Ok(s), Ok(e)) => Some(format!("S{s} E{e}")), _ => None },
+        [series, s, e] if series.starts_with("tt") => se(s, e),
+        [_, _, s, e] => se(s, e),
         _ => None,
     }
 }
@@ -519,7 +522,8 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
 /// What the store knows about a title opened from anywhere (a catalog shelf, Search, Picks):
 /// saved, watched, liked and progress come from there, the rest from the add-on.
 pub async fn stored(media: &Media) -> Option<Media> {
-    library().await.ok()?.into_iter().find(|m| m.kind == media.kind && m.id == media.id)
+    let v = exec(json!({"op":"item","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await.ok()?;
+    Media::from_json(&v["item"], &media.addon_url)
 }
 
 /// Save a title to the Library, or take it out (its history stays).
@@ -745,8 +749,9 @@ pub fn subtitle_matches(s: &OnlineSubtitle, query: &str) -> bool {
 /// Download one subtitle into the cache and return the local file for the player; a file the
 /// server says not to keep (or one Veylo can't read, like ASS) is handed to the player as a link.
 pub async fn fetch_subtitle(url: &str) -> String {
-    // The add-on chose the link: a plain-http one is fetched as offered (the player would anyway).
-    match exec(json!({"op":"subtitle_file","url":url,"allow_http":url.starts_with("http://")})).await {
+    // Plain http needs consent the core doesn't have for subtitle links: such a link isn't
+    // cached, and goes to the player as offered.
+    match exec(json!({"op":"subtitle_file","url":url})).await {
         Ok(v) => v["cache_path"].as_str().map(str::to_owned).unwrap_or_else(|| url.to_owned()),
         Err(_) => url.to_owned(),
     }
@@ -1662,6 +1667,7 @@ mod review_tests {
         assert_eq!(episode_label("tt123"), None);
         assert_eq!(episode_label("custom:abc:x"), None);
         assert_eq!(episode_label("mal:5114:3"), None);
+        assert_eq!(episode_label("tmdb:123:1:2").as_deref(), Some("S1 E2"));
     }
 
     #[test]

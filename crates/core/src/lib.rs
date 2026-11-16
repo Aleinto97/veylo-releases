@@ -254,21 +254,22 @@ impl Core {
                 let removed = self
                     .with_db(|db| Ok(db.execute("DELETE FROM addons WHERE url=?1", [&url])? > 0))?;
                 self.addons_changed();
-                // Cached responses are keyed by the addon's (possibly secret-bearing) URL.
-                if removed {
-                    if let Ok(mut base) = url::Url::parse(&url) {
-                        base.set_query(None);
-                        base.set_fragment(None);
-                        if let Some(prefix) = base.as_str().strip_suffix("manifest.json") {
-                            self.purge_cached_responses(prefix)?;
-                        }
-                    }
-                }
                 self.inner
                     .streams
                     .lock()
                     .map_err(|_| anyhow!("Stream lock poisoned"))?
                     .clear();
+                // Cached responses are keyed by the addon's (possibly secret-bearing) URL. The
+                // addon is already gone: a failed purge leaves them to normal eviction.
+                if removed {
+                    if let Ok(mut base) = url::Url::parse(&url) {
+                        base.set_query(None);
+                        base.set_fragment(None);
+                        if let Some(prefix) = base.as_str().strip_suffix("manifest.json") {
+                            let _ = self.purge_cached_responses(prefix);
+                        }
+                    }
+                }
                 Ok(json!({"removed":removed}))
             }
             "refresh_addons" => self.refresh().await,
@@ -311,6 +312,15 @@ impl Core {
             "migrate_local_history" => self.migrate_local_history(&request),
             "playback" => self.playback(&request),
             "watched_videos" => self.watched_videos(&request),
+            "item" => {
+                // One title as the store has it (saved, watched, liked, progress), or null.
+                let kind = text(&request, "type")?;
+                let id = text(&request, "id")?;
+                let addon = addon::normalize(text(&request, "addon_url")?, true)?;
+                let key = db::identity(kind, id, &addon);
+                let item = self.with_db(|db| db::media_item(db, &key))?;
+                Ok(json!({ "item": item.map(|m| m.value()) }))
+            }
             "history" => self.history(&request),
             "set_library" | "progress" | "mark_watched" | "mark_videos" | "feedback" | "forget" => {
                 self.mutate(&request)
@@ -907,7 +917,7 @@ impl Core {
                 Ok(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
             };
             Ok(json!({
-                "schema_version":2,"addons":count("addons")?,"cache_entries":count("cache")?,
+                "schema_version":3,"addons":count("addons")?,"cache_entries":count("cache")?,
                 "items":count("media")?,"playback_entries":count("playback")?,
                 "network_concurrency":8,"stream_urls_persisted":false
             }))

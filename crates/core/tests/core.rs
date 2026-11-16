@@ -1020,7 +1020,7 @@ async fn v1_migration_preserves_history_manual_marks_cache_and_addons() {
     for _ in 0..2 {
         let core = d.core();
         let diagnostics = core.execute(json!({"op":"diagnostics"})).await.unwrap();
-        assert_eq!(diagnostics["schema_version"], 2);
+        assert_eq!(diagnostics["schema_version"], 3);
         assert_eq!(diagnostics["addons"], 1);
         assert_eq!(diagnostics["cache_entries"], 1);
         assert_eq!(diagnostics["playback_entries"], 3);
@@ -1030,7 +1030,8 @@ async fn v1_migration_preserves_history_manual_marks_cache_and_addons() {
             assert_eq!(m["library"], true);
             assert_eq!(m["liked"], 1);
             assert_eq!(m["name"], "Retained");
-            assert_eq!(m["video_watched"], m["type"] != "anime");
+            // v3 keeps what the app showed: an episode played past 80% (no measured time) is watched.
+            assert_eq!(m["video_watched"], true);
             // Old manual/automatic marks are indistinguishable; don't erase either.
             assert_eq!(m["watched"], m["type"] != "anime");
             assert_eq!(core.execute(json!({"op":"playback","type":m["type"],"id":m["id"],"addon_url":addon,"video_id":m["video_id"]})).await.unwrap()["watched"],m["video_watched"]);
@@ -1588,5 +1589,52 @@ async fn an_unmarked_film_is_not_marked_again_by_the_next_report() {
     assert_eq!(
         core.execute(report(10000, 10000)).await.unwrap()["item"]["watched"],
         false
+    );
+}
+
+#[tokio::test]
+async fn old_history_played_past_80_percent_stays_watched_after_the_upgrade() {
+    let d = Data::new();
+    drop(d.core());
+    let db = rusqlite::Connection::open(d.0.join("core.sqlite3")).unwrap();
+    let addon = "https://example.test/manifest.json";
+    for (kind, id, video, position, measured) in [
+        ("movie", "tt1", "tt1", 85000, 0),
+        ("series", "tt2", "tt2:1:1", 82000, 0),
+        ("movie", "tt3", "tt3", 50000, 0),
+        ("movie", "tt4", "tt4", 85000, 10000),
+    ] {
+        let key = json!([kind, id, ""]).to_string();
+        db.execute("INSERT INTO media(key,type,raw_id,addon_url,meta,position_ms,duration_ms,watched_ms,video_id,updated) VALUES(?1,?2,?3,?4,'{}',?5,100000,?7,?6,1)",
+            rusqlite::params![key, kind, id, addon, position, video, measured]).unwrap();
+        db.execute("INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated) VALUES(?1,?2,?3,100000,?4,1)",
+            rusqlite::params![key, video, position, measured]).unwrap();
+    }
+    db.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(db);
+    let core = d.core();
+    let item = |id: &'static str, kind: &'static str| {
+        let core = core.clone();
+        async move {
+            core.execute(json!({"op":"item","type":kind,"id":id,"addon_url":addon}))
+                .await
+                .unwrap()["item"]
+                .clone()
+        }
+    };
+    assert_eq!(item("tt1", "movie").await["watched"], true);
+    assert_eq!(item("tt3", "movie").await["watched"], false);
+    // Measured time already decides; the upgrade doesn't second-guess it.
+    assert_eq!(item("tt4", "movie").await["watched"], false);
+    let videos = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt2"}))
+        .await
+        .unwrap();
+    assert_eq!(videos["video_ids"], json!(["tt2:1:1"]));
+    assert_eq!(
+        core.execute(json!({"op":"item","type":"movie","id":"tt9","addon_url":addon}))
+            .await
+            .unwrap()["item"],
+        Value::Null
     );
 }

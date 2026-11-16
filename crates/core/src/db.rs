@@ -24,7 +24,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 2 {
+    if version > 3 {
         bail!("Database was created by a newer core");
     }
     if version == 0 {
@@ -69,6 +69,21 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
         )?;
         // v1 conflated manual title marks with automatic episode completion. Preserve
         // those title flags rather than silently discard an explicit user decision.
+        tx.commit()?;
+    }
+    if version < 3 {
+        // Before v3 the app marked a film or episode watched once playback passed 80%, without
+        // measured time (watched_ms 0) and sometimes without the mark landing. Keep what it showed.
+        let tx = db.transaction()?;
+        tx.execute_batch(
+            "
+          UPDATE playback SET watched=1 WHERE watched=0 AND watched_ms=0
+            AND duration_ms>0 AND position_ms*5>=duration_ms*4;
+          UPDATE media SET watched=1 WHERE watched=0 AND type='movie' AND watched_ms=0
+            AND duration_ms>0 AND position_ms*5>=duration_ms*4;
+          PRAGMA user_version=3;
+        ",
+        )?;
         tx.commit()?;
     }
     Ok(db)

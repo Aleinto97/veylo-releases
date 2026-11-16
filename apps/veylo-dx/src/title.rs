@@ -95,9 +95,10 @@ pub fn TitlePage(media: Media) -> Element {
     let (m1, m4) = (media.clone(), media.clone());
     let rate = move |value: i64| {
         let media = m1.clone();
-        let next = if liked() == value { 0 } else { value };
+        let before = liked();
+        let next = if before == value { 0 } else { value };
         liked.set(next);
-        spawn(async move { if backend::feedback(&media, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(media.liked); } });
+        spawn(async move { if backend::feedback(&media, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } });
     };
     let (mut rate_like, mut rate_hide) = (rate.clone(), rate);
     // Save to the Library (S), and the "Already watched" switch (W): the button and the key alike.
@@ -124,7 +125,7 @@ pub fn TitlePage(media: Media) -> Element {
         let film = !episodic(&k_media);
         match key {
             'p' => if film { autoplay.call((k_media.id.clone(), None)) }
-                   else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()) { autoplay.call((id.clone(), episode_label_from_id(&id))) },
+                   else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()) { autoplay.call((id.clone(), backend::episode_label(&id))) },
             'l' => { let next = if *liked.peek() == 1 { 0 } else { 1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
             'd' => { let next = if *liked.peek() == -1 { 0 } else { -1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
             's' => toggle_save.call(()),
@@ -177,11 +178,11 @@ pub fn TitlePage(media: Media) -> Element {
                         if !film {
                             if let Some(next) = up_next(&episodes(), &media, &seen()) {
                                 button { class: "pill accent play-big", disabled: busy().is_some(),
-                                    onclick: { let l = next.clone(); move |_| autoplay.call((l.clone(), episode_label_from_id(&l))) },
+                                    onclick: { let l = next.clone(); move |_| autoplay.call((l.clone(), backend::episode_label(&l))) },
                                     if busy().is_some() { span { class: "spinner", aria_hidden: "true" } span { "Finding source" } }
                                     else { icons::Play {} span { {
                                         let verb = if media.last_video_id.as_deref() == Some(next.as_str()) && backend::in_progress(&media) { "Resume" } else { "Play" };
-                                        match episode_label_from_id(&next) { Some(l) => format!("{verb} {l}"), None => verb.into() }
+                                        match backend::episode_label(&next) { Some(l) => format!("{verb} {l}"), None => verb.into() }
                                     } } }
                                 }
                             }
@@ -306,14 +307,12 @@ pub fn resume_now(mut shell: Shell, media: Media) {
     match media.last_video_id.clone() {
         Some(video) => {
             // The label comes from the video id's own season/episode numbers (series:season:episode).
-            let label = episode_label_from_id(&video);
+            let label = backend::episode_label(&video);
             play_next(shell, media, video, label);
         }
         None => shell.opened.set(Some(media)),
     }
 }
-
-fn episode_label_from_id(id: &str) -> Option<String> { backend::episode_label(id) }
 
 /// Play one video now with the automatic choice, without the page (Resume, Next episode).
 fn play_next(mut shell: Shell, media: Media, video: String, label: Option<String>) {
