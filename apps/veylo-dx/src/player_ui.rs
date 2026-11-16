@@ -128,6 +128,35 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         });
     });
 
+    // No audio in your language: your language's subtitles instead, once per video. The file's
+    // own subtitles first, else the best download. Untagged audio says nothing, so it is left as is.
+    let mut fallback_done = use_signal(|| false);
+    let (fb_live, fb_wanted) = (live.clone(), wanted.clone());
+    use_effect(move || {
+        let s = state();
+        if *fallback_done.peek() || !s.loaded || s.tracks.is_empty() { return; }
+        fallback_done.set(true);
+        let Some(key) = backend::stream_language() else { return };
+        let name = backend::subtitle_language_of(&key);
+        let mut say = say;
+        let plan = fallback(&s.tracks, &key);
+        if let Fallback::Embedded(id) = plan {
+            fb_live.0.select(false, Some(id));
+            say(format!("No {name} audio: {name} subtitles on"));
+        }
+        if plan != Fallback::Download { return; }
+        let Some((kind, video)) = fb_wanted.clone() else { return };
+        spawn(async move {
+            let list = backend::online_subtitles(&kind, &video).await.unwrap_or_default();
+            let best = list.iter().find(|s| s.language == name).cloned();
+            if *online.peek() == Online::Idle || *online.peek() == Online::Loading { online.set(Online::Ready(list)); }
+            match best {
+                Some(sub) => download.call(sub),
+                None => say(format!("No {name} audio or subtitles for this video")),
+            }
+        });
+    });
+
     // Keys routed from the shell; the same set as the classic Android player.
     let keys = live.clone();
     use_effect(move || {
@@ -335,6 +364,20 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     }
 }
 
+/// What to do when a video starts, for the audio-language setting `key`.
+#[derive(Debug, PartialEq)]
+enum Fallback { Nothing, Embedded(i64), Download }
+
+/// Your language's audio is there (or the audio is untagged, so it can't be told): nothing.
+/// Otherwise your language's subtitles: the file's own when it has them, else a download.
+fn fallback(tracks: &[engine::Track], key: &str) -> Fallback {
+    let in_language = |t: &engine::Track| backend::track_in_language(&t.lang, key);
+    let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio).collect();
+    if audio.is_empty() || audio.iter().all(|t| t.lang.is_empty()) || audio.iter().any(|t| in_language(t)) { return Fallback::Nothing; }
+    if tracks.iter().any(|t| !t.audio && t.selected && in_language(t)) { return Fallback::Nothing; }
+    match tracks.iter().find(|t| !t.audio && in_language(t)) { Some(t) => Fallback::Embedded(t.id), None => Fallback::Download }
+}
+
 fn sheet_name(s: Sheet) -> &'static str {
     match s { Sheet::Audio => "Audio", Sheet::Subtitles => "Subtitles", Sheet::Speed => "Speed", Sheet::Picture => "Picture", Sheet::Info => "Details", Sheet::Keys => "Shortcuts" }
 }
@@ -464,6 +507,24 @@ fn OptionRow(on: bool, label: String, about: String, pick: EventHandler<MouseEve
 
 #[cfg(test)]
 mod tests {
+    use super::{fallback, Fallback};
+    use crate::engine::Track;
+    fn track(id: i64, audio: bool, lang: &str) -> Track { Track { id, audio, lang: lang.into(), ..Default::default() } }
+
+    #[test]
+    fn subtitles_only_when_your_language_is_missing_from_the_audio() {
+        let it = "italian";
+        // MULTI with Italian audio: mpv's alang picks it, nothing else to do.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita")], it), Fallback::Nothing);
+        // Untagged audio can't be told apart: left alone.
+        assert_eq!(fallback(&[track(1, true, "")], it), Fallback::Nothing);
+        // English only, with Italian subtitles in the file: those.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng"), track(4, false, "ita")], it), Fallback::Embedded(4));
+        // English only, no Italian subtitles in the file: download.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng")], it), Fallback::Download);
+        // Italian subtitles already on (forced by the file): nothing.
+        assert_eq!(fallback(&[track(1, true, "eng"), Track { selected: true, ..track(4, false, "it") }], it), Fallback::Nothing);
+    }
     #[test]
     fn clock_reads_like_a_player() {
         assert_eq!(super::clock(5.0), "0:05");

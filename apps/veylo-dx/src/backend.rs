@@ -792,6 +792,32 @@ fn set_stream_language(language: Option<String>) {
     if let Ok(mut l) = STREAM_LANGUAGE.lock() { *l = language; }
 }
 
+/// The preferred audio language (a `crate::addons::LANGUAGES` key), None for any.
+pub fn stream_language() -> Option<String> { STREAM_LANGUAGE.lock().ok().and_then(|l| l.clone()) }
+
+/// The language codes a file's tracks use for an audio-language setting, in mpv's `alang`
+/// order (ISO 639-1, then -2/B and -2/T).
+pub fn track_codes(key: &str) -> &'static [&'static str] {
+    match key {
+        "english" => &["en", "eng"], "italian" => &["it", "ita"], "spanish" => &["es", "spa"],
+        "latino" => &["es-419", "es-mx", "es", "spa"], "french" => &["fr", "fre", "fra"], "german" => &["de", "ger", "deu"],
+        "portuguese" => &["pt", "por", "pt-br", "pob"], "dutch" => &["nl", "dut", "nld"], "polish" => &["pl", "pol"],
+        "russian" => &["ru", "rus"], "ukrainian" => &["uk", "ukr"], "turkish" => &["tr", "tur"], "greek" => &["el", "gre", "ell"],
+        "swedish" => &["sv", "swe"], "danish" => &["da", "dan"], "norwegian" => &["no", "nor", "nob", "nb"],
+        "finnish" => &["fi", "fin"], "czech" => &["cs", "cze", "ces"], "hungarian" => &["hu", "hun"],
+        "romanian" => &["ro", "rum", "ron"], "arabic" => &["ar", "ara"], "hebrew" => &["he", "heb"], "hindi" => &["hi", "hin"],
+        "japanese" => &["ja", "jpn"], "korean" => &["ko", "kor"], "chinese" => &["zh", "chi", "zho"],
+        _ => &[],
+    }
+}
+
+/// Whether a track's language tag is the setting's language ("ita", "it", "it-IT" for Italian).
+pub fn track_in_language(code: &str, key: &str) -> bool {
+    let code = code.trim().to_lowercase();
+    let base = code.split(['-', '_']).next().unwrap_or("");
+    track_codes(key).iter().any(|c| *c == code || (!c.contains('-') && *c == base && key != "latino") || (key == "latino" && code.starts_with("es-") && code != "es-es"))
+}
+
 /// `play_order` with a preferred audio language: sources tagged with it (flag, name or release
 /// tag, multi-audio included) come first, each half in the usual order. English is the usual
 /// original audio and mostly untagged, so it never reorders.
@@ -1669,6 +1695,18 @@ fn luminance(r: f64, g: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[test]
+    fn track_languages_match_the_setting() {
+        assert!(track_in_language("ita", "italian"));
+        assert!(track_in_language("it-IT", "italian"));
+        assert!(!track_in_language("eng", "italian"));
+        assert!(!track_in_language("", "italian"));
+        assert!(track_in_language("es-419", "latino"));
+        assert!(!track_in_language("es-ES", "latino"));
+        assert!(track_in_language("pt-BR", "portuguese"));
+        assert_eq!(track_codes("italian").join(","), "it,ita");
+    }
 
     #[test]
     fn episode_labels_for_series_and_kitsu() {

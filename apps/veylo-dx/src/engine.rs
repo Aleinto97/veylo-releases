@@ -38,7 +38,9 @@ impl Fit {
 
 /// One audio or subtitle track as the viewer sees it.
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected: bool, pub image: bool, pub styled: bool }
+pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected: bool, pub image: bool, pub styled: bool,
+    /// The track's language tag as the file has it ("ita", "en"), empty when untagged.
+    pub lang: String }
 
 /// What the screen can show, as the platform declares it (Android's display, Windows' DXGI
 /// output the window is on); Linux output is SDR. `peak_nits`: the panel's peak, 0 if unknown.
@@ -241,6 +243,12 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         o.set_property("demuxer-max-back-bytes", "64MiB")?;
         // HDR on an SDR target: per-scene peak detection (what HDR10+ metadata is for) and the default curve.
         o.set_property("hdr-compute-peak", "yes")?;
+        // Your language's audio first, when the file has it (a MULTI or dual-audio release);
+        // mpv falls back to the file's default track otherwise. Subtitles stay off by default.
+        if let Some(key) = backend::stream_language() {
+            let codes = backend::track_codes(&key);
+            if !codes.is_empty() { o.set_property("alang", codes.join(",").as_str())?; }
+        }
         o.set_property("sub-font", "sans-serif")?;
         o.set_property("sub-color", "#F2EFEA")?;
         o.set_property("sub-border-color", "#DD000000")?;
@@ -470,7 +478,8 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
         if t["external"].as_bool() == Some(true) { parts.push("External".into()); }
         let image = t["image"].as_bool().unwrap_or(matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle"));
         let styled = matches!(codec, "ass" | "ssa");
-        Some(Track { id, audio, label: if parts.is_empty() { format!("Track {id}") } else { parts.join(", ") }, selected: t["selected"].as_bool() == Some(true), image, styled })
+        Some(Track { id, audio, label: if parts.is_empty() { format!("Track {id}") } else { parts.join(", ") }, selected: t["selected"].as_bool() == Some(true), image, styled,
+            lang: t["lang"].as_str().map(str::trim).filter(|l| *l != "und").unwrap_or_default().to_owned() })
     }).collect()
 }
 
@@ -581,6 +590,19 @@ pub fn facts(live: &Live, s: &State) -> Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against the real libmpv: every language setting is an `alang` list mpv takes as is.
+    #[test]
+    fn audio_language_lists_reach_mpv() {
+        unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
+        for l in crate::addons::LANGUAGES {
+            let codes = backend::track_codes(l.key).join(",");
+            assert!(!codes.is_empty(), "{}", l.key);
+            let mpv = Mpv::with_initializer(|o| { o.set_property("config", false)?; o.set_property("vo", "null")?; o.set_property("alang", codes.as_str())?; Ok(()) }).unwrap();
+            let back: String = mpv.get_property("alang").unwrap();
+            assert_eq!(back, codes);
+        }
+    }
 
     /// Against the real libmpv: a header with a comma stays one entry.
     #[test]
