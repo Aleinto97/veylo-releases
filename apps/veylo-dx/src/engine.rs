@@ -6,7 +6,9 @@
 //!   the GPU (`hwdec=auto-safe`: VAAPI, NVDEC, Vulkan, VideoToolbox, D3D11VA), and HDR is
 //!   tone-mapped by mpv with per-scene peak detection (GTK3 can't hand HDR to the compositor).
 //! - Windows: `vo=gpu-next` on Direct3D 11 in mpv's own child window under the WebView2,
-//!   with the GPU decoding (`hwdec=auto-safe`: D3D11VA, NVDEC).
+//!   with the GPU decoding (`hwdec=auto-safe`: D3D11VA, NVDEC). With Windows HDR on, mpv asks for
+//!   an HDR10 swapchain (`target-colorspace-hint`) and HDR reaches the screen; Dolby Vision
+//!   profile 5 is reshaped by libplacebo and shown as HDR10. Otherwise it is tone-mapped to SDR.
 //! - Android, direct (default): `vo=mediacodec_embed`. MediaCodec decodes straight into a
 //!   SurfaceView, so HDR10, HLG and HDR10+ (its dynamic metadata stays in the bitstream) reach an
 //!   HDR panel untouched, at the lowest power. Subtitles are drawn by the Dioxus layer.
@@ -38,9 +40,10 @@ impl Fit {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected: bool, pub image: bool, pub styled: bool }
 
-/// What the screen can show, as the platform declares it (Android); desktop output is SDR.
+/// What the screen can show, as the platform declares it (Android's display, Windows' DXGI
+/// output the window is on); Linux output is SDR. `peak_nits`: the panel's peak, 0 if unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct Screen { pub hdr10: bool, pub hlg: bool, pub hdr10_plus: bool, pub dolby_vision: bool }
+pub struct Screen { pub hdr10: bool, pub hlg: bool, pub hdr10_plus: bool, pub dolby_vision: bool, pub peak_nits: u32 }
 
 /// Everything the controls draw. Positions are quantised so the UI repaints a few times a second.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -84,7 +87,8 @@ pub enum Finish { Close, Next, Another }
 pub struct Live {
     pub mpv: Mpv,
     pub request: PlayRequest,
-    pub screen: Screen,
+    /// The screen when this session started; None where it couldn't be read (Linux).
+    pub screen: Option<Screen>,
     state: watch::Sender<State>,
     finish: Mutex<Option<Finish>>,
     ready: (Mutex<bool>, Condvar),
@@ -202,7 +206,7 @@ impl Live {
 
 /// Start a session: mpv is created here; the file opens once the video surface is ready.
 pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle) -> anyhow::Result<()> {
-    let screen = platform_screen();
+    let screen = crate::display::screen();
     let direct = cfg!(target_os = "android");
     let mpv = create(&req, direct)?;
     let (state, _) = watch::channel(State { speed: 1.0, volume: 100.0, direct, ..Default::default() });
@@ -213,12 +217,10 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
     Ok(())
 }
 
-#[cfg(target_os = "android")]
-fn platform_screen() -> Screen { crate::android::screen().unwrap_or_default() }
-#[cfg(not(target_os = "android"))]
-fn platform_screen() -> Screen { Screen::default() }
 
 fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
+    #[cfg(target_os = "windows")]
+    let hdr_output = backend::hdr_output();
     // libmpv refuses to start unless numbers parse the C way; GTK/WebKit set the user's locale.
     unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
     #[cfg(target_os = "android")]
@@ -259,6 +261,11 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
             let _ = o.set_property("cursor-passthrough", true);
             o.set_property("hwdec", "auto-safe")?;
             o.set_property("demuxer-max-bytes", "256MiB")?;
+            // HDR to an HDR screen: mpv asks Windows for an HDR10 swapchain when the video and
+            // the screen are HDR (Windows "Use HDR" on), and tone-maps to SDR otherwise.
+            // "Always SDR" says no explicitly, whatever this mpv build's default. The panel's peak is
+            // applied once mpv really sends HDR10 (`follow_target`), never to SDR output.
+            let _ = o.set_property("target-colorspace-hint", if hdr_output { "yes" } else { "no" });
         }
         #[cfg(not(any(target_os = "android", target_os = "windows")))]
         {
@@ -319,6 +326,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let (mut position, mut duration, mut cache_end) = (0.0f64, 0.0f64, 0.0f64);
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
+    let mut target_check = Instant::now();
     // Time actually played since the last report (seeks don't count), so "watched" means watched.
     let (mut last_tick, mut measured, mut speed) = (None::<f64>, 0.0f64, 1.0f64);
     // The title's metadata goes with this session's first report and its last one.
@@ -334,6 +342,15 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     loop {
         if stop.stopped() && !quitting { quitting = true; live.finish(Finish::Close); }
         if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured, &mut sent_meta, false); }
+        // What mpv sends to the screen is known once it renders, and changes when Windows HDR is
+        // switched or the window moves to another screen: follow it, and say so.
+        if target_check.elapsed() > Duration::from_secs(2) {
+            target_check = Instant::now();
+            if follow_target(&live) && announced {
+                let s = live.state();
+                let _ = events.send(PlayerEvent::Started { decoder: hardware(&s), codec: codec_name(&s.codec), facts: facts(&live, &s) });
+            }
+        }
         let Some(event) = mpv.wait_event(0.25) else { continue };
         match event {
             Ok(Event::FileLoaded) => {
@@ -342,7 +359,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 // Profile 5 carries no HDR10 layer: without a Dolby Vision panel only mpv's renderer
                 // (libplacebo's reshaping) shows its colours right.
                 let s = live.state();
-                if s.direct && s.dv_profile == 5 && !live.screen.dolby_vision { live.render_dolby_vision(); }
+                if s.direct && s.dv_profile == 5 && !live.screen.unwrap_or_default().dolby_vision { live.render_dolby_vision(); }
             }
             Ok(Event::VideoReconfig) => {
                 let p = |n: &str| mpv.get_property::<i64>(n).unwrap_or(0);
@@ -503,13 +520,20 @@ pub fn codec_name(codec: &str) -> String {
 }
 
 /// What the screen really shows. The stream's transfer decides HDR; the source label only adds
-/// what a stream can't state (the "+" of HDR10+, Dolby Vision). Unknown stays empty.
-pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Screen, direct: bool) -> String {
+/// what a stream can't state (the "+" of HDR10+, Dolby Vision). `target`: the transfer mpv
+/// renders to (`video-target-params/gamma`), "pq" when it sends HDR10 to the screen itself.
+/// Unknown stays empty.
+pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Screen, direct: bool, target: &str) -> String {
     let label = label.unwrap_or("");
     let plus = label.contains("10+");
     let dv = dv_profile > 0 || label.to_lowercase().contains("dolby") || label.contains("DV");
     // Profile 5 is PQ underneath even where the stream's colour tags are blank.
     let transfer = if dv_profile == 5 && !transfer.is_empty() { "pq" } else { transfer };
+    // Rendered by mpv into an HDR10 swapchain (Windows HDR): what reaches the panel is HDR10.
+    if !direct && target == "pq" && matches!(transfer, "pq" | "hlg") {
+        return if dv { "HDR10 (Dolby Vision source)".into() } else if plus { "HDR10 (HDR10+ source)".into() }
+            else if transfer == "hlg" { "HDR10 (HLG source)".into() } else { "HDR10".into() };
+    }
     match transfer {
         "pq" => {
             if direct && screen.hdr10 {
@@ -529,10 +553,27 @@ pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Scr
     }
 }
 
+/// Read the transfer mpv renders to; true when it changed. On Windows, HDR10 output is mapped to
+/// the panel's peak (read again, the window may have moved), and SDR output goes back to mpv's own.
+fn follow_target(live: &Live) -> bool {
+    let target: String = live.mpv.get_property("video-target-params/gamma").unwrap_or_default();
+    if target.is_empty() || live.state().target_transfer == target { return false; }
+    #[cfg(target_os = "windows")]
+    {
+        let peak = crate::display::screen().filter(|s| s.hdr10).map(|s| s.peak_nits).filter(|p| (300..=10_000).contains(p));
+        match peak {
+            Some(p) if target == "pq" => { let _ = live.mpv.set_property("target-peak", p as i64); }
+            _ => { let _ = live.mpv.set_property("target-peak", "auto"); }
+        }
+    }
+    live.update(|s| { s.target_transfer = target; true });
+    true
+}
+
 pub fn facts(live: &Live, s: &State) -> Facts {
     Facts {
         resolution: Some(crate::player::resolution_label(s.width, s.height)).filter(|r| !r.is_empty()).or(live.request.quality.clone()).unwrap_or_default(),
-        picture: picture(&s.transfer, live.request.hdr.as_deref(), s.dv_profile, live.screen, s.direct),
+        picture: picture(&s.transfer, live.request.hdr.as_deref(), s.dv_profile, live.screen.unwrap_or_default(), s.direct, &s.target_transfer),
         size: live.request.size.clone().unwrap_or_default(),
     }
 }
@@ -564,18 +605,24 @@ mod tests {
     }
     #[test]
     fn hdr_is_named_by_what_reaches_the_panel() {
-        let hdr = Screen { hdr10: true, hlg: true, hdr10_plus: true, dolby_vision: false };
-        assert_eq!(picture("pq", Some("HDR10+"), 0, hdr, true), "HDR10+");
-        assert_eq!(picture("pq", Some("HDR10+"), 0, Screen { hdr10: true, ..Default::default() }, true), "HDR10 (HDR10+ source)");
-        assert_eq!(picture("pq", Some("HDR10+"), 0, hdr, false), "HDR10+, tone-mapped to SDR");
-        assert_eq!(picture("pq", None, 0, Screen::default(), true), "HDR10, tone-mapped by the system");
-        assert_eq!(picture("hlg", None, 0, hdr, true), "HLG");
-        assert_eq!(picture("bt.1886", Some("HDR10"), 0, hdr, true), "SDR");
-        assert_eq!(picture("", None, 0, hdr, true), "");
+        let hdr = Screen { hdr10: true, hlg: true, hdr10_plus: true, dolby_vision: false, peak_nits: 0 };
+        assert_eq!(picture("pq", Some("HDR10+"), 0, hdr, true, ""), "HDR10+");
+        assert_eq!(picture("pq", Some("HDR10+"), 0, Screen { hdr10: true, ..Default::default() }, true, ""), "HDR10 (HDR10+ source)");
+        assert_eq!(picture("pq", Some("HDR10+"), 0, hdr, false, ""), "HDR10+, tone-mapped to SDR");
+        assert_eq!(picture("pq", None, 0, Screen::default(), true, ""), "HDR10, tone-mapped by the system");
+        assert_eq!(picture("hlg", None, 0, hdr, true, ""), "HLG");
+        assert_eq!(picture("bt.1886", Some("HDR10"), 0, hdr, true, ""), "SDR");
+        assert_eq!(picture("", None, 0, hdr, true, ""), "");
         // Dolby Vision is named only when the panel takes it.
-        assert_eq!(picture("pq", Some("Dolby Vision"), 8, hdr, true), "HDR10 (Dolby Vision source)");
-        assert_eq!(picture("pq", None, 8, Screen { dolby_vision: true, ..hdr }, true), "Dolby Vision");
-        assert_eq!(picture("bt.1886", None, 5, hdr, false), "Dolby Vision, tone-mapped to SDR");
+        assert_eq!(picture("pq", Some("Dolby Vision"), 8, hdr, true, ""), "HDR10 (Dolby Vision source)");
+        assert_eq!(picture("pq", None, 8, Screen { dolby_vision: true, ..hdr }, true, ""), "Dolby Vision");
+        assert_eq!(picture("bt.1886", None, 5, hdr, false, ""), "Dolby Vision, tone-mapped to SDR");
+        // Windows with HDR on: mpv renders into an HDR10 swapchain (target "pq").
+        assert_eq!(picture("bt.1886", None, 5, Screen::default(), false, "pq"), "HDR10 (Dolby Vision source)");
+        assert_eq!(picture("pq", Some("HDR10+"), 0, Screen::default(), false, "pq"), "HDR10 (HDR10+ source)");
+        assert_eq!(picture("hlg", None, 0, Screen::default(), false, "pq"), "HDR10 (HLG source)");
+        assert_eq!(picture("pq", None, 0, Screen::default(), false, "bt.1886"), "HDR10, tone-mapped to SDR");
+        assert_eq!(picture("bt.1886", None, 0, Screen::default(), false, "pq"), "SDR");
     }
     #[test]
     fn tracks_read_like_a_menu() {

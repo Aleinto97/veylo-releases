@@ -348,12 +348,10 @@ fn details(live: &engine::Live, s: &State, facts: &crate::player::Facts, hw: Opt
     rows.push(("Decoding", hw.map(|h| format!("Hardware, {h}")).unwrap_or_else(|| if s.loaded { "Software".into() } else { "Starting".into() })));
     rows.push(("Output", if ANDROID {
         if s.direct { "Direct to the display (MediaCodec)".into() } else if hw.is_none() && s.dv_profile == 5 { "Rendered by mpv, Dolby Vision reshaping".into() } else { "Rendered by mpv (gpu-next)".into() }
-    } else { "In the app, rendered by mpv (OpenGL)".into() }));
-    if ANDROID {
-        let sc = live.screen;
-        let caps: Vec<&str> = [(sc.hdr10, "HDR10"), (sc.hlg, "HLG"), (sc.hdr10_plus, "HDR10+")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect();
-        rows.push(("Screen", if caps.is_empty() { "SDR".into() } else { caps.join(", ") }));
-    }
+    } else if cfg!(target_os = "windows") { "In the app, rendered by mpv (Direct3D 11)".into() } else { "In the app, rendered by mpv (OpenGL)".into() }));
+    // What the screen declared when this video started (Linux: always SDR).
+    rows.push(("Screen", crate::display::summary(live.screen, backend::hdr_output()).0));
+    if !s.target_transfer.is_empty() && !ANDROID { rows.push(("Sent to the screen", if s.target_transfer == "pq" { "HDR10".into() } else { "SDR".into() })); }
     if let Some(label) = &live.request.hdr { rows.push(("Source says", label.clone())); }
     if s.dv_profile > 0 { rows.push(("Dolby Vision", format!("Profile {}", s.dv_profile))); }
     if s.loaded { rows.push(("Dropped frames", s.dropped.to_string())); }

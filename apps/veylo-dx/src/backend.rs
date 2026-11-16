@@ -81,6 +81,7 @@ pub fn init() -> Result<()> {
     // The settings the backend keeps in memory, read once.
     let saved: Value = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     BETTER_POSTERS.store(saved["better_posters"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+    HDR_OUTPUT.store(saved["hdr_output"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
     set_stream_language(saved["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned));
     set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     RUNTIME.set(runtime).map_err(|_| anyhow!("Backend already started"))?;
@@ -1041,9 +1042,11 @@ pub struct Settings {
     pub stream_language: Option<String>,
     /// You removed the Real-Debrid key: it is not adopted again from an add-on's link.
     pub rd_key_removed: bool,
+    /// Windows: send HDR to the screen when it is in HDR (off: always tone-map to SDR).
+    pub hdr_output: bool,
 }
 
-impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None, rd_key_removed: false } } }
+impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None, rd_key_removed: false, hdr_output: true } } }
 
 pub fn load_settings() -> Settings {
     let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
@@ -1056,12 +1059,14 @@ pub fn load_settings() -> Settings {
         rd_key: v["rd_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         stream_language: v["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned),
         rd_key_removed: v["rd_key_removed"].as_bool().unwrap_or(false),
+        hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
     }
 }
 
 pub fn save_settings(settings: &Settings) {
-    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed}).to_string());
+    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed, "hdr_output": settings.hdr_output}).to_string());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
+    HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
     set_stream_language(settings.stream_language.clone());
     set_tmdb_key(settings.tmdb_key.clone());
 }
@@ -1069,6 +1074,11 @@ pub fn save_settings(settings: &Settings) {
 // ---------------------------------------------------------------- posters
 
 static BETTER_POSTERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static HDR_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Windows: send HDR to an HDR screen (the setting, kept in memory for the player).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn hdr_output() -> bool { HDR_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// Poster images in order of preference: BetterPosters (by IMDb id, rating and genre tags),
 /// then the add-on's own poster (Cinemeta for most titles), then the backdrop. A failing
