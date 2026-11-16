@@ -17,5 +17,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev
+      # Inference assets are pinned but not committed; fetch.py verifies their checksums.
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai
+          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-linux-x64
+      - run: python3 tools/picks-ai/fetch.py linux-x64
       - run: cargo test --locked
         working-directory: apps/veylo-dx

@@ -211,3 +211,16 @@ pub fn take_dev_play() -> Option<serde_json::Value> {
     let _ = std::fs::remove_file(&path);
     serde_json::from_str(&text).ok()
 }
+
+/// Shipped GLiClass assets, extracted by one background inference worker.
+pub fn picks_ai_paths() -> Result<(PathBuf, PathBuf)> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloPicks")?;
+        let mut call = |name: &str| -> jni::errors::Result<PathBuf> {
+            let value = env.call_static_method(&class, name, "(Landroid/app/Activity;)Ljava/lang/String;", &[JValue::Object(activity)])?.l()?;
+            let path: String = env.get_string(&JString::from(value))?.into();
+            Ok(PathBuf::from(path))
+        };
+        Ok((call("modelDir")?, call("runtimePath")?))
+    })
+}

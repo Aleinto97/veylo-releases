@@ -10,6 +10,8 @@ mod home;
 mod library;
 mod icons;
 mod picks;
+mod picks_ai;
+mod picks_metadata;
 mod picks_rules;
 mod player;
 mod player_ui;
@@ -461,6 +463,7 @@ fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::
                 player::PlayerEvent::Finished { next, another, position_ms, .. } => {
                     clear(&mine);
                     shell.player_status.set(None);
+                    backend::flush_progress().await;
                     *shell.picks_dirty.write() += 1;
                     if next { if let Some(play_next) = &on_next { play_next(shell); } }
                     if another { if let Some(try_another) = &on_another { try_another(shell, position_ms); } }

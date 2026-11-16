@@ -86,7 +86,7 @@ pub fn SettingsPage() -> Element {
                 div { class: "group-head", span { class: "group-icon", icons::Globe {} } span { class: "group-name", "Artwork" } }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "TMDB" }
-                        span { class: "dim setting-about", if settings().tmdb_key.is_some() { "Connected: text-free backdrops, logos and episode stills" } else { "Add a free TMDB key for backdrops, logos and episode stills" } } }
+                        span { class: "dim setting-about", if settings().tmdb_key.is_some() { "Connected: artwork, episode stills and Picks keywords" } else { "Add a free TMDB key for artwork and richer Picks metadata" } } }
                     if settings().tmdb_key.is_some() {
                         button { class: "pill glass", onclick: move |_| { let next = backend::Settings { tmdb_key: None, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, icons::Trash {} span { "Remove key" } }
                     } else {
@@ -109,6 +109,11 @@ pub fn SettingsPage() -> Element {
                                 onclick: move |_| rounds(n), span { class: "tnum", "{n}" } }
                         }
                     }
+                }
+                div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "Local classifier" }
+                        span { class: "dim setting-about", "GLiClass runs on this device. TMDB keywords and sampled TVmaze episode summaries enrich its input." } }
+                    GetKey { url: "https://www.tvmaze.com/", label: "Episode metadata: TVmaze (CC BY-SA)" }
                 }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Learned taste" } span { class: "dim setting-about", "What Picks learned from your duels" } }

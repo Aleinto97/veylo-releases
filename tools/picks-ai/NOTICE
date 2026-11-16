@@ -1,0 +1,10 @@
+GLiClass-small-v1.0 by Knowledgator (Apache-2.0).
+Model and tokenizer: https://huggingface.co/knowledgator/gliclass-small-v1.0
+Pinned revision: 21edefaf7951f68c68c505f9139ba536d3b448f7
+Uses the publisher's INT8 ONNX export, unmodified.
+GLiClass: https://github.com/Knowledgator/GLiClass
+Base encoder: microsoft/deberta-v3-small (MIT).
+ONNX Runtime 1.22.0 by Microsoft (MIT); runtime LICENSE and
+ThirdPartyNotices.txt accompany the native library.
+Microsoft VC++ 2022 app-local runtime dependencies accompany the Windows runtime;
+see Microsoft-VC-Redist-License.rtf in that runtime directory.

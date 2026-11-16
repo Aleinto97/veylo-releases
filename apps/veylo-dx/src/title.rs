@@ -322,6 +322,13 @@ pub fn resume_now(mut shell: Shell, media: Media) {
     }
 }
 
+/// Picks resolves an explicit first/resume episode from fresh stored progress. Use the same
+/// source selection, player lifetime and progress recording as the title page.
+pub(crate) fn play_from_card(shell: Shell, media: Media, video: String) {
+    let label = backend::episode_label(&video);
+    play_next(shell,media,video,label);
+}
+
 /// Play one video now with the automatic choice, without the page (Resume, Next episode).
 fn play_next(mut shell: Shell, media: Media, video: String, label: Option<String>) {
     let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
@@ -354,6 +361,7 @@ fn play_next(mut shell: Shell, media: Media, video: String, label: Option<String
 #[component]
 fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last: Option<String>, busy: Option<String>,
             seen: Signal<std::collections::HashSet<String>>, on_play: EventHandler<(String, String)>, on_sources: EventHandler<(String, String)>) -> Element {
+    let mut shell = use_context::<Shell>();
     let mut season = season;
     // TMDB stills for the shown season, used where the add-on gives no thumbnail.
     let mut stills = use_signal(std::collections::HashMap::<i64, String>::new);
@@ -376,12 +384,15 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
     let mark = use_callback(move |(ids, on): (Vec<String>, bool)| {
         if ids.is_empty() { return; }
         seen.with_mut(|s| for id in &ids { if on { s.insert(id.clone()); } else { s.remove(id); } });
-        let complete = all.iter().filter(|e| e.season != 0).all(|e| seen.peek().contains(&e.id));
+        let complete = crate::picks_rules::series_complete(&all,&seen.peek(),backend::now_secs());
         let m = for_mark.clone();
         let changed = complete != *series_done.peek();
         if changed { series_done.set(complete); }
         spawn(async move {
-            if backend::set_episodes_watched(&m, ids, on).await.is_ok() && changed { let _ = backend::set_watched(&m, complete).await; }
+            if backend::set_episodes_watched(&m, ids, on).await.is_ok() {
+                if changed { let _ = backend::set_watched(&m, complete).await; }
+                *shell.picks_dirty.write() += 1;
+            }
         });
     });
     let season_ids: Vec<String> = shown.iter().map(|e| e.id.clone()).collect();

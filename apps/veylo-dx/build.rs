@@ -1,6 +1,7 @@
 //! Android: hand our Kotlin bridges (video surface, Back, updates) to the Gradle project dx
 //! generates. dx points wry at WRY_ANDROID_KOTLIN_FILES_OUT_DIR; files placed there are compiled too.
 fn main() {
+    stage_picks_ai();
     println!("cargo:rerun-if-changed=android/kotlin");
     println!("cargo:rerun-if-env-changed=WRY_ANDROID_KOTLIN_FILES_OUT_DIR");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") { return windows(); }
@@ -88,6 +89,60 @@ fn windows() {
             let dest = to.join("libmpv-2.dll");
             let stale = std::fs::metadata(&dest).and_then(|m| m.modified()).ok() < std::fs::metadata(&dll).and_then(|m| m.modified()).ok();
             if stale && std::fs::create_dir_all(&to).is_ok() { std::fs::copy(&dll, &dest).expect("copy libmpv-2.dll beside the executable"); }
+        }
+    }
+}
+
+/// The APK carries the same model/tokenizer as desktop, plus the Android CPU runtime.
+/// Fail the build if assets are absent: released apps must never silently omit local AI.
+fn stage_picks_ai() {
+    use std::path::{Path, PathBuf};
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target = match (os.as_str(), arch.as_str()) {
+        ("android", "aarch64") => "android-arm64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x64",
+        ("windows", "x86_64") => "windows-x64",
+        _ => panic!("Picks inference runtime has not been packaged for {os}/{arch}"),
+    };
+    let root = Path::new("picks-ai");
+    let native = root.join(target);
+    let library = if os == "windows" { "onnxruntime.dll" } else { "libonnxruntime.so" };
+    for file in [root.join("model/model.onnx"), root.join("model/tokenizer.json"), native.join(library)] {
+        assert!(file.is_file(), "Missing {}: run python3 ../../tools/picks-ai/fetch.py {target} from apps/veylo-dx", file.display());
+    }
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("Picks assets directory");
+        for entry in std::fs::read_dir(from).expect("Picks assets") {
+            let path = entry.unwrap().path();
+            if !path.is_file() { continue; }
+            println!("cargo:rerun-if-changed={}", path.display());
+            let dest = to.join(path.file_name().unwrap());
+            let changed = std::fs::metadata(&dest).map(|m| m.len() != std::fs::metadata(&path).unwrap().len() || m.modified().ok() < std::fs::metadata(&path).unwrap().modified().ok()).unwrap_or(true);
+            if changed { std::fs::copy(path, dest).expect("Copy Picks asset"); }
+        }
+    }
+    if os == "android" {
+        println!("cargo:rerun-if-env-changed=WRY_ANDROID_KOTLIN_FILES_OUT_DIR");
+        if let Ok(out) = std::env::var("WRY_ANDROID_KOTLIN_FILES_OUT_DIR") {
+            let main = Path::new(&out).ancestors().nth(4).expect("Android layout");
+            copy_dir(&root.join("model"), &main.join("assets/picks-ai"));
+            // Notices are assets too; only native code belongs in jniLibs.
+            copy_dir(&native, &main.join("assets/picks-ai/runtime"));
+            let libs = main.join("jniLibs/arm64-v8a");
+            std::fs::create_dir_all(&libs).expect("Picks JNI directory");
+            std::fs::copy(native.join(library), libs.join(library)).expect("Copy ONNX Runtime");
+            // The native library is already in jniLibs, avoid an extra copy in APK assets.
+            let duplicate = main.join("assets/picks-ai/runtime").join(library);
+            if duplicate.exists() { std::fs::remove_file(duplicate).expect("Remove duplicated runtime"); }
+        }
+    } else {
+        let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        let profile = out.ancestors().find(|p| p.file_name().is_some_and(|n| n == "build")).and_then(Path::parent).expect("Cargo profile directory");
+        for dest in [profile.join("picks-ai"), profile.join("deps/picks-ai")] {
+            copy_dir(&root.join("model"), &dest);
+            copy_dir(&native, &dest.join("runtime"));
         }
     }
 }

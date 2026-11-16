@@ -45,6 +45,9 @@ pass_file="$work/keystore.pass"
 # No local folder names (your home path, so your username) inside the binaries.
 remap="--remap-path-prefix=$HOME=~ --remap-path-prefix=$root=veylo"
 
+# Model assets and native runtimes are bundled: classification never downloads at runtime.
+python3 "$root/tools/picks-ai/fetch.py" windows-x64 android-arm64
+
 # ---------------------------------------------------------------- Windows
 mpv="$app/windows/mpv"
 if [ ! -f "$mpv/libmpv-2.dll" ]; then
@@ -58,7 +61,8 @@ cd "$app"
 RUSTFLAGS="-C target-feature=+crt-static $remap" cargo xwin build --release --target x86_64-pc-windows-msvc
 win_out="$app/target/x86_64-pc-windows-msvc/release"
 mkdir -p "$work/win" && cp "$win_out/veylo-dx.exe" "$win_out/libmpv-2.dll" "$work/win/"
-(cd "$work/win" && zip -q -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll)
+cp -r "$win_out/picks-ai" "$work/win/"
+(cd "$work/win" && zip -q -r -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll picks-ai)
 
 # ---------------------------------------------------------------- Android
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}

@@ -116,6 +116,40 @@ pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genre: Op
     }).cloned().collect()
 }
 
+/// Normal released episodes only; specials must not become a new viewer's first episode.
+pub fn regular_episodes(list: &[crate::backend::Episode], now: i64) -> Vec<&crate::backend::Episode> {
+    let (y,m,d,_) = crate::backend::civil(now);
+    let today = format!("{y:04}-{m:02}-{d:02}");
+    let mut out: Vec<_> = list.iter().filter(|e| e.season > 0 && e.number > 0
+        && e.released.get(..10).is_none_or(|date| date <= today.as_str())).collect();
+    out.sort_by_key(|e| (e.season,e.number));
+    out
+}
+pub fn series_complete(list: &[crate::backend::Episode], seen: &HashSet<String>, now: i64) -> bool {
+    let available = regular_episodes(list,now);
+    !available.is_empty() && available.iter().all(|e| seen.contains(&e.id))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardPlayback { pub video: String, pub label: String }
+/// Resolve from stored progress, not a catalogue card's usually empty progress fields.
+pub fn card_playback(media: &Media, list: &[crate::backend::Episode], seen: &HashSet<String>, now: i64) -> Option<CardPlayback> {
+    if media.kind == "movie" {
+        return Some(CardPlayback { video: media.id.clone(), label: if crate::backend::in_progress(media) { "Resume" } else { "Play" }.into() });
+    }
+    let episodes = regular_episodes(list,now);
+    if let Some(video) = media.last_video_id.as_ref().filter(|v| crate::backend::in_progress(media) && !seen.contains(*v)) {
+        let label = episodes.iter().find(|e| &e.id == video).map(|e| format!("S{} E{}",e.season,e.number))
+            .or_else(|| crate::backend::episode_label(video));
+        return Some(CardPlayback { video: video.clone(), label: label.map(|l| format!("Resume {l}")).unwrap_or_else(|| "Resume".into()) });
+    }
+    // If S3E4 was finished or marked watched, continue with S3E5, rather than replaying S3E4.
+    let furthest = episodes.iter().rposition(|e| seen.contains(&e.id));
+    let next = furthest.and_then(|i| episodes.iter().skip(i+1).find(|e| !seen.contains(&e.id))).copied()
+        .or_else(|| episodes.iter().find(|e| !seen.contains(&e.id)).copied()).or_else(|| episodes.first().copied())?;
+    Some(CardPlayback { video: next.id.clone(), label: format!("{} S{} E{}",if furthest.is_some() && !seen.contains(&next.id) { "Resume" } else { "Play" },next.season,next.number) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +159,38 @@ mod tests {
         tidy(Media::from_json(&json!({"id": id, "type": kind, "name": id, "releaseInfo": year, "genres": genres}), "a").unwrap())
     }
     fn ids(v: Vec<Media>) -> Vec<String> { v.into_iter().map(|m| m.id).collect() }
+
+    fn episode(season: i64, number: i64, released: &str) -> crate::backend::Episode {
+        crate::backend::Episode { id: format!("tt-fixture:{season}:{number}"), season, number, title: String::new(), thumbnail: String::new(), overview: String::new(), released: released.into() }
+    }
+    #[test]
+    fn cards_start_at_first_regular_episode_resume_mid_series_and_skip_finished_episode() {
+        let mut media = media("tt-fixture","series","2020",&["Drama"]);
+        let episodes = vec![episode(0,1,"2020-01-01"),episode(3,5,"2020-01-01"),episode(1,1,"2020-01-01"),episode(3,4,"2020-01-01"),episode(4,1,"2099-01-01")];
+        let now = 1_800_000_000;
+        let mut seen = HashSet::new();
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().label,"Play S1 E1");
+        media.last_video_id = Some("tt-fixture:3:4".into());media.position_ms=120_000;
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().label,"Resume S3 E4");
+        media.watched=true; // A prior season was complete; the current episode is unfinished.
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().label,"Resume S3 E4");
+        assert!(!series_complete(&episodes,&seen,now));
+        seen.insert("tt-fixture:3:4".into());media.video_watched=true;
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().video,"tt-fixture:3:5");
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().label,"Resume S3 E5");
+        seen.extend(["tt-fixture:1:1".into(),"tt-fixture:3:5".into()]);
+        assert!(series_complete(&episodes,&seen,now));
+        assert!(!series_complete(&[],&seen,now));
+        assert_eq!(card_playback(&media,&episodes,&seen,now).unwrap().label,"Play S1 E1");
+    }
+    #[test]
+    fn movie_cards_resume_only_unfinished_playback() {
+        let mut m=media("film","movie","2020",&[]);
+        m.position_ms=40_000;
+        assert_eq!(card_playback(&m,&[],&HashSet::new(),1_800_000_000).unwrap().label,"Resume");
+        m.watched=true;
+        assert_eq!(card_playback(&m,&[],&HashSet::new(),1_800_000_000).unwrap().label,"Play");
+    }
 
     #[test]
     fn genres_share_one_vocabulary_and_pairs_are_not_split_into_claims() {
