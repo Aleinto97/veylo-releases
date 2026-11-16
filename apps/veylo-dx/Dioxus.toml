@@ -1,0 +1,20 @@
+[application]
+name = "veylo-dx"
+
+[bundle]
+identifier = "dev.veylo.dx"
+publisher = "Veylo"
+
+[android]
+min_sdk = 26
+compile_sdk = 36
+target_sdk = 35
+# dx 0.7.10 compiles Kotlin 2.0.20, which can't read a Kotlin 2.2 stdlib: pin the stdlib strictly.
+gradle_dependencies = [
+    "org.jetbrains.kotlin:kotlin-stdlib:2.0.21!!",
+]
+
+# Updates: Veylo installs a downloaded release through PackageInstaller (android/kotlin/VeyloUpdate.kt).
+[android.raw]
+manifest = """<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />"""
+

@@ -1,0 +1,25 @@
+/target/
+/artifacts/
+*.keystore
+*.jks
+*.hprof
+.env
+*.tmpdir/
+__pycache__/
+/tools/**/target/
+# Downloaded build sources (fetched by tools/media3-ffmpeg/fetch-sources.sh)
+/tools/media3-ffmpeg/ffmpeg-src/
+/tools/media3-ffmpeg/androidx-media/
+/tools/media3-ffmpeg/ffmpeg-*.tar.*
+/tools/media3-ffmpeg/build-jni/
+/tools/media3-ffmpeg/toolchain-shims/
+
+
+*.log
+
+# Per-crate isolated test data and build caches.
+/crates/*/target/
+
+# The new app (apps/veylo-dx) ignores its own target/ and fetched mpv libraries.
+settings.json
+/dist/

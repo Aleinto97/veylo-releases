@@ -1,0 +1,93 @@
+# Builds Windows and Android and publishes them as a release of this repo whenever a push to main
+# raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch and offer Update.
+# Run it by hand from the Actions tab with "publish" off to only build (the files become an artifact).
+# Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD.
+name: release
+on:
+  push:
+    branches: [main]
+    paths: ["apps/veylo-dx/**", "crates/**", "Cargo.lock", "tools/release.sh", ".github/workflows/release.yml"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the release (off: build only)"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  NDK_VERSION: 28.2.13676358
+  DX_VERSION: 0.7.10
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Is this version new?
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/veylo-dx/Cargo.toml | head -1)
+          build=true
+          if [ "$PUBLISH" = true ] && gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::v$version is already released; raise version in apps/veylo-dx/Cargo.toml to release."
+            build=false
+          fi
+          { echo "version=$version"; echo "build=$build"; echo "publish=$PUBLISH"; } >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-pc-windows-msvc
+      - if: steps.plan.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - if: steps.plan.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+      - if: steps.plan.outputs.build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-v1
+      - if: steps.plan.outputs.build == 'true'
+        uses: cargo-bins/cargo-binstall@main
+      - name: Tools
+        if: steps.plan.outputs.build == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm libarchive-tools zip
+          cargo binstall -y --locked "dioxus-cli@$DX_VERSION" cargo-xwin
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Release key
+        if: steps.plan.outputs.build == 'true'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          [ -n "$KEYSTORE" ] || { echo "::error::The ANDROID_KEYSTORE_B64 secret is missing."; exit 1; }
+          umask 077 && printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "VEYLO_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: Build and publish
+        if: steps.plan.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VEYLO_REPO: ${{ github.repository }}
+          VEYLO_PUBLISH: ${{ steps.plan.outputs.publish == 'true' && '1' || '0' }}
+          VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: tools/release.sh "$(git log -1 --format=%B)"
+      - if: steps.plan.outputs.build == 'true' && steps.plan.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylo-${{ steps.plan.outputs.version }}
+          path: dist/
+      - if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"

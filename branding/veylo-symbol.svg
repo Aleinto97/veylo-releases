@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The Veylo mark alone, on transparency (Android adaptive foreground, monochrome uses). -->
+  <path d="M512 702 L692 324" stroke="#f2efea" stroke-opacity=".5" stroke-width="96" stroke-linecap="round"/>
+  <path d="M332 324 L512 702" stroke="#f2efea" stroke-width="96" stroke-linecap="round"/>
+</svg>

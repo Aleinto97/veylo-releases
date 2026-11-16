@@ -1,0 +1,11 @@
+{
+  "ffmpeg": "6.0",
+  "androidx_media_tag": "1.11.1",
+  "ffmpeg_source": "https://ffmpeg.org/releases/ffmpeg-6.0.tar.xz",
+  "androidx_media_source": "https://github.com/androidx/media/tree/1.11.1",
+  "packaged_audio_library_sha256": "9630d35ec5957f5dd67d7c47b3cc0aab52477d1007821979efe19e4687032f6b",
+  "ffmpeg_archive_sha256": "57be87c22d9b49c112b6d24bc67d42508660e6b718b3db89c44e47e289137082",
+  "packaged_audio_library_sha256_by_abi": {
+    "armeabi-v7a": "28f8501a9265688a8d5d10e824cfa4e457b1f2ae9f4bd1ec64b8f88035fff8d7"
+  }
+}

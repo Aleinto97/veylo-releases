@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/torrent", "crates/media-proxy", "crates/aio-meta"]
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

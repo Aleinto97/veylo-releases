@@ -1,0 +1,387 @@
+use anyhow::{bail, Result};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/// Durable metadata budget per row. A resource response is capped at 8 MiB and
+/// merged field-by-field, so repeated responses with new large fields could grow
+/// one saved/history row without bound; that row is never evicted.
+const META_BUDGET_BYTES: usize = 1 << 20;
+
+pub(crate) fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub(crate) fn open(path: &Path) -> Result<Connection> {
+    std::fs::create_dir_all(path)?;
+    let mut db = Connection::open(path.join("core.sqlite3"))?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > 2 {
+        bail!("Database was created by a newer core");
+    }
+    if version == 0 {
+        let tx = db.transaction()?;
+        tx.execute_batch("
+          CREATE TABLE addons(url TEXT PRIMARY KEY, manifest TEXT NOT NULL, allow_http INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE cache(key TEXT PRIMARY KEY, body TEXT NOT NULL, expires INTEGER NOT NULL, updated INTEGER NOT NULL);
+          CREATE TABLE media(
+            key TEXT PRIMARY KEY, type TEXT NOT NULL, raw_id TEXT NOT NULL, addon_url TEXT NOT NULL,
+            meta TEXT NOT NULL, saved INTEGER NOT NULL DEFAULT 0, watched INTEGER NOT NULL DEFAULT 0,
+            position_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0,
+            watched_ms INTEGER NOT NULL DEFAULT 0, liked INTEGER NOT NULL DEFAULT 0,
+            video_id TEXT, updated INTEGER NOT NULL
+          );
+          CREATE TABLE playback(
+            media_key TEXT NOT NULL REFERENCES media(key) ON DELETE CASCADE, video_id TEXT NOT NULL,
+            position_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL, watched_ms INTEGER NOT NULL,
+            updated INTEGER NOT NULL, PRIMARY KEY(media_key,video_id)
+          );
+          CREATE INDEX media_activity ON media(saved,watched,liked);
+          PRAGMA user_version=1;
+        ")?;
+        for (url, manifest) in defaults() {
+            tx.execute(
+                "INSERT INTO addons(url,manifest) VALUES(?1,?2)",
+                params![url, manifest.to_string()],
+            )?;
+        }
+        tx.commit()?;
+    }
+    if version < 2 {
+        let tx = db.transaction()?;
+        tx.execute_batch(
+            "
+          ALTER TABLE playback ADD COLUMN watched INTEGER NOT NULL DEFAULT 0;
+          UPDATE playback SET watched=1 WHERE duration_ms>0
+            AND watched_ms*5>=duration_ms*4 AND position_ms*10>=duration_ms*9;
+          ALTER TABLE addons ADD COLUMN generation TEXT NOT NULL DEFAULT '';
+          UPDATE addons SET generation=lower(hex(randomblob(16)));
+          PRAGMA user_version=2;
+        ",
+        )?;
+        // v1 conflated manual title marks with automatic episode completion. Preserve
+        // those title flags rather than silently discard an explicit user decision.
+        tx.commit()?;
+    }
+    Ok(db)
+}
+
+fn defaults() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "https://v3-cinemeta.strem.io/manifest.json",
+            json!({
+                "id":"com.linvo.cinemeta","name":"Cinemeta","version":"3.0.0",
+                "description":"Public movie and series metadata", "types":["movie","series"],
+                "resources":["catalog",{"name":"meta","types":["movie","series"],"idPrefixes":["tt"]}],
+                "catalogs":[
+                    {"type":"movie","id":"top","name":"Movies","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
+                    {"type":"series","id":"top","name":"Series","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]}
+                ], "bootstrap":true
+            }),
+        ),
+        (
+            "https://anime-kitsu.strem.fun/manifest.json",
+            json!({
+                "id":"com.stremio.kitsu","name":"Kitsu","version":"1.0.0",
+                "description":"Anime metadata with distinct Kitsu identities", "types":["anime","movie","series"],
+                "resources":["catalog",{"name":"meta","types":["anime","movie","series"],"idPrefixes":["kitsu:"]}],
+                "catalogs":[{"type":"anime","id":"kitsu-anime-trending","name":"Anime","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]}],
+                "bootstrap":true
+            }),
+        ),
+    ]
+}
+
+/// Only established namespace formats cross addon boundaries. No anime/IMDb inference.
+pub(crate) fn identity(kind: &str, id: &str, addon: &str) -> String {
+    let head = id.split(':').next().unwrap_or(id);
+    let imdb = head
+        .strip_prefix("tt")
+        .is_some_and(|x| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit()));
+    let kitsu = id
+        .strip_prefix("kitsu:")
+        .and_then(|s| s.split(':').next())
+        .is_some_and(|x| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit()));
+    json!([kind, id, if imdb || kitsu { "" } else { addon }]).to_string()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Media {
+    pub key: String,
+    pub kind: String,
+    pub id: String,
+    pub addon: String,
+    pub meta: Value,
+    pub saved: bool,
+    pub watched: bool,
+    pub video_watched: bool,
+    pub position: i64,
+    pub duration: i64,
+    pub watched_ms: i64,
+    pub liked: i64,
+    pub video_id: Option<String>,
+}
+impl Media {
+    pub fn in_library(&self) -> bool {
+        self.saved || self.watched || self.position > 0 || self.liked != 0 || self.watched_ms > 0
+    }
+
+    pub fn value(&self) -> Value {
+        let mut v = if self.meta.is_object() {
+            self.meta.clone()
+        } else {
+            json!({})
+        };
+        let o = v.as_object_mut().unwrap();
+        o.insert("id".into(), json!(self.id));
+        o.insert("type".into(), json!(self.kind));
+        o.insert("addon_url".into(), json!(self.addon));
+        o.insert("library".into(), json!(self.saved));
+        o.insert("watched".into(), json!(self.watched));
+        o.insert("video_watched".into(), json!(self.video_watched));
+        o.insert("position_ms".into(), json!(self.position));
+        o.insert("duration_ms".into(), json!(self.duration));
+        o.insert("watched_ms".into(), json!(self.watched_ms));
+        o.insert("liked".into(), json!(self.liked));
+        if let Some(id) = &self.video_id {
+            o.insert("video_id".into(), json!(id));
+        }
+        v
+    }
+}
+// Keep every media projection on the same mapper, including per-video completion.
+const MEDIA_SELECT: &str = "SELECT key,type,raw_id,addon_url,meta,saved,watched,position_ms,duration_ms,watched_ms,liked,video_id,COALESCE((SELECT watched FROM playback WHERE media_key=media.key AND video_id=media.video_id),0) FROM media";
+
+fn media_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Media> {
+    Ok(Media {
+        key: r.get(0)?,
+        kind: r.get(1)?,
+        id: r.get(2)?,
+        addon: r.get(3)?,
+        meta: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(json!({})),
+        saved: r.get(5)?,
+        watched: r.get(6)?,
+        position: r.get(7)?,
+        duration: r.get(8)?,
+        watched_ms: r.get(9)?,
+        liked: r.get(10)?,
+        video_id: r.get(11)?,
+        video_watched: r.get(12)?,
+    })
+}
+
+fn media_list(db: &Connection, filter: &str) -> Result<Vec<Media>> {
+    let mut stmt =
+        db.prepare_cached(&format!("{MEDIA_SELECT}{filter} ORDER BY updated DESC,key"))?;
+    let rows = stmt.query_map([], media_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Recommendation/collection input: every history row plus the most recently
+/// seen catalog rows, not the whole (up to 10k-row) metadata cache.
+const PERSONAL_CANDIDATES: usize = 1500;
+pub(crate) fn personal_media(db: &Connection) -> Result<Vec<Media>> {
+    media_list(
+        db,
+        &format!(
+            " WHERE saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0
+              OR key IN (SELECT key FROM media ORDER BY updated DESC,key LIMIT {PERSONAL_CANDIDATES})"
+        ),
+    )
+}
+
+pub(crate) fn library(db: &Connection) -> Result<Vec<Media>> {
+    // Match Media::in_library without loading/parsing inactive catalog metadata.
+    media_list(
+        db,
+        " WHERE saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0",
+    )
+}
+
+pub(crate) fn media_item(db: &Connection, key: &str) -> Result<Option<Media>> {
+    // media.key is already a primary key; no sort, scan, or schema migration needed.
+    Ok(db
+        .prepare_cached(&format!("{MEDIA_SELECT} WHERE key=?1"))?
+        .query_row([key], media_row)
+        .optional()?)
+}
+pub(crate) fn upsert_meta(
+    db: &Connection,
+    kind: &str,
+    id: &str,
+    addon: &str,
+    value: &Value,
+) -> Result<String> {
+    let key = identity(kind, id, addon);
+    if value.as_object().is_some_and(|object| object.is_empty()) {
+        // Empty metadata is a merge of no fields, NOT a request to clear metadata
+        // or replace its source. Avoid reading/rewriting the old JSON on progress.
+        db.execute(
+            "INSERT INTO media(key,type,raw_id,addon_url,meta,updated) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(key) DO NOTHING",
+            params![
+                key,
+                kind,
+                id,
+                addon,
+                json!({"id":id,"type":kind}).to_string(),
+                now()
+            ],
+        )?;
+        return Ok(key);
+    }
+    let old: Option<(String, String)> = db
+        .query_row(
+            "SELECT meta,addon_url FROM media WHERE key=?1",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let replace_source = old.as_ref().is_some_and(|(_, source)| source != addon)
+        && value
+            .as_object()
+            .is_some_and(|object| object.keys().any(|key| key != "id" && key != "type"));
+    let mut merged = old
+        .and_then(|(s, _)| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or(json!({}));
+    if replace_source {
+        // Explicit relationships belong to their supplying addon, not an ID alone.
+        for field in ["collection", "belongsToCollection", "franchise"] {
+            merged.as_object_mut().unwrap().remove(field);
+        }
+    }
+    let mut size = serde_json::to_vec(&merged)?.len();
+    if let Some(new) = value.as_object() {
+        for (k, v) in new {
+            if v.is_null() {
+                continue;
+            }
+            // Bound the durable row: keep the fields that fit, drop the rest.
+            let new_bytes = serde_json::to_vec(v)?.len();
+            let next_size = if let Some(previous) = merged.get(k) {
+                // A replacement changes the value cost, not the key or separators.
+                size.saturating_sub(serde_json::to_vec(previous)?.len())
+                    .saturating_add(new_bytes)
+            } else {
+                size.saturating_add(
+                    serde_json::to_vec(k)?.len()
+                        + 1
+                        + new_bytes
+                        + usize::from(!merged.as_object().unwrap().is_empty()),
+                )
+            };
+            if next_size > META_BUDGET_BYTES {
+                continue;
+            }
+            size = next_size;
+            merged[k] = v.clone();
+        }
+    }
+    strip_streams(&mut merged);
+    merged["id"] = json!(id);
+    merged["type"] = json!(kind);
+    db.execute(
+        "INSERT INTO media(key,type,raw_id,addon_url,meta,updated) VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(key) DO UPDATE SET meta=excluded.meta, addon_url=CASE WHEN ?7 THEN excluded.addon_url ELSE media.addon_url END,
+        -- Recency for cache eviction. Rows with history keep their activity time.
+        updated=CASE WHEN media.saved=0 AND media.watched=0 AND media.position_ms=0
+          AND media.watched_ms=0 AND media.liked=0 THEN excluded.updated ELSE media.updated END",
+        params![key, kind, id, addon, merged.to_string(), now(),replace_source],
+    )?;
+    Ok(key)
+}
+pub(crate) fn cache_metas(
+    db: &mut Connection,
+    body: &Value,
+    kind: &str,
+    addon: &str,
+) -> Result<()> {
+    let tx = db.transaction()?;
+    let listed = body
+        .get("metas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|metas| metas.iter().take(2000));
+    let single = body.get("meta").filter(|m| m.is_object());
+    for meta in listed.chain(single) {
+        if let Some(id) = meta.get("id").and_then(Value::as_str) {
+            let kind = meta.get("type").and_then(Value::as_str).unwrap_or(kind);
+            upsert_meta(&tx, kind, id, addon, meta)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Inline video streams may contain bearer URLs; only non-stream metadata reaches disk.
+pub(crate) fn strip_streams(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("streams");
+            for value in object.values_mut() {
+                strip_streams(value);
+            }
+        }
+        Value::Array(array) => {
+            for value in array {
+                strip_streams(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn contains_streams(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("streams") || object.values().any(contains_streams)
+        }
+        Value::Array(array) => array.iter().any(contains_streams),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_merge_refreshes_eviction_time_only_without_history() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/test-data/db-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = open(&dir).unwrap();
+        let addon = "https://v3-cinemeta.strem.io/manifest.json";
+        let seen = upsert_meta(&db, "movie", "tt1", addon, &json!({"name":"A"})).unwrap();
+        let saved = upsert_meta(&db, "movie", "tt2", addon, &json!({"name":"A"})).unwrap();
+        db.execute("UPDATE media SET saved=1 WHERE key=?1", [&saved])
+            .unwrap();
+        db.execute("UPDATE media SET updated=1", []).unwrap();
+        for id in ["tt1", "tt2"] {
+            upsert_meta(&db, "movie", id, addon, &json!({"name":"B"})).unwrap();
+        }
+        let updated = |key: &str| -> i64 {
+            db.query_row("SELECT updated FROM media WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert!(
+            updated(&seen) > 1,
+            "catalog row must count as recently seen"
+        );
+        assert_eq!(updated(&saved), 1, "history order must not change");
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

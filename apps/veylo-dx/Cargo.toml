@@ -1,0 +1,52 @@
+# Dioxus prototype of the Veylo shell (Search and Picks), all Rust + CSS.
+# Deliberately its own workspace: it must not touch the Android workspace's
+# manifest or Cargo.lock, which the APK packaging guard watches.
+[workspace]
+
+[package]
+name = "veylo-dx"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[dependencies]
+dioxus = { version = "0.7.10", features = ["desktop"] }
+rustmedia-core = { path = "../../crates/core" }
+# The same one-byte source check the Android app uses before Play (debrid clips, header scoping).
+rustmedia-media-proxy = { path = "../../crates/media-proxy" }
+regex = "1"
+# Read-only access to the app's own store for viewing history (same build as the core's).
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+unicode-normalization = "0.1"
+url = "2"
+# The player on every platform: libmpv driven from Rust (src/engine.rs). Android links the
+# mpv-android build in android/mpv (android/fetch-mpv.sh); desktop the system libmpv.
+libmpv2 = { version = "7.0.1", default-features = false }
+libmpv2-sys = "4.0.1"
+libc = "0.2"
+
+[build-dependencies]
+# Windows: the app icon inside veylo-dx.exe (windows/veylo.rc); a no-op for other targets.
+embed-resource = "3"
+
+# Linux: the GL area under the WebView that mpv renders into (src/video.rs); the same gtk as wry's.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+# Wayland: the picture on its own subsurface under the window (src/video.rs), on GTK's connection.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-egl = "0.32"
+
+# Android: JNI for the files folder and the Media3 player activity (android/kotlin).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.1"
