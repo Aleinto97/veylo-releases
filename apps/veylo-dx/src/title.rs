@@ -28,9 +28,12 @@ pub fn TitlePage(media: Media) -> Element {
     use_hook(move || { spawn(async move { seen.set(backend::watched_episodes(&for_seen).await); }); });
     // A title opened from a shelf, Search or Picks carries the add-on's data only: what you did
     // with it (saved, watched, liked) comes from the store.
+    // A choice made before the answer arrives wins (`touched`).
+    let mut touched = use_signal(|| false);
     let for_store = media.clone();
     use_hook(move || { spawn(async move {
         if let Some(m) = backend::stored(&for_store).await {
+            if *touched.peek() { return; }
             saved.set(m.saved);
             liked.set(m.liked);
             if !episodic(&m) { watched.set(backend::film_watched(&m)); }
@@ -95,6 +98,7 @@ pub fn TitlePage(media: Media) -> Element {
     let (m1, m4) = (media.clone(), media.clone());
     let rate = move |value: i64| {
         let media = m1.clone();
+        touched.set(true);
         let before = liked();
         let next = if before == value { 0 } else { value };
         liked.set(next);
@@ -104,6 +108,7 @@ pub fn TitlePage(media: Media) -> Element {
     // Save to the Library (S), and the "Already watched" switch (W): the button and the key alike.
     let for_save = media.clone();
     let toggle_save = use_callback(move |_: ()| {
+        touched.set(true);
         let next = !*saved.peek();
         saved.set(next);
         let m = for_save.clone();
@@ -111,6 +116,7 @@ pub fn TitlePage(media: Media) -> Element {
     });
     let for_watched = media.clone();
     let toggle_watched = use_callback(move |_: ()| {
+        touched.set(true);
         let next = !*watched.peek();
         watched.set(next);
         let m = for_watched.clone();
@@ -126,8 +132,10 @@ pub fn TitlePage(media: Media) -> Element {
         match key {
             'p' => if film { autoplay.call((k_media.id.clone(), None)) }
                    else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()) { autoplay.call((id.clone(), backend::episode_label(&id))) },
-            'l' => { let next = if *liked.peek() == 1 { 0 } else { 1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
-            'd' => { let next = if *liked.peek() == -1 { 0 } else { -1 }; liked.set(next); let m = k_m2.clone(); spawn(async move { let _ = backend::feedback(&m, next).await; *shell.picks_dirty.write() += 1; }); }
+            'l' => { touched.set(true); let before = *liked.peek(); let next = if before == 1 { 0 } else { 1 }; liked.set(next); let m = k_m2.clone();
+                spawn(async move { if backend::feedback(&m, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } }); }
+            'd' => { touched.set(true); let before = *liked.peek(); let next = if before == -1 { 0 } else { -1 }; liked.set(next); let m = k_m2.clone();
+                spawn(async move { if backend::feedback(&m, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } }); }
             's' => toggle_save.call(()),
             'w' if film => toggle_watched.call(()),
             't' => if let Load::Ready(m) = &*meta.peek() { if !m.trailers.is_empty() { crate::play_trailers(shell, m.trailers.clone()); } },

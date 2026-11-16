@@ -7,13 +7,14 @@ use url::Url;
 #[derive(Clone, Debug)]
 pub(crate) struct Addon {
     pub url: String,
-    pub manifest: Value,
+    /// Shared: the parsed manifest is cached and handed to every request without copying.
+    pub manifest: std::sync::Arc<Value>,
     pub allow_http: bool,
     pub generation: String,
 }
 impl Addon {
     pub fn descriptor(&self) -> Value {
-        let mut v = self.manifest.clone();
+        let mut v = (*self.manifest).clone();
         v["manifest_url"] = json!(self.url);
         v
     }
@@ -420,7 +421,8 @@ mod protocol_tests {
             generation: String::new(),
             manifest: json!({
                 "types":["series"],"idPrefixes":["tt"],"resources":["subtitles",{"name":"stream","types":["anime"],"idPrefixes":["kitsu:"]}]
-            }),
+            })
+            .into(),
         };
         assert!(a.supports("subtitles", "series", "tt1"));
         assert!(!a.supports("subtitles", "anime", "kitsu:1"));

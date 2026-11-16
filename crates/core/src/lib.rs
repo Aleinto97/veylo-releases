@@ -81,8 +81,8 @@ impl Core {
         f(&mut db)
     }
     fn installed(&self) -> Result<Vec<Addon>> {
-        // Read and fill the cache under the storage lock, so a write to the addons table (made
-        // under the same lock, then `addons_changed`) can't slip between the read and the fill.
+        // Read and fill the cache under the storage lock; every write to the addons table clears
+        // it under the same lock, so a reader never sees a list older than the table.
         self.with_db(|db| {
             if let Some(cached) = self.inner.addons.lock().ok().and_then(|a| a.clone()) {
                 return Ok(cached);
@@ -125,6 +125,32 @@ impl Core {
                 "DELETE FROM cache WHERE key LIKE ?1 || '%' ESCAPE '\\'",
                 [escaped],
             )?)
+        })
+    }
+    /// Delete the cached responses of one addon: keys are its base path, a resource, then (for
+    /// an addon whose manifest URL has a query) that same query. Other addons on the same host,
+    /// or the same path with another query, keep theirs.
+    fn purge_addon_responses(&self, manifest_url: &str) -> Result<usize> {
+        let mut base = url::Url::parse(manifest_url).map_err(|_| anyhow!("Invalid addon URL"))?;
+        let query = base.query().map(|q| format!("?{q}")).unwrap_or_default();
+        base.set_query(None);
+        base.set_fragment(None);
+        let prefix = base
+            .as_str()
+            .strip_suffix("manifest.json")
+            .context("Expected manifest.json URL")?
+            .to_owned();
+        self.with_db(|db| {
+            let mut removed = 0;
+            for resource in ["catalog", "meta", "stream", "subtitles"] {
+                let start = format!("{prefix}{resource}/");
+                removed += db.execute(
+                    "DELETE FROM cache WHERE substr(key,1,length(?1))=?1
+                     AND (CASE WHEN ?2='' THEN instr(key,'?')=0 ELSE substr(key,-length(?2))=?2 END)",
+                    params![start, query],
+                )?;
+            }
+            Ok(removed)
         })
     }
     /// Embedded-addon revision (`?v=`) for a loopback registration of it.
@@ -224,12 +250,12 @@ impl Core {
                  ON CONFLICT(url) DO UPDATE SET manifest=excluded.manifest,allow_http=excluded.allow_http,generation=excluded.generation",
                 params![url,manifest.to_string(),allow_http],
             )?;
+            self.addons_changed();
             Ok(())
         })?;
-        self.addons_changed();
         Ok(Addon {
             url,
-            manifest,
+            manifest: manifest.into(),
             allow_http,
             generation: String::new(),
         }
@@ -251,9 +277,11 @@ impl Core {
             }
             "remove_addon" => {
                 let url = addon::normalize(text(&request, "url")?, true)?;
-                let removed = self
-                    .with_db(|db| Ok(db.execute("DELETE FROM addons WHERE url=?1", [&url])? > 0))?;
-                self.addons_changed();
+                let removed = self.with_db(|db| {
+                    let removed = db.execute("DELETE FROM addons WHERE url=?1", [&url])? > 0;
+                    self.addons_changed();
+                    Ok(removed)
+                })?;
                 self.inner
                     .streams
                     .lock()
@@ -262,13 +290,7 @@ impl Core {
                 // Cached responses are keyed by the addon's (possibly secret-bearing) URL. The
                 // addon is already gone: a failed purge leaves them to normal eviction.
                 if removed {
-                    if let Ok(mut base) = url::Url::parse(&url) {
-                        base.set_query(None);
-                        base.set_fragment(None);
-                        if let Some(prefix) = base.as_str().strip_suffix("manifest.json") {
-                            let _ = self.purge_cached_responses(prefix);
-                        }
-                    }
+                    let _ = self.purge_addon_responses(&url);
                 }
                 Ok(json!({"removed":removed}))
             }
@@ -351,18 +373,19 @@ impl Core {
         let fetched = self.fetch(&a.url, a.allow_http, 3600, 86400).await?;
         let manifest = addon::validate_manifest(fetched.body)?;
         let updated = self.with_db(|db| {
-            Ok(db.execute(
+            let updated = db.execute(
                 "UPDATE addons SET manifest=?2,generation=lower(hex(randomblob(16))) WHERE url=?1 AND generation=?3",
                 params![a.url,manifest.to_string(),a.generation],
-            )? > 0)
+            )? > 0;
+            self.addons_changed();
+            Ok(updated)
         })?;
-        self.addons_changed();
         ensure!(
             updated,
             "Addon changed or was removed during refresh; stale response ignored"
         );
         let mut refreshed = a.clone();
-        refreshed.manifest = manifest;
+        refreshed.manifest = manifest.into();
         Ok(refreshed.descriptor())
     }
     async fn refresh(&self) -> Result<Value> {
@@ -808,7 +831,8 @@ impl Core {
                 }
                 Ok(meta)
             })?;
-            Ok(json!({ "items": rows.collect::<rusqlite::Result<Vec<_>>>()? }))
+            // A row that can't be read is left out, not the whole history.
+            Ok(json!({ "items": rows.filter_map(rusqlite::Result::ok).collect::<Vec<_>>() }))
         })
     }
     fn mutate(&self, req: &Value) -> Result<Value> {
@@ -1225,7 +1249,7 @@ fn read_installed(db: &rusqlite::Connection) -> Result<Vec<Addon>> {
         let (url, manifest, allow_http, generation) = item?;
         addons.push(Addon {
             url,
-            manifest: serde_json::from_str(&manifest)?,
+            manifest: std::sync::Arc::new(serde_json::from_str(&manifest)?),
             allow_http,
             generation,
         });

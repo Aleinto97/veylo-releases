@@ -81,6 +81,11 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
             AND duration_ms>0 AND position_ms*5>=duration_ms*4;
           UPDATE media SET watched=1 WHERE watched=0 AND type='movie' AND watched_ms=0
             AND duration_ms>0 AND position_ms*5>=duration_ms*4;
+          -- Playback before v3 was never measured: count what was reached as watched, so a
+          -- film half-seen then is completed by watching the rest now.
+          UPDATE playback SET watched_ms=position_ms WHERE watched_ms=0 AND position_ms>0;
+          UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=media.key)
+            WHERE watched_ms=0 AND EXISTS (SELECT 1 FROM playback WHERE media_key=media.key AND watched_ms>0);
           PRAGMA user_version=3;
         ",
         )?;

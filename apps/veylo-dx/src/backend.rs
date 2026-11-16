@@ -518,7 +518,6 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
     })
 }
 
-/// Save or remove from the library, and mark watched: the core's own mutations.
 /// What the store knows about a title opened from anywhere (a catalog shelf, Search, Picks):
 /// saved, watched, liked and progress come from there, the rest from the add-on.
 pub async fn stored(media: &Media) -> Option<Media> {
@@ -532,6 +531,7 @@ pub async fn set_saved(media: &Media, saved: bool) -> Result<()> {
     Ok(())
 }
 
+/// Mark a film watched or not: the core's own mutation.
 pub async fn set_watched(media: &Media, watched: bool) -> Result<()> {
     exec(json!({"op":"mark_watched","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":watched,"meta":media.raw})).await?;
     Ok(())

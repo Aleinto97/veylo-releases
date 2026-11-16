@@ -369,16 +369,24 @@ pub async fn remove_rd_key() -> Result<()> {
     // Veylo's own records of those add-ons hold the key too (Torrentio's link, the AIOStreams
     // login of a configuration that has the key): delete the AIOStreams configuration on its
     // server where it still answers, and forget all of them.
+    // If AIOStreams doesn't answer, its login and the key stay so Remove key can be tried again;
+    // a configuration its server no longer has (or won't let us in) is simply forgotten.
     let mut store = load();
+    let mut unreachable = false;
     for c in Curated::ALL {
-        for record in [store.managed.remove(c.id()), store.managed.remove(&format!("{}:pending", c.id()))].into_iter().flatten() {
+        for name in [c.id().to_owned(), format!("{}:pending", c.id())] {
+            let Some(record) = store.managed.get(&name).cloned() else { continue };
             let (uuid, password) = (s(&record, "uuid"), s(&record, "password"));
             if c == Curated::AioStreams && !uuid.is_empty() && !password.is_empty() {
-                let _ = aiostreams_call(reqwest::Method::DELETE, json!({}), Some((uuid, password))).await;
+                if let Err(e) = aiostreams_call(reqwest::Method::DELETE, json!({}), Some((uuid, password))).await {
+                    if format!("{e}").starts_with("AIOStreams didn't answer") { unreachable = true; continue; }
+                }
             }
+            store.managed.remove(&name);
         }
     }
     save(&store);
+    ensure!(!unreachable, "AIOStreams didn't answer, so its copy of your key is still there. Try Remove key again later.");
     let settings = backend::Settings { rd_key: None, rd_key_removed: true, ..backend::load_settings() };
     backend::save_settings(&settings);
     Ok(())

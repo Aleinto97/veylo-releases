@@ -1638,3 +1638,45 @@ async fn old_history_played_past_80_percent_stays_watched_after_the_upgrade() {
         Value::Null
     );
 }
+
+#[tokio::test]
+async fn removing_an_addon_keeps_its_neighbours_cache() {
+    let d = Data::new();
+    drop(d.core());
+    let gone = "https://host.test/manifest.json?key=a";
+    d.install(gone, &manifest());
+    let db = d.db();
+    for key in [
+        "https://host.test/catalog/movie/top.json?key=a", // the removed addon's
+        "https://host.test/catalog/movie/top.json?key=b", // same path, another query
+        "https://host.test/sort=x|rd=K/catalog/movie/top.json", // a configured addon on the host
+        "https://other.test/catalog/movie/top.json?key=a",
+    ] {
+        db.execute(
+            "INSERT INTO cache(key,body,expires,updated) VALUES(?1,'{}',9999999999,1)",
+            [key],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let core = d.core();
+    core.execute(json!({"op":"remove_addon","url":gone}))
+        .await
+        .unwrap();
+    let left: Vec<String> = d
+        .db()
+        .prepare("SELECT key FROM cache ORDER BY key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "https://host.test/catalog/movie/top.json?key=b",
+            "https://host.test/sort=x|rd=K/catalog/movie/top.json",
+            "https://other.test/catalog/movie/top.json?key=a",
+        ]
+    );
+}

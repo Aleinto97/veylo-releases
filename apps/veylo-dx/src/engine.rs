@@ -287,11 +287,14 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
 
 /// The source's request headers, one `http-header-fields` entry each through `change-list
 /// append`: setting the list as a whole splits on commas, which header values (cookies) hold.
+/// A header that can't be passed is left out (as before), never the whole stream.
 fn add_headers(mpv: &Mpv, headers: &[(String, String)]) -> anyhow::Result<()> {
     for (k, v) in headers {
-        if k.is_empty() || k.contains([':', '\r', '\n']) || v.contains(['\r', '\n']) { continue; }
-        mpv.command("change-list", &["http-header-fields", "append", &format!("{k}: {v}")])
-            .map_err(|e| anyhow::anyhow!("mpv refused a request header: {e}"))?;
+        if k.is_empty() || k.contains([':', '\r', '\n', '\0']) || v.contains(['\r', '\n', '\0']) { continue; }
+        if mpv.command("change-list", &["http-header-fields", "append", &format!("{k}: {v}")]).is_err() {
+            // The name only: header values can be credentials.
+            eprintln!("veylo: a request header ({k}) couldn't be passed to the player");
+        }
     }
     Ok(())
 }
@@ -543,7 +546,7 @@ mod tests {
     fn headers_with_commas_reach_mpv_whole() {
         unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
         let mpv = Mpv::with_initializer(|o| { o.set_property("config", false)?; o.set_property("vo", "null")?; o.set_property("ao", "null")?; Ok(()) }).unwrap();
-        add_headers(&mpv, &[("Cookie".into(), "a=1, b=2".into()), ("X-Token".into(), "t".into()), ("Bad:Name".into(), "x".into())]).unwrap();
+        add_headers(&mpv, &[("Cookie".into(), "a=1, b=2".into()), ("X-Token".into(), "t".into()), ("Bad:Name".into(), "x".into()), ("Nul".into(), "a\0b".into())]).unwrap();
         let list: String = mpv.get_property("http-header-fields").unwrap();
         assert!(list.contains("Cookie: a=1, b=2") && list.contains("X-Token: t") && !list.contains("Bad:Name"), "{list}");
         // mpv prints a list joined by commas; removing the cookie as one entry proves it is one.
