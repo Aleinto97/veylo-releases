@@ -140,8 +140,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     });
     let download = use_callback(move |sub: OnlineSubtitle| add_online.call((sub, true)));
 
-    // No audio in your language: your language's subtitles instead, once per video. The file's
-    // own subtitles first, else the best download. Untagged audio says nothing, so it is left as is.
+    // Subtitles follow the Audio language setting, once per video: off when that language is in
+    // the audio (or the setting is Any), otherwise the file's own full subtitles in that language,
+    // else the best download. Untagged audio says nothing, so it is left as is.
     let mut fallback_done = use_signal(|| false);
     // Re-runs only when the video becomes ready, not on every position tick.
     let ready = use_memo(move || { let s = state.read(); s.loaded && !s.tracks.is_empty() });
@@ -150,17 +151,28 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         if !ready() || *fallback_done.peek() { return; }
         fallback_done.set(true);
         let s = state.peek().clone();
-        let Some(key) = backend::stream_language() else { return };
-        let name = backend::subtitle_language_of(&key);
+        let key = backend::stream_language();
+        let name = key.as_deref().map(backend::subtitle_language_of).unwrap_or_default();
         let mut say = say;
-        let plan = fallback(&s.tracks, &key);
-        if let Fallback::Embedded(id) = plan {
-            fb_live.0.select(false, Some(id));
-            say(format!("No {name} audio: {name} subtitles on"));
+        match fallback(&s.tracks, key.as_deref()) {
+            Fallback::Off(audio) => {
+                // mpv's alang normally picked this already; make it explicit when it did not.
+                if let Some(id) = audio {
+                    if !s.tracks.iter().any(|t| t.audio && t.selected && t.id == id) { fb_live.0.select(true, Some(id)); }
+                }
+                if s.tracks.iter().any(|t| !t.audio && t.selected) { fb_live.0.select(false, None); }
+            }
+            Fallback::Embedded(id) => {
+                fb_live.0.select(false, Some(id));
+                say(format!("No {name} audio: {name} subtitles on"));
+            }
+            Fallback::Download => {
+                let Some(key) = key else { return };
+                if fb_wanted.is_none() { return; }
+                automatic_language.set(Some(key));
+            }
+            Fallback::Nothing => {}
         }
-        if plan != Fallback::Download { return; }
-        if fb_wanted.is_none() { return; }
-        automatic_language.set(Some(key));
     });
     // One lookup feeds both the sheet and the automatic fallback, whichever starts first.
     use_effect(move || {
@@ -389,17 +401,31 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     }
 }
 
-/// What to do when a video starts, for the audio-language setting `key`.
+/// What to do when a video starts, for the audio-language setting (`None` is "Any language").
 #[derive(Debug, PartialEq)]
-enum Fallback { Nothing, Embedded(i64), Download }
+enum Fallback {
+    /// No audio tracks, or untagged audio that could be yours: leave the file as it plays.
+    Nothing,
+    /// Your language's audio is there (this track, when it was not already on), or the setting is
+    /// Any: subtitles off.
+    Off(Option<i64>),
+    /// No audio in your language: this embedded subtitle track on.
+    Embedded(i64),
+    /// No audio and no embedded subtitles in your language: download them.
+    Download,
+}
 
-/// Your language's audio is there, or any audio track is untagged (it could be yours): nothing.
-/// Otherwise your language's subtitles: the file's own full ones (text before image, never
-/// forced-only signs) when it has them, else a download.
-fn fallback(tracks: &[engine::Track], key: &str) -> Fallback {
+/// The Audio language setting decides subtitles: off when its language is in the main audio (a
+/// file can flag a default subtitle regardless), otherwise full subtitles in that language (text
+/// before image, never forced-only signs), else a download. Untagged audio says nothing, so the
+/// file's own choice stays.
+fn fallback(tracks: &[engine::Track], key: Option<&str>) -> Fallback {
+    let Some(key) = key else { return Fallback::Off(None) };
     let in_language = |t: &engine::Track| backend::track_in_language(&t.lang, key);
     let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
-    if audio.is_empty() || audio.iter().any(|t| t.lang.is_empty()) || audio.iter().any(|t| in_language(t)) { return Fallback::Nothing; }
+    if audio.is_empty() { return Fallback::Nothing; }
+    if let Some(t) = audio.iter().find(|t| in_language(t)) { return Fallback::Off(Some(t.id)); }
+    if audio.iter().any(|t| t.lang.is_empty()) { return Fallback::Nothing; }
     if tracks.iter().any(|t| !t.audio && t.selected && !t.forced && in_language(t)) { return Fallback::Nothing; }
     let full = |t: &&engine::Track| !t.audio && !t.forced && in_language(t);
     match tracks.iter().filter(full).find(|t| !t.image).or_else(|| tracks.iter().find(full)) {
@@ -542,13 +568,19 @@ mod tests {
     fn track(id: i64, audio: bool, lang: &str) -> Track { Track { id, audio, lang: lang.into(), ..Default::default() } }
 
     #[test]
-    fn subtitles_only_when_your_language_is_missing_from_the_audio() {
-        let it = "italian";
-        // MULTI with Italian audio: mpv's alang picks it, nothing else to do.
-        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita")], it), Fallback::Nothing);
-        // Untagged audio can't be told apart, alone or next to a tagged track: left alone.
+    fn subtitles_follow_the_audio_language_setting() {
+        let it = Some("italian");
+        // MULTI with Italian audio: mpv's alang picks it, and a flagged subtitle is turned off.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita")], it), Fallback::Off(Some(2)));
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita"), track(3, false, "eng")], it), Fallback::Off(Some(2)));
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita"), Track { selected: true, ..track(3, false, "eng") }], it), Fallback::Off(Some(2)));
+        // "Any language": the file's default audio, no subtitles even when one is flagged.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita"), track(3, false, "eng")], None), Fallback::Off(None));
+        // Untagged audio can't be told apart, alone or next to another language: left alone.
         assert_eq!(fallback(&[track(1, true, "")], it), Fallback::Nothing);
         assert_eq!(fallback(&[track(1, true, ""), track(2, true, "eng")], it), Fallback::Nothing);
+        // ...but it does not hide your language when that track is there too.
+        assert_eq!(fallback(&[track(1, true, ""), track(2, true, "ita")], it), Fallback::Off(Some(2)));
         // Forced Italian (signs only) is skipped for the full track; an image track only if nothing else.
         let forced = Track { forced: true, ..track(5, false, "ita") };
         let pgs = Track { image: true, ..track(6, false, "ita") };
@@ -561,9 +593,11 @@ mod tests {
         assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng")], it), Fallback::Download);
         // Commentary in your language does not suppress subtitles over the main foreign audio.
         let commentary = Track { label: "English director commentary".into(), ..track(2, true, "eng") };
-        assert_eq!(fallback(&[track(1, true, "jpn"), commentary], "english"), Fallback::Download);
+        assert_eq!(fallback(&[track(1, true, "jpn"), commentary], Some("english")), Fallback::Download);
         // Italian subtitles already on (forced by the file): nothing.
         assert_eq!(fallback(&[track(1, true, "eng"), Track { selected: true, ..track(4, false, "it") }], it), Fallback::Nothing);
+        // A subtitle language tag with a region still counts.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, false, "it-IT")], it), Fallback::Embedded(2));
     }
     #[test]
     fn clock_reads_like_a_player() {

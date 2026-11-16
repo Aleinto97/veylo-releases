@@ -248,11 +248,16 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         // HDR on an SDR target: per-scene peak detection (what HDR10+ metadata is for) and the default curve.
         o.set_property("hdr-compute-peak", "yes")?;
         // Your language's audio first, when the file has it (a MULTI or dual-audio release);
-        // mpv falls back to the file's default track otherwise. Subtitles stay off by default.
+        // mpv falls back to the file's default track otherwise.
         if let Some(key) = backend::stream_language() {
             let codes = backend::track_codes(&key);
             if !codes.is_empty() { o.set_property("alang", codes.join(",").as_str())?; }
         }
+        // Subtitles are the app's decision once the tracks are known (player_ui's fallback):
+        // off when your language is in the audio (or "Any language"), else the file's full
+        // subtitles in your language, or a download. Starting with none avoids a flash of a
+        // container-default subtitle before that runs.
+        o.set_property("sid", "no")?;
         o.set_property("sub-font", "sans-serif")?;
         o.set_property("sub-color", "#F2EFEA")?;
         o.set_property("sub-border-color", "#DD000000")?;
