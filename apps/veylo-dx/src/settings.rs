@@ -226,7 +226,7 @@ fn GetKey(url: &'static str, label: &'static str) -> Element {
 #[component]
 fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
     let mut screen = use_signal(crate::display::screen);
-    let (title, about) = crate::display::summary(screen());
+    let (title, about) = crate::display::summary(screen(), settings().hdr_output);
     rsx! {
         section { class: "settings-block",
             div { class: "group-head", span { class: "group-icon", icons::Tv {} } span { class: "group-name", "Screen" } }
@@ -238,7 +238,7 @@ fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
             if cfg!(target_os = "windows") {
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "HDR output" }
-                        span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when Windows HDR is on. Always SDR tone-maps them, for screens whose HDR looks washed out." } }
+                        span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when Windows HDR is on. Always SDR tone-maps them, for screens whose HDR looks washed out. Applies from the next video." } }
                     div { class: "segmented glass", role: "radiogroup", aria_label: "HDR output",
                         for (on, name) in [(true, "Automatic"), (false, "Always SDR")] {
                             button { class: if settings().hdr_output == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().hdr_output == on}",

@@ -9,7 +9,8 @@ pub fn screen() -> Option<Screen> { imp::screen() }
 
 /// One line for Settings and the player's details: what this screen shows, and what to do
 /// about it when HDR could reach it but doesn't.
-pub fn summary(screen: Option<Screen>) -> (String, String) {
+/// `hdr_output`: the Windows setting (Always SDR tone-maps even on an HDR screen).
+pub fn summary(screen: Option<Screen>, hdr_output: bool) -> (String, String) {
     let peak = |s: &Screen| if s.peak_nits > 0 { format!(", up to {} nits", s.peak_nits) } else { String::new() };
     match screen {
         Some(s) if s.hdr10 || s.hlg || s.hdr10_plus || s.dolby_vision => {
@@ -17,8 +18,10 @@ pub fn summary(screen: Option<Screen>) -> (String, String) {
             if s.dolby_vision { kinds.push("Dolby Vision"); }
             if s.hdr10_plus { kinds.push("HDR10+"); }
             if s.hdr10 { kinds.push("HDR10"); }
-            if s.hlg && !cfg!(target_os = "windows") { kinds.push("HLG"); }
-            (format!("HDR: {}{}", kinds.join(", "), peak(&s)), "HDR videos play in HDR.".into())
+            if s.hlg { kinds.push("HLG"); }
+            let about = if cfg!(target_os = "windows") && !hdr_output { "HDR output is set to Always SDR: HDR videos are tone-mapped." }
+                else { "HDR videos play in HDR." };
+            (format!("HDR: {}{}", kinds.join(", "), peak(&s)), about.into())
         }
         Some(_) if cfg!(target_os = "windows") => ("SDR".into(),
             "HDR videos are tone-mapped to SDR. If this screen supports HDR, turn on \u{201c}Use HDR\u{201d} in Windows Settings \u{203a} Display, then check again.".into()),
@@ -57,8 +60,8 @@ mod imp {
                 let Ok(desc) = (unsafe { output.GetDesc1() }) else { continue };
                 if desc.Monitor != monitor { continue; }
                 let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                // mpv converts HLG to the HDR10 swapchain, so an HDR output takes both.
-                return Some(Screen { hdr10: hdr, hlg: hdr, peak_nits: if hdr { desc.MaxLuminance.round() as u32 } else { 0 }, ..Default::default() });
+                // HLG videos reach it as HDR10 too (mpv converts them): the screen itself takes HDR10.
+                return Some(Screen { hdr10: hdr, peak_nits: if hdr { desc.MaxLuminance.round() as u32 } else { 0 }, ..Default::default() });
             }
         }
         None
@@ -76,9 +79,9 @@ mod tests {
     #[test]
     fn summary_names_what_reaches_the_screen() {
         let hdr = Screen { hdr10: true, peak_nits: 1000, ..Default::default() };
-        assert_eq!(summary(Some(hdr)).0, "HDR: HDR10, up to 1000 nits");
+        assert_eq!(summary(Some(hdr), true).0, "HDR: HDR10, up to 1000 nits");
         let tv = Screen { hdr10: true, hdr10_plus: true, dolby_vision: true, ..Default::default() };
-        assert_eq!(summary(Some(tv)).0, "HDR: Dolby Vision, HDR10+, HDR10");
-        assert_eq!(summary(Some(Screen::default())).0, "SDR");
+        assert_eq!(summary(Some(tv), true).0, "HDR: Dolby Vision, HDR10+, HDR10");
+        assert_eq!(summary(Some(Screen::default()), true).0, "SDR");
     }
 }

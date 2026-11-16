@@ -87,7 +87,8 @@ pub enum Finish { Close, Next, Another }
 pub struct Live {
     pub mpv: Mpv,
     pub request: PlayRequest,
-    pub screen: Screen,
+    /// The screen when this session started; None where it couldn't be read (Linux).
+    pub screen: Option<Screen>,
     state: watch::Sender<State>,
     finish: Mutex<Option<Finish>>,
     ready: (Mutex<bool>, Condvar),
@@ -205,9 +206,9 @@ impl Live {
 
 /// Start a session: mpv is created here; the file opens once the video surface is ready.
 pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle) -> anyhow::Result<()> {
-    let screen = platform_screen();
+    let screen = crate::display::screen();
     let direct = cfg!(target_os = "android");
-    let mpv = create(&req, direct, screen)?;
+    let mpv = create(&req, direct)?;
     let (state, _) = watch::channel(State { speed: 1.0, volume: 100.0, direct, ..Default::default() });
     let live = Arc::new(Live { mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
     if let Ok(mut a) = ACTIVE.lock() { *a = Some(live.clone()); }
@@ -216,13 +217,10 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
     Ok(())
 }
 
-fn platform_screen() -> Screen { crate::display::screen().unwrap_or_default() }
 
-fn create(req: &PlayRequest, direct: bool, screen: Screen) -> anyhow::Result<Mpv> {
-    #[cfg(not(target_os = "windows"))]
-    let _ = screen;
+fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
     #[cfg(target_os = "windows")]
-    let hdr_output = backend::load_settings().hdr_output;
+    let hdr_output = backend::hdr_output();
     // libmpv refuses to start unless numbers parse the C way; GTK/WebKit set the user's locale.
     unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
     #[cfg(target_os = "android")]
@@ -265,13 +263,9 @@ fn create(req: &PlayRequest, direct: bool, screen: Screen) -> anyhow::Result<Mpv
             o.set_property("demuxer-max-bytes", "256MiB")?;
             // HDR to an HDR screen: mpv asks Windows for an HDR10 swapchain when the video and
             // the screen are HDR (Windows "Use HDR" on), and tone-maps to SDR otherwise.
-            if hdr_output {
-                let _ = o.set_property("target-colorspace-hint", "yes");
-                // The panel's own peak, so highlights are mapped to what it can show.
-                if screen.hdr10 && (300..=10_000).contains(&screen.peak_nits) {
-                    let _ = o.set_property("target-peak", screen.peak_nits as i64);
-                }
-            }
+            // "Always SDR" says no explicitly, whatever this mpv build's default. The panel's peak is
+            // applied once mpv really sends HDR10 (`follow_target`), never to SDR output.
+            let _ = o.set_property("target-colorspace-hint", if hdr_output { "yes" } else { "no" });
         }
         #[cfg(not(any(target_os = "android", target_os = "windows")))]
         {
@@ -332,6 +326,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let (mut position, mut duration, mut cache_end) = (0.0f64, 0.0f64, 0.0f64);
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
+    let mut target_check = Instant::now();
     // Time actually played since the last report (seeks don't count), so "watched" means watched.
     let (mut last_tick, mut measured, mut speed) = (None::<f64>, 0.0f64, 1.0f64);
     // The title's metadata goes with this session's first report and its last one.
@@ -347,6 +342,15 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     loop {
         if stop.stopped() && !quitting { quitting = true; live.finish(Finish::Close); }
         if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured, &mut sent_meta, false); }
+        // What mpv sends to the screen is known once it renders, and changes when Windows HDR is
+        // switched or the window moves to another screen: follow it, and say so.
+        if target_check.elapsed() > Duration::from_secs(2) {
+            target_check = Instant::now();
+            if follow_target(&live) && announced {
+                let s = live.state();
+                let _ = events.send(PlayerEvent::Started { decoder: hardware(&s), codec: codec_name(&s.codec), facts: facts(&live, &s) });
+            }
+        }
         let Some(event) = mpv.wait_event(0.25) else { continue };
         match event {
             Ok(Event::FileLoaded) => {
@@ -355,7 +359,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 // Profile 5 carries no HDR10 layer: without a Dolby Vision panel only mpv's renderer
                 // (libplacebo's reshaping) shows its colours right.
                 let s = live.state();
-                if s.direct && s.dv_profile == 5 && !live.screen.dolby_vision { live.render_dolby_vision(); }
+                if s.direct && s.dv_profile == 5 && !live.screen.unwrap_or_default().dolby_vision { live.render_dolby_vision(); }
             }
             Ok(Event::VideoReconfig) => {
                 let p = |n: &str| mpv.get_property::<i64>(n).unwrap_or(0);
@@ -549,10 +553,27 @@ pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Scr
     }
 }
 
+/// Read the transfer mpv renders to; true when it changed. On Windows, HDR10 output is mapped to
+/// the panel's peak (read again, the window may have moved), and SDR output goes back to mpv's own.
+fn follow_target(live: &Live) -> bool {
+    let target: String = live.mpv.get_property("video-target-params/gamma").unwrap_or_default();
+    if target.is_empty() || live.state().target_transfer == target { return false; }
+    #[cfg(target_os = "windows")]
+    {
+        let peak = crate::display::screen().filter(|s| s.hdr10).map(|s| s.peak_nits).filter(|p| (300..=10_000).contains(p));
+        match peak {
+            Some(p) if target == "pq" => { let _ = live.mpv.set_property("target-peak", p as i64); }
+            _ => { let _ = live.mpv.set_property("target-peak", "auto"); }
+        }
+    }
+    live.update(|s| { s.target_transfer = target; true });
+    true
+}
+
 pub fn facts(live: &Live, s: &State) -> Facts {
     Facts {
         resolution: Some(crate::player::resolution_label(s.width, s.height)).filter(|r| !r.is_empty()).or(live.request.quality.clone()).unwrap_or_default(),
-        picture: picture(&s.transfer, live.request.hdr.as_deref(), s.dv_profile, live.screen, s.direct, &s.target_transfer),
+        picture: picture(&s.transfer, live.request.hdr.as_deref(), s.dv_profile, live.screen.unwrap_or_default(), s.direct, &s.target_transfer),
         size: live.request.size.clone().unwrap_or_default(),
     }
 }
