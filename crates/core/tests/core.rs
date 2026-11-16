@@ -1572,10 +1572,21 @@ async fn an_unmarked_film_is_not_marked_again_by_the_next_report() {
     let a = "https://a.test/manifest.json";
     let report = |position: i64, add: i64| json!({"op":"progress","type":"movie","id":"tt3","addon_url":a,"position_ms":position,"duration_ms":100000,"watched_add_ms":add});
     // Stopped at the credits (85%) after watching it all: watched.
-    assert_eq!(core.execute(report(85000, 84000)).await.unwrap()["item"]["watched"], true);
-    let unmarked = core.execute(json!({"op":"mark_watched","type":"movie","id":"tt3","addon_url":a,"watched":false})).await.unwrap();
+    assert_eq!(
+        core.execute(report(85000, 84000)).await.unwrap()["item"]["watched"],
+        true
+    );
+    let unmarked = core
+        .execute(
+            json!({"op":"mark_watched","type":"movie","id":"tt3","addon_url":a,"watched":false}),
+        )
+        .await
+        .unwrap();
     assert_eq!(unmarked["item"]["watched"], false);
     assert_eq!(unmarked["item"]["watched_ms"], 0);
     // Watching it again: ten seconds in, it stays unwatched.
-    assert_eq!(core.execute(report(10000, 10000)).await.unwrap()["item"]["watched"], false);
+    assert_eq!(
+        core.execute(report(10000, 10000)).await.unwrap()["item"]["watched"],
+        false
+    );
 }
