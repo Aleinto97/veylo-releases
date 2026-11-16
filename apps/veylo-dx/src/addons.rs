@@ -230,7 +230,7 @@ fn torrentio_url(key: &str, language: Option<&Language>) -> String {
 }
 
 /// AIOStreams configuration: three debrid scrapers on Real-Debrid, cached only, streams only
-/// (no extra catalogues), the Torrentio-style labels the Play order reads, no filters.
+/// (no extra catalogues), the Torrentio-style labels the Play order reads, 3D excluded.
 fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
     let preset = |kind: &str, name: &str| json!({"type": kind, "instanceId": kind, "enabled": true,
         "options": {"name": name, "timeout": 5000, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false}});
@@ -242,6 +242,7 @@ fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
         "presets": [preset("comet", "Comet"), preset("mediafusion", "MediaFusion"), preset("stremthruTorz", "StremThru Torz")],
         "formatter": {"id": "torrentio"},
         "excludeUncached": true,
+        "excludedVisualTags": ["3D"],
         "sortCriteria": {"global": sort},
     });
     if let Some(l) = language { config["preferredLanguages"] = json!([l.aio]); }
@@ -324,6 +325,7 @@ pub async fn install(c: Curated) -> Result<()> {
     }
     let mut record = record;
     record["url"] = json!(new_url);
+    if c == Curated::AioStreams { record["exclude_3d"] = json!(true); }
     store.managed.insert(c.id().into(), record);
     store.managed.remove(&pending);
     mark_seen(&mut store, &addon);
@@ -408,6 +410,11 @@ pub async fn check_rd_key(key: String) -> Result<String> {
     }).await?
 }
 
+// Only Veylo-managed, installed AIOStreams configurations need this one-time upgrade.
+fn needs_3d_filter(c: Curated, record: Option<&Value>) -> bool {
+    c == Curated::AioStreams && record.is_some_and(|r| r["exclude_3d"] != true)
+}
+
 /// At start: adopt the Real-Debrid key from a Torrentio link installed from its website,
 /// replace website installs of curated add-ons with Veylo's own, then look for new versions.
 pub async fn startup() -> usize {
@@ -428,7 +435,9 @@ pub async fn startup() -> usize {
         for c in Curated::ALL {
             let managed = store.managed.get(c.id()).map(|m| s(m, "url"));
             let foreign = addons.iter().any(|a| { let u = s(a, "manifest_url"); host_of(&u) == c.host() && Some(&u) != managed.as_ref() });
-            if foreign { let _ = install(c).await; }
+            let outdated = needs_3d_filter(c, store.managed.get(c.id()))
+                && addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
+            if foreign || outdated { let _ = install(c).await; }
         }
     }
     check_updates().await
@@ -448,13 +457,22 @@ mod tests {
     }
 
     #[test]
-    fn aiostreams_config_is_cached_only_without_filters() {
+    fn aiostreams_config_excludes_3d_without_size_or_resolution_limits() {
         let c = aiostreams_config("KEY", language("italian"));
         assert_eq!(c["excludeUncached"], true);
+        assert_eq!(c["excludedVisualTags"], json!(["3D"]));
         assert_eq!(c["preferredLanguages"], json!(["Italian"]));
         assert_eq!(c["services"][0]["credentials"]["apiKey"], "KEY");
         assert!(c["presets"].as_array().unwrap().iter().all(|p| p["options"]["resources"] == json!(["stream"])));
         assert!(c.get("excludedResolutions").is_none() && c.get("resultLimits").is_none());
+    }
+
+    #[test]
+    fn existing_managed_aiostreams_gets_the_3d_filter_once() {
+        assert!(needs_3d_filter(Curated::AioStreams, Some(&json!({}))));
+        assert!(!needs_3d_filter(Curated::AioStreams, Some(&json!({"exclude_3d":true}))));
+        assert!(!needs_3d_filter(Curated::AioStreams, None));
+        assert!(!needs_3d_filter(Curated::Torrentio, Some(&json!({}))));
     }
 
     #[test]

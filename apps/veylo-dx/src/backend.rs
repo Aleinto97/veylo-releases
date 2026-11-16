@@ -608,6 +608,11 @@ static_re!(episode_mark, r"(?i)\bS\d{1,2}[ ._-]?E\d{1,3}\b|\b\d{1,2}x\d{2,3}\b|\
 static_re!(season_pack, r"(?i)\bS\d{1,2}\b|\bSEASONS?[ ._-]?\d|\bCOMPLETE\b");
 static_re!(html_tag, "<[^>]+>");
 static_re!(multi_audio, r"(?i)\b(?:MULTI|DUAL)(?:[ ._-]?AUDIO)?\b|\bMULTi\b");
+// Release tags used by Torrentio, AIOStreams and their upstream scrapers.
+static_re!(stereo_video, r"(?i)\b(?:3[ .-]?D|(?:H(?:ALF)?|F(?:ULL)?)[ .-]?(?:SBS|OU|TAB)|SBS|TAB|SIDE[ .-]BY[ .-]SIDE|TOP[ .-](?:AND[ .-])?BOTTOM|OVER[ .-]UNDER|STEREOSCOPIC)\b");
+
+fn is_3d(label: &str) -> bool { stereo_video().is_match(&label.replace('_', ".")) }
+
 static_re!(size_label, r"(?i)(?:💾\s*)?(\d[\d.,]*)\s*([KMGT]i?B)\b");
 
 /// HDR10+ (3), HDR10/HDR/HLG (2), Dolby Vision alone (1), SDR (0); "DV HDR10" counts as HDR10.
@@ -672,7 +677,7 @@ pub async fn sources(kind: &str, video_id: &str) -> Result<(Vec<Source>, Vec<Str
     for g in v["groups"].as_array().into_iter().flatten() {
         let addon = s(g, "addon_name");
         if g.get("error").is_some() { failed.push(addon.clone()); }
-        out.extend(g["streams"].as_array().into_iter().flatten().map(|st| source_of(&addon, st)));
+        out.extend(g["streams"].as_array().into_iter().flatten().map(|st| source_of(&addon, st)).filter(|s| !is_3d(&s.label)));
     }
     out.sort_by_key(|x| (x.kind != SourceKind::Direct, quality_rank(x.quality)));
     Ok((out, failed))
@@ -780,7 +785,7 @@ fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option<u64> {
     Some(size / n as u64)
 }
 
-/// Play order: direct sources only; biggest file first (per episode for season packs),
+/// Play order: 2D direct sources only; HDR before SDR, then biggest file (per episode for season packs),
 /// then 4K > 1080p > ..., remux > WEB-DL > WEBRip > other, HDR10+ > HDR > SDR,
 /// then AV1 > H.265 > H.264. Dolby-Vision-only files (usually profile 5,
 /// wrong colours without a DV decoder) come last. Torrents and external links never.
@@ -849,9 +854,9 @@ fn other_language_only(label: &str, key: &str) -> bool {
 fn play_order_any(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
     // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
     let hdr = |s: &Source| match hdr_tier(&s.label) { 1 => 0, 0 => 1, t => t };
-    let key = |s: &Source| std::cmp::Reverse((episode_size(s, pack_episodes).unwrap_or(0),
+    let key = |s: &Source| std::cmp::Reverse((hdr_tier(&s.label) >= 2, episode_size(s, pack_episodes).unwrap_or(0),
         5 - quality_rank(s.quality), source_tier(&s.label).map_or(-1, i16::from), hdr(s), codec_tier(&s.label)));
-    let (mut preferred, mut demoted): (Vec<Source>, Vec<Source>) = sources.iter().filter(|s| s.kind == SourceKind::Direct).cloned()
+    let (mut preferred, mut demoted): (Vec<Source>, Vec<Source>) = sources.iter().filter(|s| s.kind == SourceKind::Direct && !is_3d(&s.label)).cloned()
         .partition(|s| hdr_tier(&s.label) != 1);
     preferred.sort_by_key(key);
     demoted.sort_by_key(key);
@@ -1840,10 +1845,10 @@ mod tests {
         assert_eq!(episode_size(&own, Some(10)), Some(9_000_000_000));
         let single = source_of("A", &json!({"url":"https://x.invalid/e","title":"Show.S01E01.2160p.WEB-DL\n💾 9 GB"}));
         assert!(!single.pack);
-        // Compare per-episode sizes, not whole packs: the larger remux episode wins.
+        // HDR beats a larger SDR pack, comparing pack sizes per episode within each HDR tier.
         let hdr = source_of("A", &json!({"url":"https://x.invalid/h","behaviorHints":{"filename":"Show.S01E01.2160p.WEB.DL.DV.HDR10P.H.265-GRP.mkv","videoSize":100813874330u64},
             "description":"Show.S01.2160p.WEB.DL.DV.HDR10P.H.265-GRP\nShow.S01E01.2160p.WEB.DL.DV.HDR10P.H.265-GRP.mkv\n💾93.89 GiB","name":"[RD+] MediaFusion 2160p\nHDR10+ | DV"}));
-        assert_eq!(play_order_for(&[pack.clone(), hdr.clone()], Some(10), None)[0].url, pack.url);
+        assert_eq!(play_order_for(&[pack.clone(), hdr.clone()], Some(10), None)[0].url, hdr.url);
     }
 
     #[test]
@@ -1877,22 +1882,47 @@ mod tests {
             src("Film.1080p.BluRay.x264 💾 40 GB"), src("Film.2160p.HDR.REMUX 💾 20.5 GB"),
             source_of("B", &json!({"title": "Film 4K 💾 90 GB", "infoHash": "abc"}))];
         let order: Vec<String> = play_order(&list, None).into_iter().map(|s| s.label.trim().to_owned()).collect();
-        // File size first, including Blu-ray encodes; DV-only stays last; torrents never.
-        assert_eq!(order, ["Film.1080p.BluRay.x264 💾 40 GB", "Film.2160p.HDR.REMUX 💾 20.5 GB",
-            "Film.2160p.HDR10+.WEB-DL.HEVC 💾 20 GB", "Film.2160p.DV.WEB-DL 💾 30 GB"]);
+        // HDR first, size before HDR10+; DV-only stays last; torrents never.
+        assert_eq!(order, ["Film.2160p.HDR.REMUX 💾 20.5 GB", "Film.2160p.HDR10+.WEB-DL.HEVC 💾 20 GB",
+            "Film.1080p.BluRay.x264 💾 40 GB", "Film.2160p.DV.WEB-DL 💾 30 GB"]);
         let pack = source_of("C", &json!({"title": "Show S01 COMPLETE 1080p 💾 40 GB", "url": "https://x.invalid/p"}));
         assert_eq!(episode_size(&pack, Some(10)), Some(4_000_000_000));
         assert_eq!(date_label("2014-11-05T00:00:00.000Z"), "5 Nov 2014");
     }
 
     #[test]
-    fn size_beats_hdr_tags_and_unknown_sizes() {
+    fn hdr_then_size_then_hdr_format() {
         let src = |title: &str| source_of("A", &json!({"title": title, "url": "https://x.invalid/a"}));
         let list = [src("Film 2160p HDR10+ WEB-DL 20 GB"), src("Film 2160p REMUX 60 GB"),
             src("Film 2160p HDR10+ WEB-DL"), src("Film 2160p HDR10+ REMUX 60 GB")];
         let order: Vec<_> = play_order_for(&list, None, None).into_iter().map(|s| s.label.trim().to_owned()).collect();
-        assert_eq!(order, ["Film 2160p HDR10+ REMUX 60 GB", "Film 2160p REMUX 60 GB",
-            "Film 2160p HDR10+ WEB-DL 20 GB", "Film 2160p HDR10+ WEB-DL"]);
+        assert_eq!(order, ["Film 2160p HDR10+ REMUX 60 GB", "Film 2160p HDR10+ WEB-DL 20 GB",
+            "Film 2160p HDR10+ WEB-DL", "Film 2160p REMUX 60 GB"]);
+    }
+
+    #[test]
+    fn exclude_3d_from_every_provider_and_metadata_field() {
+        for tag in ["3D", "3-D", "SBS", "HSBS", "H-SBS", "Half.SBS", "Full_SBS", "HOU", "H-TAB", "TAB", "Side.by.Side", "Top.And.Bottom", "Over-Under", "Stereoscopic"] {
+            assert!(is_3d(&format!("Show.S04E07.{tag}.2160p.mkv")), "{tag}");
+        }
+        for title in ["Three Days 2160p", "3 Days to Kill", "S03E03 1080p", "Film AC3 DDP5.1 HDR", "Film Stereotype"] {
+            assert!(!is_3d(title), "{title}");
+        }
+        for addon in ["Torrentio RD", "AIOStreams", "Other"] {
+            for field in ["name", "title", "description", "filename"] {
+                let mut v = json!({"url":"https://x.invalid/3d", "title":"Show S04E07 2160p HDR 90 GB"});
+                if field == "filename" { v["behaviorHints"] = json!({"filename":"Show.S04E07.3D.HSBS.mkv"}); }
+                else { v[field] = json!("Show S04E07 3D HDR 90 GB"); }
+                assert!(play_order_for(&[source_of(addon, &v)], None, None).is_empty(), "{addon}/{field}");
+            }
+        }
+        let src = |title: &str| source_of("AIOStreams", &json!({"title":title,"url":"https://x.invalid/2d"}));
+        let small = src("Film 2160p HDR10+ WEB-DL 5 GB");
+        let big = src("Film 2160p HDR REMUX 50 GB");
+        let sdr = src("Film 2160p SDR REMUX 90 GB");
+        let order: Vec<_> = play_order_for(&[sdr.clone(), small, big], None, None).into_iter().map(|s| s.size_bytes).collect();
+        assert_eq!(order, [Some(50_000_000_000), Some(5_000_000_000), Some(90_000_000_000)]);
+        assert_eq!(play_order_for(&[sdr.clone()], None, None), [sdr]);
     }
 
     #[test]
