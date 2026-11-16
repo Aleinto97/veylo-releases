@@ -5253,6 +5253,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-egl",
+ "windows",
 ]
 
 [[package]]

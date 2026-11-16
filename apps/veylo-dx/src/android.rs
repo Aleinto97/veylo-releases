@@ -115,7 +115,7 @@ pub fn screen() -> Result<crate::engine::Screen> {
         let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
         env.call_static_method(&class, "hdrTypes", "(Landroid/app/Activity;)I", &[JValue::Object(activity)])?.i()
     })?;
-    Ok(crate::engine::Screen { hdr10: mask & 1 != 0, hlg: mask & 2 != 0, hdr10_plus: mask & 4 != 0, dolby_vision: mask & 8 != 0 })
+    Ok(crate::engine::Screen { hdr10: mask & 1 != 0, hlg: mask & 2 != 0, hdr10_plus: mask & 4 != 0, dolby_vision: mask & 8 != 0, peak_nits: 0 })
 }
 
 /// Before mpv starts: FFmpeg's MediaCodec decoders need the Java VM and the app context (what

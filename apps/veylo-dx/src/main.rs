@@ -18,6 +18,7 @@ mod settings;
 mod title;
 mod video;
 mod updater;
+mod display;
 
 use backend::Media;
 use base64::Engine;

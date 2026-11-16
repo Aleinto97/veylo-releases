@@ -80,6 +80,8 @@ pub fn SettingsPage() -> Element {
                 }
             }
 
+            ScreenBlock { settings }
+
             section { class: "settings-block",
                 div { class: "group-head", span { class: "group-icon", icons::Globe {} } span { class: "group-name", "Artwork" } }
                 div { class: "setting-row glass",
@@ -216,5 +218,35 @@ fn GetKey(url: &'static str, label: &'static str) -> Element {
     rsx! {
         button { class: "link-btn", title: "{url}", onclick: move |_| crate::open_external(url),
             icons::Link {} span { "{label}" } }
+    }
+}
+
+/// What this screen can show (read from the system, again on "Check again"), and on Windows
+/// whether HDR goes to it. The player reads the screen itself at every start.
+#[component]
+fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
+    let mut screen = use_signal(crate::display::screen);
+    let (title, about) = crate::display::summary(screen());
+    rsx! {
+        section { class: "settings-block",
+            div { class: "group-head", span { class: "group-icon", icons::Tv {} } span { class: "group-name", "Screen" } }
+            div { class: "setting-row glass",
+                div { class: "setting-copy", span { class: "setting-name", "This screen: {title}" }
+                    span { class: "dim setting-about", "{about}" } }
+                button { class: "pill glass", onclick: move |_| screen.set(crate::display::screen()), icons::Refresh {} span { "Check again" } }
+            }
+            if cfg!(target_os = "windows") {
+                div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "HDR output" }
+                        span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when Windows HDR is on. Always SDR tone-maps them, for screens whose HDR looks washed out." } }
+                    div { class: "segmented glass", role: "radiogroup", aria_label: "HDR output",
+                        for (on, name) in [(true, "Automatic"), (false, "Always SDR")] {
+                            button { class: if settings().hdr_output == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().hdr_output == on}",
+                                onclick: move |_| { let next = backend::Settings { hdr_output: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

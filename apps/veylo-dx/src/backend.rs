@@ -1041,9 +1041,11 @@ pub struct Settings {
     pub stream_language: Option<String>,
     /// You removed the Real-Debrid key: it is not adopted again from an add-on's link.
     pub rd_key_removed: bool,
+    /// Windows: send HDR to the screen when it is in HDR (off: always tone-map to SDR).
+    pub hdr_output: bool,
 }
 
-impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None, rd_key_removed: false } } }
+impl Default for Settings { fn default() -> Self { Settings { picks_rounds: 5, better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: None, rd_key_removed: false, hdr_output: true } } }
 
 pub fn load_settings() -> Settings {
     let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
@@ -1056,11 +1058,12 @@ pub fn load_settings() -> Settings {
         rd_key: v["rd_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         stream_language: v["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).map(str::to_owned),
         rd_key_removed: v["rd_key_removed"].as_bool().unwrap_or(false),
+        hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
     }
 }
 
 pub fn save_settings(settings: &Settings) {
-    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed}).to_string());
+    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"picks_rounds": settings.picks_rounds, "better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed, "hdr_output": settings.hdr_output}).to_string());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     set_stream_language(settings.stream_language.clone());
     set_tmdb_key(settings.tmdb_key.clone());

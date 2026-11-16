@@ -37,6 +37,10 @@ libc = "0.2"
 # Windows: the app icon inside veylo-dx.exe (windows/veylo.rc); a no-op for other targets.
 embed-resource = "3"
 
+# Windows: the screen's HDR state and peak luminance (src/display.rs), the same windows crate wry uses.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
+
 # Linux: the GL area under the WebView that mpv renders into (src/video.rs); the same gtk as wry's.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
