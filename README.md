@@ -104,9 +104,35 @@ neighbours share genre at 0.42 (random 0.21, the earlier 18-label classifier 0.4
 recommendations for it appear among its ten nearest three times as often as with that classifier.
 A duel loss is a relative preference, not a permanent dislike. Shared features cancel during
 learning; the learned direction is a sum of embedding differences between kept and passed titles.
-Session preferences are saved with the duel and cleared for a fresh duel, while smaller
-updates persist in `picks-taste.json`. Genre, type and decade preferences from older profiles remain readable.
+Session preferences and stopping evidence are saved with the duel and cleared for a fresh duel,
+while smaller updates persist in `picks-taste.json`. Genre, type and decade preferences from older
+profiles remain readable. Fixed rounds are no longer used (the legacy settings value is preserved).
+Picks only suggests a title after four consecutive independent confirmations: before each vote,
+the model must already rank the incumbent at least 0.45 above its strongest rival, and the user
+must then keep it against a previously untested opponent. At least three opponent genre/type/
+decade profiles must have been explored. The current vote is learned only after its prediction
+is recorded. Embeddings must cover the winner and 75% of the strongest alternatives (up to 24,
+at least three). These heuristics are not calibrated enjoyment probabilities. Ten choices no
+longer force a result. Exhausting a fully loaded candidate pool is labelled separately; a
+partial background catalogue cannot declare an only match or exhaustion.
+Continue preserves the cumulative choice count, comparisons, current mood and lasting taste;
+a checkpoint requires four fresh confirmations before another proposal. It never silently
+starts a new duel when challengers run out. A bounded private `picks-decisions.json` records the
+last 128 actions, titles, pre-vote margins, counts and stopping reasons, without provider keys,
+URLs, credentials or raw metadata. Older round-by-round choices cannot be reconstructed.
+Every third challenger tests a different genre direction when available. Play is always available.
+S changes the pair without a vote; N clears tonight’s direction and seeks a different pair without
+changing lasting preferences; C continues from a suggestion. Left/right arrows keep a card.
+Keep this retains its arrow keycaps. Other controls use icons, accessible names and tooltips.
+A keyboard icon beside Search opens shortcuts for the current page, including Search and title
+pages. The player has the same icon beside Details and its own H / ? sheet; reading it does not
+execute playback shortcuts. ? also opens the app’s page-specific shortcut sheet.
 "Start over" resets learned preferences; it does not remove the model or embedding cache.
+
+Style verification combines full add-on/TMDB genres with TVmaze's show type; missing animation
+tags from a sparse catalogue are repaired before a card can be selected. Deduplication preserves
+richer genre/style evidence and already open cards are rechecked when it arrives. The action bar
+keeps Keep this, Play/Resume, trailer and details on one line; longer playback labels can shrink.
 
 Duel cards and final picks have Play/Resume controls. New series begin at the first released
 regular episode; existing progress resumes the saved episode and position, or continues after

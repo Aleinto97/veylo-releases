@@ -15,11 +15,13 @@ const ONLINE_SHOWN: usize = 60;
 enum Sheet { Audio, Subtitles, Speed, Picture, Info, Keys }
 
 const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-const KEYS: [(&[&str], &str); 14] = [
-    (&["Space", "K"], "Play or pause"), (&["←", "→"], "Back or forward 10 seconds"), (&["J", "L"], "Back or forward 10 seconds"),
-    (&["0", "9"], "Jump to 0–90%"), (&["Home"], "Back to the start"), (&["↑", "↓"], "Volume"), (&["M"], "Mute"),
+const KEYS: [(&[&str], &str); 19] = [
+    (&["Space", "K", "Enter"], "Play or pause"), (&["←", "→"], "Back or forward 10 seconds"), (&["J", "L"], "Back or forward 10 seconds"),
+    (&["0–9"], "Jump to 0–90%"), (&["Home"], "Back to the start"), (&["↑", "↓"], "Volume"), (&["M"], "Mute"),
     (&["A"], "Next audio track"), (&["C"], "Next subtitles, then off"), (&["S"], "Subtitles list"), (&["Z"], "Fit, fill, stretch"),
-    (&["[", "]", "\\"], "Slower, faster, normal speed"), (&["I", "H"], "Details, these shortcuts"), (&["N", "Esc"], "Next episode, close"),
+    (&["[", "]", "\\"], "Slower, faster, normal speed"), (&["I"], "Details"), (&["H", "?"], "Show or hide shortcuts"),
+    (&["N"], "Next episode"), (&["Esc"], "Close panel, leave fullscreen, or close player"), (&["Q"], "Close player"),
+    (&["F"], "Fullscreen"), (&["Tab"], "Next control; Shift+Tab goes back"),
 ];
 const ANDROID: bool = cfg!(target_os = "android");
 
@@ -201,6 +203,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         let live = &keys.0;
         let now = state.peek().clone();
         let speed = |v: f64| { let v = (v * 100.0).round() / 100.0; live.set_speed(v); if v == 1.0 { "Normal speed".to_string() } else { format!("Speed {v}×") } };
+        // Reading shortcuts must not seek, change tracks or close playback accidentally.
+        if sheet() == Some(Sheet::Keys) && !matches!(key.as_str(), "h" | "H" | "?" | "Escape" | "Backspace") { return; }
         match key.as_str() {
             " " | "k" | "K" | "Enter" | "MediaPlayPause" => { live.toggle_pause(); poke(); }
             "MediaPlay" => { if now.paused { live.toggle_pause(); } }
@@ -271,7 +275,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 div { class: "player-center", aria_label: "Loading", div { class: "player-spinner" } }
             }
 
-            div { class: "player-chrome", inert: (!visible).then_some("true"),
+            div { class: "player-chrome", inert: (!visible || sheet() == Some(Sheet::Keys)).then_some("true"),
+                onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                 div { class: "player-top",
                     button { class: "bare", aria_label: "Back (Esc)", title: "Back (Esc)", onclick: { let live = lc(); move |_| live.finish(Finish::Close) }, icons::ArrowLeft {} }
                     div { class: "player-heading",
@@ -289,6 +294,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         }
                     }
                     span { class: "topbar-spacer" }
+                    button { class: "bare", aria_label: "Player shortcuts (H / ?)", title: "Player shortcuts (H / ?)", aria_pressed: "{sheet() == Some(Sheet::Keys)}",
+                        onclick: move |_| sheet.set(if sheet() == Some(Sheet::Keys) { None } else { Some(Sheet::Keys) }), icons::Keyboard {} }
                     button { class: "bare", aria_label: "Details (I)", title: "Details (I)", aria_pressed: "{sheet() == Some(Sheet::Info)}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Info) { None } else { Some(Sheet::Info) }), icons::Info {} }
                 }
@@ -333,7 +340,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             }
 
             if let Some(which) = sheet() {
-                section { class: "player-sheet glass", role: "dialog", aria_label: sheet_name(which),
+                section { class: "player-sheet glass", role: "dialog", aria_label: sheet_name(which), aria_modal: (which == Sheet::Keys).then_some("true"),
+                    tabindex: (which == Sheet::Keys).then_some("-1"), onmounted: move |e| async move { if which == Sheet::Keys { let _ = e.set_focus(true).await; } },
+                    onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                     div { class: "sheet-head",
                         span { class: "group-name", "{sheet_name(which)}" }
                         icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| sheet.set(None), icons::Close {} }
@@ -382,7 +391,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             },
                             Sheet::Keys => rsx! {
                                 div { class: "shortcut-list player-keys",
-                                    for (k, what) in KEYS { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
+                                    for (k, what) in KEYS.into_iter().filter(|(k,_)| !(ANDROID && k == &["F"]) && (req.has_next || k != &["N"])) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
                                 }
                             },
                             Sheet::Info => {
@@ -531,15 +540,17 @@ fn OnlineSubtitles(online: Online, query: Signal<String>, busy: Option<String>, 
 /// The player before a source is found: it opens with the tap, and Back stops the search.
 #[component]
 pub fn PendingPlayer(title: String, step: String) -> Element {
-    let shell = use_context::<Shell>();
+    let mut shell = use_context::<Shell>();
     rsx! {
         div { class: "player pending", role: "dialog", aria_label: "{title}",
-            div { class: "player-top",
+            div { class: "player-top", onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                 button { class: "bare", aria_label: "Back (Esc)", title: "Back (Esc)", onclick: move |_| crate::cancel_finding(shell), icons::ArrowLeft {} }
                 div { class: "player-heading",
                     span { class: "player-title display", "{title}" }
                     span { class: "player-facts-line", span { "{step}" } }
                 }
+                span { class: "topbar-spacer" }
+                button { class: "bare", aria_label: "Page shortcuts (?)", title: "Page shortcuts (?)", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} }
             }
             div { class: "player-center", role: "status", aria_label: "{step}",
                 div { class: "player-pending-note", div { class: "player-spinner" } span { class: "dim", "{step}" } }

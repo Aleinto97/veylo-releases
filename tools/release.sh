@@ -93,7 +93,7 @@ rm -f "$stage/$APK_ASSET.idsig"
 
 # ---------------------------------------------------------------- privacy check
 # Unpack everything that will be public and refuse if a key from your settings.json or your home path is inside.
-mkdir -p "$work/check" && cp "$work/win/"* "$work/check/" && bsdtar -xf "$stage/$APK_ASSET" -C "$work/check"
+mkdir -p "$work/check" && cp -r "$work/win/"* "$work/check/" && bsdtar -xf "$stage/$APK_ASSET" -C "$work/check"
 settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
 python3 - "$settings" "$HOME" "$work/check" <<'PY'
 import json, os, sys

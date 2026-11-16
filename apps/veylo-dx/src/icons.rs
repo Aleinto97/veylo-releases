@@ -89,3 +89,5 @@ pub fn IconButton(
 #[component] pub fn Gauge() -> Element { rsx! { Glyph { d: "M12 20a8 8 0 1 1 8-8M12 12l4.5-3.5M4.5 12h1m13 0h1M12 4.5v1" } } }
 #[component] pub fn Resize() -> Element { rsx! { Glyph { d: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M9 12h6M12 9v6" } } }
 #[component] pub fn Expand() -> Element { rsx! { Glyph { d: "M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" } } }
+
+#[component] pub fn Keyboard() -> Element { rsx! { Glyph { d: "M3 6h18v12H3zM6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 12h.01M9 12h.01M12 12h.01M15 12h.01M18 12h.01M7 15h10" } } }

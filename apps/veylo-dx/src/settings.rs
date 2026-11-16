@@ -57,11 +57,6 @@ pub fn SettingsPage() -> Element {
         settings.set(next);
         run("language".into(), Box::pin(async { addons::reconfigure().await }));
     };
-    let mut rounds = move |n: u32| {
-        let next = backend::Settings { picks_rounds: n, ..backend::load_settings() };
-        backend::save_settings(&next);
-        settings.set(next);
-    };
     rsx! {
         div { class: "settings",
             h1 { class: "display title", "Settings" }
@@ -101,15 +96,6 @@ pub fn SettingsPage() -> Element {
 
             section { class: "settings-block",
                 div { class: "group-head", span { class: "group-icon", icons::Sparkles {} } span { class: "group-name", "Picks" } }
-                div { class: "setting-row glass",
-                    div { class: "setting-copy", span { class: "setting-name", "Rounds" } span { class: "dim setting-about", "Duels before the final pick" } }
-                    div { class: "segmented glass", role: "radiogroup", aria_label: "Rounds",
-                        for n in [3u32, 5, 7, 10] {
-                            button { class: if settings().picks_rounds == n { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().picks_rounds == n}",
-                                onclick: move |_| rounds(n), span { class: "tnum", "{n}" } }
-                        }
-                    }
-                }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Local AI" }
                         span { class: "dim setting-about", "The bge-small model runs on this device and compares synopses. TMDB keywords enrich its input." } }

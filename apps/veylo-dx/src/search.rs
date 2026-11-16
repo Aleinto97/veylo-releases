@@ -77,7 +77,7 @@ pub fn SearchOverlay() -> Element {
         else { String::new() };
 
     rsx! {
-        div { class: "search", role: "dialog", aria_modal: "true", aria_label: "Search",
+        div { class: "search", inert: (shell.shortcuts_open)().then_some("true"), role: "dialog", aria_modal: "true", aria_label: "Search",
             // Frosted without backdrop-filter (unsupported in some webviews): its own blurred artwork.
             div { class: "search-ambient", aria_hidden: "true",
                 if !(shell.lamp_source)().is_empty() { img { src: "{(shell.lamp_source)()}", alt: "" } }
@@ -101,6 +101,7 @@ pub fn SearchOverlay() -> Element {
                         icons::IconButton { label: "Clear", class: "small", onclick: move |_| set_query(String::new(), 0), icons::Backspace {} }
                     }
                 }
+                crate::ShortcutButton {}
                 icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| close(), icons::Close {} }
             }
             p { class: "visually-hidden", aria_live: "polite", "{status}" }

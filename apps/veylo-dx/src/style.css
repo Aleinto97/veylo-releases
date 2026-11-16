@@ -389,10 +389,13 @@ img { display: block; }
 .demo-row:focus-visible { outline: 2px solid var(--bone); }
 
 /* ---------------------------------------------------------------- shortcuts, trailer */
-.shortcuts { width: min(620px, 100%); border-radius: 28px; padding-bottom: 16px; --glass: var(--glass-strong); animation: rise-sheet .2s ease-out; }
+.shortcuts-scrim { z-index: 60; }
+.shortcuts { display: flex; flex-direction: column; max-height: calc(100dvh - var(--top-inset) - var(--bottom-inset) - 64px); overflow: hidden; width: min(620px, 100%); border-radius: 28px; padding-bottom: 16px; --glass: var(--glass-strong); animation: rise-sheet .2s ease-out; }
+.shortcuts .sheet-head { flex: none; }
+.shortcuts > .shortcut-list { overflow-y: auto; min-height: 0; }
 .shortcut-list { display: flex; flex-direction: column; padding: 0 22px; }
 .shortcut { display: flex; align-items: center; gap: 16px; min-height: 42px; color: #d2d0cc; font-size: 15px; }
-.caps { display: inline-flex; gap: 5px; width: 120px; flex: none; }
+.caps { display: inline-flex; flex-wrap: wrap; gap: 5px; width: 120px; flex: none; }
 .keycap { display: inline-grid; place-items: center; min-width: 30px; height: 28px; padding: 0 8px; border-radius: 7px; font: 700 13px var(--ui);
   color: var(--bone); background: rgba(255,255,255,.12); box-shadow: inset 0 -2px 0 rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.22); }
 .trailer-scrim { place-items: center; }
@@ -418,10 +421,6 @@ img { display: block; }
 .duel-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .duel-progress { display: flex; align-items: center; gap: 16px; }
 .duel-round { font-size: 30px; font-weight: 750; }
-.dots { display: inline-flex; gap: 7px; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: rgba(255,255,255,.18); transition: background-color .2s, transform .2s; }
-.dot.done { background: var(--bone); }
-.dot.now { background: transparent; box-shadow: inset 0 0 0 2px var(--bone); transform: scale(1.15); }
 .duel .popover { top: 150px; }
 .duel-cards { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; gap: 14px; margin-top: 16px; }
 .versus { align-self: center; font-size: 22px; font-weight: 700; color: var(--dust); }
@@ -440,14 +439,20 @@ img { display: block; }
 .duel-synopsis { margin: 10px 0 0; -webkit-line-clamp: 3 !important; font-size: 15px; line-height: 1.5; color: #dcdad6; font-weight: 400; }
 .duel-credit { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; font-size: 14px; color: #d2d0cc; }
 .duel-credit .icon { width: 17px; height: 17px; }
-.duel-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+/* Keep the action baseline stable even when Play becomes the longer Resume label. */
+.duel-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: nowrap; }
+.duel-actions > .pill { min-width: 0; padding-inline: 16px; white-space: nowrap; }
+.duel-actions > .pill:first-child { flex: none; }
+.duel-actions > .pill:not(:first-child) { flex: 0 1 auto; }
+.duel-actions > .pill > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.duel-actions .keycap { flex: none; }
 .small-cap { height: 22px; min-width: 22px; font-size: 12px; margin-left: 4px; color: #000; background: rgba(0,0,0,.12); box-shadow: inset 0 0 0 1px rgba(0,0,0,.25); }
 .final-pick { position: relative; margin-top: 16px; flex: 1; min-height: 0; border-radius: 32px; overflow: hidden; isolation: isolate; display: flex; align-items: flex-end;
   box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 30px 80px rgba(0,0,0,.5); animation: rise-sheet .3s ease-out; }
 .final-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -2; }
 .final-pick::after { content: ''; position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, rgba(0,0,0,.85) 0%, rgba(0,0,0,.45) 50%, rgba(0,0,0,.1) 80%), linear-gradient(180deg, rgba(0,0,0,0) 40%, rgba(0,0,0,.7) 100%); }
 .final-copy { padding: 0 36px 32px; max-width: 760px; }
-@media (max-width: 760px) { .duel-cards { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } .versus { display: none; } .duel-synopsis, .duel-credit, .duel-poster { display: none; } }
+@media (max-width: 980px) { .duel-cards { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } .versus { display: none; } .duel-synopsis, .duel-credit, .duel-poster { display: none; } }
 
 /* ---------------------------------------------------------------- library */
 .library { padding: 96px var(--gutter) 64px; }

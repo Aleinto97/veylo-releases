@@ -1,6 +1,5 @@
 //! Picks as a duel: two big cards, keep one. The kept title stays and meets a challenger
-//! chosen by your ranked recommendations re-weighted by what you kept; after the set number
-//! of rounds the winner is the final pick. Taste is saved until "Start over".
+//! chosen by local semantic taste. Independent pre-vote confirmations suggest a pick. Taste is saved until "Start over".
 use crate::{backend::{self, Media, Taste, TitleMeta}, icons, picks_rules::{self as rules, Style}, PickCommand, Shell};
 use dioxus::prelude::*;
 use std::collections::HashSet;
@@ -15,14 +14,15 @@ pub fn Picks() -> Element {
     let mut shell = use_context::<Shell>();
     let mut pool = use_signal(Vec::<Media>::new);
     let mut loading = use_signal(|| true);
+    let mut pool_complete = use_signal(|| false);
     let mut taste = use_signal(backend::load_taste);
-    let rounds = use_signal(|| backend::load_settings().picks_rounds);
     // A duel in progress comes back as you left it, filters included.
     let saved = use_hook(backend::load_duel);
     let mut restored = use_signal(|| saved.is_some());
     let saved = saved.unwrap_or_default();
     use_hook(|| { let mut t = taste.write(); t.session = saved.session.clone(); t.session_vibe = saved.session_vibe.clone(); });
     let mut round = use_signal(|| saved.round);
+    let mut evidence = use_signal(|| saved.evidence.clone());
     // Left and right cards; the kept one stays on its side.
     let mut pair = use_signal(|| (saved.left.clone(), saved.right.clone()));
     let mut shown = use_signal(|| saved.shown.clone());
@@ -62,6 +62,7 @@ pub fn Picks() -> Element {
         let mut more = backend::tmdb_candidates(None, None, Style::Both, None, None, pages).await;
         more.extend(backend::tvmaze_candidates(None, Style::Both, None, None).await);
         pool.with_mut(|p| rules::merge(p, more));
+        pool_complete.set(true);
     });
 
     let from = use_memo(move || from_text().parse::<i32>().ok().filter(|_| from_text().len() == 4));
@@ -78,6 +79,11 @@ pub fn Picks() -> Element {
         let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
         let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|i| seen.contains(i));
         out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(m)).collect::<Vec<_>>()
+    });
+    let resolved_pair = use_memo(move || {
+        let list = pool.read();
+        let resolve = |m: Option<Media>| m.map(|m| list.iter().find(|x| x.key() == m.key() || rules::title_key(x) == rules::title_key(&m)).cloned().unwrap_or(m));
+        let (l,r) = pair(); (resolve(l),resolve(r))
     });
     // Embed beyond the first trailer-ready titles. Otherwise a matching title deeper in the
     // catalogue cannot challenge one that happened to finish verification first.
@@ -113,7 +119,7 @@ pub fn Picks() -> Element {
             let all_watched = watched.peek().clone().unwrap_or_default();
             spawn(async move {
                 match check(&m, &all_watched).await {
-                    Check::Ready => { verified.write().insert(m.key()); }
+                    Check::Ready(ready) => { pool.with_mut(|p| rules::merge(p, vec![ready])); verified.write().insert(m.key()); }
                     Check::Reject => { rejected.write().insert(m.key()); }
                     Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
                 }
@@ -158,8 +164,12 @@ pub fn Picks() -> Element {
         });
         shown.set([&first, &second].iter().filter_map(|m| m.as_ref().map(Media::key)).collect());
         round.set(0);
+        evidence.set(Default::default());
+        crate::picks_decision::audit("start", None, None, &evidence.peek(), None, list.len());
         // A single match is the answer: show it as the pick rather than "nothing matches".
-        if let (Some(only), None) = (&first, &second) { winner.set(Some(only.clone())); pair.set((None, None)); return; }
+        if let (Some(only), None) = (&first, &second) {
+            if *pool_complete.peek() && !*enriching.peek() { winner.set(Some(only.clone())); pair.set((None, None)); return; }
+        }
         pair.set((first, second));
         winner.set(None);
     };
@@ -185,38 +195,92 @@ pub fn Picks() -> Element {
     use_effect(move || {
         let (left, right) = pair();
         backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genre: genre(), from: from_text(), to: to_text(), round: round(),
-            session: taste().session, session_vibe: taste().session_vibe, shown: shown(), left, right, winner: winner() });
+            evidence: evidence(), session: taste().session, session_vibe: taste().session_vibe, shown: shown(), left, right, winner: winner() });
     });
     use_effect(move || {
         let n = filtered.read().len();
+        let complete = pool_complete();
+        let growing = enriching();
         let (l, r) = pair.peek().clone();
         let waiting = (l.is_none() || r.is_none()) && winner.peek().is_none();
         let lone = winner.peek().is_some() && *round.peek() == 0;
-        if !loading() && n >= 2 && (waiting || lone) { start_duel(); }
+        if !loading() && ((n >= 2 && ((waiting && shown.peek().len() <= 1) || lone))
+            || (n == 1 && complete && !growing && waiting && *round.peek() == 0)) { start_duel(); }
+    });
+
+    // Style is an invariant of visible cards, including restored cards enriched later.
+    use_effect(move || {
+        let list = filtered();
+        let (l,r) = resolved_pair();
+        let st = style();
+        let invalid = l.iter().chain(r.iter()).any(|m| !rules::style_matches(m,st));
+        let final_invalid = winner().is_some_and(|m| {
+            let all = pool.read();
+            let canonical = all.iter().find(|x| x.key() == m.key() || rules::title_key(x) == rules::title_key(&m)).unwrap_or(&m);
+            !rules::style_matches(canonical,st)
+        });
+        let waiting_empty = l.is_none() && r.is_none() && winner.peek().is_none() && *round.peek() > 0;
+        if !invalid && !final_invalid && !waiting_empty { return; }
+        let mut exclude = shown.peek().clone();
+        let mut replace = |m: Option<Media>| {
+            if m.as_ref().is_some_and(|m| rules::style_matches(m,st)) { return m; }
+            let next = backend::next_challenger(&list,&taste.peek(),&exclude,3);
+            if let Some(m) = &next { exclude.push(m.key()); }
+            next
+        };
+        let (l,r) = (replace(l),replace(r));
+        shown.set(exclude);pair.set((l,r));
+        if final_invalid { winner.set(None); }
     });
 
     // Keep one side: learn, then bring a challenger to the other side (or crown the winner).
     let mut keep = move |left: bool| {
-        let (l, r) = pair.peek().clone();
+        let (l, r) = resolved_pair.peek().clone();
         let (Some(kept), Some(dropped)) = (if left { (l.clone(), r.clone()) } else { (r.clone(), l.clone()) }) else { return };
         // Not while a card is still being checked (a key press could pick a card you cannot see).
-        if !verified.peek().contains(&kept.key()) || !verified.peek().contains(&dropped.key()) { return; }
+        if !verified.peek().contains(&kept.key()) || !verified.peek().contains(&dropped.key())
+            || !rules::style_matches(&kept,*style.peek()) || !rules::style_matches(&dropped,*style.peek()) { return; }
         let mut t = taste.peek().clone();
-        t.learn(&kept, &dropped);
+        let mut e = evidence.peek().clone();
+        let candidates = filtered.peek().clone();
+        let (suggested, before) = e.choose(&mut t, &kept, &dropped, &candidates, *pool_complete.peek() && !*enriching.peek());
         backend::save_taste(&t);
         taste.set(t.clone());
-        let done = *round.peek() + 1;
+        let done = (*round.peek()).saturating_add(1);
         round.set(done);
-        if done >= *rounds.peek() { winner.set(Some(kept)); return; }
+        crate::picks_decision::audit("keep", Some(&kept), Some(&dropped), &e, before, candidates.len());
+        evidence.set(e);
+        if suggested { winner.set(Some(kept)); return; }
         let mut exclude = shown.peek().clone();
-        let challenger = backend::challenger_against(&filtered.peek(), &t, &exclude, &kept, done, *rounds.peek());
+        let challenger = backend::challenger_against(&filtered.peek(), &t, &exclude, &kept, done);
         if let Some(c) = &challenger { exclude.push(c.key()); }
         shown.set(exclude);
         match challenger {
             Some(c) => pair.set(if left { (Some(kept), Some(c)) } else { (Some(c), Some(kept)) }),
-            None => winner.set(Some(kept)),
+            // A background catalogue fetch can still provide the next opponent. Do not
+            // turn a temporarily small pool into an early result.
+            None => pair.set(if left { (Some(kept), None) } else { (None, Some(kept)) }),
         }
     };
+
+    // A kept title waiting for the catalogue to catch up retains all duel evidence.
+    use_effect(move || {
+        let list = filtered();
+        let complete = pool_complete();
+        let growing = enriching();
+        let (l,r) = pair();
+        if loading() || winner().is_some() || round() == 0 { return; }
+        let (kept,left) = match (l,r) { (Some(m),None) => (m,true), (None,Some(m)) => (m,false), _ => return };
+        let mut exclude = shown.peek().clone();
+        if let Some(c) = backend::challenger_against(&list, &taste.peek(), &exclude, &kept, *round.peek()) {
+            exclude.push(c.key()); shown.set(exclude);
+            pair.set(if left { (Some(kept),Some(c)) } else { (Some(c),Some(kept)) });
+        } else if complete && !growing {
+            evidence.write().reason = "exhausted".into();
+            crate::picks_decision::audit("exhausted", Some(&kept), None, &evidence.peek(), None, list.len());
+            winner.set(Some(kept));
+        }
+    });
 
     // A card on screen that turns out to lack a poster or trailer gives its place to another
     // (not a round).
@@ -228,7 +292,7 @@ pub fn Picks() -> Element {
             let all_watched = watched.peek().clone().unwrap_or_default();
             spawn(async move {
                 match check(&m, &all_watched).await {
-                    Check::Ready => { verified.write().insert(m.key()); return; }
+                    Check::Ready(ready) => { pool.with_mut(|p| rules::merge(p, vec![ready])); verified.write().insert(m.key()); return; }
                     Check::Reject => { rejected.write().insert(m.key()); }
                     Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
                 }
@@ -240,7 +304,7 @@ pub fn Picks() -> Element {
                 // Nothing else to offer: show it anyway rather than an empty side.
                 let opponent = if left { pair.peek().1.clone() } else { pair.peek().0.clone() };
                 let challenger = match opponent {
-                    Some(opponent) => backend::challenger_against(&filtered.peek(), &t, &exclude, &opponent, *round.peek(), *rounds.peek()),
+                    Some(opponent) => backend::challenger_against(&filtered.peek(), &t, &exclude, &opponent, *round.peek()),
                     None => backend::next_challenger(&prefer(&filtered.peek(), &exclude), &t, &exclude, 3),
                 };
                 let Some(c) = challenger else { verified.write().insert(m.key()); return };
@@ -251,10 +315,73 @@ pub fn Picks() -> Element {
         }
     });
 
+    // Skipping is not a dislike. Neither clears tonight's direction, leaving lasting taste intact.
+    let mut change_pair = move |neither: bool| {
+        if winner.peek().is_some() || loading() { return; }
+        let (left, right) = pair.peek().clone();
+        if left.iter().chain(right.iter()).any(|m| !verified.peek().contains(&m.key())) { return; }
+        if neither { let mut t = taste.write(); t.session.clear(); t.session_vibe.clear(); }
+        let t = taste.peek().clone();
+        let list = filtered.peek().clone();
+        let mut exclude = shown.peek().clone();
+        let current: Vec<String> = left.iter().chain(right.iter()).map(Media::key).collect();
+        let alternative: Vec<Media> = if neither {
+            list.iter().filter(|m| !left.iter().chain(right.iter()).any(|old| old.genres.iter().any(|g| m.genres.contains(g)))).cloned().collect()
+        } else { list.clone() };
+        let first = backend::next_challenger(&alternative, &t, &exclude, 12)
+            .or_else(|| backend::next_challenger(&list, &t, &exclude, 12))
+            .or_else(|| backend::next_challenger(&list, &t, &current, 12));
+        // All other titles exhausted: leave the visible pair available rather than replaying it as a vote.
+        let Some(first) = first else { return };
+        if !exclude.contains(&first.key()) { exclude.push(first.key()); }
+        let second = backend::next_challenger(&alternative, &t, &exclude, 12)
+            .or_else(|| backend::next_challenger(&list, &t, &exclude, 12))
+            .or_else(|| { let mut avoid = current; avoid.push(first.key()); backend::next_challenger(&list, &t, &avoid, 12) });
+        if let Some(m) = &second { if !exclude.contains(&m.key()) { exclude.push(m.key()); } }
+        shown.set(exclude);
+        // A skipped comparison supplies no stability evidence.
+        let choices = evidence.peek().choices;
+        evidence.set(crate::picks_decision::Evidence { choices, ..Default::default() });
+        crate::picks_decision::audit(if neither { "neither" } else { "skip" }, None, None, &evidence.peek(), None, list.len());
+        match second {
+            Some(second) => pair.set((Some(first), Some(second))),
+            None => { evidence.write().reason = "exhausted".into(); winner.set(Some(first)); }
+        }
+    };
+    let mut continue_duel = move || {
+        let Some(w) = winner.peek().clone() else { return };
+        let mut exclude = shown.peek().clone();
+        let challenger = backend::challenger_against(&filtered.peek(), &taste.peek(), &exclude, &w, 0);
+        let Some(c) = challenger else {
+            if !*pool_complete.peek() || *enriching.peek() {
+                evidence.write().resume();
+                crate::picks_decision::audit("continue_wait", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
+                pair.set((Some(w),None)); winner.set(None);
+                return;
+            }
+            evidence.write().reason = "exhausted".into();
+            crate::picks_decision::audit("continue_exhausted", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
+            return;
+        };
+        exclude.push(c.key());
+        shown.set(exclude);
+        evidence.write().resume();
+        crate::picks_decision::audit("continue", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
+        pair.set((Some(w), Some(c)));
+        winner.set(None);
+    };
     use_effect(move || {
         let Some(command) = (shell.pick_command)() else { return };
         shell.pick_command.set(None);
-        if winner.peek().is_none() { keep(command == PickCommand::Left); }
+        if slot.peek().is_some() { return; }
+        match command {
+            PickCommand::Left if winner.peek().is_none() => keep(true),
+            PickCommand::Right if winner.peek().is_none() => keep(false),
+            PickCommand::Skip => change_pair(false),
+            PickCommand::Neither => change_pair(true),
+            PickCommand::Continue => continue_duel(),
+            _ => {}
+        }
     });
 
     // Only genres that can make a duel: at least two titles, or a catalog that can fetch more.
@@ -269,16 +396,18 @@ pub fn Picks() -> Element {
     let years = year_span(&from_text(), &to_text());
     let mut toggle_slot = move |s: Slot| slot.set(if slot() == Some(s) { None } else { Some(s) });
     let type_options: [(Option<&'static str>, &'static str); 3] = [(None, "Everything"), (Some("movie"), "Films"), (Some("series"), "Series")];
+    let pair_ready = { let (l,r) = pair(); l.as_ref().zip(r.as_ref()).is_some_and(|(l,r)| verified.read().contains(&l.key()) && verified.read().contains(&r.key())) };
     let style_options: [(Style, &'static str); 3] = [(Style::Live, "Live action"), (Style::Animation, "Animation"), (Style::Both, "Live action and animation")];
-    let total = rounds();
-    let done = round();
 
     rsx! {
         div { class: "duel",
             div { class: "duel-bar",
-                div { class: "duel-progress", aria_label: "Round {done.min(total) + 1} of {total}",
-                    span { class: "display duel-round", if winner().is_some() { "Your pick" } else { "Round {done + 1}" } }
-                    span { class: "dots", for i in 0..total { i { key: "{i}", class: if i < done { "dot done" } else if i == done && winner().is_none() { "dot now" } else { "dot" } } } }
+                div { class: "duel-progress",
+                    if winner().is_some() { span { class: "display duel-round", "Your pick" } }
+                    if winner().is_none() {
+                        icons::IconButton { label: "Change pair without voting (S)", class: "glass small", disabled: loading() || !pair_ready, onclick: move |_| change_pair(false), icons::Refresh {} }
+                        icons::IconButton { label: "Neither: change direction (N)", class: "glass small", disabled: loading() || !pair_ready, onclick: move |_| change_pair(true), icons::Close {} }
+                    }
                 }
                 div { class: "chips",
                     div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
@@ -343,35 +472,32 @@ pub fn Picks() -> Element {
                 p { class: "picks-ai-status", role: "status", "Local AI unavailable. Using catalogue preferences." }
             }
 
-            if loading() || (hide_watched() && watched.read().is_none()) || (enriching() && pair().0.is_none() && winner().is_none()) {
+            if loading() || (hide_watched() && watched.read().is_none())
+                || (winner().is_none() && ((pair().0.is_some() != pair().1.is_some())
+                    || ((!pool_complete() || enriching()) && pair().0.is_none()))) {
                 div { class: "duel-cards", div { class: "duel-card skeleton-card" } div { class: "duel-card skeleton-card" } }
             } else if let Some(pick) = winner() {
                 for pick in [pick.clone()] { FinalPick { key: "{pick.key()}", media: pick.clone(),
-                    reason: if round() == 0 { vec!["__only".to_string()] } else { taste().top_genres(&pick) },
-                    on_continue: move |_| {
-                        // Keep refining: the pick stays in play and meets new challengers.
-                        let Some(w) = winner.peek().clone() else { return start_duel() };
-                        let mut exclude = shown.peek().clone();
-                        let challenger = backend::challenger_against(&filtered.peek(), &taste.peek(), &exclude, &w, 0, *rounds.peek());
-                        let Some(c) = challenger else { return start_duel() };
-                        exclude.push(c.key());
-                        shown.set(exclude);
-                        round.set(0);
-                        pair.set((Some(w), Some(c)));
-                        winner.set(None);
-                    },
+                    reason: match evidence().reason.as_str() {
+                        "pause" => "Your choice so far. Keep exploring if it’s not quite right.",
+                        "stable" => "Your choices keep pointing here.",
+                        "exhausted" => "No new challengers in these filters.",
+                        _ if round() == 0 => "The only match for these filters.",
+                        _ => "Your choice from the titles explored.",
+                    }.to_owned(),
+                    on_continue: move |_| continue_duel(),
                     on_reset: move |_| { backend::reset_taste(); taste.set(Taste::default()); start_duel(); } } }
             } else {
-                match pair() {
+                match resolved_pair() {
                     (Some(l), Some(r)) => rsx! {
                         div { class: "duel-cards",
                             // A key only renews a component inside a list: a new title must get a new card.
                             // A card shows once its poster and trailer are confirmed.
-                            if verified.read().contains(&l.key()) {
+                            if verified.read().contains(&l.key()) && rules::style_matches(&l,style()) {
                                 for m in [l.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "left", on_keep: move |_| keep(true) } }
                             } else { div { class: "duel-card skeleton-card" } }
                             span { class: "versus display", aria_hidden: "true", "or" }
-                            if verified.read().contains(&r.key()) {
+                            if verified.read().contains(&r.key()) && rules::style_matches(&r,style()) {
                                 for m in [r.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "right", on_keep: move |_| keep(false) } }
                             } else { div { class: "duel-card skeleton-card" } }
                         }
@@ -426,7 +552,7 @@ fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Elem
                 if !media.description.is_empty() { p { class: "duel-synopsis clamp-3", "{media.description}" } }
                 if let Some(d) = director { p { class: "duel-credit", span { class: "dim", icons::Clapper {} } span { "{d}" } } }
                 div { class: "duel-actions",
-                    button { class: "pill accent", onclick: move |e| { e.stop_propagation(); on_keep.call(()) }, icons::Check {} span { "Keep this" } kbd { class: "keycap small-cap", "{arrow}" } }
+                    button { class: "pill accent", title: "Keep this ({arrow})", onclick: move |e| { e.stop_propagation(); on_keep.call(()) }, icons::Check {} span { "Keep this" } kbd { class: "keycap small-cap", "{arrow}" } }
                     CardPlayButton { media: media.clone(), episodes: facts.as_ref().map(|f| f.episodes.clone()).unwrap_or_default() }
                     if let Some(t) = trailer { icons::IconButton { label: "Trailer", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} } }
                     icons::IconButton { label: "Details", class: "glass", onclick: move |_| { let mut s = shell; s.opened.set(Some(open.clone())) }, icons::Info {} }
@@ -465,7 +591,7 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
 
 /// The winner, with why, and the ways on: watch it, or keep refining, or start over.
 #[component]
-fn FinalPick(media: Media, reason: Vec<String>, on_continue: EventHandler<()>, on_reset: EventHandler<()>) -> Element {
+fn FinalPick(media: Media, reason: String, on_continue: EventHandler<()>, on_reset: EventHandler<()>) -> Element {
     let mut shell = use_context::<Shell>();
     let mut meta = use_signal(|| None::<TitleMeta>);
     let m = media.clone();
@@ -475,14 +601,12 @@ fn FinalPick(media: Media, reason: Vec<String>, on_continue: EventHandler<()>, o
         .or_else(|| art().map(|a| a.trailers.into_iter().map(|k| backend::Trailer { youtube: Some(k), url: None }).collect::<Vec<_>>()).filter(|t| !t.is_empty()));
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
     let (play, open) = (media.clone(), media.clone());
-    let why = if reason.first().map(String::as_str) == Some("__only") { "The only match for these filters".to_string() }
-        else if reason.is_empty() { "It won every duel".to_string() } else { format!("You keep choosing {}", reason.join(" and ").to_lowercase()) };
     rsx! {
         article { class: "final-pick", aria_label: "Your pick: {media.name}",
             if !backdrop.is_empty() { img { class: "final-art", src: "{backdrop}", alt: "" } }
             crate::home::PosterArt { media: media.clone(), class: "final-poster".to_string() }
             div { class: "final-copy",
-                p { class: "reason", span { class: "lamp", icons::Sparkles {} } span { "{why}" } }
+                p { class: "reason", span { class: "lamp", icons::Sparkles {} } span { "{reason}" } }
                 h1 { class: "display pick-title", "{media.name}" }
                 p { class: "meta", "{media.meta_line(true)}" if !media.genres.is_empty() { span { class: "dim", ", {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(\", \")}" } } }
                 if !media.description.is_empty() { p { class: "synopsis clamp-3", "{media.description}" } }
@@ -490,8 +614,8 @@ fn FinalPick(media: Media, reason: Vec<String>, on_continue: EventHandler<()>, o
                     CardPlayButton { media: play.clone(), episodes: meta().map(|m| m.episodes).unwrap_or_default(), accent: true }
                     if let Some(t) = trailer { icons::IconButton { label: "Trailer", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} } }
                     icons::IconButton { label: "Details", class: "glass", onclick: move |_| shell.opened.set(Some(open.clone())), icons::Info {} }
-                    button { class: "pill glass", title: "Keep this pick and face new challengers", onclick: move |_| on_continue.call(()), icons::ArrowRight {} span { "Continue" } }
-                    button { class: "pill glass", title: "Forget what Picks learned", onclick: move |_| on_reset.call(()), icons::Undo {} span { "Start over" } }
+                    icons::IconButton { label: "Keep exploring (C)", class: "glass", onclick: move |_| on_continue.call(()), icons::ArrowRight {} }
+                    icons::IconButton { label: "Start over: forget what Picks learned", class: "glass", onclick: move |_| on_reset.call(()), icons::Undo {} }
                 }
             }
         }
@@ -525,14 +649,14 @@ pub fn PosterButton(media: Media, on_press: EventHandler<Media>, #[props(default
 }
 
 /// What a candidate check found.
-enum Check { Ready, Reject, Instead(Media) }
+enum Check { Ready(Media), Reject, Instead(Media) }
 
 /// A title can stand in a duel with a poster and a trailer; a later film in a collection gives
 /// way to the first part you have not seen.
 async fn check(m: &Media, watched: &HashSet<String>) -> Check {
-    if !backend::duel_ready(m).await { return Check::Reject; }
-    match backend::earlier_part(m, watched).await {
+    let Some(ready) = backend::duel_ready(m).await else { return Check::Reject };
+    match backend::earlier_part(&ready, watched).await {
         Some(first) => Check::Instead(first),
-        None => { let _ = crate::picks_ai::embed(m).await; Check::Ready }
+        None => { let _ = crate::picks_ai::embed(&ready).await; Check::Ready(ready) }
     }
 }

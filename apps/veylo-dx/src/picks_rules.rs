@@ -49,7 +49,14 @@ const STYLES: [&str; 2] = ["Animation", "Anime"];
 
 pub fn is_format(m: &Media) -> bool { m.genres.iter().any(|g| FORMATS.contains(&g.as_str())) }
 pub fn is_kids(m: &Media) -> bool { m.genres.iter().any(|g| g == "Kids") }
-pub fn is_animated(m: &Media) -> bool { m.kind == "anime" || m.genres.iter().any(|g| STYLES.contains(&g.as_str())) }
+pub fn is_animated(m: &Media) -> bool {
+    m.kind == "anime" || m.genres.iter().any(|g| STYLES.iter().any(|s| g.eq_ignore_ascii_case(s)))
+        || (m.raw["tmdb_id"].as_i64().is_some() && m.raw["genre_ids"].as_array().is_some_and(|a| a.iter().any(|g| g.as_i64() == Some(16))))
+        || m.raw["show_type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("animation") || t.eq_ignore_ascii_case("anime"))
+}
+pub fn style_matches(m: &Media, style: Style) -> bool {
+    match style { Style::Live => !is_animated(m), Style::Animation => is_animated(m), Style::Both => true }
+}
 
 /// Whether a title carries a genre; a pair carries both its halves.
 pub fn has_genre(m: &Media, wanted: &str) -> bool {
@@ -95,10 +102,14 @@ pub fn tidy(mut m: Media) -> Media {
 
 /// Add titles to the pool once each: same entry or same title from another source.
 pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
-    let mut keys: HashSet<String> = pool.iter().map(Media::key).collect();
-    let mut titles: HashSet<String> = pool.iter().map(title_key).collect();
     for m in more.into_iter().map(tidy) {
-        if keys.insert(m.key()) && titles.insert(title_key(&m)) { pool.push(m); }
+        let title = title_key(&m);
+        if let Some(existing) = pool.iter_mut().find(|old| old.key() == m.key() || title_key(old) == title) {
+            // A later source can supply a missing style. Deduplication must not throw it away.
+            if is_animated(&m) && !is_animated(existing) { existing.genres.push("Animation".into()); }
+            for genre in m.genres { if !existing.genres.contains(&genre) { existing.genres.push(genre); } }
+            existing.raw["genres"] = serde_json::json!(existing.genres);
+        } else { pool.push(m); }
     }
 }
 
@@ -108,7 +119,7 @@ pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genre: Op
     let wants_kids = genre.is_some_and(|g| canonical_genre(g) == "Kids");
     items.iter().filter(|m| {
         let kind_ok = kind.map_or(true, |k| if k == "series" { m.kind == "series" || m.kind == "anime" } else { m.kind == k });
-        let style_ok = match style { Style::Live => !is_animated(m), Style::Animation => is_animated(m), Style::Both => true };
+        let style_ok = style_matches(m,style);
         let years_ok = if from.is_none() && to.is_none() { true } else {
             year_range(m, this_year).is_some_and(|(a, b)| from.map_or(true, |f| b >= f) && to.map_or(true, |t| a <= t))
         };
@@ -204,6 +215,18 @@ mod tests {
         assert_eq!(genre_choices(&media("y", "movie", "2020", &["Animation", "Comedy"])), ["Comedy"]);
     }
 
+    #[test]
+    fn duplicate_metadata_preserves_animation_and_live_action_excludes_it() {
+        let sparse=media("simpsons","series","1989",&["Comedy","Family"]);
+        let mut detailed=sparse.clone();detailed.genres.push("Animation".into());
+        let mut pool=vec![sparse];merge(&mut pool,vec![detailed]);
+        assert_eq!(pool.len(),1);assert!(is_animated(&pool[0]));
+        assert!(filter_picks(&pool,None,Style::Live,None,None,None,2026).is_empty());
+        assert_eq!(filter_picks(&pool,None,Style::Animation,None,None,None,2026).len(),1);
+        let mut raw=media("raw","series","2020",&["Comedy"]);
+        raw.raw["tmdb_id"]=serde_json::json!(1);raw.raw["genre_ids"]=serde_json::json!([16,35]);assert!(is_animated(&raw));
+        raw.raw["genre_ids"]=serde_json::Value::Null;raw.raw["show_type"]=serde_json::json!("Animation");assert!(is_animated(&raw));
+    }
     #[test]
     fn type_and_style_combine_and_formats_and_kids_stay_out() {
         let c = [media("film", "movie", "2000", &["Drama"]), media("toon", "movie", "2010", &["Animation"]),

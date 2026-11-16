@@ -10,6 +10,7 @@ mod home;
 mod library;
 mod icons;
 mod picks;
+mod picks_decision;
 mod picks_ai;
 mod picks_metadata;
 mod picks_rules;
@@ -56,7 +57,7 @@ pub struct Accent(pub Signal<String>);
 
 /// Keyboard commands routed from the window to the Picks screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PickCommand { Left, Right }
+pub enum PickCommand { Left, Right, Skip, Neither, Continue }
 
 /// Shared shell state, provided once at the root.
 #[derive(Clone, Copy)]
@@ -271,16 +272,26 @@ fn Shell_() -> Element {
 
     // Android Back closes a page or Search, like Esc; on a top-level screen it leaves the app.
     #[cfg(target_os = "android")]
-    use_effect(move || { let _ = android::set_back_enabled(search_open() || opened.read().is_some() || (shell.player)().is_some()
+    use_effect(move || { let _ = android::set_back_enabled(shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
         || matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))); });
     // Written in an effect, never during render (a write there would re-render forever).
     let mut accent = use_context_provider(|| Accent(Signal::new(String::new()))).0;
     let current = lamp_css.clone();
     use_effect(use_reactive!(|current| if *accent.peek() != current { accent.set(current); }));
+    // The pending overlay can finish asynchronously while its help is open.
+    use_effect(move || { if (shell.player)().is_some() && *shortcuts_open.peek() { shortcuts_open.set(false); } });
+
     // App shortcuts (the ? sheet lists them). Typing in Search or a field never triggers them.
     let on_key = move |e: KeyboardEvent| {
+        if shortcuts_open() {
+            if matches!(e.key(), Key::Escape | Key::Backspace) || e.key() == Key::Character("?".into()) {
+                e.prevent_default(); shortcuts_open.set(false);
+            }
+            return;
+        }
         // The player's controls take every key while it is on screen.
         if shell.player.peek().is_some() {
+            if e.key() == Key::Tab { return; }
             e.prevent_default();
             let mut key = shell.player_key;
             key.set(Some(e.key().to_string()));
@@ -288,8 +299,10 @@ fn Shell_() -> Element {
         }
         // The player waiting for its source: Esc or Back leaves it, other keys wait.
         if shell.pending().is_some() {
+            if e.key() == Key::Tab { return; }
             e.prevent_default();
             if matches!(e.key(), Key::Escape | Key::Backspace) { cancel_finding(shell); }
+            else if e.key() == Key::Character("?".into()) { shortcuts_open.set(true); }
             return;
         }
         let ctrl = e.modifiers().ctrl() || e.modifiers().meta();
@@ -304,16 +317,19 @@ fn Shell_() -> Element {
             Key::Escape if shortcuts_open() => shortcuts_open.set(false),
             Key::Escape if search_open() => search_open.set(false),
             Key::Escape if opened.read().is_some() => opened.set(None),
-            _ if search_open() || ctrl => {}
+            _ if search_open() || shortcuts_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
             Key::Backspace if shortcuts_open() => shortcuts_open.set(false),
             Key::Backspace if opened.read().is_some() => opened.set(None),
             Key::Character(c) if c == "?" => shortcuts_open.set(!shortcuts_open()),
             Key::Character(c) if c == "/" => { e.prevent_default(); search_open.set(true); }
             // Title page: P play, L like, D not for me, S save, W watched, T trailer, O sources.
             Key::Character(c) if opened.read().is_some() => title_command.set(c.to_lowercase().chars().next()),
-            _ if tab() != Tab::Picks => {}
-            Key::ArrowLeft => pick_command.set(Some(PickCommand::Left)),
-            Key::ArrowRight => pick_command.set(Some(PickCommand::Right)),
+            _ if tab() != Tab::Picks || e.is_auto_repeating() || e.is_composing() => {}
+            Key::ArrowLeft => { e.prevent_default(); pick_command.set(Some(PickCommand::Left)); }
+            Key::ArrowRight => { e.prevent_default(); pick_command.set(Some(PickCommand::Right)); }
+            Key::Character(c) if c.eq_ignore_ascii_case("s") => { e.prevent_default(); pick_command.set(Some(PickCommand::Skip)); }
+            Key::Character(c) if c.eq_ignore_ascii_case("n") => { e.prevent_default(); pick_command.set(Some(PickCommand::Neither)); }
+            Key::Character(c) if c.eq_ignore_ascii_case("c") => { e.prevent_default(); pick_command.set(Some(PickCommand::Continue)); }
             _ => {}
         }
     };
@@ -330,7 +346,6 @@ fn Shell_() -> Element {
             style: "--lamp: {lamp_css}; --top-inset: {insets.0}px; --bottom-inset: {insets.1}px",
             tabindex: "-1",
             onkeydown: on_key,
-            onkeyup: move |e: KeyboardEvent| if shell.player.peek().is_some() { e.prevent_default(); },
             onmounted: move |e| async move { let _ = e.set_focus(true).await; },
             // The light the glass refracts: the title in front, blurred into the room.
             div { class: "ambient", aria_hidden: "true",
@@ -340,7 +355,7 @@ fn Shell_() -> Element {
             div { class: "status-guard", aria_hidden: "true" }
             TopBar {}
             // `inert` is a boolean attribute: present means on, even as inert="false". Omit it when unused.
-            main { class: "page", key: "{opened.read().as_ref().map(|m| m.key()).unwrap_or_default()}", inert: search_open().then_some("true"),
+            main { class: "page", key: "{opened.read().as_ref().map(|m| m.key()).unwrap_or_default()}", inert: (search_open() || shortcuts_open()).then_some("true"),
                 if let Some(media) = opened() { for media in [media] { title::TitlePage { key: "{media.key()}", media } } }
                 else { match tab() {
                     Tab::Home => rsx! { home::Home {} },
@@ -372,7 +387,7 @@ fn Shell_() -> Element {
 fn TopBar() -> Element {
     let mut shell = use_context::<Shell>();
     rsx! {
-        header { class: "topbar",
+        header { class: "topbar", inert: (shell.shortcuts_open)().then_some("true"),
             if shell.opened.read().is_some() {
                 icons::IconButton { label: "Back", class: "glass", onclick: move |_| shell.opened.set(None), icons::ArrowLeft {} }
             } else {
@@ -399,6 +414,7 @@ fn TopBar() -> Element {
             }
             }
             span { class: "topbar-spacer" }
+            ShortcutButton {}
             icons::IconButton { label: "Search (Ctrl+K)", class: "glass", onclick: move |_| shell.search_open.set(true), icons::Search {} }
         }
     }
@@ -487,22 +503,44 @@ pub fn open_external(url: &str) {
     { let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
 }
 
-/// Every app shortcut, as key caps (the player has its own sheet: H or ?).
+/// The same discoverable control in the top bar and Search; player uses its own sheet.
+#[component]
+fn ShortcutButton() -> Element {
+    let mut shell = use_context::<Shell>();
+    rsx! { icons::IconButton { label: "Page shortcuts (?)", class: "glass", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} } }
+}
+
+/// Only commands that apply here, followed by shared app navigation.
 #[component]
 fn AppShortcuts() -> Element {
     let mut shell = use_context::<Shell>();
-    let rows: [(&[&str], &str); 12] = [
-        (&["Ctrl", "K"], "Search"), (&["/"], "Search"), (&["Ctrl", "1"], "Home"), (&["Ctrl", "2"], "Picks"),
-        (&["Ctrl", "3"], "Library"), (&["Ctrl", "4"], "Settings"),
-        (&["Esc"], "Back"), (&["P"], "Title page: play or resume"), (&["L", "D"], "Title page: like, not for me"),
-        (&["S", "W"], "Title page: save, watched"), (&["T", "O"], "Title page: trailer, sources"), (&["←", "→"], "Picks: keep the left or right card"),
-    ];
+    let mut rows: Vec<(&[&str], &str)> = Vec::new();
+    let context = if shell.pending().is_some() {
+        rows.push((&["Esc"], "Cancel opening")); "Opening"
+    } else if (shell.search_open)() {
+        rows.extend([(&["Enter"][..], "Search"), (&["Esc"][..], "Close search")]); "Search"
+    } else if let Some(media) = shell.opened.read().as_ref() {
+        rows.extend([(&["P"][..], "Play or resume"), (&["L"][..], "Like"), (&["D"][..], "Not for me"), (&["S"][..], "Save"), (&["T"][..], "Trailer")]);
+        if media.kind == "movie" { rows.extend([(&["W"][..], "Watched"), (&["O"][..], "Choose source")]); }
+        rows.push((&["Esc"], "Back")); "Title"
+    } else {
+        if (shell.tab)() == Tab::Picks {
+            rows.extend([(&["←", "→"][..], "Keep the left or right card"), (&["S"][..], "Change pair without voting"),
+                (&["N"][..], "Neither: change direction"), (&["C"][..], "Keep exploring after a suggestion")]);
+        }
+        (shell.tab)().title()
+    };
+    if shell.pending().is_none() {
+        rows.extend([(&["Ctrl", "K"][..], "Search"), (&["Ctrl", "1–4"][..], "Home / Picks / Library / Settings")]);
+        if !(shell.search_open)() { rows.push((&["/"], "Search")); }
+    }
+    rows.extend([(&["Tab"][..], "Next control; Shift+Tab goes back"), (&["Enter", "Space"][..], "Activate a focused button"), (&["?"][..], "Show or hide shortcuts")]);
     rsx! {
-        div { class: "scrim", onclick: move |_| shell.shortcuts_open.set(false),
-            section { class: "shortcuts glass", role: "dialog", aria_label: "Shortcuts", onclick: move |e| e.stop_propagation(),
+        div { class: "scrim shortcuts-scrim", onclick: move |_| shell.shortcuts_open.set(false),
+            section { class: "shortcuts glass", role: "dialog", aria_modal: "true", aria_label: "{context} shortcuts", tabindex: "-1", onmounted: move |e| async move { let _ = e.set_focus(true).await; }, onclick: move |e| e.stop_propagation(),
                 div { class: "sheet-head",
-                    span { class: "group-icon", icons::Grid {} }
-                    span { class: "group-name", "Shortcuts" }
+                    span { class: "group-icon", icons::Keyboard {} }
+                    span { class: "group-name", "{context} shortcuts" }
                     icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| shell.shortcuts_open.set(false), icons::Close {} }
                 }
                 div { class: "shortcut-list",
