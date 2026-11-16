@@ -40,14 +40,20 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut fullscreen = use_signal(|| false);
     let mut online = use_signal(|| Online::Idle);
     let sub_query = use_signal(String::new);
+    let mut automatic_language = use_signal(|| None::<String>);
     // The download in progress, and what each downloaded subtitle became (its track id).
     let mut sub_busy = use_signal(|| None::<String>);
     let mut sub_added = use_signal(std::collections::HashMap::<String, i64>::new);
     // The video whose subtitles can be downloaded: the episode, or the film itself.
     let wanted = live.0.request.record.as_ref().map(|(m, v)| (m.kind.clone(), v.clone().unwrap_or_else(|| m.id.clone())));
+    use_effect(move || {
+        // Reopening the sheet retries a failed lookup, without a retry loop while it stays open.
+        if sheet() == Some(Sheet::Subtitles) && *online.peek() == Online::Failed { online.set(Online::Idle); }
+    });
     let target = wanted.clone();
     use_effect(move || {
-        if sheet() != Some(Sheet::Subtitles) || *online.peek() != Online::Idle { return; }
+        if sheet() != Some(Sheet::Subtitles) && automatic_language().is_none() { return; }
+        if *online.peek() != Online::Idle { return; }
         let Some((kind, video)) = target.clone() else { return };
         online.set(Online::Loading);
         spawn(async move {
@@ -110,9 +116,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
     // Tap a downloadable subtitle: download it, add it as a track and turn it on.
     let get = live.clone();
-    let download = use_callback(move |sub: OnlineSubtitle| {
+    // `tapped`: chosen in the sheet (which then closes), not added on its own by the fallback.
+    let add_online = use_callback(move |(sub, tapped): (OnlineSubtitle, bool)| {
         let live = get.0.clone();
-        if let Some(id) = sub_added.peek().get(&sub.id).copied() { live.select(false, Some(id)); sheet.set(None); return; }
+        if let Some(id) = sub_added.peek().get(&sub.id).copied() { live.select(false, Some(id)); if tapped { sheet.set(None); } return; }
         if sub_busy.peek().is_some() { return; }
         sub_busy.set(Some(sub.id.clone()));
         let mut say = say;
@@ -122,10 +129,56 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             let added = backend::on_runtime(async move { tokio::task::spawn_blocking(move || live.add_subtitle(&file, &title, &code)).await }).await;
             sub_busy.set(None);
             match added {
-                Ok(Ok(Ok(id))) => { sub_added.write().insert(sub.id.clone(), id); sheet.set(None); say(format!("Subtitles: {}", sub.language)); }
+                Ok(Ok(Ok(id))) => {
+                    sub_added.write().insert(sub.id.clone(), id);
+                    if tapped { sheet.set(None); say(format!("Subtitles: {}", sub.language)); }
+                    else { say(format!("No {0} audio: {0} subtitles on", sub.language)); }
+                }
                 _ => say("Those subtitles couldn’t be loaded".into()),
             }
         });
+    });
+    let download = use_callback(move |sub: OnlineSubtitle| add_online.call((sub, true)));
+
+    // No audio in your language: your language's subtitles instead, once per video. The file's
+    // own subtitles first, else the best download. Untagged audio says nothing, so it is left as is.
+    let mut fallback_done = use_signal(|| false);
+    // Re-runs only when the video becomes ready, not on every position tick.
+    let ready = use_memo(move || { let s = state.read(); s.loaded && !s.tracks.is_empty() });
+    let (fb_live, fb_wanted) = (live.clone(), wanted.clone());
+    use_effect(move || {
+        if !ready() || *fallback_done.peek() { return; }
+        fallback_done.set(true);
+        let s = state.peek().clone();
+        let Some(key) = backend::stream_language() else { return };
+        let name = backend::subtitle_language_of(&key);
+        let mut say = say;
+        let plan = fallback(&s.tracks, &key);
+        if let Fallback::Embedded(id) = plan {
+            fb_live.0.select(false, Some(id));
+            say(format!("No {name} audio: {name} subtitles on"));
+        }
+        if plan != Fallback::Download { return; }
+        if fb_wanted.is_none() { return; }
+        automatic_language.set(Some(key));
+    });
+    // One lookup feeds both the sheet and the automatic fallback, whichever starts first.
+    use_effect(move || {
+        let Some(key) = automatic_language() else { return };
+        match online() {
+            Online::Ready(list) => {
+                automatic_language.set(None);
+                // A user's download takes precedence over automatic selection.
+                if sub_busy.peek().is_some() { return; }
+                let name = backend::subtitle_language_of(&key);
+                match list.into_iter().find(|s| backend::track_in_language(&s.code, &key) || s.language == name) {
+                    Some(sub) => add_online.call((sub, false)),
+                    None => say(format!("No {name} audio or subtitles for this video")),
+                }
+            }
+            Online::Failed => { automatic_language.set(None); say("Subtitles couldn’t be looked up right now".into()); }
+            _ => {}
+        }
     });
 
     // Keys routed from the shell; the same set as the classic Android player.
@@ -215,6 +268,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         span { class: "player-facts-line",
                             if !req.subtitle.is_empty() { span { "{req.subtitle}" } }
                             if !facts.resolution.is_empty() { span { "{facts.resolution}" } }
+                            if !facts.size.is_empty() { span { class: "tnum", title: "File size", "{facts.size}" } }
                             if !facts.picture.is_empty() { span { class: if hdr && !mapped { "lit" } else { "" }, title: "{facts.picture}", "{short_picture}" } }
                             if s.loaded && !s.codec.is_empty() {
                                 span { class: if hw.is_some() { "" } else { "warn" }, title: if hw.is_some() { "Hardware decoding" } else { "Software decoding" },
@@ -332,6 +386,25 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 }
             }
         }
+    }
+}
+
+/// What to do when a video starts, for the audio-language setting `key`.
+#[derive(Debug, PartialEq)]
+enum Fallback { Nothing, Embedded(i64), Download }
+
+/// Your language's audio is there, or any audio track is untagged (it could be yours): nothing.
+/// Otherwise your language's subtitles: the file's own full ones (text before image, never
+/// forced-only signs) when it has them, else a download.
+fn fallback(tracks: &[engine::Track], key: &str) -> Fallback {
+    let in_language = |t: &engine::Track| backend::track_in_language(&t.lang, key);
+    let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
+    if audio.is_empty() || audio.iter().any(|t| t.lang.is_empty()) || audio.iter().any(|t| in_language(t)) { return Fallback::Nothing; }
+    if tracks.iter().any(|t| !t.audio && t.selected && !t.forced && in_language(t)) { return Fallback::Nothing; }
+    let full = |t: &&engine::Track| !t.audio && !t.forced && in_language(t);
+    match tracks.iter().filter(full).find(|t| !t.image).or_else(|| tracks.iter().find(full)) {
+        Some(t) => Fallback::Embedded(t.id),
+        None => Fallback::Download,
     }
 }
 
@@ -464,6 +537,34 @@ fn OptionRow(on: bool, label: String, about: String, pick: EventHandler<MouseEve
 
 #[cfg(test)]
 mod tests {
+    use super::{fallback, Fallback};
+    use crate::engine::Track;
+    fn track(id: i64, audio: bool, lang: &str) -> Track { Track { id, audio, lang: lang.into(), ..Default::default() } }
+
+    #[test]
+    fn subtitles_only_when_your_language_is_missing_from_the_audio() {
+        let it = "italian";
+        // MULTI with Italian audio: mpv's alang picks it, nothing else to do.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(2, true, "ita")], it), Fallback::Nothing);
+        // Untagged audio can't be told apart, alone or next to a tagged track: left alone.
+        assert_eq!(fallback(&[track(1, true, "")], it), Fallback::Nothing);
+        assert_eq!(fallback(&[track(1, true, ""), track(2, true, "eng")], it), Fallback::Nothing);
+        // Forced Italian (signs only) is skipped for the full track; an image track only if nothing else.
+        let forced = Track { forced: true, ..track(5, false, "ita") };
+        let pgs = Track { image: true, ..track(6, false, "ita") };
+        assert_eq!(fallback(&[track(1, true, "eng"), forced.clone(), pgs.clone(), track(7, false, "ita")], it), Fallback::Embedded(7));
+        assert_eq!(fallback(&[track(1, true, "eng"), forced.clone(), pgs], it), Fallback::Embedded(6));
+        assert_eq!(fallback(&[track(1, true, "eng"), forced], it), Fallback::Download);
+        // English only, with Italian subtitles in the file: those.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng"), track(4, false, "ita")], it), Fallback::Embedded(4));
+        // English only, no Italian subtitles in the file: download.
+        assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng")], it), Fallback::Download);
+        // Commentary in your language does not suppress subtitles over the main foreign audio.
+        let commentary = Track { label: "English director commentary".into(), ..track(2, true, "eng") };
+        assert_eq!(fallback(&[track(1, true, "jpn"), commentary], "english"), Fallback::Download);
+        // Italian subtitles already on (forced by the file): nothing.
+        assert_eq!(fallback(&[track(1, true, "eng"), Track { selected: true, ..track(4, false, "it") }], it), Fallback::Nothing);
+    }
     #[test]
     fn clock_reads_like_a_player() {
         assert_eq!(super::clock(5.0), "0:05");
