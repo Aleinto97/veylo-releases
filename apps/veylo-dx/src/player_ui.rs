@@ -40,14 +40,20 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut fullscreen = use_signal(|| false);
     let mut online = use_signal(|| Online::Idle);
     let sub_query = use_signal(String::new);
+    let mut automatic_language = use_signal(|| None::<String>);
     // The download in progress, and what each downloaded subtitle became (its track id).
     let mut sub_busy = use_signal(|| None::<String>);
     let mut sub_added = use_signal(std::collections::HashMap::<String, i64>::new);
     // The video whose subtitles can be downloaded: the episode, or the film itself.
     let wanted = live.0.request.record.as_ref().map(|(m, v)| (m.kind.clone(), v.clone().unwrap_or_else(|| m.id.clone())));
+    use_effect(move || {
+        // Reopening the sheet retries a failed lookup, without a retry loop while it stays open.
+        if sheet() == Some(Sheet::Subtitles) && *online.peek() == Online::Failed { online.set(Online::Idle); }
+    });
     let target = wanted.clone();
     use_effect(move || {
-        if sheet() != Some(Sheet::Subtitles) || *online.peek() != Online::Idle { return; }
+        if sheet() != Some(Sheet::Subtitles) && automatic_language().is_none() { return; }
+        if *online.peek() != Online::Idle { return; }
         let Some((kind, video)) = target.clone() else { return };
         online.set(Online::Loading);
         spawn(async move {
@@ -153,23 +159,26 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             say(format!("No {name} audio: {name} subtitles on"));
         }
         if plan != Fallback::Download { return; }
-        let Some((kind, video)) = fb_wanted.clone() else { return };
-        // The Subtitles sheet shares this lookup: it shows "Looking" meanwhile and doesn't ask again.
-        let ours = *online.peek() == Online::Idle;
-        if ours { online.set(Online::Loading); }
-        spawn(async move {
-            let list = match online.peek().clone() { Online::Ready(list) => Ok(list), _ => backend::online_subtitles(&kind, &video).await };
-            let list = match list {
-                Ok(list) => list,
-                // Unreachable is not "none": say so, and let the sheet try again.
-                Err(_) => { if ours { online.set(Online::Idle); } say("Subtitles couldn’t be looked up right now".into()); return; }
-            };
-            if ours { online.set(Online::Ready(list.clone())); }
-            match list.into_iter().find(|s| backend::track_in_language(&s.code, &key) || s.language == name) {
-                Some(sub) => add_online.call((sub, false)),
-                None => say(format!("No {name} audio or subtitles for this video")),
+        if fb_wanted.is_none() { return; }
+        automatic_language.set(Some(key));
+    });
+    // One lookup feeds both the sheet and the automatic fallback, whichever starts first.
+    use_effect(move || {
+        let Some(key) = automatic_language() else { return };
+        match online() {
+            Online::Ready(list) => {
+                automatic_language.set(None);
+                // A user's download takes precedence over automatic selection.
+                if sub_busy.peek().is_some() { return; }
+                let name = backend::subtitle_language_of(&key);
+                match list.into_iter().find(|s| backend::track_in_language(&s.code, &key) || s.language == name) {
+                    Some(sub) => add_online.call((sub, false)),
+                    None => say(format!("No {name} audio or subtitles for this video")),
+                }
             }
-        });
+            Online::Failed => { automatic_language.set(None); say("Subtitles couldn’t be looked up right now".into()); }
+            _ => {}
+        }
     });
 
     // Keys routed from the shell; the same set as the classic Android player.
@@ -389,7 +398,7 @@ enum Fallback { Nothing, Embedded(i64), Download }
 /// forced-only signs) when it has them, else a download.
 fn fallback(tracks: &[engine::Track], key: &str) -> Fallback {
     let in_language = |t: &engine::Track| backend::track_in_language(&t.lang, key);
-    let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio).collect();
+    let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
     if audio.is_empty() || audio.iter().any(|t| t.lang.is_empty()) || audio.iter().any(|t| in_language(t)) { return Fallback::Nothing; }
     if tracks.iter().any(|t| !t.audio && t.selected && !t.forced && in_language(t)) { return Fallback::Nothing; }
     let full = |t: &&engine::Track| !t.audio && !t.forced && in_language(t);
@@ -550,6 +559,9 @@ mod tests {
         assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng"), track(4, false, "ita")], it), Fallback::Embedded(4));
         // English only, no Italian subtitles in the file: download.
         assert_eq!(fallback(&[track(1, true, "eng"), track(3, false, "eng")], it), Fallback::Download);
+        // Commentary in your language does not suppress subtitles over the main foreign audio.
+        let commentary = Track { label: "English director commentary".into(), ..track(2, true, "eng") };
+        assert_eq!(fallback(&[track(1, true, "jpn"), commentary], "english"), Fallback::Download);
         // Italian subtitles already on (forced by the file): nothing.
         assert_eq!(fallback(&[track(1, true, "eng"), Track { selected: true, ..track(4, false, "it") }], it), Fallback::Nothing);
     }

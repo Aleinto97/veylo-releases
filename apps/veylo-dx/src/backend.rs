@@ -702,7 +702,10 @@ pub async fn online_subtitles(kind: &str, video_id: &str) -> Result<Vec<OnlineSu
     let v = exec(json!({"op":"subtitles","type":kind,"id":video_id})).await?;
     let mut list = v["subtitles"].as_array().cloned().unwrap_or_default();
     if list.is_empty() && video_id.starts_with("tt") {
-        list = opensubtitles(kind, video_id).await.unwrap_or_default();
+        list = opensubtitles(kind, video_id).await?;
+    }
+    if list.is_empty() && v["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+        anyhow::bail!("Subtitle providers could not be reached");
     }
     let preferred = stream_language().map(|k| subtitle_language_of(&k));
     Ok(rank_subtitles(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref()))

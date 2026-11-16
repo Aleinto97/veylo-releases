@@ -572,13 +572,17 @@ pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Scr
 
 /// `alang` picks a track by language before the file's default, so it can land on a commentary or
 /// audio-description track: then take the first other track in that language, else the default.
+pub fn extra_audio(t: &Track) -> bool {
+    let l = t.label.to_lowercase();
+    t.audio && (l.contains("commentary") || l.contains("description") || l.contains("descriptive"))
+}
+
 fn skip_commentary(live: &Live) {
     let s = live.state();
-    let extra = |t: &Track| { let l = t.label.to_lowercase(); l.contains("commentary") || l.contains("description") || l.contains("descriptive") };
     let Some(on) = s.tracks.iter().find(|t| t.audio && t.selected) else { return };
-    if !extra(on) { return; }
-    let main = s.tracks.iter().find(|t| t.audio && !extra(t) && t.lang == on.lang && !on.lang.is_empty())
-        .or_else(|| s.tracks.iter().find(|t| t.audio && !extra(t)));
+    if !extra_audio(on) { return; }
+    let main = s.tracks.iter().find(|t| t.audio && !extra_audio(t) && t.lang == on.lang && !on.lang.is_empty())
+        .or_else(|| s.tracks.iter().find(|t| t.audio && !extra_audio(t)));
     if let Some(t) = main { live.select(true, Some(t.id)); }
 }
 
