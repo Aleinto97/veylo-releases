@@ -81,7 +81,8 @@ sed -i "s/versionCode = [0-9]*/versionCode = $version_code/; s/versionName = \"[
 (cd "$project" && ./gradlew assembleDebug -q)
 build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
 # Gradle signs with this machine's debug key; the release carries Veylo's own key instead.
-"$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias veylo --ks-pass "file:$pass_file" --key-pass "file:$pass_file" \
+# (PKCS12: the key's password is the keystore's. Passing the same file twice would make apksigner read a second line.)
+"$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias veylo --ks-pass "file:$pass_file" \
     --out "$stage/$APK_ASSET" "$project/app/build/outputs/apk/debug/app-debug.apk"
 rm -f "$stage/$APK_ASSET.idsig"
 "$build_tools/apksigner" verify --print-certs "$stage/$APK_ASSET" | grep 'SHA-256' | sed 's/^/APK /'
