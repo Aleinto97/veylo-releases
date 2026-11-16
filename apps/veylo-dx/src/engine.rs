@@ -40,7 +40,9 @@ impl Fit {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected: bool, pub image: bool, pub styled: bool,
     /// The track's language tag as the file has it ("ita", "en"), empty when untagged.
-    pub lang: String }
+    pub lang: String,
+    /// Forced subtitles: signs and foreign lines only, not the dialogue.
+    pub forced: bool }
 
 /// What the screen can show, as the platform declares it (Android's display, Windows' DXGI
 /// output the window is on); Linux output is SDR. `peak_nits`: the panel's peak, 0 if unknown.
@@ -80,6 +82,8 @@ pub struct State {
     pub dv_profile: i64,
     /// Frames the player had to drop (decoder or display too slow).
     pub dropped: i64,
+    /// The playing file's size in bytes as mpv reads it (0 until known).
+    pub file_size: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -363,7 +367,9 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         match event {
             Ok(Event::FileLoaded) => {
                 refresh_tracks(&live);
-                live.update(|s| { s.loaded = true; s.error = None; true });
+                let size = mpv.get_property::<i64>("file-size").unwrap_or(0).max(0);
+                live.update(|s| { s.loaded = true; s.error = None; s.file_size = size; true });
+                skip_commentary(&live);
                 // Profile 5 carries no HDR10 layer: without a Dolby Vision panel only mpv's renderer
                 // (libplacebo's reshaping) shows its colours right.
                 let s = live.state();
@@ -479,7 +485,9 @@ pub fn parse_tracks(json: &str) -> Vec<Track> {
         let image = t["image"].as_bool().unwrap_or(matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle"));
         let styled = matches!(codec, "ass" | "ssa");
         Some(Track { id, audio, label: if parts.is_empty() { format!("Track {id}") } else { parts.join(", ") }, selected: t["selected"].as_bool() == Some(true), image, styled,
-            lang: t["lang"].as_str().map(str::trim).filter(|l| *l != "und").unwrap_or_default().to_owned() })
+            // "und" (undetermined), "mul" (several), "zxx" (no speech) say nothing about the language.
+            lang: t["lang"].as_str().map(str::trim).filter(|l| !["und", "mul", "zxx", "mis"].contains(&l.to_lowercase().as_str())).unwrap_or_default().to_owned(),
+            forced: t["forced"].as_bool() == Some(true) || title.to_lowercase().contains("forced") })
     }).collect()
 }
 
@@ -498,7 +506,7 @@ pub fn language_name(code: &str) -> String {
         "en" | "eng" => "English", "it" | "ita" => "Italian", "es" | "spa" => "Spanish", "fr" | "fre" | "fra" => "French",
         "de" | "ger" | "deu" => "German", "pt" | "por" => "Portuguese", "ja" | "jpn" => "Japanese", "ko" | "kor" => "Korean",
         "zh" | "chi" | "zho" => "Chinese", "ru" | "rus" => "Russian", "nl" | "dut" | "nld" => "Dutch", "pl" | "pol" => "Polish",
-        "sv" | "swe" => "Swedish", "da" | "dan" => "Danish", "no" | "nor" | "nob" => "Norwegian", "fi" | "fin" => "Finnish",
+        "sv" | "swe" => "Swedish", "da" | "dan" => "Danish", "no" | "nor" | "nob" | "nb" => "Norwegian", "fi" | "fin" => "Finnish",
         "tr" | "tur" => "Turkish", "ar" | "ara" => "Arabic", "hi" | "hin" => "Hindi", "el" | "gre" | "ell" => "Greek",
         "he" | "heb" => "Hebrew", "cs" | "cze" | "ces" => "Czech", "hu" | "hun" => "Hungarian", "ro" | "rum" | "ron" => "Romanian",
         "pb" | "pob" | "pt-br" => "Portuguese (Brazil)", "uk" | "ukr" => "Ukrainian", "bg" | "bul" => "Bulgarian", "hr" | "hrv" => "Croatian",
@@ -562,6 +570,18 @@ pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Scr
     }
 }
 
+/// `alang` picks a track by language before the file's default, so it can land on a commentary or
+/// audio-description track: then take the first other track in that language, else the default.
+fn skip_commentary(live: &Live) {
+    let s = live.state();
+    let extra = |t: &Track| { let l = t.label.to_lowercase(); l.contains("commentary") || l.contains("description") || l.contains("descriptive") };
+    let Some(on) = s.tracks.iter().find(|t| t.audio && t.selected) else { return };
+    if !extra(on) { return; }
+    let main = s.tracks.iter().find(|t| t.audio && !extra(t) && t.lang == on.lang && !on.lang.is_empty())
+        .or_else(|| s.tracks.iter().find(|t| t.audio && !extra(t)));
+    if let Some(t) = main { live.select(true, Some(t.id)); }
+}
+
 /// Read the transfer mpv renders to; true when it changed. On Windows, HDR10 output is mapped to
 /// the panel's peak (read again, the window may have moved), and SDR output goes back to mpv's own.
 fn follow_target(live: &Live) -> bool {
@@ -583,7 +603,8 @@ pub fn facts(live: &Live, s: &State) -> Facts {
     Facts {
         resolution: Some(crate::player::resolution_label(s.width, s.height)).filter(|r| !r.is_empty()).or(live.request.quality.clone()).unwrap_or_default(),
         picture: picture(&s.transfer, live.request.hdr.as_deref(), s.dv_profile, live.screen.unwrap_or_default(), s.direct, &s.target_transfer),
-        size: live.request.size.clone().unwrap_or_default(),
+        // The file mpv opened (an episode's own size, not its season pack's), else what the source declared.
+        size: if s.file_size > 0 { backend::file_size_label(s.file_size as u64) } else { live.request.size.clone().unwrap_or_default() },
     }
 }
 

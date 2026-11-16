@@ -579,6 +579,9 @@ fn find_hdr(text: &str) -> Option<&'static str> {
     match hdr_tier(text) { 3 => Some("HDR10+"), 2 => Some("HDR"), 1 => Some("DV"), _ => None }
 }
 
+/// "4.2 GiB": a size in bytes as the player shows it.
+pub fn file_size_label(bytes: u64) -> String { binary_size(bytes as f64) }
+
 fn binary_size(bytes: f64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes; let mut i = 0;
@@ -604,6 +607,7 @@ static_re!(avc, r"(?i)\b(?:AVC|[HX][ ._-]?264)\b");
 static_re!(episode_mark, r"(?i)\bS\d{1,2}[ ._-]?E\d{1,3}\b|\b\d{1,2}x\d{2,3}\b|\bEP?[ ._-]?\d{2,3}\b");
 static_re!(season_pack, r"(?i)\bS\d{1,2}\b|\bSEASONS?[ ._-]?\d|\bCOMPLETE\b");
 static_re!(html_tag, "<[^>]+>");
+static_re!(multi_audio, r"(?i)\b(?:MULTI|DUAL)(?:[ ._-]?AUDIO)?\b|\bMULTi\b");
 static_re!(size_label, r"(?i)(?:💾\s*)?(\d[\d.,]*)\s*([KMGT]i?B)\b");
 
 /// HDR10+ (3), HDR10/HDR/HLG (2), Dolby Vision alone (1), SDR (0); "DV HDR10" counts as HDR10.
@@ -700,7 +704,7 @@ pub async fn online_subtitles(kind: &str, video_id: &str) -> Result<Vec<OnlineSu
     if list.is_empty() && video_id.starts_with("tt") {
         list = opensubtitles(kind, video_id).await.unwrap_or_default();
     }
-    let preferred = STREAM_LANGUAGE.lock().ok().and_then(|l| l.clone()).map(|k| subtitle_language_of(&k));
+    let preferred = stream_language().map(|k| subtitle_language_of(&k));
     Ok(rank_subtitles(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref()))
 }
 
@@ -783,7 +787,7 @@ fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option<u64> {
 /// then AV1 > H.265 > H.264. Blu-ray re-encodes and Dolby-Vision-only files (usually profile 5,
 /// wrong colours without a DV decoder) come last. Torrents and external links never.
 pub fn play_order(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
-    let language = STREAM_LANGUAGE.lock().ok().and_then(|l| l.clone());
+    let language = stream_language();
     play_order_for(sources, pack_episodes, language.as_deref())
 }
 
@@ -812,21 +816,36 @@ pub fn track_codes(key: &str) -> &'static [&'static str] {
 }
 
 /// Whether a track's language tag is the setting's language ("ita", "it", "it-IT" for Italian).
+/// Also for subtitle add-on codes: "pob" is Portuguese, "spl" Latin-American Spanish.
 pub fn track_in_language(code: &str, key: &str) -> bool {
     let code = code.trim().to_lowercase();
+    if code.is_empty() { return false; }
     let base = code.split(['-', '_']).next().unwrap_or("");
+    let named = crate::engine::language_name(&code);
     track_codes(key).iter().any(|c| *c == code || (!c.contains('-') && *c == base && key != "latino") || (key == "latino" && code.starts_with("es-") && code != "es-es"))
+        || named == subtitle_language_of(key)
+        || (key == "portuguese" && named == "Portuguese (Brazil)")
 }
 
-/// `play_order` with a preferred audio language: sources tagged with it (flag, name or release
-/// tag, multi-audio included) come first, each half in the usual order. English is the usual
-/// original audio and mostly untagged, so it never reorders.
+/// `play_order` with a preferred audio language, in three tiers, each in the usual order:
+/// sources tagged with it (flag, name or release tag, multi-audio included); then untagged or
+/// multi-language ones; then those tagged only with other languages (an Italian-only release
+/// when you chose English). English is mostly untagged, so for English the first two are one.
 pub fn play_order_for(sources: &[Source], pack_episodes: Option<usize>, language: Option<&str>) -> Vec<Source> {
-    let ordered = play_order_any(sources, pack_episodes);
-    let Some(lang) = language.and_then(crate::addons::language).filter(|l| l.key != "english") else { return ordered };
-    let (mut first, rest): (Vec<Source>, Vec<Source>) = ordered.into_iter().partition(|s| lang.matches(&s.label));
-    first.extend(rest);
-    first
+    let mut ordered = play_order_any(sources, pack_episodes);
+    let Some(lang) = language.and_then(crate::addons::language) else { return ordered };
+    let tier = |s: &Source| {
+        if lang.matches(&s.label) { 0 }
+        else if other_language_only(&s.label, lang.key) { 2 }
+        else if lang.key == "english" { 0 } else { 1 }
+    };
+    ordered.sort_by_key(tier);
+    ordered
+}
+
+/// A label tagged with some language other than `key`, and not as a multi-language release.
+fn other_language_only(label: &str, key: &str) -> bool {
+    !multi_audio().is_match(label) && crate::addons::LANGUAGES.iter().any(|l| l.key != key && l.matches(label))
 }
 
 fn play_order_any(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
@@ -1706,6 +1725,10 @@ mod review_tests {
         assert!(!track_in_language("es-ES", "latino"));
         assert!(track_in_language("pt-BR", "portuguese"));
         assert_eq!(track_codes("italian").join(","), "it,ita");
+        // Subtitle add-on codes.
+        assert!(track_in_language("pob", "portuguese"));
+        assert!(track_in_language("spl", "latino"));
+        assert!(track_in_language("nb", "norwegian"));
     }
 
     #[test]
@@ -1832,8 +1855,21 @@ mod tests {
         let list = vec![big.clone(), ita.clone()];
         assert_eq!(play_order_for(&list, None, None)[0].url, big.url);
         assert_eq!(play_order_for(&list, None, Some("italian"))[0].url, ita.url);
-        // English never reorders: original audio is mostly untagged.
+        // English: untagged sources count as English; the ITA ENG release has English too.
         assert_eq!(play_order_for(&list, None, Some("english"))[0].url, big.url);
+        // An Italian-only 4K HDR10+ release goes after a smaller English one when you chose English.
+        let ita_only = source_of("A", &json!({"url":"https://x.invalid/c","title":"Film 2160p WEB-DL HDR10+ ITA\n💾 30 GB\n🇮🇹"}));
+        let eng = source_of("A", &json!({"url":"https://x.invalid/d","title":"Film 1080p WEB-DL\n💾 8 GB"}));
+        let multi = source_of("A", &json!({"url":"https://x.invalid/e","title":"Film 2160p WEB-DL HDR10+ MULTi\n💾 32 GB\n🇮🇹 / 🇫🇷"}));
+        let order: Vec<String> = play_order_for(&[ita_only.clone(), eng.clone()], None, Some("english")).into_iter().map(|s| s.url).collect();
+        assert_eq!(order, [eng.url.clone(), ita_only.url.clone()]);
+        assert_eq!(play_order_for(&[ita_only.clone(), eng.clone()], None, None)[0].url, ita_only.url);
+        // A multi-audio release isn't "Italian only": it keeps its place for English.
+        assert_eq!(play_order_for(&[eng.clone(), multi.clone()], None, Some("english"))[0].url, multi.url);
+        // For Italian: Italian first, then untagged, then other languages only.
+        let fr = source_of("A", &json!({"url":"https://x.invalid/f","title":"Film 2160p REMUX FRENCH\n💾 70 GB\n🇫🇷"}));
+        let order: Vec<String> = play_order_for(&[fr.clone(), eng.clone(), ita_only.clone()], None, Some("italian")).into_iter().map(|s| s.url).collect();
+        assert_eq!(order, [ita_only.url.clone(), eng.url.clone(), fr.url.clone()]);
     }
 
     #[test]
