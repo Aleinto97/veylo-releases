@@ -244,10 +244,14 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         o.set_property("sub-border-color", "#DD000000")?;
         o.set_property("sub-scale", 1.05)?;
         if req.start_ms > 0 { o.set_property("start", format!("+{}", req.start_ms as f64 / 1000.0).as_str())?; }
-        // mpv's list syntax splits on commas, so a header value containing one can't be passed safely.
-        let fields: Vec<String> = req.headers.iter().filter(|(k, v)| !k.contains(',') && !v.contains(','))
-            .map(|(k, v)| format!("{k}: {v}")).collect();
-        if !fields.is_empty() { o.set_property("http-header-fields", fields.join(",").as_str())?; }
+        // Certificates are checked everywhere (mpv's default is not to): Android with mpv-android's CA
+        // bundle below, Linux with the system's, Windows through Schannel and the Windows store.
+        o.set_property("tls-verify", "yes")?;
+        // One header per append: the plain list option splits on commas, which header values may hold.
+        for (k, v) in &req.headers {
+            if k.is_empty() || k.contains([':', '\r', '\n']) || v.contains(['\r', '\n']) { continue; }
+            o.set_property("http-header-fields-append", format!("{k}: {v}").as_str())?;
+        }
         // Windows: mpv draws into its own child window of the app window (video.rs) with Direct3D 11.
         #[cfg(target_os = "windows")]
         {
@@ -276,7 +280,6 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
             o.set_property("force-window", "no")?;
             o.set_property("ao", "audiotrack,opensles")?;
             o.set_property("audio-set-media-role", "yes")?;
-            o.set_property("tls-verify", "yes")?;
             o.set_property("tls-ca-file", ca.as_str())?;
             o.set_property("demuxer-max-bytes", "96MiB")?;
             // The SurfaceView is sized to the picture (video.rs); mpv fills it exactly.
@@ -306,12 +309,17 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let (mut position, mut duration, mut cache_end) = (0.0f64, 0.0f64, 0.0f64);
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
-    let record = |position: f64, duration: f64| if let Some((media, video)) = &live.request.record {
-        if position > 0.0 && duration > 0.0 { backend::record_progress(media.clone(), video.clone(), (position * 1000.0) as i64, (duration * 1000.0) as i64); }
+    // Time actually played since the last report (seeks don't count), so "watched" means watched.
+    let (mut last_tick, mut measured) = (None::<f64>, 0.0f64);
+    let record = |position: f64, duration: f64, measured: &mut f64| if let Some((media, video)) = &live.request.record {
+        if position > 0.0 && duration > 0.0 {
+            backend::record_progress(media.clone(), video.clone(), (position * 1000.0) as i64, (duration * 1000.0) as i64, (*measured * 1000.0) as i64);
+            *measured = 0.0;
+        }
     };
     loop {
         if stop.stopped() && !quitting { quitting = true; live.finish(Finish::Close); }
-        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration); }
+        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured); }
         let Some(event) = mpv.wait_event(0.25) else { continue };
         match event {
             Ok(Event::FileLoaded) => {
@@ -347,6 +355,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
             }
             Ok(Event::PropertyChange { name, change, .. }) => match (name, change) {
                 ("time-pos", PropertyData::Double(v)) => {
+                    if let Some(prev) = last_tick { measured += played_between(prev, v, live.state().speed); }
+                    last_tick = Some(v);
                     position = v;
                     if v > 1.0 { played = true; }
                     live.update(|s| { let moved = (s.position - v).abs() >= 0.25; if moved { s.position = v; s.buffered = (cache_end - v).max(0.0); } moved });
@@ -382,7 +392,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         }
         if live.finish.lock().map(|f| f.is_some()).unwrap_or(false) { quitting = true; }
     }
-    record(position, duration);
+    record(position, duration, &mut measured);
     if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
     let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
     let _ = events.send(PlayerEvent::Finished {
@@ -396,6 +406,13 @@ fn refresh_tracks(live: &Live) {
     let tracks = parse_tracks(&json);
     let dv = dv_profile(&json);
     live.update(|s| { let c = s.tracks != tracks || s.dv_profile != dv; s.tracks = tracks; s.dv_profile = dv; c });
+}
+
+/// Seconds of playback between two time-pos reports: a small step forward is watching, a jump
+/// (a seek, either way) is not.
+pub fn played_between(prev: f64, now: f64, speed: f64) -> f64 {
+    let step = now - prev;
+    if step > 0.0 && step <= 2.0 * speed.max(1.0) { step } else { 0.0 }
 }
 
 /// The selected video track's Dolby Vision profile, 0 without one.
@@ -509,6 +526,14 @@ pub fn facts(live: &Live, s: &State) -> Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_small_forward_steps_count_as_watching() {
+        assert_eq!(super::played_between(10.0, 10.5, 1.0), 0.5);
+        assert_eq!(super::played_between(10.0, 20.0, 1.0), 0.0); // a +10 s seek
+        assert_eq!(super::played_between(20.0, 10.0, 1.0), 0.0); // back
+        assert_eq!(super::played_between(10.0, 13.0, 2.0), 3.0); // fast playback
+        assert_eq!(super::played_between(10.0, 10.0, 1.0), 0.0);
+    }
     #[test]
     fn hdr_is_named_by_what_reaches_the_panel() {
         let hdr = Screen { hdr10: true, hlg: true, hdr10_plus: true, dolby_vision: false };

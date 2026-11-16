@@ -1481,3 +1481,86 @@ async fn large_metadata_replacement_fits_the_resulting_row_budget() {
     let oversized = core.execute(request(&"C".repeat(1_100_000))).await.unwrap();
     assert_eq!(oversized["item"]["description"], "B".repeat(600_000));
 }
+
+#[tokio::test]
+async fn measured_time_adds_up_across_sessions_and_unmarking_resets_the_total() {
+    let d = Data::new();
+    let core = d.core();
+    let a = "https://a.test/manifest.json";
+    let film = |position: i64, add: i64| json!({"op":"progress","type":"movie","id":"tt9","addon_url":a,"position_ms":position,"duration_ms":100000,"watched_add_ms":add,"meta":{"name":"F"}});
+    // Two sittings of 45%: neither alone counts, together they do once the end is reached.
+    let first = core.execute(film(45000, 45000)).await.unwrap();
+    assert_eq!(first["item"]["watched"], false);
+    core.execute(film(50000, 0)).await.unwrap();
+    let done = core.execute(film(95000, 45000)).await.unwrap();
+    assert_eq!(done["item"]["watched_ms"], 90000);
+    assert_eq!(done["item"]["watched"], true);
+    // A jump to the end with little playback is not watching.
+    let skip = core.execute(json!({"op":"progress","type":"movie","id":"tt8","addon_url":a,"position_ms":99000,"duration_ms":100000,"watched_add_ms":3000})).await.unwrap();
+    assert_eq!(skip["item"]["watched"], false);
+    // Never more than the whole video.
+    let big = core.execute(json!({"op":"progress","type":"movie","id":"tt7","addon_url":a,"position_ms":10,"duration_ms":1000,"watched_add_ms":999999})).await.unwrap();
+    assert_eq!(big["item"]["watched_ms"], 1000);
+
+    let ep = |video: &str| json!({"op":"progress","type":"series","id":"tt5","video_id":video,"addon_url":a,"position_ms":95000,"duration_ms":100000,"watched_add_ms":90000});
+    core.execute(ep("tt5:1:1")).await.unwrap();
+    core.execute(ep("tt5:1:2")).await.unwrap();
+    let watched = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt5"}))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = watched["video_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["tt5:1:1", "tt5:1:2"]);
+    let after = core.execute(json!({"op":"mark_videos","type":"series","id":"tt5","addon_url":a,"watched":false,"video_ids":["tt5:1:1"]})).await.unwrap();
+    assert_eq!(after["item"]["watched_ms"], 90000);
+    let watched = core
+        .execute(json!({"op":"watched_videos","type":"series","id":"tt5"}))
+        .await
+        .unwrap();
+    assert_eq!(watched["video_ids"], json!(["tt5:1:2"]));
+
+    let history = core.execute(json!({"op":"history"})).await.unwrap();
+    let items = history["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert!(items
+        .iter()
+        .all(|i| i["seen"].as_i64().unwrap() > 0 && i["type"].is_string()));
+}
+
+#[tokio::test]
+async fn removing_an_addon_drops_its_cached_responses() {
+    let s = Server::new(|p| {
+        if p.contains("manifest.json") {
+            Reply::ok(manifest())
+        } else {
+            Reply::ok(json!({"metas":[{"id":"tt1","type":"movie","name":"A"}]}))
+        }
+    });
+    let d = Data::new();
+    let core = d.core();
+    empty(&core).await;
+    install(&core, &s).await;
+    core.execute(json!({"op":"catalog","addon_url":s.url(),"type":"movie","id":"top"}))
+        .await
+        .unwrap();
+    let cached = |core: Core| async move {
+        core.execute(json!({"op":"diagnostics"})).await.unwrap()["cache_entries"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(cached(core.clone()).await, 1);
+    core.execute(json!({"op":"remove_addon","url":s.url()}))
+        .await
+        .unwrap();
+    assert_eq!(cached(core.clone()).await, 0);
+    assert_eq!(
+        core.execute(json!({"op":"addons"})).await.unwrap()["addons"],
+        json!([])
+    );
+}

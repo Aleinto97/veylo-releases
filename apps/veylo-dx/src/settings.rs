@@ -39,7 +39,7 @@ pub fn SettingsPage() -> Element {
         spawn(async move {
             match addons::check_rd_key(key.clone()).await {
                 Ok(account) => {
-                    let next = backend::Settings { rd_key: Some(key), ..backend::load_settings() };
+                    let next = backend::Settings { rd_key: Some(key), rd_key_removed: false, ..backend::load_settings() };
                     backend::save_settings(&next);
                     settings.set(next);
                     rd_account.set(Some(account));
@@ -52,13 +52,13 @@ pub fn SettingsPage() -> Element {
         });
     };
     let mut choose_language = move |key: String| {
-        let next = backend::Settings { stream_language: Some(key).filter(|k| addons::language(k).is_some()), ..settings() };
+        let next = backend::Settings { stream_language: Some(key).filter(|k| addons::language(k).is_some()), ..backend::load_settings() };
         backend::save_settings(&next);
         settings.set(next);
         run("language".into(), Box::pin(async { addons::reconfigure().await }));
     };
     let mut rounds = move |n: u32| {
-        let next = backend::Settings { picks_rounds: n, ..settings() };
+        let next = backend::Settings { picks_rounds: n, ..backend::load_settings() };
         backend::save_settings(&next);
         settings.set(next);
     };
@@ -74,7 +74,7 @@ pub fn SettingsPage() -> Element {
                     div { class: "segmented glass", role: "radiogroup", aria_label: "Poster source",
                         for (on, name) in [(true, "BetterPosters"), (false, "Add-on")] {
                             button { class: if settings().better_posters == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().better_posters == on}",
-                                onclick: move |_| { let next = backend::Settings { better_posters: on, ..settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
+                                onclick: move |_| { let next = backend::Settings { better_posters: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
                         }
                     }
                 }
@@ -86,13 +86,13 @@ pub fn SettingsPage() -> Element {
                     div { class: "setting-copy", span { class: "setting-name", "TMDB" }
                         span { class: "dim setting-about", if settings().tmdb_key.is_some() { "Connected: text-free backdrops, logos and episode stills" } else { "Add a free TMDB key for backdrops, logos and episode stills" } } }
                     if settings().tmdb_key.is_some() {
-                        button { class: "pill glass", onclick: move |_| { let next = backend::Settings { tmdb_key: None, ..settings() }; backend::save_settings(&next); settings.set(next); }, icons::Trash {} span { "Remove key" } }
+                        button { class: "pill glass", onclick: move |_| { let next = backend::Settings { tmdb_key: None, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, icons::Trash {} span { "Remove key" } }
                     } else {
                         GetKey { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
                         // Masked while typing; saved on Enter.
                         input { class: "key-field", r#type: "password", placeholder: "TMDB API key", aria_label: "TMDB API key", autocomplete: "off",
                             onkeydown: move |e| { e.stop_propagation(); },
-                            onchange: move |e| { let v = e.value().trim().to_owned(); if !v.is_empty() { let next = backend::Settings { tmdb_key: Some(v), ..settings() }; backend::save_settings(&next); settings.set(next); } } }
+                            onchange: move |e| { let v = e.value().trim().to_owned(); if !v.is_empty() { let next = backend::Settings { tmdb_key: Some(v), ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); } } }
                     }
                 }
             }
@@ -124,7 +124,10 @@ pub fn SettingsPage() -> Element {
                             else if settings().rd_key.is_some() { "Connected. Every add-on below uses this key." }
                             else { "Paste your API token once; every add-on below uses it." } } }
                     if settings().rd_key.is_some() {
-                        button { class: "pill glass", disabled: busy().is_some(), onclick: move |_| { let next = backend::Settings { rd_key: None, ..settings() }; backend::save_settings(&next); settings.set(next); rd_account.set(None); }, icons::Trash {} span { "Remove key" } }
+                        button { class: "pill glass", disabled: busy().is_some(), title: "Removes the key and the add-ons Veylo set up with it",
+                            onclick: move |_| { rd_account.set(None); run("key".into(), Box::pin(async move {
+                                let done = addons::remove_rd_key().await; settings.set(backend::load_settings()); done })); },
+                            icons::Trash {} span { "Remove key" } }
                     } else {
                         GetKey { url: addons::RD_KEY_PAGE, label: "Get your Real-Debrid key" }
                         input { class: "key-field", r#type: "password", placeholder: "Real-Debrid API token", aria_label: "Real-Debrid API token", autocomplete: "off",

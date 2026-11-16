@@ -12,7 +12,6 @@ use crate::backend::{self, exec, on_runtime, s};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read;
 
 const TORRENTIO: &str = "https://torrentio.strem.fun";
 const AIOSTREAMS: &str = "https://aiostreams.elfhosted.com";
@@ -251,7 +250,8 @@ fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
 
 fn random_password() -> Result<String> {
     let mut bytes = [0u8; 18];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    // The OS generator on every platform (Windows has no /dev/urandom).
+    getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("Couldn't make a password for AIOStreams"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -301,7 +301,14 @@ pub async fn install(c: Curated) -> Result<()> {
     let previous = store.managed.get(c.id()).cloned();
     let (url, record) = match c {
         Curated::Torrentio => { let url = torrentio_url(&key, language); (url.clone(), json!({"url": url})) }
-        Curated::AioStreams => aiostreams_link(&key, language, previous.as_ref()).await?,
+        Curated::AioStreams => {
+            let link = aiostreams_link(&key, language, previous.as_ref()).await?;
+            // Keep the login before installing: if the install fails, a retry updates this
+            // configuration instead of making another one on the server.
+            store.managed.insert(c.id().into(), link.1.clone());
+            save(&store);
+            link
+        }
     };
     let addon = exec(json!({"op":"install_addon","url":url})).await.map_err(|_| anyhow::anyhow!("{} couldn't be installed. Check your connection and try again.", c.name()))?;
     let new_url = s(&addon, "manifest_url");
@@ -347,6 +354,19 @@ pub async fn reconfigure() -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+/// "Remove key": forget the Real-Debrid key, and take out the add-ons Veylo set up with it
+/// (their links carry the key). Add-ons you installed yourself stay.
+pub async fn remove_rd_key() -> Result<()> {
+    let settings = backend::Settings { rd_key: None, rd_key_removed: true, ..backend::load_settings() };
+    backend::save_settings(&settings);
+    let ov = overview().await;
+    let mut first_error = None;
+    for row in ov.curated.into_iter().filter_map(|(_, row)| row) {
+        if let Err(e) = exec(json!({"op":"remove_addon","url":row.url})).await { first_error.get_or_insert(e); }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Real-Debrid account check for a pasted key: "Premium until 2027-03-12".
 pub async fn check_rd_key(key: String) -> Result<String> {
     on_runtime(async move {
@@ -368,7 +388,8 @@ pub async fn check_rd_key(key: String) -> Result<String> {
 pub async fn startup() -> usize {
     let mut settings = backend::load_settings();
     let addons = installed().await;
-    if settings.rd_key.is_none() {
+    // A key you removed in Settings is not taken back from an add-on's link.
+    if settings.rd_key.is_none() && !settings.rd_key_removed {
         let key = addons.iter().map(|a| s(a, "manifest_url")).filter(|u| host_of(u) == Curated::Torrentio.host())
             .find_map(|u| u.split(['/', '|']).find_map(|p| p.strip_prefix("realdebrid=").map(str::to_owned)))
             .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric()));
