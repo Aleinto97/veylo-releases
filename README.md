@@ -5,7 +5,7 @@
 A quiet, all-Rust media client for Android tablets and the Linux and Windows desktop, built with [Dioxus](https://dioxuslabs.com).
 
 - **Home**: an artwork-lit marquee, continue watching and catalogues.
-- **Picks**: a two-card duel that learns your taste from metadata and local GLiClass synopsis traits, separates tonight’s mood from lasting preferences, and hides what you have watched.
+- **Picks**: a two-card duel that learns your taste from metadata and local synopsis embeddings, separates tonight’s mood from lasting preferences, and hides what you have watched.
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
   under the page through a bridge per OS (`video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
@@ -79,34 +79,34 @@ locally (`VEYLO_PUBLISH=0` builds into `dist/` without publishing). It refuses t
 settings or a local path is inside the files.
 
 Picks inference runs entirely on the CPU, in Rust through ONNX Runtime 1.22.0. Releases bundle
-the pinned INT8 GLiClass-small-v1.0 model, tokenizer, native runtime and licences; the APK needs
+the pinned INT8 bge-small-en-v1.5 model (MIT), tokenizer, native runtime and licences; the APK needs
 no model download or Python. Android extracts the model once into app-private storage. The
-model is about 174 MB before APK compression, and the app needs extra private storage for the
+model is about 34 MB before APK compression, and the app needs extra private storage for the
 extracted copy. Linux and Windows load `picks-ai/` beside the executable. Preserve that directory
 when distributing a desktop build. The Windows bundle includes its app-local VC++ runtime DLLs.
 
-Picks enriches available synopses with TMDB movie/TV keywords using the existing Settings key,
-and up to four cleaned TVmaze episode summaries sampled across each series. TVmaze uses IMDb
-lookup, or a unique exact title/year match when no IMDb ID exists, and needs no key; episode data is credited to TVmaze under
-CC BY-SA. Enrichment runs in the background, with per-title request deduplication, rate limiting
+Picks enriches available synopses with TMDB movie/TV keywords using the existing Settings key.
+Enrichment runs in the background, with per-title request deduplication, rate limiting
 and a bounded `picks-metadata-v1.json` cache (1,024 titles). Successful results refresh after seven
 days; missing results after one day; failures retry after five minutes while keeping stale data.
-No API key or authenticated request is written to these caches. GLiClass still runs entirely locally.
-Its 384-token input reserves space for every evidence section and every label, so keywords and
-sampled summaries survive long synopses. Changed enrichment invalidates the corresponding
-prediction; older learned taste remains compatible.
+No API key or authenticated request is written to these caches. The model still runs entirely locally.
+Its 256-token input is the title, year, synopsis and keywords (genres are separate taste features);
+the name and keywords keep a reserved share so a long synopsis never crowds them out.
 
-Classification uses this enriched text and 18 mood/theme labels, cached locally by
-model/label version and metadata hash (`picks-traits-v1.json`, at most 2,048 entries). Scores are
-relative affinities, not calibrated probabilities. Titles without a usable synopsis keep metadata
-ranking. An inference failure shows a status message and preserves the duel with metadata ranking.
-After a choice, challengers first follow the kept title’s strongest clear AI mood (or topic) when a confident
-match is available; catalogue order and long-term taste rank alternatives within that direction.
-If matches run out, Picks uses the closest classified alternatives, then metadata when needed.
+Each title becomes a 384-dimension embedding, cached locally by model version and input hash
+(`picks-embeddings-v1.json`, at most 1,024 entries). Changed enrichment embeds the title again. Titles
+without a usable synopsis keep metadata ranking. An inference failure shows a status message and
+preserves the duel with metadata ranking.
+After a choice, every challenger is ranked by how much closer than the other candidates its embedding is
+to the kept title, together with catalogue order and long-term taste; near-ties are drawn at random so
+duels differ. Nothing is filtered by a fixed label list. On 593 TMDB top-rated titles, a title's five nearest
+neighbours share genre at 0.42 (random 0.21, the earlier 18-label classifier 0.40), and TMDB's own
+recommendations for it appear among its ten nearest three times as often as with that classifier.
 A duel loss is a relative preference, not a permanent dislike. Shared features cancel during
-learning; session preferences are saved with the duel and cleared for a fresh duel, while smaller
-updates persist in `picks-taste.json`. Old profiles and saved duels remain readable. Choosing
-"Start over" resets learned preferences; it does not remove the model or title-trait cache.
+learning; the learned direction is a sum of embedding differences between kept and passed titles.
+Session preferences are saved with the duel and cleared for a fresh duel, while smaller
+updates persist in `picks-taste.json`. Genre, type and decade preferences from older profiles remain readable.
+"Start over" resets learned preferences; it does not remove the model or embedding cache.
 
 Duel cards and final picks have Play/Resume controls. New series begin at the first released
 regular episode; existing progress resumes the saved episode and position, or continues after

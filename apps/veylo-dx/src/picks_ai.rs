@@ -1,97 +1,100 @@
-//! Local GLiClass title traits. Optional public metadata is fetched separately in the background;
-//! inference never calls an AI service or exposes provider URLs or credentials.
+//! Local title embeddings (bge-small-en-v1.5). Optional public metadata is fetched separately in
+//! the background; inference never calls an AI service or exposes provider URLs or credentials.
 //! One bounded CPU session is shared by background checks on every platform.
 use crate::{backend::{self, Media}, picks_metadata};
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, ensure, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use ort::{session::Session, value::Tensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::{Mutex, OnceLock, RwLock}};
+use std::{collections::{BTreeMap, VecDeque}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock, RwLock}, time::Duration};
 use tokenizers::Tokenizer;
 
-pub const MODEL_VERSION: &str = "gliclass-21edefaf-int8-enriched-v2";
-/// Input enrichment changes cache identity, but the label vocabulary and learned weights stay
-/// compatible with the first local classifier release.
-pub const TRAITS_VERSION: &str = "gliclass-21edefaf-int8-traits-v1";
-// Changing labels, prompt construction or normalization requires a new cache version.
-pub const LABELS: [&str; 18] = [
-    "humor and comedy", "suspense and tension", "horror and fear", "romance and love",
-    "family relationships", "friendship", "politics and power", "crime and investigation",
-    "science fiction", "fantasy and magic", "action and adventure", "war and conflict",
-    "hope and inspiration", "tragedy and grief", "psychological drama", "survival",
-    "a lighthearted comforting story", "a dark disturbing story",
-];
-const MAX_ENTRIES: usize = 2048;
-type Scores = Vec<f32>;
-static CACHE: OnceLock<RwLock<BTreeMap<String, Scores>>> = OnceLock::new();
-static CLASSIFIER: Mutex<Option<Result<Classifier, String>>> = Mutex::new(None);
+// Changing the model, input construction or normalization requires a new version.
+pub const MODEL_VERSION: &str = "bge-small-en-v1.5-int8-ea104dac-v1";
+/// Learned taste vectors live in this embedding space; a new space invalidates them.
+pub const SPACE_VERSION: &str = "bge-small-en-v1.5-v1";
+pub const DIM: usize = 384;
+const MAX_TOKENS: usize = 256;
+const HEAD_TOKENS: usize = 32;
+const KEYWORD_TOKENS: usize = 64;
+const MAX_ENTRIES: usize = 1024;
+const SAVE_EVERY: Duration = Duration::from_secs(10);
+const CACHE_FILE: &str = "picks-embeddings-v1.json";
+
+/// Bounded first-in-first-out store; `order` is persisted so eviction survives restarts.
+#[derive(Default)]
+struct Cache { map: BTreeMap<String, Vec<f32>>, order: VecDeque<String> }
+impl Cache {
+    fn get(&self, key: &str) -> Option<&Vec<f32>> { self.map.get(key) }
+    fn contains_key(&self, key: &str) -> bool { self.map.contains_key(key) }
+    fn insert(&mut self, key: String, vector: Vec<f32>) {
+        if self.map.insert(key.clone(), vector).is_none() { self.order.push_back(key); }
+        while self.map.len() > MAX_ENTRIES {
+            let Some(oldest) = self.order.pop_front() else { break };
+            self.map.remove(&oldest);
+        }
+    }
+    fn encode(&self) -> Value {
+        let entries: BTreeMap<&String, String> = self.map.iter().map(|(k, v)| (k, pack(v))).collect();
+        json!({"version": MODEL_VERSION, "entries": entries, "order": self.order})
+    }
+}
+/// Unit vectors have components in [-1, 1]; 16 bits keep cosine error far below ranking noise.
+fn pack(vector: &[f32]) -> String {
+    let bytes: Vec<u8> = vector.iter().flat_map(|x| ((x.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect();
+    STANDARD.encode(bytes)
+}
+fn unpack(text: &str) -> Option<Vec<f32>> {
+    let bytes = STANDARD.decode(text).ok()?;
+    (bytes.len() == DIM * 2).then(|| bytes.chunks_exact(2).map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32767.0).collect())
+}
+
+static CACHE: OnceLock<RwLock<Cache>> = OnceLock::new();
+static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
+static EMBEDDER: Mutex<Option<Result<Embedder, String>>> = Mutex::new(None);
 static FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
-fn cache() -> &'static RwLock<BTreeMap<String, Scores>> { CACHE.get_or_init(Default::default) }
+fn cache() -> &'static RwLock<Cache> { CACHE.get_or_init(Default::default) }
 
-/// Hash only inference input; never put a provider URL, token or raw metadata in this cache.
-fn sections(m: &Media, extra: &picks_metadata::Extra) -> Vec<String> {
-    let description = picks_metadata::clean(&m.description,4000);
-    if description.chars().count() < 30 && extra.keywords.is_empty() && extra.episodes.is_empty() { return Vec::new(); }
-    let genres = m.genres.iter().take(8).map(|g| picks_metadata::clean(g,40)).collect::<Vec<_>>().join(", ");
-    let mut parts = vec![format!("{} ({}). {}.",picks_metadata::clean(&m.name,256),picks_metadata::clean(&m.year,64),genres)];
-    if !description.is_empty() { parts.push(format!("Synopsis: {description}")); }
-    if !extra.keywords.is_empty() { parts.push(format!("Keywords: {}.",extra.keywords.join(", "))); }
-    for episode in &extra.episodes { parts.push(format!("Episode summary: {episode}")); }
-    parts
+/// The text a title is embedded from. No genres: they are separate taste features, and leaving
+/// them out lets synopsis and keywords decide the similarity on their own.
+struct Parts { head: String, synopsis: String, keywords: String }
+impl Parts {
+    fn new(m: &Media, extra: &picks_metadata::Extra) -> Option<Self> {
+        let synopsis = picks_metadata::clean(&m.description, 4000);
+        if synopsis.chars().count() < 30 && extra.keywords.is_empty() { return None; }
+        let name = picks_metadata::clean(&m.name, 256);
+        let year = picks_metadata::clean(&m.year, 64);
+        let head = if year.is_empty() { format!("{name}.") } else { format!("{name} ({year}).") };
+        let keywords = if extra.keywords.is_empty() { String::new() } else { format!("Keywords: {}.", extra.keywords.join(", ")) };
+        Some(Self { head, synopsis, keywords })
+    }
+    /// Hash only inference input; never put a provider URL, token or raw metadata in this cache.
+    fn key(&self) -> String {
+        let input = format!("{}\n{}\n{}", self.head, self.synopsis, self.keywords);
+        format!("{MODEL_VERSION}-{:x}", Sha256::digest(input.as_bytes()))
+    }
 }
-fn text(m: &Media) -> Option<String> {
-    let parts = sections(m, &picks_metadata::cached(m));
-    (!parts.is_empty()).then(|| parts.join("\n"))
-}
+fn parts(m: &Media) -> Option<Parts> { Parts::new(m, &picks_metadata::cached(m)) }
 
-fn key(input: &str) -> String {
-    format!("{MODEL_VERSION}-{:x}", Sha256::digest(input.as_bytes()))
-}
-pub fn scores(m: &Media) -> Option<Scores> {
-    let input = text(m)?;
+/// The title's embedding, if computed. While refreshed enrichment is still being embedded, the
+/// vector from the unenriched text keeps serving.
+pub fn embedding(m: &Media) -> Option<Vec<f32>> {
     let cache = cache().read().ok()?;
-    cache.get(&key(&input)).cloned().or_else(|| {
-        // Continue using a base prediction while refreshed enrichment is being classified.
-        let base = sections(m,&picks_metadata::Extra::default());
-        cache.get(&key(&base.join("\n"))).cloned()
+    let full = parts(m)?;
+    cache.get(&full.key()).cloned().or_else(|| {
+        Parts::new(m, &picks_metadata::Extra::default()).and_then(|base| cache.get(&base.key()).cloned())
     })
 }
-/// How closely a challenger follows the title just kept. Genre/type are deliberately absent:
-/// two animated series can have opposite moods despite sharing most catalogue metadata.
-pub struct TraitMatch {
-    pub similarity: f64,
-    pub follows: bool,
-}
-pub fn match_traits(kept: &Media, candidate: &Media) -> Option<TraitMatch> {
-    match_scores(&scores(kept)?, &scores(candidate)?)
-}
-fn match_scores(kept: &[f32], candidate: &[f32]) -> Option<TraitMatch> {
-    if kept.len() != LABELS.len() || candidate.len() != LABELS.len() { return None; }
-    // Mood takes precedence over topic: sci-fi and dark can be nearly tied, and selecting
-    // the numerically highest of all labels would switch directions across CPU kernels.
-    const MOODS: [usize; 5] = [0, 1, 2, 16, 17];
-    let mood = MOODS.into_iter().max_by(|a, b| kept[*a].total_cmp(&kept[*b]))?;
-    let mood_total: f32 = MOODS.iter().map(|i| kept[*i]).sum();
-    let clear_mood = kept[mood] >= 0.07 && kept[mood] >= mood_total * 0.3;
-    let dominant = if clear_mood { mood } else { (0..kept.len()).max_by(|a, b| kept[*a].total_cmp(&kept[*b]))? };
-    let candidate_max = if clear_mood { MOODS.iter().map(|i| candidate[*i]).fold(0.0f32, f32::max) }
-        else { candidate.iter().copied().fold(0.0f32, f32::max) };
-    let dot: f64 = kept.iter().zip(candidate).map(|(a,b)| f64::from(*a) * f64::from(*b)).sum();
-    let norm = (kept.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()
-        * candidate.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()).sqrt();
-    if norm <= 0.0 { return None; }
-    // Only anchor to a distinctive trait, never an almost-uniform classifier output. Require
-    // the same trait to be prominent in the challenger, relative to its own strongest trait.
-    let follows = (clear_mood || kept[dominant] >= 2.0 / LABELS.len() as f32)
-        && candidate[dominant] >= if clear_mood { 0.07 } else { 2.0 / LABELS.len() as f32 }
-        && candidate[dominant] >= candidate_max * 0.65;
-    Some(TraitMatch { similarity: (dot / norm).clamp(0.0, 1.0), follows })
+/// Both vectors are unit length, so the dot product is the cosine.
+pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum()
 }
 
 #[cfg(test)]
-pub(crate) fn cache_test_scores(media: &Media, values: Vec<f32>) {
-    cache().write().unwrap().insert(key(&text(media).unwrap()), values);
+pub(crate) fn cache_test_embedding(media: &Media, vector: Vec<f32>) {
+    cache().write().unwrap().insert(parts(media).unwrap().key(), vector);
 }
 
 pub fn failed() -> bool { FAILURE.lock().map(|f| f.is_some()).unwrap_or(true) }
@@ -103,21 +106,20 @@ fn paths() -> Result<(PathBuf, PathBuf)> {
         let target = if cfg!(target_os = "android") { "android-arm64" } else if cfg!(windows) { "windows-x64" } else if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x64" };
         let runtime = if std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").is_some() { dir.join("libonnxruntime.so") }
             else { Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai").join(target).join(if cfg!(windows) { "onnxruntime.dll" } else { "libonnxruntime.so" }) };
-        return Ok((dir, runtime));
+        Ok((dir, runtime))
     }
     #[cfg(all(not(test), target_os = "android"))]
     { crate::android::picks_ai_paths() }
     #[cfg(all(not(test), not(target_os = "android")))]
     {
-        let dir = std::env::current_exe()?.parent().context("Executable directory")?.join("picks-ai");
+        let dir = std::env::current_exe()?.parent().ok_or_else(|| anyhow!("Executable directory"))?.join("picks-ai");
         let library = if cfg!(windows) { "onnxruntime.dll" } else { "libonnxruntime.so" };
         Ok((dir.clone(), dir.join("runtime").join(library)))
     }
 }
 
-
-struct Classifier { session: Session, tokenizer: Tokenizer }
-impl Classifier {
+struct Embedder { session: Session, tokenizer: Tokenizer, cls: i64, sep: i64 }
+impl Embedder {
     fn open(dir: &Path, runtime: &Path) -> Result<Self> {
         ensure!(runtime.is_file(), "Bundled ONNX Runtime is missing");
         #[cfg(windows)]
@@ -135,50 +137,50 @@ impl Classifier {
         let session = Session::builder()?.with_intra_threads(2)?.with_inter_threads(1)?
             .commit_from_file(dir.join("model.onnx"))?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("Tokenizer: {e}"))?;
-        Ok(Self { session, tokenizer })
+        let special = |token: &str| tokenizer.token_to_id(token).map(i64::from).ok_or_else(|| anyhow!("Tokenizer lacks {token}"));
+        let (cls, sep) = (special("[CLS]")?, special("[SEP]")?);
+        Ok(Self { session, tokenizer, cls, sep })
     }
-    #[cfg(test)]
-    fn classify(&mut self, input: &str) -> Result<Scores> {
-        self.classify_sections(&[input.to_owned()])
+    fn encode(&self, text: &str) -> Result<Vec<i64>> {
+        if text.is_empty() { return Ok(Vec::new()); }
+        self.tokenizer.encode(text, false).map(|e| e.get_ids().iter().map(|id| i64::from(*id)).collect())
+            .map_err(|e| anyhow!("Tokenization: {e}"))
     }
-    fn input_ids(&self, parts: &[String]) -> Result<Vec<i64>> {
-        // Reserve all label markers, then share the remaining budget between synopsis,
-        // keywords and sampled episodes. A long synopsis cannot truncate the new evidence.
-        let suffix = LABELS.iter().map(|label| format!("<<LABEL>>{label}")).collect::<String>() + "<<SEP>>";
-        let suffix = self.tokenizer.encode(suffix,false).map_err(|e| anyhow!("Tokenization: {e}"))?;
-        let budget = 384usize.saturating_sub(suffix.len()+2);
-        let encoded: Vec<Vec<i64>> = parts.iter().map(|part| {
-            let safe = part.replace("<<LABEL>>"," ").replace("<<SEP>>"," ");
-            self.tokenizer.encode(safe,false).map(|e| e.get_ids().iter().map(|id| i64::from(*id)).collect())
-                .map_err(|e| anyhow!("Tokenization: {e}"))
-        }).collect::<Result<_>>()?;
-        let mut lengths = vec![0;encoded.len()];
-        let mut left = budget;
-        while left > 0 {
-            let before = left;
-            for (part, len) in encoded.iter().zip(&mut lengths) {
-                if left > 0 && *len < part.len() { *len += 1; left -= 1; }
-            }
-            if left == before { break; }
-        }
-        let mut ids = vec![1]; // DeBERTa [CLS]
-        for (part,len) in encoded.iter().zip(lengths) { ids.extend(part.iter().take(len)); }
-        ids.extend(suffix.get_ids().iter().map(|id| i64::from(*id)));
-        ids.push(2); // DeBERTa [SEP]
-        ensure!(ids.iter().filter(|id| **id == 128001).count() == LABELS.len(), "Invalid GLiClass label markers");
+    /// The name and keywords keep a reserved share, so a long synopsis never crowds them out.
+    fn input_ids(&self, parts: &Parts) -> Result<Vec<i64>> {
+        let head = self.encode(&parts.head)?;
+        let keywords = self.encode(&parts.keywords)?;
+        let synopsis = self.encode(&parts.synopsis)?;
+        let head = &head[..head.len().min(HEAD_TOKENS)];
+        let keywords = &keywords[..keywords.len().min(KEYWORD_TOKENS)];
+        let room = (MAX_TOKENS - 2).saturating_sub(head.len() + keywords.len());
+        let mut ids = vec![self.cls];
+        ids.extend(head);
+        ids.extend(&synopsis[..synopsis.len().min(room)]);
+        ids.extend(keywords);
+        ids.push(self.sep);
         Ok(ids)
     }
-    fn classify_sections(&mut self, parts: &[String]) -> Result<Scores> {
+    fn embed(&mut self, parts: &Parts) -> Result<Vec<f32>> {
         let ids = self.input_ids(parts)?;
         let len = ids.len();
         let outputs = self.session.run(ort::inputs![
             "input_ids" => Tensor::from_array(([1, len], ids))?,
             "attention_mask" => Tensor::from_array(([1, len], vec![1i64; len]))?,
+            "token_type_ids" => Tensor::from_array(([1, len], vec![0i64; len]))?,
         ])?;
-        let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>()?;
-        ensure!(shape.as_ref() == [1, LABELS.len() as i64], "Unexpected GLiClass output shape");
-        relative_scores(logits)
+        let (shape, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+        ensure!(shape.as_ref() == [1, len as i64, DIM as i64], "Unexpected embedding output shape");
+        // The first ([CLS]) token is the sentence embedding for bge models.
+        unit(&hidden[..DIM])
     }
+}
+
+fn unit(vector: &[f32]) -> Result<Vec<f32>> {
+    ensure!(vector.len() == DIM && vector.iter().all(|x| x.is_finite()), "Invalid embedding");
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    ensure!(norm > 0.0, "Empty embedding");
+    Ok(vector.iter().map(|x| x / norm).collect())
 }
 
 /// ort keeps its Environment in a Rust static, which is not dropped at process exit. On
@@ -190,10 +192,10 @@ fn register_android_shutdown() {
     REGISTERED.get_or_init(|| {
         extern "C" fn shutdown() {
             use ort::AsPointer;
-            if let Ok(mut state) = CLASSIFIER.lock() {
+            if let Ok(mut state) = EMBEDDER.lock() {
                 // Block queued workers from creating another session during process shutdown.
-                let classifier = state.replace(Err("Local inference is shutting down".into()));
-                drop(classifier);
+                let embedder = state.replace(Err("Local inference is shutting down".into()));
+                drop(embedder);
                 if let Ok(environment) = ort::environment::get_environment() {
                     // No session survives this point. G_ENV itself never drops, so this is
                     // the only ReleaseEnv; the process exits immediately after atexit hooks.
@@ -205,116 +207,140 @@ fn register_android_shutdown() {
     });
 }
 
-/// Relative affinities, not calibrated independent probabilities. Softmax at temperature 2
-/// retains distinctions that the shipped model's large logits lose under plain sigmoid.
-fn relative_scores(logits: &[f32]) -> Result<Scores> {
-    ensure!(logits.len() == LABELS.len() && logits.iter().all(|x| x.is_finite()), "Invalid GLiClass scores");
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut scores: Vec<f32> = logits.iter().map(|x| ((x - max) / 2.0).exp()).collect();
-    let sum: f32 = scores.iter().sum();
-    for score in &mut scores { *score /= sum; }
-    Ok(scores)
+fn read_cache(path: &Path) -> Cache {
+    let value: Value = std::fs::read_to_string(path).ok().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+    if value["version"] != MODEL_VERSION { return Cache::default(); }
+    let mut entries: BTreeMap<String, Vec<f32>> = value["entries"].as_object().into_iter().flatten()
+        .filter_map(|(key, value)| Some((key.clone(), unpack(value.as_str()?)?))).collect();
+    let mut cache = Cache::default();
+    // Saved insertion order first (oldest first); entries without it follow in key order.
+    for key in value["order"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if let Some(vector) = entries.remove(key) { cache.insert(key.to_owned(), vector); }
+    }
+    for (key, vector) in entries { cache.insert(key, vector); }
+    cache
 }
 
-fn read_cache(path: &Path) -> BTreeMap<String, Scores> {
-    let value: Value = std::fs::read_to_string(path).ok().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-    if value["version"] != MODEL_VERSION { return BTreeMap::new(); }
-    value["entries"].as_object().into_iter().flatten().take(MAX_ENTRIES).filter_map(|(key, value)| {
-        let scores: Vec<f32> = value.as_array()?.iter().map(|x| x.as_f64().map(|x| x as f32)).collect::<Option<_>>()?;
-        let valid = scores.len() == LABELS.len() && scores.iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x));
-        valid.then(|| (key.clone(), scores))
-    }).collect()
+/// Rewriting the whole file per title is costly on flash, so one delayed write covers every
+/// title embedded meanwhile. A failed save must not disable inference.
+fn save_soon(path: PathBuf) {
+    if SAVE_PENDING.swap(true, Ordering::AcqRel) { return; }
+    std::thread::spawn(move || {
+        std::thread::sleep(SAVE_EVERY);
+        SAVE_PENDING.store(false, Ordering::Release);
+        let serialized = cache().read().map(|c| c.encode().to_string());
+        if let Ok(serialized) = serialized { let _ = std::fs::write(path, serialized); }
+    });
 }
 
 /// Called only from title verification. Serialize inference off the UI executor; cached titles
 /// never rerun. A failed runtime is reported to the UI and retried on the next app launch.
-pub async fn classify(m: &Media) -> Result<()> {
+pub async fn embed(m: &Media) -> Result<()> {
     picks_metadata::load().await;
-    let parts = sections(m,&picks_metadata::cached(m));
-    if parts.is_empty() { return Ok(()); }
-    let input = parts.join("\n");
-    if cache().read().ok().is_some_and(|c| c.contains_key(&key(&input))) { return Ok(()); }
-    let result = backend::on_runtime(async move {
+    let Some(parts) = parts(m) else { return Ok(()) };
+    let id = parts.key();
+    if cache().read().ok().is_some_and(|c| c.contains_key(&id)) { return Ok(()); }
+    backend::on_runtime(async move {
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut state = CLASSIFIER.lock().map_err(|_| anyhow!("Classifier lock"))?;
-            let cache_path = backend::backend_data_dir().join("picks-traits-v1.json");
+            let mut state = EMBEDDER.lock().map_err(|_| anyhow!("Embedder lock"))?;
+            let dir = backend::backend_data_dir();
+            let cache_path = dir.join(CACHE_FILE);
             if state.is_none() {
-                *cache().write().map_err(|_| anyhow!("Trait cache lock"))? = read_cache(&cache_path);
-                *state = Some(paths().and_then(|(dir, runtime)| Classifier::open(&dir, &runtime)).map_err(|e| e.to_string()));
+                // The earlier classifier's score cache is of no further use.
+                let _ = std::fs::remove_file(dir.join("picks-traits-v1.json"));
+                *cache().write().map_err(|_| anyhow!("Embedding cache lock"))? = read_cache(&cache_path);
+                *state = Some(paths().and_then(|(dir, runtime)| Embedder::open(&dir, &runtime)).map_err(|e| e.to_string()));
             }
-            let classifier = state.as_mut().unwrap().as_mut().map_err(|e| anyhow!(e.clone()))?;
-            let id = key(&input);
-            if cache().read().map_err(|_| anyhow!("Trait cache lock"))?.contains_key(&id) { return Ok(()); }
-            let values = classifier.classify_sections(&parts)?;
-            let serialized = {
-                let mut cache = cache().write().map_err(|_| anyhow!("Trait cache lock"))?;
-                if cache.len() >= MAX_ENTRIES { cache.pop_first(); }
-                cache.insert(id, values);
-                json!({"version": MODEL_VERSION, "entries": &*cache}).to_string()
+            let embedder = match state.as_mut().unwrap() {
+                Ok(embedder) => embedder,
+                // Only an unusable runtime is reported to the UI; one bad title is skipped.
+                Err(error) => {
+                    if let Ok(mut failure) = FAILURE.lock() { *failure = Some(error.clone()); }
+                    return Err(anyhow!(error.clone()));
+                }
             };
-            std::fs::write(cache_path, serialized).context("Save title traits")?;
+            if cache().read().map_err(|_| anyhow!("Embedding cache lock"))?.contains_key(&id) { return Ok(()); }
+            let vector = embedder.embed(&parts)?;
+            cache().write().map_err(|_| anyhow!("Embedding cache lock"))?.insert(id, vector);
+            save_soon(cache_path);
             Ok(())
         }).await.map_err(|_| anyhow!("Inference worker stopped"))?
-    }).await?;
-    if let Err(error) = &result { if let Ok(mut failure) = FAILURE.lock() { *failure = Some(error.to_string()); } }
-    result
+    }).await?
 }
 
 /// Metadata requests stay outside verification/playback; inference itself remains local.
-pub async fn enrich_and_classify(m: &Media) -> Result<()> {
+pub async fn enrich_and_embed(m: &Media) -> Result<()> {
     picks_metadata::enrich(m).await;
-    classify(m).await
+    embed(m).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn affinities_remain_finite_and_reject_bad_output() {
-        let mut logits = vec![1000.0; LABELS.len()];
-        logits[0] = 1004.0;
-        let scores = relative_scores(&logits).unwrap();
-        assert!(scores[0] > scores[1]);
-        assert!((scores.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(relative_scores(&[f32::NAN; 18]).is_err());
+    fn fixture(name: &str, year: &str, synopsis: &str) -> Media {
+        Media::from_json(&json!({"id": format!("test:{name}"), "type": "series", "name": name, "releaseInfo": year, "description": synopsis}), "fixture").unwrap()
     }
     #[test]
-    fn bundled_model_classifies_and_preserves_labels_for_long_text() {
+    fn bundled_model_places_similar_titles_closer() {
         let (dir, runtime) = paths().unwrap();
-        let mut classifier = Classifier::open(&dir, &runtime).unwrap();
-        let politics = classifier.classify("The senate votes in an election to replace the prime minister amid a political scandal.").unwrap();
-        let comedy = classifier.classify("A group of friends get drunk at a bachelor party, wake up with no memory, and retrace their steps through hilarious disasters.").unwrap();
-        assert!(politics[6] > comedy[6], "Politics should reflect the synopsis");
-        assert!(comedy[0] > politics[0], "Comedy should reflect the synopsis");
-        let dark = classifier.classify("Love, Death & Robots (2019–2025). Animation, Sci-Fi & Fantasy. Terrifying creatures, wicked surprises and dark comedy converge in this NSFW anthology of animated stories presented by Tim Miller and David Fincher.").unwrap();
-        let similar = classifier.classify("Castlevania (2017–2021). Animation, Action & Adventure, Sci-Fi & Fantasy. A vampire hunter fights to save a besieged city from an army of otherworldly creatures controlled by Dracula.").unwrap();
-        let light = classifier.classify("Bob's Burgers (2011–). Animation, Comedy. Bob's Burgers follows a third-generation restaurateur, Bob, as he runs Bob's Burgers with the help of his wife and their three kids. Bob and his quirky family have big ideas about burgers, but fall short on service and sophistication.").unwrap();
-        let matched = match_scores(&dark, &similar).unwrap();
-        let unrelated = match_scores(&dark, &light).unwrap();
-        for (title, scores) in [("Love, Death & Robots", &dark), ("Castlevania", &similar), ("Bob's Burgers", &light)] {
-            let mut ranked: Vec<_> = LABELS.iter().zip(scores).collect();
-            ranked.sort_by(|a,b| b.1.total_cmp(a.1));
-            println!("{title}: {:?}", &ranked[..4]);
-        }
-        assert!(matched.follows && !unrelated.follows, "Dark match: {}, comedy match: {}", matched.follows, unrelated.follows);
-        assert!(matched.similarity > unrelated.similarity);
-        let extra = picks_metadata::Extra { keywords: vec!["psychological horror".into(),"dystopia".into()], episodes: vec!["A vampire threatens a city in a dark and disturbing nightmare.".into();4] };
-        let mut m = Media::from_json(&json!({"id":"test:input-budget","type":"series","name":"Input budget fixture","description":"Long synopsis. ".repeat(2000)}),"fixture").unwrap();
-        let parts = sections(&m,&extra);
-        let ids = classifier.input_ids(&parts).unwrap();
-        assert!(ids.len() <= 384);
-        let decoded = classifier.tokenizer.decode(&ids.iter().map(|i| *i as u32).collect::<Vec<_>>(),false).unwrap();
-        assert!(decoded.contains("psychological horror") && decoded.contains("vampire"),"All evidence needs a token budget");
-        assert_eq!(classifier.classify_sections(&parts).unwrap().len(),LABELS.len());
-        let base = key(&sections(&m,&picks_metadata::Extra::default()).join("\n"));
-        assert_ne!(base,key(&parts.join("\n")));
-        m.description.clear();
-        assert!(!sections(&m,&extra).is_empty(),"Enrichment can classify a missing synopsis");
-        assert_eq!(classifier.classify(&"An adventure. ".repeat(1000)).unwrap().len(), LABELS.len());
+        let mut embedder = Embedder::open(&dir, &runtime).unwrap();
+        let mut embed = |m: &Media| embedder.embed(&Parts::new(m, &picks_metadata::Extra::default()).unwrap()).unwrap();
+        let dark = embed(&fixture("Love, Death & Robots", "2019–2025", "Terrifying creatures, wicked surprises and dark comedy converge in this NSFW anthology of animated stories presented by Tim Miller and David Fincher."));
+        let similar = embed(&fixture("Castlevania", "2017–2021", "A vampire hunter fights to save a besieged city from an army of otherworldly creatures controlled by Dracula."));
+        let light = embed(&fixture("Bob's Burgers", "2011–", "Bob follows a third-generation restaurateur as he runs Bob's Burgers with the help of his wife and their three kids. Bob and his quirky family have big ideas about burgers, but fall short on service and sophistication."));
+        assert!((cosine(&dark, &dark) - 1.0).abs() < 1e-4);
+        let (near, far) = (cosine(&dark, &similar), cosine(&dark, &light));
+        println!("dark~similar {near:.3}, dark~light {far:.3}");
+        assert!(near > far, "Dark animation {near} should sit closer than a family sitcom {far}");
+        let politics = embed(&fixture("Senate", "2020", "The senate votes in an election to replace the prime minister amid a political scandal."));
+        let party = embed(&fixture("Bachelor", "2009", "A group of friends get drunk at a bachelor party, wake up with no memory, and retrace their steps through hilarious disasters."));
+        let comedy = embed(&fixture("Reunion", "2012", "Old friends hold a chaotic wedding weekend where every plan falls apart in hilarious ways."));
+        assert!(cosine(&party, &comedy) > cosine(&party, &politics));
     }
     #[test]
-    fn cache_version_and_input_both_matter() {
-        assert_ne!(key("one synopsis"), key("another synopsis"));
-        assert!(key("synopsis").starts_with(MODEL_VERSION));
+    fn long_synopses_keep_name_and_keywords_within_the_token_budget() {
+        let (dir, runtime) = paths().unwrap();
+        let mut embedder = Embedder::open(&dir, &runtime).unwrap();
+        let m = fixture("Input budget fixture", "2020", &"Long synopsis. ".repeat(2000));
+        let extra = picks_metadata::Extra { keywords: vec!["psychological horror".into(), "dystopia".into()] };
+        let parts = Parts::new(&m, &extra).unwrap();
+        let ids = embedder.input_ids(&parts).unwrap();
+        assert!(ids.len() <= MAX_TOKENS);
+        let decoded = embedder.tokenizer.decode(&ids.iter().map(|i| *i as u32).collect::<Vec<_>>(), false).unwrap();
+        assert!(decoded.contains("psychological horror") && decoded.contains("input budget fixture"));
+        assert_eq!(embedder.embed(&parts).unwrap().len(), DIM);
+        let mut empty = m.clone();
+        empty.description.clear();
+        assert!(Parts::new(&empty, &extra).is_some(), "Keywords can stand in for a missing synopsis");
+        assert!(Parts::new(&empty, &picks_metadata::Extra::default()).is_none());
+    }
+    #[test]
+    fn packed_vectors_round_trip_and_bad_ones_are_rejected() {
+        let vector = unit(&(0..DIM).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>()).unwrap();
+        let restored = unpack(&pack(&vector)).unwrap();
+        assert!(cosine(&vector, &restored) > 0.99999);
+        assert!(unpack("AAAA").is_none() && unpack("not base64!").is_none());
+        assert!(unit(&vec![0.0; DIM]).is_err() && unit(&vec![f32::NAN; DIM]).is_err() && unit(&[1.0]).is_err());
+    }
+    #[test]
+    fn cache_evicts_the_oldest_entry_and_keeps_order_across_save() {
+        let mut cache = Cache::default();
+        let vector = unit(&vec![1.0; DIM]).unwrap();
+        for i in 0..=MAX_ENTRIES { cache.insert(format!("k{i:05}"), vector.clone()); }
+        assert!(!cache.contains_key("k00000") && cache.contains_key(&format!("k{MAX_ENTRIES:05}")));
+        let path = std::env::temp_dir().join(format!("veylo-embeddings-{}.json", std::process::id()));
+        std::fs::write(&path, cache.encode().to_string()).unwrap();
+        let mut loaded = read_cache(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.map.len(), MAX_ENTRIES);
+        loaded.insert("new".into(), vector);
+        assert!(!loaded.contains_key("k00001") && loaded.contains_key("k00002"));
+    }
+    #[test]
+    fn cache_key_depends_on_model_and_input() {
+        let extra = picks_metadata::Extra::default();
+        let key = |synopsis: &str| Parts::new(&fixture("Same", "2020", synopsis), &extra).unwrap().key();
+        assert_ne!(key("one synopsis that is long enough"), key("another synopsis that is long enough"));
+        assert!(key("one synopsis that is long enough").starts_with(MODEL_VERSION));
     }
 }

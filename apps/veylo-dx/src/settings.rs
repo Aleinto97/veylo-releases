@@ -111,8 +111,8 @@ pub fn SettingsPage() -> Element {
                     }
                 }
                 div { class: "setting-row glass",
-                    div { class: "setting-copy", span { class: "setting-name", "Local classifier" }
-                        span { class: "dim setting-about", "GLiClass runs on this device. TMDB keywords and sampled TVmaze episode summaries enrich its input." } }
+                    div { class: "setting-copy", span { class: "setting-name", "Local AI" }
+                        span { class: "dim setting-about", "The bge-small model runs on this device and compares synopses. TMDB keywords enrich its input." } }
                     GetKey { url: "https://www.tvmaze.com/", label: "Episode metadata: TVmaze (CC BY-SA)" }
                 }
                 div { class: "setting-row glass",

@@ -1413,7 +1413,7 @@ pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option
         if from.is_some_and(|f| year == 0 || last < f) || to.is_some_and(|t| year == 0 || year > t) { return None; }
         let summary = html_tag().replace_all(s["summary"].as_str().unwrap_or_default(), "").to_string();
         let meta = json!({
-            "id": s["externals"]["imdb"], "type": "series", "name": s["name"], "description": summary, "tvmaze_id": s["id"],
+            "id": s["externals"]["imdb"], "type": "series", "name": s["name"], "description": summary,
             "releaseInfo": match (year, ended) { (0, _) => String::new(), (y, Some(e)) if e != y => format!("{y}–{e}"), (y, Some(_)) => y.to_string(), (y, None) => format!("{y}–") },
             "poster": s["image"]["original"].as_str().or(s["image"]["medium"].as_str()).unwrap_or_default(),
             "genres": genres, "imdbRating": s["rating"]["average"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_default(),
@@ -1473,60 +1473,11 @@ pub(crate) async fn picks_keywords(m: &Media) -> Option<Vec<String>> {
     Some(crate::picks_metadata::keywords(&response))
 }
 
-/// Stay below TVmaze's public rate limit, including concurrent classifier prefetches.
-async fn picks_tvmaze_get(path: String, query: Vec<(&'static str,String)>) -> Option<Value> {
-    static NEXT: tokio::sync::Mutex<Option<tokio::time::Instant>> = tokio::sync::Mutex::const_new(None);
-    {
-        let mut next = NEXT.lock().await;
-        if let Some(at) = *next { tokio::time::sleep_until(at).await; }
-        *next = Some(tokio::time::Instant::now()+Duration::from_millis(600));
-    }
-    let response = backend().http.get(format!("https://api.tvmaze.com/{path}")).query(&query).send().await.ok()?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND { return Some(Value::Null); }
-    response.error_for_status().ok()?.json().await.ok()
-}
-
-fn picks_tvmaze_search_id(m: &Media, payload: &Value) -> Option<i64> {
-    // Kitsu titles often have no IMDb id. Accept only one exact name + year match; this is
-    // enrichment only and never changes the title's playback/history namespace.
-    let year = m.first_year()?;
-    let mut ids = payload.as_array().into_iter().flatten().filter_map(|r| {
-        let show = &r["show"];
-        let name = show["name"].as_str()?;
-        let show_year = show["premiered"].as_str()?.get(..4)?.parse::<i32>().ok()?;
-        (search_words(name) == search_words(&m.name) && (year-show_year).abs() <= 1).then(|| show["id"].as_i64()).flatten().filter(|id| *id > 0)
-    });
-    let id = ids.next()?;
-    ids.next().is_none().then_some(id)
-}
-
-/// IMDb lookup avoids mixing remakes or similarly named shows. TVmaze needs no API key.
-pub(crate) async fn picks_episode_summaries(m: &Media) -> Option<Vec<String>> {
-    if m.kind == "movie" { return Some(Vec::new()); }
-    let known = m.raw["tvmaze_id"].as_i64().filter(|id| *id > 0);
-    let imdb = imdb_of(m);
-    let media = m.clone();
-    on_runtime(async move {
-        let id = if let Some(id) = known { id } else if let Some(imdb) = imdb {
-            let show = picks_tvmaze_get("lookup/shows".into(),vec![("imdb",imdb.clone())]).await?;
-            if show.is_null() { return Some(Vec::new()); }
-            if show["externals"]["imdb"].as_str() != Some(imdb.as_str()) { return Some(Vec::new()); }
-            show["id"].as_i64().filter(|id| *id > 0)?
-        } else {
-            let found = picks_tvmaze_get("search/shows".into(),vec![("q",media.name.clone())]).await?;
-            let Some(id) = picks_tvmaze_search_id(&media,&found) else { return Some(Vec::new()); };
-            id
-        };
-        let payload = picks_tvmaze_get(format!("shows/{id}/episodes"),vec![]).await?;
-        if payload.is_null() { return Some(Vec::new()); }
-        Some(crate::picks_metadata::episode_sample(&payload))
-    }).await.ok().flatten()
-}
-
 // ---------------------------------------------------------------- picks duel
 
 /// Taste learned from duels, saved between sessions until reset: weights per genre, type and
-/// decade, and titles set aside (discarded or turned down as a final pick).
+/// decade, a direction in synopsis-embedding space, and titles set aside (discarded or turned
+/// down as a final pick).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Taste {
     pub genres: HashMap<String, f64>,
@@ -1534,9 +1485,28 @@ pub struct Taste {
     pub decades: HashMap<String, f64>,
     pub set_aside: Vec<String>,
     pub duels: u32,
-    pub traits: HashMap<String, f64>,
+    /// Lasting direction in embedding space; empty until two embedded titles were compared.
+    pub vibe: Vec<f32>,
     /// Tonight’s preferences; persisted with the duel, never in the permanent profile.
     pub session: HashMap<String, f64>,
+    pub session_vibe: Vec<f32>,
+}
+
+/// An embedding difference is small next to a one-hot genre feature; scaling it lets a single
+/// duel steer the vibe as strongly as it steers genres. The norm caps keep long duels bounded.
+const VIBE_GAIN: f64 = 4.0;
+const VIBE_CAP: f64 = 1.5;
+const SESSION_VIBE_CAP: f64 = 2.5;
+
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() { return 0.0; }
+    a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum()
+}
+fn step(vector: &mut Vec<f32>, direction: &[f32], rate: f64, cap: f64) {
+    if vector.len() != direction.len() { *vector = vec![0.0; direction.len()]; }
+    for (x, d) in vector.iter_mut().zip(direction) { *x += (rate * f64::from(*d)) as f32; }
+    let norm = dot(vector, vector).sqrt();
+    if norm > cap { for x in vector.iter_mut() { *x = (f64::from(*x) * cap / norm) as f32; } }
 }
 
 fn decade(m: &Media) -> Option<String> { m.first_year().map(|y| format!("{}s", y / 10 * 10)) }
@@ -1544,24 +1514,29 @@ fn decade(m: &Media) -> Option<String> { m.first_year().map(|y| format!("{}s", y
 impl Taste {
     /// Metadata remains useful while a synopsis is missing or the model is unavailable.
     pub fn fit(&self, m: &Media) -> f64 {
-        self.fit_features(&taste_features(m, true))
+        let vibe = crate::picks_ai::embedding(m).map_or(0.0, |e| self.vibe_fit(&e));
+        self.fit_features(&taste_features(m)) + vibe
     }
+    /// The learned directions are sums of embedding differences, so an average title scores
+    /// about zero and an unembedded one stays comparable to an embedded one.
+    fn vibe_fit(&self, embedding: &[f32]) -> f64 { dot(&self.vibe, embedding) + dot(&self.session_vibe, embedding) }
     fn fit_features(&self, features: &HashMap<String, f64>) -> f64 {
         features.iter().map(|(key, value)| {
             let persistent = if let Some(g) = key.strip_prefix("genre:") { self.genres.get(g) }
                 else if let Some(k) = key.strip_prefix("kind:") { self.kinds.get(k) }
                 else if let Some(d) = key.strip_prefix("decade:") { self.decades.get(d) }
-                else { self.traits.get(key) }.copied().unwrap_or(0.0).clamp(-4.0, 4.0);
+                else { None }.copied().unwrap_or(0.0).clamp(-4.0, 4.0);
             (persistent + self.session.get(key).copied().unwrap_or(0.0)) * value
         }).sum()
     }
     /// Pairwise logistic update: a loss means "less than this opponent", not "disliked".
     /// Shared features cancel; temporary preferences learn faster than lasting taste.
     pub fn learn(&mut self, kept: &Media, dropped: &Media) {
-        let both_classified = crate::picks_ai::scores(kept).is_some() && crate::picks_ai::scores(dropped).is_some();
-        let mut difference = taste_features(kept, both_classified);
-        for (key, value) in taste_features(dropped, both_classified) { *difference.entry(key).or_default() -= value; }
-        let margin = self.fit_features(&difference).clamp(-20.0, 20.0);
+        let mut difference = taste_features(kept);
+        for (key, value) in taste_features(dropped) { *difference.entry(key).or_default() -= value; }
+        let vibe: Option<Vec<f32>> = crate::picks_ai::embedding(kept).zip(crate::picks_ai::embedding(dropped))
+            .map(|(a, b)| a.iter().zip(&b).map(|(x, y)| x - y).collect());
+        let margin = (self.fit_features(&difference) + vibe.as_deref().map_or(0.0, |d| self.vibe_fit(d))).clamp(-20.0, 20.0);
         let error = 1.0 / (1.0 + margin.exp());
         for (key, value) in difference {
             if value.abs() < 1e-9 { continue; }
@@ -1569,11 +1544,13 @@ impl Taste {
             *current = (*current + 0.8 * error * value).clamp(-4.0, 4.0);
             let map = if key.starts_with("genre:") { &mut self.genres }
                 else if key.starts_with("kind:") { &mut self.kinds }
-                else if key.starts_with("decade:") { &mut self.decades }
-                else { &mut self.traits };
-            let feature = if key.starts_with("trait:") { key } else { key.split_once(':').unwrap().1.to_owned() };
-            let current = map.entry(feature).or_default();
+                else { &mut self.decades };
+            let current = map.entry(key.split_once(':').unwrap().1.to_owned()).or_default();
             *current = (*current + 0.12 * error * value).clamp(-4.0, 4.0);
+        }
+        if let Some(direction) = vibe {
+            step(&mut self.session_vibe, &direction, 0.8 * error * VIBE_GAIN, SESSION_VIBE_CAP);
+            step(&mut self.vibe, &direction, 0.12 * error * VIBE_GAIN, VIBE_CAP);
         }
         self.duels = self.duels.saturating_add(1);
     }
@@ -1586,19 +1563,12 @@ impl Taste {
 }
 
 /// Use exactly the same feature scaling for prediction and learning.
-fn taste_features(m: &Media, include_ai: bool) -> HashMap<String, f64> {
+fn taste_features(m: &Media) -> HashMap<String, f64> {
     let mut features = HashMap::new();
     let norm = (m.genres.len().max(1) as f64).sqrt();
     for genre in &m.genres { features.insert(format!("genre:{}", genre.to_lowercase()), 1.0 / norm); }
     features.insert(format!("kind:{}", m.kind), 0.5);
     if let Some(decade) = decade(m) { features.insert(format!("decade:{decade}"), 0.5); }
-    if include_ai {
-        if let Some(scores) = crate::picks_ai::scores(m) {
-            for (label, score) in crate::picks_ai::LABELS.iter().zip(scores) {
-                features.insert(format!("trait:{label}"), f64::from(score).sqrt() * 2.0);
-            }
-        }
-    }
     features
 }
 
@@ -1610,47 +1580,56 @@ pub fn challenger_against(pool: &[Media], taste: &Taste, exclude: &[String], inc
     let progress = (round as f64 / rounds.max(1) as f64).clamp(0.0, 1.0);
     choose_challenger(pool, taste, exclude, if progress >= 0.7 { 1 } else { 3 }, Some((incumbent, progress)))
 }
+/// How strongly resemblance to the title just kept steers the next card, and how close to the
+/// best score another card must be to share the random draw.
+const SIMILARITY_WEIGHT: f64 = 1.5;
+const TIE_MARGIN: f64 = 0.6;
 fn choose_challenger(pool: &[Media], taste: &Taste, exclude: &[String], spread: usize, duel: Option<(&Media, f64)>) -> Option<Media> {
     let n = pool.len().max(1) as f64;
-    let score = |aside: bool| { pool.iter().enumerate()
-        .filter(|(_, m)| !exclude.contains(&m.key()) && duel.is_none_or(|(winner, _)| winner.key() != m.key())
-            && (aside || !taste.set_aside.contains(&m.key())))
-        .map(|(i, m)| {
+    let winner_vibe = duel.and_then(|(winner, _)| crate::picks_ai::embedding(winner));
+    let score = |aside: bool| {
+        let eligible: Vec<(usize, &Media)> = pool.iter().enumerate()
+            .filter(|(_, m)| !exclude.contains(&m.key()) && duel.is_none_or(|(winner, _)| winner.key() != m.key())
+                && (aside || !taste.set_aside.contains(&m.key())))
+            .collect();
+        let similarity: Vec<Option<f64>> = eligible.iter().map(|(_, m)| {
+            let kept = winner_vibe.as_ref()?;
+            crate::picks_ai::embedding(m).map(|e| crate::picks_ai::cosine(kept, &e))
+        }).collect();
+        // Embedding cosines of all titles sit in a narrow band; only how a card compares with
+        // the other candidates tells the likeliest next card apart.
+        let known: Vec<f64> = similarity.iter().flatten().copied().collect();
+        let mean = known.iter().sum::<f64>() / known.len().max(1) as f64;
+        let spread_of = (known.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / known.len().max(1) as f64).sqrt();
+        eligible.iter().zip(similarity).map(|((i, m), similarity)| {
             let fit = taste.fit(m);
-            let mut score = (n - i as f64) / n * 0.35 + fit;
-            let traits = duel.and_then(|(winner, _)| crate::picks_ai::match_traits(winner, m));
+            let mut score = (n - *i as f64) / n * 0.35 + fit;
             if let Some((winner, progress)) = duel {
-                if let Some(traits) = &traits {
-                    // Follow the actual choice immediately. Exploration stays inside this
-                    // direction, rather than rewarding a challenger for being unlike it.
-                    score += 3.0 * traits.similarity;
-                } else {
-                    let a = taste_features(winner, false);
-                    let b = taste_features(m, false);
-                    let dot: f64 = a.iter().map(|(k, v)| v * b.get(k).unwrap_or(&0.0)).sum();
-                    let norm = (a.values().map(|v| v * v).sum::<f64>() * b.values().map(|v| v * v).sum::<f64>()).sqrt();
-                    if norm > 0.0 { score += 0.5 * (dot / norm).clamp(0.0, 1.0); }
+                match similarity {
+                    // Follow the actual choice immediately; exploration stays inside that direction.
+                    Some(s) if known.len() >= 2 && spread_of > 1e-4 => score += SIMILARITY_WEIGHT * ((s - mean) / spread_of).clamp(-2.0, 2.0),
+                    Some(_) => {}
+                    None => {
+                        let a = taste_features(winner);
+                        let b = taste_features(m);
+                        let dot: f64 = a.iter().map(|(k, v)| v * b.get(k).unwrap_or(&0.0)).sum();
+                        let norm = (a.values().map(|v| v * v).sum::<f64>() * b.values().map(|v| v * v).sum::<f64>()).sqrt();
+                        if norm > 0.0 { score += 0.5 * (dot / norm).clamp(0.0, 1.0); }
+                    }
                 }
                 let gap = (fit - taste.fit(winner)).clamp(-20.0, 20.0);
                 let p = 1.0 / (1.0 + (-gap).exp());
                 score += (1.0 - progress) * 0.15 * 4.0 * p * (1.0 - p);
             }
-            (score, m, traits)
-        }).collect::<Vec<_>>() };
+            (score, *m)
+        }).collect::<Vec<_>>()
+    };
     let mut scored = score(false);
     if scored.is_empty() { scored = score(true); }
-    // A clear shared mood is an eligibility rule, not a tiny bonus that popularity, old taste
-    // or a random top-three draw can outweigh. All exclusions above still apply.
-    if scored.iter().any(|(_, _, traits)| traits.as_ref().is_some_and(|t| t.follows)) {
-        scored.retain(|(_, _, traits)| traits.as_ref().is_some_and(|t| t.follows));
-    } else if let Some(best) = scored.iter().filter_map(|(_, _, traits)| traits.as_ref().map(|t| t.similarity)).max_by(f64::total_cmp) {
-        // No strong match remains: use the closest available classified alternatives. If
-        // nothing is classified, retain the metadata fallback so the duel can still continue.
-        scored.retain(|(_, _, traits)| traits.as_ref().is_some_and(|t| t.similarity >= best - 0.1));
-    }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
-    let pick = (rand_u64() as usize) % spread.max(1).min(scored.len().max(1));
-    scored.get(pick).map(|(_, m, _)| (*m).clone())
+    let best = scored.first()?.0;
+    let close = scored.iter().take(spread.max(1)).take_while(|(score, _)| *score >= best - TIE_MARGIN).count();
+    scored.get((rand_u64() as usize) % close.max(1)).map(|(_, m)| (*m).clone())
 }
 
 /// Genres some installed catalog can be asked for (lower-case), e.g. Cinemeta's genre list.
@@ -1690,19 +1669,28 @@ pub async fn genre_candidates(genre: &str) -> Vec<Media> {
     out
 }
 
+/// An embedding-space vector, or empty if it is not exactly the current dimension of finite numbers.
+fn vector(v: &Value) -> Vec<f32> {
+    let values: Option<Vec<f32>> = v.as_array().map(|a| a.iter().map(|x| x.as_f64().filter(|x| x.is_finite()).map(|x| x as f32)).collect::<Option<_>>()).flatten();
+    values.filter(|x| x.len() == crate::picks_ai::DIM).unwrap_or_default()
+}
+
 fn duel_path() -> PathBuf { backend().data_dir.join("picks-taste.json") }
 
 pub fn load_taste() -> Taste {
     let Ok(v) = std::fs::read_to_string(duel_path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else { return Taste::default() };
     let map = |k: &str| v[k].as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f))).collect()).unwrap_or_default();
-    Taste { genres: map("genres"), kinds: map("kinds"), decades: map("decades"), traits: if v["traits_version"] == crate::picks_ai::TRAITS_VERSION { map("traits") } else { HashMap::new() }, session: HashMap::new(),
+    Taste { genres: map("genres"), kinds: map("kinds"), decades: map("decades"),
+        // A direction only means something in the embedding space it was learned in.
+        vibe: if v["space_version"] == crate::picks_ai::SPACE_VERSION { vector(&v["vibe"]) } else { Vec::new() },
+        session: HashMap::new(), session_vibe: Vec::new(),
         // Version 1 set aside every duel loser; those were relative choices, not dislikes.
         set_aside: if v["profile_version"] == 2 { v["set_aside"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect() } else { Vec::new() },
         duels: v["duels"].as_u64().unwrap_or(0) as u32 }
 }
 
 pub fn save_taste(t: &Taste) {
-    let _ = std::fs::write(duel_path(), json!({"profile_version": 2, "traits_version": crate::picks_ai::TRAITS_VERSION, "genres": t.genres, "kinds": t.kinds, "decades": t.decades, "traits": t.traits, "set_aside": t.set_aside, "duels": t.duels}).to_string());
+    let _ = std::fs::write(duel_path(), json!({"profile_version": 2, "space_version": crate::picks_ai::SPACE_VERSION, "genres": t.genres, "kinds": t.kinds, "decades": t.decades, "vibe": t.vibe, "set_aside": t.set_aside, "duels": t.duels}).to_string());
 }
 
 pub fn reset_taste() { let _ = std::fs::remove_file(duel_path()); let _ = std::fs::remove_file(duel_state_path()); }
@@ -1715,6 +1703,7 @@ pub struct DuelState {
     pub kind: Option<String>, pub style: String, pub genre: Option<String>, pub from: String, pub to: String,
     pub round: u32, pub shown: Vec<String>,
     pub session: HashMap<String, f64>,
+    pub session_vibe: Vec<f32>,
     pub left: Option<Media>, pub right: Option<Media>, pub winner: Option<Media>,
 }
 
@@ -1731,7 +1720,7 @@ fn media_json(m: &Media) -> Value {
 pub fn save_duel(d: &DuelState) {
     let m = |x: &Option<Media>| x.as_ref().map(media_json).unwrap_or(Value::Null);
     let _ = std::fs::write(duel_state_path(), json!({"kind": d.kind, "style": d.style, "genre": d.genre, "from": d.from, "to": d.to, "round": d.round,
-        "session": d.session, "shown": d.shown, "left": m(&d.left), "right": m(&d.right), "winner": m(&d.winner)}).to_string());
+        "session": d.session, "session_vibe": d.session_vibe, "shown": d.shown, "left": m(&d.left), "right": m(&d.right), "winner": m(&d.winner)}).to_string());
 }
 
 pub fn load_duel() -> Option<DuelState> {
@@ -1745,6 +1734,7 @@ pub fn load_duel() -> Option<DuelState> {
         from: s(&v, "from"), to: s(&v, "to"), round: v["round"].as_u64().unwrap_or(0) as u32,
         shown: v["shown"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
         session: v["session"].as_object().map(|o| o.iter().filter_map(|(k,v)| v.as_f64().map(|v| (k.clone(), v.clamp(-4.0, 4.0)))).collect()).unwrap_or_default(),
+        session_vibe: vector(&v["session_vibe"]),
         left: m("left"), right: m("right"), winner: m("winner"),
     };
     (d.winner.is_some() || (d.left.is_some() && d.right.is_some())).then_some(d)
@@ -2152,29 +2142,34 @@ mod tests {
     }
 
     #[test]
-    fn next_card_follows_kept_mood_despite_popularity_old_taste_and_randomness() {
-        let make = |name: &str, dark: bool| {
+    fn next_card_follows_the_kept_title_despite_popularity_old_taste_and_randomness() {
+        let axis = |main: usize, side: usize| {
+            let mut v = vec![0.0f32; crate::picks_ai::DIM];
+            v[main] = 1.0;
+            v[side] = 0.1;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / norm).collect::<Vec<_>>()
+        };
+        let make = |name: &str, main: usize, side: usize| {
             let mut m = media(name, "series", "2020", "Animation");
             m.description = format!("An isolated test synopsis with sufficient detail for {name}.");
-            let mut scores = vec![0.01; crate::picks_ai::LABELS.len()];
-            scores[if dark { 17 } else { 16 }] = 0.83;
-            crate::picks_ai::cache_test_scores(&m, scores);
+            crate::picks_ai::cache_test_embedding(&m, axis(main, side));
             m
         };
-        let kept = make("test kept dark", true);
-        let dark = make("test dark challenger", true);
-        let light = make("test light challenger", false);
+        let kept = make("test kept dark", 0, 2);
+        let dark = make("test dark challenger", 0, 3);
+        let light = make("test light challenger", 1, 4);
         let mut taste = Taste::default();
-        // Even a strong historic preference must not cancel the explicit direction tonight.
-        taste.traits.insert("trait:a lighthearted comforting story".into(), 4.0);
+        // A historic liking for the other direction does not cancel the choice made tonight.
+        taste.vibe = axis(1, 4).iter().map(|x| x * 1.5).collect();
         let pool = vec![light.clone(), dark.clone(), kept.clone()];
         for round in 1..5 {
             for _ in 0..20 {
                 assert_eq!(challenger_against(&pool, &taste, &[], &kept, round, 5).unwrap().id, dark.id);
             }
         }
-        // The same behavior works in the other direction; there is no hardcoded dark genre.
-        let other_light = make("test another light challenger", false);
+        // The same behavior works in the other direction; nothing names a dark genre.
+        let other_light = make("test another light challenger", 1, 5);
         let pool = vec![dark.clone(), other_light.clone()];
         assert_eq!(challenger_against(&pool, &Taste::default(), &[], &light, 1, 5).unwrap().id, other_light.id);
         // Exhausted matches still respect exclusions and let the duel continue.
@@ -2182,13 +2177,24 @@ mod tests {
     }
 
     #[test]
-    fn tvmaze_enrichment_requires_a_unique_exact_title_and_year_without_imdb() {
-        let m = media("Monster","anime","2004","Animation");
-        let result = json!({"show":{"id":7,"name":"Monster","premiered":"2004-04-07"}});
-        assert_eq!(picks_tvmaze_search_id(&m,&json!([result.clone()])),Some(7));
-        assert_eq!(picks_tvmaze_search_id(&m,&json!([result.clone(),result])),None);
-        assert_eq!(picks_tvmaze_search_id(&m,&json!([{"show":{"id":8,"name":"Monster","premiered":"2022-01-01"}}])),None);
-        assert_eq!(picks_tvmaze_search_id(&m,&json!([{"show":{"id":9,"name":"The Monster","premiered":"2004-01-01"}}])),None);
+    fn duels_move_the_vibe_toward_the_kept_title_and_stay_bounded() {
+        let axis = |main: usize| { let mut v = vec![0.0f32; crate::picks_ai::DIM]; v[main] = 1.0; v };
+        let make = |name: &str, main: usize| {
+            let mut m = media(name, "series", "2020", "Drama");
+            m.description = format!("An isolated vibe test synopsis with sufficient detail for {name}.");
+            crate::picks_ai::cache_test_embedding(&m, axis(main));
+            m
+        };
+        let (kept, dropped) = (make("vibe kept", 10), make("vibe dropped", 11));
+        let (like_kept, like_dropped) = (make("vibe like kept", 10), make("vibe like dropped", 11));
+        let mut t = Taste::default();
+        t.learn(&kept, &dropped);
+        assert!(t.fit(&like_kept) > t.fit(&like_dropped));
+        assert!(t.genres.is_empty(), "A shared genre cancels out");
+        for _ in 0..10000 { t.learn(&kept, &dropped); }
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        assert!(norm(&t.vibe) <= VIBE_CAP + 1e-3 && norm(&t.session_vibe) <= SESSION_VIBE_CAP + 1e-3);
+        assert!(t.fit(&like_kept).is_finite());
     }
 
     #[test]

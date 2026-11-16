@@ -12,8 +12,8 @@ import tarfile
 import urllib.request
 import zipfile
 
-REVISION = '21edefaf7951f68c68c505f9139ba536d3b448f7'
-MODEL_BASE = f'https://huggingface.co/knowledgator/gliclass-small-v1.0/resolve/{REVISION}/'
+REVISION = 'ea104dacec62c0de699686887e3f920caeb4f3e3'
+MODEL_BASE = f'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/{REVISION}/'
 ORT_BASE = 'https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/'
 RUNTIMES = {
     'linux-aarch64': (ORT_BASE + 'onnxruntime-linux-aarch64-1.22.0.tgz', 'bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702'),
@@ -22,8 +22,8 @@ RUNTIMES = {
     'android-arm64': ('https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar', '04a4617a9c797cf49225595e45b5546081cb34c86ac817581141577d3b7dbfe2'),
 }
 ASSETS = {
-    'model.onnx': ('onnx/model-int8-quantized.onnx', '825c1f9231ec43d7acab7f21ef0b5954a06aaf3cf5660511883a2775e2459bb8'),
-    'tokenizer.json': ('tokenizer.json', '519648948c4c59da1af88f2cf2c8b4f84417b5c673981bc9809abf84cda1b7cc'),
+    'model.onnx': ('onnx/model_quantized.onnx', '6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4'),
+    'tokenizer.json': ('tokenizer.json', 'd241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66'),
 }
 ROOT = Path(__file__).resolve().parents[2]
 DEST = ROOT / 'apps/veylo-dx/picks-ai'

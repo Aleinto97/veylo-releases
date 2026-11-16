@@ -7,7 +7,9 @@ import java.io.File
 object VeyloPicks {
     @JvmStatic
     fun modelDir(activity: Activity): String {
-        val root = File(activity.filesDir, "picks-ai/21edefaf-v1")
+        // The earlier classifier's copy is no longer used.
+        File(activity.filesDir, "picks-ai/21edefaf-v1").deleteRecursively()
+        val root = File(activity.filesDir, "picks-ai/bge-ea104dac-v1")
         root.mkdirs()
         for (name in arrayOf("model.onnx", "tokenizer.json", "LICENSE", "NOTICE")) {
             val dest = File(root, name)
@@ -18,7 +20,7 @@ object VeyloPicks {
                 }
             }
         }
-        File(root, "ready").writeText("21edefaf-v1")
+        File(root, "ready").writeText("bge-ea104dac-v1")
         return root.absolutePath
     }
 

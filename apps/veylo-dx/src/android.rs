@@ -212,7 +212,7 @@ pub fn take_dev_play() -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// Shipped GLiClass assets, extracted by one background inference worker.
+/// Shipped embedding model assets, extracted by one background inference worker.
 pub fn picks_ai_paths() -> Result<(PathBuf, PathBuf)> {
     with_activity(|env, activity| {
         let class = load_class(env, activity, "dev.veylo.dx.VeyloPicks")?;

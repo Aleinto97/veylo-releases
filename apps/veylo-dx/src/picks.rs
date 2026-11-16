@@ -21,7 +21,7 @@ pub fn Picks() -> Element {
     let saved = use_hook(backend::load_duel);
     let mut restored = use_signal(|| saved.is_some());
     let saved = saved.unwrap_or_default();
-    use_hook(|| { taste.write().session = saved.session.clone(); });
+    use_hook(|| { let mut t = taste.write(); t.session = saved.session.clone(); t.session_vibe = saved.session_vibe.clone(); });
     let mut round = use_signal(|| saved.round);
     // Left and right cards; the kept one stays on its side.
     let mut pair = use_signal(|| (saved.left.clone(), saved.right.clone()));
@@ -79,9 +79,9 @@ pub fn Picks() -> Element {
         let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|i| seen.contains(i));
         out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(m)).collect::<Vec<_>>()
     });
-    // Classify beyond the first trailer-ready titles. Otherwise a matching dark title deeper
-    // in the catalogue cannot challenge a comedy that happened to finish verification first.
-    let _trait_prefetch = use_resource(move || {
+    // Embed beyond the first trailer-ready titles. Otherwise a matching title deeper in the
+    // catalogue cannot challenge one that happened to finish verification first.
+    let _embedding_prefetch = use_resource(move || {
         let candidates = filtered();
         async move {
             for batch in candidates.into_iter().take(96).collect::<Vec<_>>().chunks(4) {
@@ -89,7 +89,7 @@ pub fn Picks() -> Element {
                 let batch = batch.to_vec();
                 let _ = backend::on_runtime(async move {
                     let mut tasks = tokio::task::JoinSet::new();
-                    for media in batch { tasks.spawn(async move { let _ = crate::picks_ai::enrich_and_classify(&media).await; }); }
+                    for media in batch { tasks.spawn(async move { let _ = crate::picks_ai::enrich_and_embed(&media).await; }); }
                     while tasks.join_next().await.is_some() {}
                 }).await;
             }
@@ -146,7 +146,7 @@ pub fn Picks() -> Element {
     // A fresh duel whenever the candidates or filters change.
     let mut start_duel = move || {
         let list = filtered.peek().clone();
-        taste.write().session.clear();
+        { let mut t = taste.write(); t.session.clear(); t.session_vibe.clear(); }
         let t = taste.peek().clone();
         // Opening pair: drawn at random from the dozen best fits, so no visit starts the same.
         let list = prefer(&list, &[]);
@@ -185,7 +185,7 @@ pub fn Picks() -> Element {
     use_effect(move || {
         let (left, right) = pair();
         backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genre: genre(), from: from_text(), to: to_text(), round: round(),
-            session: taste().session, shown: shown(), left, right, winner: winner() });
+            session: taste().session, session_vibe: taste().session_vibe, shown: shown(), left, right, winner: winner() });
     });
     use_effect(move || {
         let n = filtered.read().len();
@@ -533,6 +533,6 @@ async fn check(m: &Media, watched: &HashSet<String>) -> Check {
     if !backend::duel_ready(m).await { return Check::Reject; }
     match backend::earlier_part(m, watched).await {
         Some(first) => Check::Instead(first),
-        None => { let _ = crate::picks_ai::classify(m).await; Check::Ready }
+        None => { let _ = crate::picks_ai::embed(m).await; Check::Ready }
     }
 }
