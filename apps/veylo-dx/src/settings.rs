@@ -165,7 +165,7 @@ pub fn SettingsPage() -> Element {
                                         if let Some(r) = &row { span { class: "dim tnum market-version", "v{r.version}" } }
                                     }
                                     p { class: "market-about", "{c.about()}" }
-                                    p { class: "dim market-about", "Cached Real-Debrid results only, no filters" }
+                                    p { class: "dim market-about", "{c.detail()}" }
                                     div { class: "market-actions",
                                         if busy().as_deref() == Some(c.name()) {
                                             span { class: "pill static glass", "Setting up…" }
@@ -175,8 +175,8 @@ pub fn SettingsPage() -> Element {
                                             } else { span { class: "pill static glass", icons::Check {} span { "Installed" } } }
                                             button { class: "pill glass", disabled: busy().is_some(), onclick: move |_| { let r = r.clone(); run(c.name().into(), Box::pin(async move { addons::remove(&r).await })) }, icons::Trash {} span { "Remove" } }
                                         } else {
-                                            button { class: "pill accent", disabled: busy().is_some() || settings().rd_key.is_none(),
-                                                title: if settings().rd_key.is_none() { "Add your Real-Debrid key first" } else { "" },
+                                            button { class: "pill accent", disabled: busy().is_some() || (c.needs_key() && settings().rd_key.is_none()),
+                                                title: if c.needs_key() && settings().rd_key.is_none() { "Add your Real-Debrid key first" } else { "" },
                                                 onclick: move |_| run(c.name().into(), Box::pin(async move { addons::install(c).await })),
                                                 icons::Magnet {} span { "Install" } }
                                         }

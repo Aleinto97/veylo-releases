@@ -200,9 +200,14 @@ impl MediaProxy {
                 .and_then(|v| v.parse::<u64>().ok()),
             _ => None,
         };
+        // A streaming playlist (HLS, DASH) is a few KB by nature: the playlist type is the proof.
+        let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        let path = final_url.path().to_ascii_lowercase();
+        let playlist = content_type.contains("mpegurl") || content_type.contains("dash+xml")
+            || path.ends_with(".m3u8") || path.ends_with(".mpd");
         // Status clips and error pages are a few MB at most; a film is not.
-        let ok = matches!(status, 200 | 206) && bytes.is_none_or(|n| n >= PROBE_MIN_BYTES);
-        Ok(json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null}))
+        let ok = matches!(status, 200 | 206) && (playlist || bytes.is_none_or(|n| n >= PROBE_MIN_BYTES));
+        Ok(json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist}))
     }
     /// "downloading" or "failed" when the current source turned out to be a
     /// debrid status clip (torrent not cached yet, cancelled, over a limit…).

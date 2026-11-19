@@ -1,7 +1,7 @@
 //! Veylo's player controls, in Dioxus: the same glass over the picture on Linux and Android.
 //! The picture itself is under the transparent WebView (video.rs); everything here is the
 //! app's own design, lit by the title's accent. Keys arrive through the shell (Shell::player_key).
-use crate::{backend::{self, OnlineSubtitle}, engine::{self, Finish, Fit, LiveRef, State}, icons, Shell};
+use crate::{backend::{self, OnlineSubtitle}, engine::{self, Finish, Fit, LiveRef, Segment, SegmentKind, State}, icons, Shell};
 use dioxus::prelude::*;
 
 /// Subtitles the add-ons offer for this video, fetched the first time the sheet opens.
@@ -15,7 +15,8 @@ const ONLINE_SHOWN: usize = 60;
 enum Sheet { Audio, Subtitles, Speed, Picture, Info, Keys }
 
 const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-const KEYS: [(&[&str], &str); 19] = [
+const KEYS: [(&[&str], &str); 20] = [
+    (&["Enter"], "Skip the intro or recap, when offered"),
     (&["Space", "K", "Enter"], "Play or pause"), (&["←", "→"], "Back or forward 10 seconds"), (&["J", "L"], "Back or forward 10 seconds"),
     (&["0–9"], "Jump to 0–90%"), (&["Home"], "Back to the start"), (&["↑", "↓"], "Volume"), (&["M"], "Mute"),
     (&["A"], "Next audio track"), (&["C"], "Next subtitles, then off"), (&["S"], "Subtitles list"), (&["Z"], "Fit, fill, stretch"),
@@ -24,6 +25,15 @@ const KEYS: [(&[&str], &str); 19] = [
     (&["F"], "Fullscreen"), (&["Tab"], "Next control; Shift+Tab goes back"),
 ];
 const ANDROID: bool = cfg!(target_os = "android");
+
+/// The skip the player offers for a segment: credits only lead to the next episode.
+fn offer(segments: &[Segment], position: f64, has_next: bool) -> Option<Segment> {
+    engine::skip_offer(segments, position).filter(|g| g.kind != SegmentKind::Credits || has_next)
+}
+
+fn skip(live: &engine::Live, g: Segment) {
+    if g.kind == SegmentKind::Credits { live.finish(Finish::Next) } else { live.seek_to(g.end) }
+}
 
 pub fn clock(seconds: f64) -> String {
     let t = seconds.max(0.0) as u64;
@@ -61,6 +71,20 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         spawn(async move {
             online.set(match backend::online_subtitles(&kind, &video).await { Ok(list) => Online::Ready(list), Err(_) => Online::Failed });
         });
+    });
+
+    // Intro times from IntroDB or AniSkip, asked once the episode's length is known (AniSkip
+    // matches its entries to it). Films and previews have no episode to look up.
+    let episode = live.0.request.record.as_ref().and_then(|(_, v)| v.clone());
+    let mut looked_up = use_signal(|| false);
+    let ask = live.clone();
+    use_effect(move || {
+        let duration = state().duration;
+        if duration <= 0.0 || *looked_up.peek() { return; }
+        let Some(video) = episode.clone() else { return };
+        looked_up.set(true);
+        let live = ask.0.clone();
+        spawn(async move { live.set_online_segments(backend::online_segments(&video, duration).await); });
     });
 
     // The engine publishes its state; the controls follow it.
@@ -106,6 +130,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let sub_on = s.tracks.iter().any(|t| !t.audio && t.selected);
     // Direct output: mpv can't draw into the picture, so text subtitles are drawn here.
     let caption = (s.direct && sub_on && !s.subtitle.trim().is_empty()).then(|| s.subtitle.clone());
+    let skippable = offer(&s.skips(), s.position, req.has_next).filter(|_| sheet().is_none() && s.error.is_none() && scrub().is_none());
 
     // Keys routed from the shell.
     // A short word on screen for what a key just did ("Fill", "Speed 1.25×").
@@ -206,6 +231,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         // Reading shortcuts must not seek, change tracks or close playback accidentally.
         if sheet() == Some(Sheet::Keys) && !matches!(key.as_str(), "h" | "H" | "?" | "Escape" | "Backspace") { return; }
         match key.as_str() {
+            "Enter" if offer(&now.skips(), now.position, live.request.has_next).is_some() => {
+                if let Some(g) = offer(&now.skips(), now.position, live.request.has_next) { skip(live, g); }
+            }
             " " | "k" | "K" | "Enter" | "MediaPlayPause" => { live.toggle_pause(); poke(); }
             "MediaPlay" => { if now.paused { live.toggle_pause(); } }
             "MediaPause" => { if !now.paused { live.toggle_pause(); } poke(); }
@@ -258,6 +286,14 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 }
             }
             if let Some((text, n)) = osd() { div { key: "{n}", class: "player-osd", role: "status", "{text}" } }
+            // Over the picture even when the controls have faded, as long as the segment lasts.
+            if let Some(g) = skippable {
+                button { class: if visible { "pill glass player-skip lifted" } else { "pill glass player-skip" }, title: "Enter",
+                    onclick: { let live = lc(); move |_| skip(&live, g) },
+                    span { match g.kind { SegmentKind::Intro => "Skip intro", SegmentKind::Recap => "Skip recap", SegmentKind::Credits => "Next episode" } }
+                    icons::Next {}
+                }
+            }
             if let Some(error) = s.error.clone() {
                 div { class: "player-center",
                     div { class: "glass panel player-error", role: "alert",

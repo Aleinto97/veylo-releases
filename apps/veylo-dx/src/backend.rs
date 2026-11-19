@@ -712,6 +712,101 @@ pub async fn sources(kind: &str, video_id: &str) -> Result<(Vec<Source>, Vec<Str
 
 /// OpenSubtitles' public add-on, asked when no installed add-on has subtitles for a video.
 const OPENSUBTITLES: &str = "https://opensubtitles-v3.strem.io";
+const INTRODB: &str = "https://api.introdb.app/segments";
+const ANISKIP: &str = "https://api.aniskip.com/v2/skip-times";
+const KITSU_API: &str = "https://kitsu.app/api/edge/anime";
+
+/// Where an episode's intro times can be looked up, from its video id.
+#[derive(Debug, PartialEq)]
+pub enum SkipLookup { IntroDb { imdb: String, season: u32, episode: u32 }, Kitsu { id: u64, episode: u32 }, Mal { id: u64, episode: u32 } }
+
+/// "tt0903747:1:2" (IntroDB), "kitsu:1376:5" and "mal:5114:3" (AniSkip); None for films and the rest.
+pub fn skip_lookup(video_id: &str) -> Option<SkipLookup> {
+    let parts: Vec<&str> = video_id.split(':').collect();
+    match parts.as_slice() {
+        [imdb, s, e] if imdb.starts_with("tt") && imdb[2..].chars().all(|c| c.is_ascii_digit()) && imdb.len() > 2 =>
+            Some(SkipLookup::IntroDb { imdb: (*imdb).to_owned(), season: s.parse().ok()?, episode: e.parse().ok()? }),
+        ["kitsu", id, e] => Some(SkipLookup::Kitsu { id: id.parse().ok()?, episode: e.parse().ok()? }),
+        ["mal", id, e] => Some(SkipLookup::Mal { id: id.parse().ok()?, episode: e.parse().ok()? }),
+        _ => None,
+    }
+}
+
+/// The intro, recap and credits the online databases know for an episode: IntroDB for IMDb
+/// episodes, AniSkip for anime (a Kitsu id is turned into its MyAnimeList id first). Only public
+/// ids are sent. Nothing found, or a service down, is an empty list: the player just offers no skip.
+pub async fn online_segments(video_id: &str, duration: f64) -> Vec<crate::engine::Segment> {
+    let Some(lookup) = skip_lookup(video_id) else { return Vec::new() };
+    let found = on_runtime(async move {
+        let http = backend_http();
+        let get = |url: url::Url| { let http = http.clone(); async move {
+            let r = http.get(url).send().await?;
+            // AniSkip answers 404 when it has nothing; that is an answer, not a failure.
+            if r.status() == reqwest::StatusCode::NOT_FOUND { return Ok::<Value, anyhow::Error>(Value::Null); }
+            Ok(r.error_for_status()?.json::<Value>().await?)
+        } };
+        let aniskip = |mal: u64, episode: u32| async move {
+            let mut url = url::Url::parse(ANISKIP)?;
+            url.path_segments_mut().map_err(|_| anyhow!("bad url"))?.extend([mal.to_string(), episode.to_string()]);
+            {
+                let mut q = url.query_pairs_mut();
+                for t in ["op", "ed", "mixed-op", "mixed-ed", "recap"] { q.append_pair("types", t); }
+                q.append_pair("episodeLength", &format!("{:.3}", duration.max(0.0)));
+            }
+            Ok::<_, anyhow::Error>(aniskip_segments(&get(url).await?, duration))
+        };
+        match lookup {
+            SkipLookup::IntroDb { imdb, season, episode } => {
+                let mut url = url::Url::parse(INTRODB)?;
+                url.query_pairs_mut().append_pair("imdb_id", &imdb).append_pair("season", &season.to_string()).append_pair("episode", &episode.to_string());
+                Ok(introdb_segments(&get(url).await?, duration))
+            }
+            SkipLookup::Mal { id, episode } => aniskip(id, episode).await,
+            SkipLookup::Kitsu { id, episode } => {
+                let mut url = url::Url::parse(KITSU_API)?;
+                url.path_segments_mut().map_err(|_| anyhow!("bad url"))?.extend([id.to_string(), "mappings".into()]);
+                url.query_pairs_mut().append_pair("filter[externalSite]", "myanimelist/anime");
+                match mal_of(&get(url).await?) { Some(mal) => aniskip(mal, episode).await, None => Ok(Vec::new()) }
+            }
+        }
+    }).await;
+    match found { Ok(Ok(list)) => list, _ => Vec::new() }
+}
+
+/// The MyAnimeList id in a Kitsu mappings answer.
+pub fn mal_of(v: &Value) -> Option<u64> {
+    v["data"].as_array()?.iter().find(|m| m["attributes"]["externalSite"] == "myanimelist/anime")
+        .and_then(|m| m["attributes"]["externalId"].as_str()?.parse().ok())
+}
+
+/// A segment from a database, kept only when it fits inside this video (an entry for another cut
+/// of the episode can run past its end).
+fn online_segment(kind: crate::engine::SegmentKind, start: f64, end: f64, duration: f64) -> Option<crate::engine::Segment> {
+    let end = if duration > 0.0 && end > duration { if end - duration <= 5.0 { duration } else { return None } } else { end };
+    (start >= 0.0 && end - start >= 3.0).then_some(crate::engine::Segment { kind, start, end })
+}
+
+pub fn introdb_segments(v: &Value, duration: f64) -> Vec<crate::engine::Segment> {
+    use crate::engine::SegmentKind::*;
+    [("recap", Recap), ("intro", Intro), ("outro", Credits)].into_iter().filter_map(|(key, kind)| {
+        let g = &v[key];
+        let start = g["start_ms"].as_f64().map(|ms| ms / 1000.0).or_else(|| g["start_sec"].as_f64())?;
+        // Credits to the end can be stored without an end.
+        let end = g["end_ms"].as_f64().map(|ms| ms / 1000.0).or_else(|| g["end_sec"].as_f64())
+            .or((kind == Credits && duration > 0.0).then_some(duration))?;
+        online_segment(kind, start, end, duration)
+    }).collect()
+}
+
+pub fn aniskip_segments(v: &Value, duration: f64) -> Vec<crate::engine::Segment> {
+    use crate::engine::SegmentKind::*;
+    let mut out: Vec<crate::engine::Segment> = v["results"].as_array().into_iter().flatten().filter_map(|r| {
+        let kind = match r["skipType"].as_str()? { "op" | "mixed-op" => Intro, "ed" | "mixed-ed" => Credits, "recap" => Recap, _ => return None };
+        online_segment(kind, r["interval"]["startTime"].as_f64()?, r["interval"]["endTime"].as_f64()?, duration)
+    }).collect();
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
+}
 
 /// A subtitle file an add-on offers for the playing video.
 #[derive(Clone, Debug, PartialEq)]
@@ -876,7 +971,18 @@ fn other_language_only(label: &str, key: &str) -> bool {
     !multi_audio().is_match(label) && crate::addons::LANGUAGES.iter().any(|l| l.key != key && l.matches(label))
 }
 
+/// Real-Debrid sources first, then the free web add-ons' (NoTorrent, Absolute Cinema), each in
+/// the usual order; a free web link marked as a trial goes last, as it may stop partway.
 fn play_order_any(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
+    let (web, debrid): (Vec<Source>, Vec<Source>) = sources.iter().cloned().partition(|s| crate::addons::is_free_addon(&s.addon));
+    let (trial, web): (Vec<Source>, Vec<Source>) = web.into_iter().partition(|s| s.label.to_uppercase().contains("FREE TRIAL"));
+    let mut out = play_order_one(&debrid, pack_episodes);
+    out.extend(play_order_one(&web, pack_episodes));
+    out.extend(play_order_one(&trial, pack_episodes));
+    out
+}
+
+fn play_order_one(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
     // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
     let hdr = |s: &Source| match hdr_tier(&s.label) { 1 => 0, 0 => 1, t => t };
     let key = |s: &Source| std::cmp::Reverse((hdr_tier(&s.label) >= 2, episode_size(s, pack_episodes).unwrap_or(0),
@@ -1929,6 +2035,29 @@ mod review_tests {
     }
 
     #[test]
+    fn skip_times_come_from_introdb_and_aniskip() {
+        use crate::engine::{Segment, SegmentKind::*};
+        assert_eq!(skip_lookup("tt0903747:1:2"), Some(SkipLookup::IntroDb { imdb: "tt0903747".into(), season: 1, episode: 2 }));
+        assert_eq!(skip_lookup("kitsu:1376:5"), Some(SkipLookup::Kitsu { id: 1376, episode: 5 }));
+        assert_eq!(skip_lookup("mal:5114:3"), Some(SkipLookup::Mal { id: 5114, episode: 3 }));
+        assert_eq!(skip_lookup("tt0903747"), None);
+        assert_eq!(skip_lookup("kitsu:1376"), None);
+        assert_eq!(skip_lookup("tt:1:2"), None);
+        // IntroDB's answer, as the service sends it.
+        let intro = json!({"imdb_id":"tt0903747","intro":{"start_sec":60,"end_sec":95,"start_ms":60000,"end_ms":95500},"recap":null,
+            "outro":{"start_sec":3431,"end_sec":3500,"start_ms":3431000,"end_ms":3500000},"no_intro":false});
+        assert_eq!(introdb_segments(&intro, 3480.0), vec![Segment { kind: Intro, start: 60.0, end: 95.5 }]);
+        assert_eq!(introdb_segments(&intro, 3502.0).len(), 2);
+        assert_eq!(introdb_segments(&json!({"outro":{"start_ms":3000000,"end_ms":null}}), 3100.0), vec![Segment { kind: Credits, start: 3000.0, end: 3100.0 }]);
+        assert!(introdb_segments(&Value::Null, 100.0).is_empty());
+        // AniSkip's, and a Kitsu mapping.
+        let ani = json!({"found":true,"results":[{"interval":{"startTime":1349.903,"endTime":1474},"skipType":"ed"},
+            {"interval":{"startTime":58.642,"endTime":148.642},"skipType":"op"},{"interval":{"startTime":1,"endTime":2},"skipType":"recap"}]});
+        assert_eq!(aniskip_segments(&ani, 1474.6), vec![Segment { kind: Intro, start: 58.642, end: 148.642 }, Segment { kind: Credits, start: 1349.903, end: 1474.0 }]);
+        assert_eq!(mal_of(&json!({"data":[{"attributes":{"externalSite":"myanimelist/anime","externalId":"1535"}}]})), Some(1535));
+        assert_eq!(mal_of(&json!({"data":[]})), None);
+    }
+    #[test]
     fn episode_labels_for_series_and_kitsu() {
         assert_eq!(episode_label("tt123:2:5").as_deref(), Some("S2 E5"));
         assert_eq!(episode_label("kitsu:12345:5").as_deref(), Some("E5"));
@@ -2078,6 +2207,21 @@ mod tests {
         assert_eq!(order, [ita_only.url.clone(), eng.url.clone(), fr.url.clone()]);
     }
 
+    #[test]
+    fn real_debrid_plays_before_the_free_web_addons() {
+        let rd = source_of("Torrentio", &json!({"name":"[RD+] Torrentio 720p","title":"Film.720p.WEBRip.mkv","url":"https://x.invalid/rd"}));
+        let web = source_of("Absolute Cinema", &json!({"name":"Absolute Cinema","title":"[4KHDHub] Film 2160p REMUX\n💾 60 GB","url":"https://x.invalid/w"}));
+        let trial = source_of("NoTorrent", &json!({"name":"🌐 1080p - MPV Player","title":"Original Audio [FREE TRIAL]","url":"https://x.invalid/t"}));
+        let free = source_of("NoTorrent", &json!({"name":"🌐 480p - VLC Player","title":"Original Audio [NEW FREE]","url":"https://x.invalid/f"}));
+        let urls = |v: Vec<Source>| v.into_iter().map(|s| s.url).collect::<Vec<_>>();
+        assert_eq!(urls(play_order_for(&[trial.clone(), free.clone(), web.clone(), rd.clone()], None, None)),
+            ["https://x.invalid/rd", "https://x.invalid/w", "https://x.invalid/f", "https://x.invalid/t"]);
+        // Without a key there are only web sources: they play.
+        assert_eq!(urls(play_order_for(&[free, web], None, None)), ["https://x.invalid/w", "https://x.invalid/f"]);
+        // The chosen language still comes first: Italian web audio before English Real-Debrid.
+        let ita = source_of("Absolute Cinema", &json!({"name":"Absolute Cinema","title":"[VixSrc] Film 1080P · 🇬🇧🇮🇹","url":"https://x.invalid/i"}));
+        assert_eq!(urls(play_order_for(&[rd, ita], None, Some("italian")))[0], "https://x.invalid/i");
+    }
     #[test]
     fn play_order_matches_the_android_app() {
         let src = |title: &str| source_of("A", &json!({"title": title, "url": "https://x.invalid/a"}));

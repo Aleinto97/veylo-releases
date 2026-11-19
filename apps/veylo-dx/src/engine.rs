@@ -44,6 +44,13 @@ pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected
     /// Forced subtitles: signs and foreign lines only, not the dialogue.
     pub forced: bool }
 
+/// A part of the video the viewer may want to pass over, from the file's chapter names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SegmentKind { Intro, Recap, Credits }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment { pub kind: SegmentKind, pub start: f64, pub end: f64 }
+
 /// What the screen can show, as the platform declares it (Android's display, Windows' DXGI
 /// output the window is on); Linux output is SDR. `peak_nits`: the panel's peak, 0 if unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -84,6 +91,19 @@ pub struct State {
     pub dropped: i64,
     /// The playing file's size in bytes as mpv reads it (0 until known).
     pub file_size: i64,
+    /// Intro, recap and credits, where the file's chapters name them.
+    pub segments: Vec<Segment>,
+    /// The same from the online databases (IntroDB, AniSkip), for what the chapters don't name.
+    pub online_segments: Vec<Segment>,
+}
+
+impl State {
+    /// What can be skipped: the file's own chapters first, the databases for the kinds they miss.
+    pub fn skips(&self) -> Vec<Segment> {
+        let mut all = self.segments.clone();
+        all.extend(self.online_segments.iter().filter(|g| !self.segments.iter().any(|c| c.kind == g.kind)));
+        all
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -196,6 +216,9 @@ impl Live {
         self.update(|s| { s.direct = false; true });
         let _ = self.mpv.set_property("hwdec", "no");
         let _ = self.mpv.set_property("vo", if cfg!(any(target_os = "android", target_os = "windows")) { "gpu-next" } else { "libmpv" });
+    }
+    pub fn set_online_segments(&self, found: Vec<Segment>) {
+        self.update(|s| { let c = s.online_segments != found; s.online_segments = found; c });
     }
     /// Reload the source where it stopped (after a network error).
     pub fn retry(&self) {
@@ -323,7 +346,8 @@ fn add_headers(mpv: &Mpv, headers: &[(String, String)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-const OBSERVED: [(&str, Format); 18] = [
+const OBSERVED: [(&str, Format); 19] = [
+    ("chapter-list", Format::String),
     ("frame-drop-count", Format::Int64),
     ("time-pos", Format::Double), ("duration", Format::Double), ("demuxer-cache-time", Format::Double),
     ("pause", Format::Flag), ("paused-for-cache", Format::Flag), ("seeking", Format::Flag), ("eof-reached", Format::Flag),
@@ -341,6 +365,9 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         live.update(|s| { s.error = Some(format!("This source couldn't be opened ({e}).")); true });
     }
     let (mut position, mut duration, mut cache_end) = (0.0f64, 0.0f64, 0.0f64);
+    // The chapters, kept to place the last one's end once the duration is known.
+    let mut chapters = String::new();
+    let mark = |chapters: &str, duration: f64| { let found = segments(chapters, duration); live.update(|s| { let c = s.segments != found; s.segments = found; c }); };
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
     let mut target_check = Instant::now();
@@ -411,7 +438,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                     if v > 1.0 { played = true; }
                     live.update(|s| { let moved = (s.position - v).abs() >= 0.25; if moved { s.position = v; s.buffered = (cache_end - v).max(0.0); } moved });
                 }
-                ("duration", PropertyData::Double(v)) => { duration = v; live.update(|s| { s.duration = v; true }); }
+                ("duration", PropertyData::Double(v)) => { duration = v; live.update(|s| { s.duration = v; true }); mark(&chapters, duration); }
+                ("chapter-list", PropertyData::Str(j)) => { chapters = j.to_owned(); mark(&chapters, duration); }
                 ("demuxer-cache-time", PropertyData::Double(v)) => cache_end = v,
                 ("pause", PropertyData::Flag(v)) => live.update(|s| { s.paused = v; true }),
                 ("paused-for-cache", PropertyData::Flag(v)) => live.update(|s| { s.buffering = v; true }),
@@ -456,6 +484,48 @@ fn refresh_tracks(live: &Live) {
     let tracks = parse_tracks(&json);
     let dv = dv_profile(&json);
     live.update(|s| { let c = s.tracks != tracks || s.dv_profile != dv; s.tracks = tracks; s.dv_profile = dv; c });
+}
+
+/// Intro, recap and credits from mpv's `chapter-list` (JSON). A chapter runs to the next one's
+/// start (the last one to `duration`). Names are matched as whole words; a chapter too long or
+/// too short for what its name claims is a misnamed one and left alone, and credits only count
+/// in the second half of the video.
+pub fn segments(json: &str, duration: f64) -> Vec<Segment> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    let mut marks: Vec<(f64, &str)> = list.iter().filter_map(|c| Some((c["time"].as_f64()?, c["title"].as_str().unwrap_or("")))).collect();
+    marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out = Vec::new();
+    for (i, (start, title)) in marks.iter().enumerate() {
+        let end = marks.get(i + 1).map(|m| m.0).unwrap_or(duration);
+        let Some(kind) = chapter_kind(title) else { continue };
+        let length = end - start;
+        let fits = match kind {
+            SegmentKind::Intro => (5.0..=240.0).contains(&length),
+            SegmentKind::Recap => (5.0..=300.0).contains(&length),
+            SegmentKind::Credits => (5.0..=900.0).contains(&length) && duration > 0.0 && *start >= duration / 2.0,
+        };
+        if fits { out.push(Segment { kind, start: *start, end }); }
+    }
+    out
+}
+
+fn chapter_kind(title: &str) -> Option<SegmentKind> {
+    let t = title.to_lowercase();
+    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let has = |w: &str| words.contains(&w);
+    // "OP", "OP1", "ED 2": the anime names, only when they are the whole name.
+    let short = |p: &str| words.len() <= 2 && words.first().is_some_and(|w| w.strip_prefix(p).is_some_and(|r| r.chars().all(|c| c.is_ascii_digit())))
+        && words.get(1).is_none_or(|w| w.chars().all(|c| c.is_ascii_digit()));
+    if has("recap") || words.first() == Some(&"previously") { return Some(SegmentKind::Recap); }
+    if has("intro") || has("opening") || short("op") || t.contains("title sequence") || t.contains("main title") { return Some(SegmentKind::Intro); }
+    if has("credits") || has("outro") || has("ending") || short("ed") || t.contains("end titles") { return Some(SegmentKind::Credits); }
+    None
+}
+
+/// The segment being played that can be skipped now: not in its last second and a half, where a
+/// skip would only cut a cut.
+pub fn skip_offer(segments: &[Segment], position: f64) -> Option<Segment> {
+    segments.iter().copied().find(|g| position >= g.start && position < g.end - 1.5)
 }
 
 /// Seconds of playback between two time-pos reports: a small step forward is watching, a jump
@@ -646,6 +716,46 @@ mod tests {
         mpv.command("change-list", &["http-header-fields", "remove", "Cookie: a=1, b=2"]).unwrap();
         let rest: String = mpv.get_property("http-header-fields").unwrap();
         assert_eq!(rest, "X-Token: t");
+    }
+    #[test]
+    fn chapters_name_the_intro_recap_and_credits() {
+        let json = r#"[{"title":"Previously on","time":0},{"title":"Prologue","time":40},{"title":"Opening","time":200},
+            {"title":"Part A","time":290},{"title":"Ending Credits","time":1300},{"title":"Preview","time":1390}]"#;
+        let got = segments(json, 1420.0);
+        assert_eq!(got, vec![
+            Segment { kind: SegmentKind::Recap, start: 0.0, end: 40.0 },
+            Segment { kind: SegmentKind::Intro, start: 200.0, end: 290.0 },
+            Segment { kind: SegmentKind::Credits, start: 1300.0, end: 1390.0 },
+        ]);
+        // Opening credits are the intro; anime short names count only alone.
+        assert_eq!(chapter_kind("Opening Credits"), Some(SegmentKind::Intro));
+        assert_eq!(chapter_kind("OP2"), Some(SegmentKind::Intro));
+        assert_eq!(chapter_kind("ED 1"), Some(SegmentKind::Credits));
+        assert_eq!(chapter_kind("Operation Overlord"), None);
+        assert_eq!(chapter_kind("Edward"), None);
+        assert_eq!(chapter_kind("Introduction"), None);
+        assert_eq!(chapter_kind("Chapter 3"), None);
+        // A whole-act "Intro", credits early on, an unordered list: misnamed or sorted out.
+        assert!(segments(r#"[{"title":"Intro","time":0},{"title":"Act 2","time":900}]"#, 2000.0).is_empty());
+        assert!(segments(r#"[{"title":"Credits","time":10},{"title":"Story","time":60}]"#, 2000.0).is_empty());
+        assert_eq!(segments(r#"[{"title":"Story","time":30},{"title":"Intro","time":0}]"#, 600.0),
+            vec![Segment { kind: SegmentKind::Intro, start: 0.0, end: 30.0 }]);
+        assert!(segments("", 100.0).is_empty());
+    }
+    #[test]
+    fn chapters_come_before_the_databases() {
+        let chapter = Segment { kind: SegmentKind::Intro, start: 60.0, end: 150.0 };
+        let online = vec![Segment { kind: SegmentKind::Intro, start: 58.0, end: 149.0 }, Segment { kind: SegmentKind::Credits, start: 1300.0, end: 1400.0 }];
+        let s = State { segments: vec![chapter], online_segments: online.clone(), ..Default::default() };
+        assert_eq!(s.skips(), vec![chapter, online[1]]);
+    }
+    #[test]
+    fn a_skip_is_offered_inside_the_segment_only() {
+        let g = [Segment { kind: SegmentKind::Intro, start: 60.0, end: 150.0 }];
+        assert_eq!(skip_offer(&g, 59.0), None);
+        assert_eq!(skip_offer(&g, 60.0), Some(g[0]));
+        assert_eq!(skip_offer(&g, 148.0), Some(g[0]));
+        assert_eq!(skip_offer(&g, 149.0), None);
     }
     #[test]
     fn only_small_forward_steps_count_as_watching() {

@@ -710,3 +710,8 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
   background: rgba(10,10,12,.55); font: 700 17px/1.2 var(--ui); color: var(--bone); white-space: nowrap; pointer-events: none;
   text-shadow: 0 1px 6px rgba(0,0,0,.6); animation: arrive .12s ease-out; }
 .player-keys { padding: 0 12px 8px; }
+/* Skip intro: stays over the picture while the segment lasts, clear of the controls when they show. */
+.player .player-skip { position: absolute; right: 24px; bottom: 32px; z-index: 2; background: var(--glass-strong);
+  border: 1px solid rgba(242,239,234,.22); animation: arrive .18s ease-out; transition: bottom .28s ease, transform .12s; }
+.player .player-skip.lifted { bottom: 84px; }
+@media (max-width: 760px) { .player .player-skip { right: 12px; bottom: 20px; } .player .player-skip.lifted { bottom: 128px; } }

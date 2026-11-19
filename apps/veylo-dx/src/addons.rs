@@ -6,7 +6,13 @@
 //!   its server; Veylo creates and updates that configuration through its API.
 //!
 //! Both ask for every cached Real-Debrid result with no quality filter and no limit: the
-//! Play order picks the best one. Install links, passwords and keys live only in the app's
+//! Play order picks the best one.
+//!
+//! Two free add-ons need no key and are installed by default (a removal is remembered):
+//! NoTorrent (web streams in the original audio, Spanish, Portuguese and Turkish) and Absolute
+//! Cinema (web streams in the original audio and Italian), set to web streams only with none of
+//! its catalogues. The Play order puts Real-Debrid sources before them, so with a key they are
+//! the fallback and without one they are what plays. Install links, passwords and keys live only in the app's
 //! own folder (addons.json, settings.json) and are never logged, shown or put in errors.
 use crate::backend::{self, exec, on_runtime, s};
 use anyhow::{bail, ensure, Context, Result};
@@ -15,6 +21,9 @@ use std::collections::HashMap;
 
 const TORRENTIO: &str = "https://torrentio.strem.fun";
 const AIOSTREAMS: &str = "https://aiostreams.elfhosted.com";
+const NOTORRENT: &str = "https://addon.notorrent2.workers.dev/manifest.json";
+/// Web streams only (no torrents), without its title-info row, rows on Home or discovery lists.
+const ABSOLUTE_CINEMA: &str = "https://cinema.debrid.in/mode=http|titleinfo=0|discoverycatalogs=0|genrecatalogs=0|searchcatalogs=0|animecatalogs=0|anilistcatalogs=0|tdcatalog=0|watchlist=0|upnext=0|streamingservices=none|hidecatalogs=magnetio_similar_movie,magnetio_similar_series/manifest.json";
 /// Where each key is copied from: opened in the browser by "Get your key".
 pub const RD_KEY_PAGE: &str = "https://real-debrid.com/apitoken";
 pub const TMDB_KEY_PAGE: &str = "https://www.themoviedb.org/settings/api";
@@ -84,20 +93,48 @@ pub fn language(key: &str) -> Option<&'static Language> { LANGUAGES.iter().find(
 // ---------------------------------------------------------------- catalogue
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Curated { Torrentio, AioStreams }
+pub enum Curated { Torrentio, AioStreams, NoTorrent, AbsoluteCinema }
 
 impl Curated {
-    pub const ALL: [Curated; 2] = [Curated::Torrentio, Curated::AioStreams];
-    fn id(self) -> &'static str { match self { Curated::Torrentio => "torrentio", Curated::AioStreams => "aiostreams" } }
-    pub fn name(self) -> &'static str { match self { Curated::Torrentio => "Torrentio", Curated::AioStreams => "AIOStreams" } }
+    pub const ALL: [Curated; 4] = [Curated::Torrentio, Curated::AioStreams, Curated::NoTorrent, Curated::AbsoluteCinema];
+    fn id(self) -> &'static str {
+        match self { Curated::Torrentio => "torrentio", Curated::AioStreams => "aiostreams", Curated::NoTorrent => "notorrent", Curated::AbsoluteCinema => "absolutecinema" }
+    }
+    pub fn name(self) -> &'static str {
+        match self { Curated::Torrentio => "Torrentio", Curated::AioStreams => "AIOStreams", Curated::NoTorrent => "NoTorrent", Curated::AbsoluteCinema => "Absolute Cinema" }
+    }
     pub fn about(self) -> &'static str {
         match self {
             Curated::Torrentio => "Torrents from every public tracker, ready on Real-Debrid.",
             Curated::AioStreams => "Comet, MediaFusion and StremThru together, on ElfHosted's public server.",
+            Curated::NoTorrent => "Free web streams: original audio, Spanish, Portuguese and Turkish.",
+            Curated::AbsoluteCinema => "Free web streams: original audio and Italian.",
         }
     }
-    fn host(self) -> &'static str { match self { Curated::Torrentio => "torrentio.strem.fun", Curated::AioStreams => "aiostreams.elfhosted.com" } }
+    /// The second line on its card.
+    pub fn detail(self) -> &'static str {
+        if self.needs_key() { "Cached Real-Debrid results only, no filters" } else { "No key needed. Real-Debrid sources play first when you have one" }
+    }
+    fn host(self) -> &'static str {
+        match self {
+            Curated::Torrentio => "torrentio.strem.fun", Curated::AioStreams => "aiostreams.elfhosted.com",
+            Curated::NoTorrent => "addon.notorrent2.workers.dev", Curated::AbsoluteCinema => "cinema.debrid.in",
+        }
+    }
+    /// Set up with the Real-Debrid key (its link or configuration holds it).
+    pub fn needs_key(self) -> bool { matches!(self, Curated::Torrentio | Curated::AioStreams) }
+    /// The install link of a free add-on.
+    fn free_url(self) -> Option<&'static str> {
+        match self { Curated::NoTorrent => Some(NOTORRENT), Curated::AbsoluteCinema => Some(ABSOLUTE_CINEMA), _ => None }
+    }
 }
+
+/// Whether a source comes from one of the free web add-ons (by the add-on's name, as streams carry it).
+pub fn is_free_addon(name: &str) -> bool {
+    Curated::ALL.iter().any(|c| !c.needs_key() && c.name().eq_ignore_ascii_case(name.trim()))
+}
+
+fn removed_key(c: Curated) -> String { format!("{}:removed", c.id()) }
 
 fn host_of(url: &str) -> String { url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default() }
 
@@ -176,7 +213,9 @@ pub async fn overview() -> Overview {
             None => { store.seen.insert(key, version.clone()); changed = true; None }
         };
         let url = s(a, "manifest_url");
-        let curated = Curated::ALL.into_iter().find(|c| managed_url(*c, &store).as_deref() == Some(url.as_str()));
+        // A free add-on is the same whoever installed it: matched by its server.
+        let curated = Curated::ALL.into_iter().find(|c| managed_url(*c, &store).as_deref() == Some(url.as_str())
+            || (!c.needs_key() && host_of(&url) == c.host()));
         let offers = a["resources"].as_array().into_iter().flatten()
             .filter_map(|r| r.as_str().map(str::to_owned).or_else(|| r["name"].as_str().map(str::to_owned))).collect::<Vec<_>>().join(", ");
         rows.push(Row { name: s(a, "name"), version, update, offers, curated, url });
@@ -295,6 +334,7 @@ async fn aiostreams_link(key: &str, language: Option<&Language>, previous: Optio
 /// Install (or set up again) a curated add-on with the current key and language. Any other
 /// copy of it (one installed from its website) is replaced.
 pub async fn install(c: Curated) -> Result<()> {
+    if let Some(url) = c.free_url() { return install_free(c, url).await; }
     let key = rd_key()?;
     let settings = backend::load_settings();
     let language = settings.stream_language.as_deref().and_then(language);
@@ -304,6 +344,7 @@ pub async fn install(c: Curated) -> Result<()> {
     let previous = store.managed.get(&pending).or_else(|| store.managed.get(c.id())).cloned();
     let (url, record) = match c {
         Curated::Torrentio => { let url = torrentio_url(&key, language); (url.clone(), json!({"url": url})) }
+        Curated::NoTorrent | Curated::AbsoluteCinema => unreachable!("free add-ons are installed above"),
         Curated::AioStreams => {
             let link = aiostreams_link(&key, language, previous.as_ref()).await?;
             // Keep the new login aside before installing: if the install fails, a retry updates
@@ -333,9 +374,31 @@ pub async fn install(c: Curated) -> Result<()> {
     Ok(())
 }
 
+/// A free add-on: its fixed link, replacing any other copy (another configuration of it).
+async fn install_free(c: Curated, url: &str) -> Result<()> {
+    let addon = exec(json!({"op":"install_addon","url":url})).await.map_err(|_| anyhow::anyhow!("{} couldn't be installed. Check your connection and try again.", c.name()))?;
+    let new_url = s(&addon, "manifest_url");
+    for a in installed().await {
+        let u = s(&a, "manifest_url");
+        if u != new_url && host_of(&u) == c.host() { let _ = exec(json!({"op":"remove_addon","url":u})).await; }
+    }
+    let mut store = load();
+    store.managed.insert(c.id().into(), json!({"url": new_url}));
+    store.managed.remove(&removed_key(c));
+    mark_seen(&mut store, &addon);
+    save(&store);
+    Ok(())
+}
+
 pub async fn remove(row: &Row) -> Result<()> {
     // The AIOStreams login stays in addons.json so a later install updates the same configuration.
     exec(json!({"op":"remove_addon","url":row.url})).await?;
+    // A free add-on you removed is not installed again by default.
+    if let Some(c) = row.curated.filter(|c| !c.needs_key()) {
+        let mut store = load();
+        store.managed.insert(removed_key(c), json!(true));
+        save(&store);
+    }
     Ok(())
 }
 
@@ -355,7 +418,7 @@ pub async fn reconfigure() -> Result<()> {
     let ov = overview().await;
     let mut first_error = None;
     for (c, row) in ov.curated {
-        if row.is_some() { if let Err(e) = install(c).await { first_error.get_or_insert(e); } }
+        if row.is_some() && c.needs_key() { if let Err(e) = install(c).await { first_error.get_or_insert(e); } }
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -364,7 +427,7 @@ pub async fn reconfigure() -> Result<()> {
 /// (their links carry the key). Add-ons you installed yourself stay.
 pub async fn remove_rd_key() -> Result<()> {
     // The add-ons go first: if one can't be removed, the key stays so Remove key can be tried again.
-    for row in overview().await.curated.into_iter().filter_map(|(_, row)| row) {
+    for row in overview().await.curated.into_iter().filter(|(c, _)| c.needs_key()).filter_map(|(_, row)| row) {
         exec(json!({"op":"remove_addon","url":row.url})).await
             .map_err(|_| anyhow::anyhow!("{} couldn't be removed, so the key was kept. Try again.", row.name))?;
     }
@@ -430,9 +493,17 @@ pub async fn startup() -> usize {
             backend::save_settings(&settings);
         }
     }
+    // The free add-ons, unless you removed them.
+    {
+        let store = load();
+        for c in Curated::ALL.into_iter().filter(|c| !c.needs_key()) {
+            let present = addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
+            if !present && !store.managed.contains_key(&removed_key(c)) { let _ = install(c).await; }
+        }
+    }
     if settings.rd_key.is_some() {
         let store = load();
-        for c in Curated::ALL {
+        for c in Curated::ALL.into_iter().filter(|c| c.needs_key()) {
             let managed = store.managed.get(c.id()).map(|m| s(m, "url"));
             let foreign = addons.iter().any(|a| { let u = s(a, "manifest_url"); host_of(&u) == c.host() && Some(&u) != managed.as_ref() });
             let outdated = needs_3d_filter(c, store.managed.get(c.id()))
@@ -473,6 +544,16 @@ mod tests {
         assert!(!needs_3d_filter(Curated::AioStreams, Some(&json!({"exclude_3d":true}))));
         assert!(!needs_3d_filter(Curated::AioStreams, None));
         assert!(!needs_3d_filter(Curated::Torrentio, Some(&json!({}))));
+    }
+
+    #[test]
+    fn free_addons_need_no_key_and_are_known_by_name() {
+        assert!(Curated::ALL.iter().filter(|c| !c.needs_key()).all(|c| c.free_url().is_some_and(|u| host_of(u) == c.host())));
+        assert!(Curated::ALL.iter().filter(|c| c.needs_key()).all(|c| c.free_url().is_none()));
+        assert!(is_free_addon("Absolute Cinema") && is_free_addon("NoTorrent"));
+        assert!(!is_free_addon("Torrentio") && !is_free_addon("AIOStreams") && !is_free_addon(""));
+        // Absolute Cinema: web streams only, no catalogues.
+        assert!(ABSOLUTE_CINEMA.contains("mode=http") && ABSOLUTE_CINEMA.contains("streamingservices=none"));
     }
 
     #[test]

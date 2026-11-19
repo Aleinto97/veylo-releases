@@ -2145,6 +2145,12 @@ async fn probe_accepts_only_real_film_sized_sources() {
                 "Content-Type: video/mp4\r\nContent-Range: bytes 0-0/900000\r\n",
                 "x",
             ),
+            "/web/index.m3u8" | "/web/playlist" => reply(
+                "200 OK",
+                "Content-Type: application/vnd.apple.mpegurl\r\n",
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow.m3u8\n",
+            ),
+            "/error.html" => reply("200 OK", "Content-Type: text/html\r\n", "<html>nope</html>"),
             _ => reply(
                 "503 Service Unavailable",
                 "Content-Type: text/plain\r\n",
@@ -2166,6 +2172,10 @@ async fn probe_accepts_only_real_film_sized_sources() {
     assert_eq!(uncached["ok"], false);
     assert_eq!(uncached["debrid_status"], "downloading");
     assert_eq!(probe("/tiny.mp4").await["ok"], false);
+    // A web stream's HLS playlist is small and still a real source; a small page is not.
+    assert_eq!(probe("/web/index.m3u8").await["ok"], true);
+    assert_eq!(probe("/web/playlist").await["playlist"], true);
+    assert_eq!(probe("/error.html").await["ok"], false);
     let busy = probe("/busy").await;
     assert_eq!(busy["ok"], false);
     assert_eq!(busy["status"], 503);
