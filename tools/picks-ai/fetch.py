@@ -8,18 +8,25 @@ import shutil
 import struct
 import subprocess
 import tempfile
-import tarfile
 import urllib.request
 import zipfile
 
 REVISION = 'ea104dacec62c0de699686887e3f920caeb4f3e3'
 MODEL_BASE = f'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/{REVISION}/'
-ORT_BASE = 'https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/'
+# Microsoft's NuGet package contains the same native binaries as the desktop release archives.
+ORT_DESKTOP = (
+    'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg',
+    'd571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a',
+)
+ORT_ANDROID = (
+    'https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar',
+    '04a4617a9c797cf49225595e45b5546081cb34c86ac817581141577d3b7dbfe2',
+)
 RUNTIMES = {
-    'linux-aarch64': (ORT_BASE + 'onnxruntime-linux-aarch64-1.22.0.tgz', 'bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702'),
-    'linux-x64': (ORT_BASE + 'onnxruntime-linux-x64-1.22.0.tgz', '8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3'),
-    'windows-x64': (ORT_BASE + 'onnxruntime-win-x64-1.22.0.zip', '174c616efc0271194488642a72f1a514e01487da4dfe84c49296d66e40ebe0da'),
-    'android-arm64': ('https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar', '04a4617a9c797cf49225595e45b5546081cb34c86ac817581141577d3b7dbfe2'),
+    'linux-aarch64': 'runtimes/linux-arm64/native/libonnxruntime.so',
+    'linux-x64': 'runtimes/linux-x64/native/libonnxruntime.so',
+    'windows-x64': 'runtimes/win-x64/native/onnxruntime.dll',
+    'android-arm64': 'jni/arm64-v8a/libonnxruntime.so',
 }
 ASSETS = {
     'model.onnx': ('onnx/model_quantized.onnx', '6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4'),
@@ -49,33 +56,19 @@ def prepare(target):
             shutil.copyfile(download(MODEL_BASE + remote, digest), path)
     for name in ['LICENSE', 'NOTICE']:
         shutil.copyfile(Path(__file__).parent / name, shared / name)
-    url, digest = RUNTIMES[target]
-    archive = download(url, digest)
     dest = DEST / target
     dest.mkdir(parents=True, exist_ok=True)
-    if url.endswith('.tgz'):
-        with tarfile.open(archive) as tar:
-            for member in tar.getmembers():
-                if member.isfile() and (Path(member.name).name.startswith('libonnxruntime.so.') or Path(member.name).name in ['LICENSE', 'ThirdPartyNotices.txt']):
-                    name = 'libonnxruntime.so' if '.so.' in member.name else Path(member.name).name
-                    with tar.extractfile(member) as src, open(dest / name, 'wb') as out:
-                        shutil.copyfileobj(src, out)
-    else:
-        with zipfile.ZipFile(archive) as z:
-            for name in z.namelist():
-                base = Path(name).name
-                runtime = (target == 'android-arm64' and name == 'jni/arm64-v8a/libonnxruntime.so') or (target == 'windows-x64' and base == 'onnxruntime.dll')
-                if runtime or base in ['LICENSE', 'LICENSE.txt', 'ThirdPartyNotices.txt']:
-                    with z.open(name) as src, open(dest / base, 'wb') as out:
-                        shutil.copyfileobj(src, out)
-    if target == 'android-arm64':
-        # The Maven AAR omits notices; ship those from the matching pinned release.
-        notice_url, notice_digest = RUNTIMES['linux-x64']
-        with tarfile.open(download(notice_url, notice_digest)) as tar:
-            for member in tar.getmembers():
-                if Path(member.name).name in ['LICENSE', 'ThirdPartyNotices.txt']:
-                    with tar.extractfile(member) as src, open(dest / Path(member.name).name, 'wb') as out:
-                        shutil.copyfileobj(src, out)
+    native_path = RUNTIMES[target]
+    desktop_archive = download(*ORT_DESKTOP)
+    runtime_archive = download(*ORT_ANDROID) if target == 'android-arm64' else desktop_archive
+    with zipfile.ZipFile(runtime_archive) as z:
+        with z.open(native_path) as src, open(dest / Path(native_path).name, 'wb') as out:
+            shutil.copyfileobj(src, out)
+    # The Android AAR omits notices; include them from the matching desktop package.
+    with zipfile.ZipFile(desktop_archive) as z:
+        for name in ['LICENSE', 'ThirdPartyNotices.txt']:
+            with z.open(name) as src, open(dest / name, 'wb') as out:
+                shutil.copyfileobj(src, out)
     if target == 'windows-x64':
         prepare_windows_crt(dest)
     print('Prepared', target)
