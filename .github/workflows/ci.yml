@@ -8,6 +8,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked -- --test-threads=2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -17,6 +18,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
       # Inference assets are pinned but not committed; fetch.py verifies their checksums.
       - uses: actions/cache@v4
         with:
