@@ -187,8 +187,8 @@ impl Embedder {
             unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) }?;
         }
         ort::init_from(runtime.to_string_lossy()).with_name("Veylo Picks").commit()?;
-        #[cfg(target_os = "android")]
-        register_android_shutdown();
+        #[cfg(any(target_os = "android", target_os = "macos"))]
+        register_shutdown();
         let session = Session::builder()?.with_intra_threads(2)?.with_inter_threads(1)?
             .commit_from_file(dir.join("model.onnx"))?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("Tokenizer: {e}"))?;
@@ -250,10 +250,11 @@ fn unit(vector: &[f32]) -> Result<Vec<f32>> {
 }
 
 /// ort keeps its Environment in a Rust static, which is not dropped at process exit. On
-/// Android the native library's C++ static destructors can then destroy a mutex before the
-/// environment releases it. Register after dlopen, so cleanup runs before those destructors.
-#[cfg(target_os = "android")]
-fn register_android_shutdown() {
+/// Android and macOS the native library's C++ static destructors can then destroy a mutex before
+/// the environment releases it ("mutex lock failed", an abort at every exit). Register after dlopen,
+/// so cleanup runs before those destructors.
+#[cfg(any(target_os = "android", target_os = "macos"))]
+fn register_shutdown() {
     static REGISTERED: OnceLock<()> = OnceLock::new();
     REGISTERED.get_or_init(|| {
         extern "C" fn shutdown() {
