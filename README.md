@@ -8,7 +8,7 @@ A quiet, all-Rust media client for Android tablets and the Linux and Windows des
   [BetterPosters](https://btttr.cc) and your add-ons' catalogues. The top bar shows what is on the player: one tap carries on.
 - **Title pages**: the film's own logo, stills, tagline, chart rank, studios, cast and crew, season art, trailers, and an
   episode grid that splits long seasons into ranges.
-- **Picks**: a two-card duel that learns your taste from metadata and local synopsis embeddings, separates tonight’s mood from lasting preferences, and hides what you have watched.
+- **Picks**: an endless two-card duel run by one local taste model over synopsis embeddings: match scores, reasons, moods, a shortlist of tonight's winners, Like and Not for me on every card, and nothing shown twice in a night.
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
   under the page through a bridge per OS (`video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
@@ -100,24 +100,24 @@ Each title becomes a 384-dimension embedding, cached locally by model version an
 (`picks-embeddings-v1.json`, at most 1,024 entries). Changed enrichment embeds the title again. Titles
 without a usable synopsis keep metadata ranking. An inference failure shows a status message and
 preserves the duel with metadata ranking.
-After a choice, every challenger is ranked by how much closer than the other candidates its embedding is
-to the kept title, together with catalogue order and long-term taste; near-ties are drawn at random so
-duels differ. Nothing is filtered by a fixed label list. On 593 TMDB top-rated titles, a title's five nearest
-neighbours share genre at 0.42 (random 0.21, the earlier 18-label classifier 0.40), and TMDB's own
-recommendations for it appear among its ten nearest three times as often as with that classifier.
-A duel loss is a relative preference, not a permanent dislike. Shared features cancel during
-learning; the learned direction is a sum of embedding differences between kept and passed titles.
-Session preferences and stopping evidence are saved with the duel and cleared for a fresh duel,
-while smaller updates persist in `picks-taste.json`. Genre, type and decade preferences from older
-profiles remain readable. Fixed rounds are no longer used (the legacy settings value is preserved).
-Picks only suggests a title after four consecutive independent confirmations: before each vote,
-the model must already rank the incumbent at least 0.45 above its strongest rival, and the user
-must then keep it against a previously untested opponent. At least three opponent genre/type/
-decade profiles must have been explored. The current vote is learned only after its prediction
-is recorded. Embeddings must cover the winner and 75% of the strongest alternatives (up to 24,
-at least three). These heuristics are not calibrated enjoyment probabilities. Ten choices no
-longer force a result. Exhausting a fully loaded candidate pool is labelled separately; a
-partial background catalogue cannot declare an only match or exhaustion.
+One taste model (`apps/veylo-dx/src/brain.rs`) is the brain of Picks and of Home's Tonight's pick.
+Each title's features are its embedding projected onto the main directions the catalogue varies along
+(PCA over the embedded titles, whitened, refitted as the catalogue grows), plus genre, type, style,
+decade and rating. Taste is a Gaussian belief over those weights (online Bayesian logistic regression),
+so the model knows how sure it is. Lasting taste learns from likes and dislikes, finishes, saves and
+long watches in the library, plays from Picks and, lightly, duel votes; tonight starts from lasting
+taste with room to move, is steered by duel votes, Neither and moods, and lets older votes fade.
+The duel never stops: the card you keep meets the favourite of one plausible taste drawn from the
+belief (Thompson sampling), which balances showing likely winners with testing uncertain directions.
+A card that wins four in a row joins tonight's shortlist. Within a night a title is never shown twice
+(under any source's key, IMDb id or name and year) until every title for the filters has been seen,
+then Picks says it is reshuffling. Moods (chips or typed words) are embedded by the same model as
+search queries and steer tonight; the same mood words describe what tonight leans to and how a card
+feels. Every signal is kept in a local event log (`picks-brain-events.jsonl`, titles' features in
+`picks-brain-items.json`, never add-on URLs) and replayed, so a new projection or model loses nothing.
+Genre, type and decade weights of the earlier `picks-taste.json` profile seed lasting taste. Not for me
+removes a title from Picks for good; Settings > Learned taste forgets everything. When TMDB knows a
+title, its genres decide whether it is animated (catalogues sometimes tag live-action films Animation).
 Continue preserves the cumulative choice count, comparisons, current mood and lasting taste;
 a checkpoint requires four fresh confirmations before another proposal. It never silently
 starts a new duel when challengers run out. A bounded private `picks-decisions.json` records the

@@ -38,7 +38,7 @@ pub fn SearchOverlay() -> Element {
         if q.trim().chars().count() >= 2 { backend::remember_query(&mut shell.history.write(), &q); }
     };
     let mut close = move || { remember(); shell.search_open.set(false); };
-    let mut open = move |m: Media| {
+    let open = move |m: Media| {
         remember();
         backend::remember_item(&mut shell.history.write(), &m);
         shell.opened.set(Some(m));
@@ -119,7 +119,7 @@ pub fn SearchOverlay() -> Element {
                         div { class: "group-head", title: "Opened from search", span { class: "group-icon", icons::History {} } }
                         div { class: "strip",
                             for m in history.items.iter().take(10).cloned() {
-                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: move |m| open(m) }
+                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
                             }
                         }
                     }
@@ -127,13 +127,13 @@ pub fn SearchOverlay() -> Element {
                         div { class: "group-head", title: "From your picks", span { class: "group-icon lamp", icons::Sparkles {} } }
                         div { class: "strip",
                             for m in list.into_iter().take(10) {
-                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: move |m| open(m) }
+                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
                             }
                         }
                     }
                 } else {
                     if let Some((addon, media)) = top {
-                        TopMatch { media: media.clone(), source: several_addons.then_some(addon), on_open: move |m| open(m) }
+                        TopMatch { media: media.clone(), source: several_addons.then_some(addon), on_open: open }
                     }
                     for (kind, list) in groups {
                         div { class: "group-head", title: "{backend::group_label(&kind)}",
@@ -150,7 +150,7 @@ pub fn SearchOverlay() -> Element {
                         }
                         div { class: "grid",
                             for m in list {
-                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: move |m| open(m) }
+                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
                             }
                         }
                     }

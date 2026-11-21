@@ -49,7 +49,12 @@ const STYLES: [&str; 2] = ["Animation", "Anime"];
 
 pub fn is_format(m: &Media) -> bool { m.genres.iter().any(|g| FORMATS.contains(&g.as_str())) }
 pub fn is_kids(m: &Media) -> bool { m.genres.iter().any(|g| g == "Kids") }
+/// Set once TMDB has said whether a title is animated: catalogues sometimes tag live-action
+/// films "Animation" (Cinemeta lists The Last Viking, 2025, so), and TMDB's answer then wins.
+const SETTLED: &str = "animated";
+
 pub fn is_animated(m: &Media) -> bool {
+    if let Some(settled) = m.raw[SETTLED].as_bool() { return settled; }
     m.kind == "anime" || m.genres.iter().any(|g| STYLES.iter().any(|s| g.eq_ignore_ascii_case(s)))
         || (m.raw["tmdb_id"].as_i64().is_some() && m.raw["genre_ids"].as_array().is_some_and(|a| a.iter().any(|g| g.as_i64() == Some(16))))
         || m.raw["show_type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("animation") || t.eq_ignore_ascii_case("anime"))
@@ -100,15 +105,34 @@ pub fn tidy(mut m: Media) -> Media {
     m
 }
 
-/// Add titles to the pool once each: same entry or same title from another source.
+/// A title's IMDb id, whichever source listed it.
+pub fn imdb(m: &Media) -> Option<String> {
+    Some(m.id.as_str()).filter(|i| i.starts_with("tt"))
+        .or_else(|| m.raw["imdb_id"].as_str().filter(|i| i.starts_with("tt")))
+        .map(|i| i.split(':').next().unwrap_or(i).to_owned())
+}
+
+/// Record TMDB's word on whether a title is animated, and make its genres agree.
+pub fn settle_style(m: &mut Media, animated: bool) {
+    let style = |g: &String| STYLES.iter().any(|s| g.eq_ignore_ascii_case(s));
+    if !animated { m.genres.retain(|g| !style(g)); } else if !m.genres.iter().any(style) { m.genres.push("Animation".into()); }
+    m.raw[SETTLED] = serde_json::json!(animated);
+    m.raw["genres"] = serde_json::json!(m.genres);
+}
+
+/// Add titles to the pool once each: same entry, same IMDb id or same title from another source.
 pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
     for m in more.into_iter().map(tidy) {
         let title = title_key(&m);
-        if let Some(existing) = pool.iter_mut().find(|old| old.key() == m.key() || title_key(old) == title) {
-            // A later source can supply a missing style. Deduplication must not throw it away.
-            if is_animated(&m) && !is_animated(existing) { existing.genres.push("Animation".into()); }
+        let id = imdb(&m);
+        if let Some(existing) = pool.iter_mut().find(|old| old.key() == m.key() || title_key(old) == title || (id.is_some() && imdb(old) == id)) {
+            // A later source can supply a missing style. Deduplication must not throw it away,
+            // unless TMDB already settled it (then only TMDB's word counts).
+            let settled = m.raw[SETTLED].as_bool().or_else(|| existing.raw[SETTLED].as_bool());
+            if settled.is_none() && is_animated(&m) && !is_animated(existing) { existing.genres.push("Animation".into()); }
             for genre in m.genres { if !existing.genres.contains(&genre) { existing.genres.push(genre); } }
             existing.raw["genres"] = serde_json::json!(existing.genres);
+            if let Some(animated) = settled { settle_style(existing, animated); }
         } else { pool.push(m); }
     }
 }
@@ -118,12 +142,12 @@ pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
 pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genre: Option<&str>, from: Option<i32>, to: Option<i32>, this_year: i32) -> Vec<Media> {
     let wants_kids = genre.is_some_and(|g| canonical_genre(g) == "Kids");
     items.iter().filter(|m| {
-        let kind_ok = kind.map_or(true, |k| if k == "series" { m.kind == "series" || m.kind == "anime" } else { m.kind == k });
+        let kind_ok = kind.is_none_or(|k| if k == "series" { m.kind == "series" || m.kind == "anime" } else { m.kind == k });
         let style_ok = style_matches(m,style);
         let years_ok = if from.is_none() && to.is_none() { true } else {
-            year_range(m, this_year).is_some_and(|(a, b)| from.map_or(true, |f| b >= f) && to.map_or(true, |t| a <= t))
+            year_range(m, this_year).is_some_and(|(a, b)| from.is_none_or(|f| b >= f) && to.is_none_or(|t| a <= t))
         };
-        kind_ok && style_ok && years_ok && !is_format(m) && (wants_kids || !is_kids(m)) && genre.map_or(true, |g| has_genre(m, g))
+        kind_ok && style_ok && years_ok && !is_format(m) && (wants_kids || !is_kids(m)) && genre.is_none_or(|g| has_genre(m, g))
     }).cloned().collect()
 }
 
@@ -170,6 +194,28 @@ mod tests {
         tidy(Media::from_json(&json!({"id": id, "type": kind, "name": id, "releaseInfo": year, "genres": genres}), "a").unwrap())
     }
     fn ids(v: Vec<Media>) -> Vec<String> { v.into_iter().map(|m| m.id).collect() }
+
+    #[test]
+    fn tmdb_settles_a_catalogue_s_wrong_animation_tag() {
+        // Cinemeta lists this live-action film as Animation, Comedy, Crime.
+        let mut viking = media("tt27817389", "movie", "2025", &["Animation", "Comedy", "Crime"]);
+        assert!(is_animated(&viking));
+        settle_style(&mut viking, false);
+        assert!(!is_animated(&viking) && viking.genres == ["Comedy", "Crime"]);
+        assert!(filter_picks(std::slice::from_ref(&viking), Some("movie"), Style::Animation, None, None, None, 2026).is_empty());
+        // The same title from the catalogue again cannot bring the style back.
+        let mut pool = vec![viking.clone()];
+        merge(&mut pool, vec![media("tt27817389", "movie", "2025", &["Animation", "Comedy"])]);
+        assert!(!is_animated(&pool[0]) && !pool[0].genres.iter().any(|g| g == "Animation"));
+        // A settled entry arriving later corrects the one already in the pool.
+        let mut pool = vec![media("tt27817389", "movie", "2025", &["Animation", "Comedy"])];
+        merge(&mut pool, vec![viking]);
+        assert!(!is_animated(&pool[0]));
+        // TMDB can also confirm animation a catalogue left out.
+        let mut film = media("tt0000001", "movie", "2020", &["Comedy"]);
+        settle_style(&mut film, true);
+        assert!(is_animated(&film) && style_matches(&film, Style::Animation));
+    }
 
     fn episode(season: i64, number: i64, released: &str) -> crate::backend::Episode {
         crate::backend::Episode { id: format!("tt-fixture:{season}:{number}"), season, number, title: String::new(), thumbnail: String::new(), overview: String::new(), released: released.into() }

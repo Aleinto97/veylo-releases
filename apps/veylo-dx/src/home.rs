@@ -42,8 +42,27 @@ pub fn Home() -> Element {
             }
             Err(e) => rows_error.set(Some(format!("{e:#}"))),
         }
-        // Tonight's pick: Picks' first recommendation you have neither watched nor started.
-        if let Ok(p) = backend::picks().await { tonight.set(p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(6).collect()); }
+        // Tonight's pick: recommendations you have neither watched nor started, in the order of
+        // the taste Picks learned (brain.rs), with its reason when it has one.
+        if let Ok(p) = backend::picks().await {
+            let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(24).collect();
+            let known = library.peek().clone();
+            let order = fresh.clone();
+            let ranked = backend::on_runtime(async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut taste = crate::brain::load(0);
+                    taste.set_facts(crate::brain::facts(&known));
+                    // The core's order breaks near-ties: it knows the catalogues' own ranking.
+                    let mut scored: Vec<(f64, Media)> = fresh.into_iter().enumerate().map(|(i, mut m)| {
+                        if let Some(r) = taste.home_reason(&m) { m.reason = r; }
+                        (taste.lasting(&m) - i as f64 * 0.02, m)
+                    }).collect();
+                    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+                }).await.ok()
+            }).await.ok().flatten();
+            tonight.set(ranked.unwrap_or(order).into_iter().take(6).collect());
+        }
         loading.set(false);
     });
 

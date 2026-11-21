@@ -105,8 +105,8 @@ pub fn SettingsPage() -> Element {
                     GetKey { url: "https://www.tvmaze.com/", label: "Episode metadata: TVmaze (CC BY-SA)" }
                 }
                 div { class: "setting-row glass",
-                    div { class: "setting-copy", span { class: "setting-name", "Learned taste" } span { class: "dim setting-about", "What Picks learned from your duels" } }
-                    crate::picks::StartOver { labelled: true, on_reset: move |_| backend::reset_taste() }
+                    div { class: "setting-copy", span { class: "setting-name", "Learned taste" } span { class: "dim setting-about", "What Picks learned from your duels, plays, likes and moods" } }
+                    crate::picks::StartOver { labelled: true, on_reset: move |_| crate::brain::reset() }
                 }
             }
 

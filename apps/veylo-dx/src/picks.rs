@@ -1,53 +1,93 @@
-//! Picks as a duel: two big cards, keep one. The kept title stays and meets a challenger
-//! chosen by local semantic taste. Independent pre-vote confirmations suggest a pick. Taste is saved until "Start over".
-use crate::{backend::{self, Media, Taste, TitleMeta}, icons, picks_rules::{self as rules, Style}, PickCommand, Shell};
+//! Picks: an endless duel with the brain (brain.rs) at its centre. Two cards; keep the one you'd
+//! rather watch tonight. Every vote, Neither, play, like and mood teaches one local model, and the
+//! next card is the favourite of one plausible version of your taste. A card that keeps winning
+//! joins tonight's shortlist. There is no final answer: play anything, any time.
+use crate::{backend::{self, Media, TitleMeta}, brain::{self, Brain}, icons, picks_rules::{self as rules, Style}, PickCommand, Shell};
 use dioxus::prelude::*;
 use std::collections::HashSet;
 
+/// Wins in a row that take a card onto the shortlist (and make room for new titles).
+const GRADUATE: u32 = 4;
+/// Idle time after which Picks starts a new night (tonight's moods and votes are set aside).
+const NIGHT_GAP: i64 = 6 * 3600;
+/// Extra catalogue pages fetched in one night once these filters run low on unseen titles.
+const MAX_GROWTH: u32 = 6;
+
 #[derive(Clone, Copy, PartialEq)]
-enum Slot { Genre, Years }
+enum Slot { Filters, Mood }
 
 fn year_span(from: &str, to: &str) -> Option<String> { (!from.is_empty() || !to.is_empty()).then(|| format!("{from}–{to}")) }
+fn new_night_id() -> u64 { backend::rand_u64() | 1 }
+fn has(list: &[Media], m: &Media) -> bool { list.iter().any(|x| x.key() == m.key()) }
 
 #[component]
 pub fn Picks() -> Element {
     let mut shell = use_context::<Shell>();
+    // Tonight as you left it, unless the night is over: then only the filters carry on.
+    let (start, same_night) = use_hook(|| {
+        let saved = backend::load_duel().unwrap_or_default();
+        let same = saved.night != 0 && backend::now_secs() - saved.last < NIGHT_GAP;
+        let start = if same { saved } else {
+            backend::DuelState { kind: saved.kind, style: saved.style, genre: saved.genre, from: saved.from, to: saved.to, night: new_night_id(), ..Default::default() }
+        };
+        (start, same)
+    });
     let mut pool = use_signal(Vec::<Media>::new);
     let mut loading = use_signal(|| true);
     let mut pool_complete = use_signal(|| false);
-    let mut taste = use_signal(backend::load_taste);
-    // A duel in progress comes back as you left it, filters included.
-    let saved = use_hook(backend::load_duel);
-    let mut restored = use_signal(|| saved.is_some());
-    let saved = saved.unwrap_or_default();
-    use_hook(|| { let mut t = taste.write(); t.session = saved.session.clone(); t.session_vibe = saved.session_vibe.clone(); });
-    let mut round = use_signal(|| saved.round);
-    let mut evidence = use_signal(|| saved.evidence.clone());
-    // Left and right cards; the kept one stays on its side.
-    let mut pair = use_signal(|| (saved.left.clone(), saved.right.clone()));
-    let mut shown = use_signal(|| saved.shown.clone());
-    let mut winner = use_signal(|| saved.winner.clone());
-    let mut kind = use_signal(|| saved.kind.clone());
-    let mut style = use_signal(|| Style::parse(&saved.style));
-    let mut genre = use_signal(|| saved.genre.clone());
-    let mut from_text = use_signal(|| saved.from.clone());
-    let mut to_text = use_signal(|| saved.to.clone());
+    let mut night = use_signal(|| start.night);
+    let mut restored = use_signal(|| same_night && (start.left.is_some() || start.right.is_some()));
+    let mut round = use_signal(|| start.round);
+    let mut streak = use_signal(|| start.streak);
+    let mut pair = use_signal(|| (start.left.clone(), start.right.clone()));
+    let mut shown = use_signal(|| start.shown.clone());
+    let mut kept = use_signal(|| start.kept.clone());
+    let mut starred = use_signal(|| start.starred.clone());
+    let mut kind = use_signal(|| start.kind.clone());
+    let mut style = use_signal(|| Style::parse(&start.style));
+    let mut genre = use_signal(|| start.genre.clone());
+    let mut from_text = use_signal(|| start.from.clone());
+    let mut to_text = use_signal(|| start.to.clone());
     let mut hide_watched = use_signal(|| backend::load_settings().picks_hide_watched);
     let watched = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::watched_ids().await } });
+    let library = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::library().await.unwrap_or_default() } });
     let mut slot = use_signal(|| None::<Slot>);
-    // The app's accent: neutral during a duel (each card has its own), the winner's once chosen.
+    let mut toast = use_signal(|| None::<(u64, String)>);
+    let mut mood_text = use_signal(String::new);
+    let mut mood_busy = use_signal(|| false);
+
+    // The brain: loaded off the UI thread, then its projection and mood words as they come.
+    let mut brain = use_signal(Brain::default);
+    let mut brain_ready = use_signal(|| false);
+    use_future(move || async move {
+        let n = *night.peek();
+        let loaded = backend::on_runtime(async move { tokio::task::spawn_blocking(move || brain::load(n)).await.ok() }).await.ok().flatten();
+        let mut b = loaded.unwrap_or_default();
+        b.set_session(n);
+        brain.set(b);
+        brain_ready.set(true);
+        if !crate::picks_ai::failed() {
+            let anchors = brain::anchors().await;
+            if !anchors.is_empty() { brain.write().set_anchors(anchors); }
+        }
+    });
+
+    // The room takes its light from tonight's favourite while it is on screen.
     let mut lamp = shell.lamp_source;
     use_effect(move || {
-        let Some(w) = winner() else { if !lamp.peek().is_empty() { lamp.set(String::new()); } return };
+        let champion = kept.read().first().cloned().filter(|_| *streak.read() > 0);
+        let (l, r) = pair();
+        let on_screen = champion.filter(|c| [l, r].iter().flatten().any(|m| m.key() == c.key()));
+        let Some(c) = on_screen else { if !lamp.peek().is_empty() { lamp.set(String::new()); } return };
         spawn(async move {
-            let src = backend::artwork(&w).await.and_then(|a| a.backdrop).unwrap_or_else(|| w.backdrop().to_owned());
-            if winner.peek().as_ref().map(Media::key) == Some(w.key()) && *lamp.peek() != src { lamp.set(src); }
+            let src = backend::artwork(&c).await.and_then(|a| a.backdrop).unwrap_or_else(|| c.backdrop().to_owned());
+            if *lamp.peek() != src { lamp.set(src); }
         });
     });
 
-    // Candidates: your ranked recommendations first (the duel starts on them), then the wider
-    // catalogue in the background: random pages of popular, well-rated TMDB titles and a TVmaze
-    // sample, so every visit brings new titles.
+    // Candidates: your ranked recommendations first, then the wider catalogue in the background:
+    // random pages of popular, well-rated TMDB titles and a TVmaze sample, so every visit brings
+    // new titles. Titles you keep pull in more like them as you go (expand, below).
     use_future(move || async move {
         let mut items = backend::picks().await.map(|p| p.items).unwrap_or_default();
         if items.len() < 6 { items.extend(backend::seed_catalogs().await); }
@@ -65,6 +105,33 @@ pub fn Picks() -> Element {
         pool_complete.set(true);
     });
 
+    // The library teaches lasting taste: likes and dislikes, finishes, saves, long watches. Its
+    // liked and finished titles are embedded once so their story counts, not just their genres.
+    let mut facts_tick = use_signal(|| 0u32);
+    use_effect(move || {
+        let _ = facts_tick();
+        let Some(items) = library.read().clone() else { return };
+        if !brain_ready() { return; }
+        let facts = brain::facts(&items);
+        let mut b = brain.write();
+        b.set_facts(facts);
+        brain::persist(&mut b, None);
+    });
+    let mut library_embedded = use_signal(|| false);
+    use_effect(move || {
+        let Some(items) = library.read().clone() else { return };
+        if *library_embedded.peek() { return; }
+        library_embedded.set(true);
+        let todo: Vec<Media> = items.into_iter().filter(|m| (m.liked != 0 || m.watched) && crate::picks_ai::embedding(m).is_none()).take(40).collect();
+        if todo.is_empty() { return; }
+        spawn(async move {
+            for m in todo { if crate::picks_ai::failed() { break; } let _ = crate::picks_ai::enrich_and_embed(&m).await; }
+            facts_tick += 1;
+        });
+    });
+    let disliked = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked < 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
+    let liked_ids = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked > 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
+
     let from = use_memo(move || from_text().parse::<i32>().ok().filter(|_| from_text().len() == 4));
     let to = use_memo(move || to_text().parse::<i32>().ok().filter(|_| to_text().len() == 4));
     // Titles checked for a poster and a trailer: only ready ones are drawn when enough are, and a
@@ -76,17 +143,18 @@ pub fn Picks() -> Element {
         let this_year = backend::civil(backend::now_secs()).0 as i32;
         let out = rules::filter_picks(&pool.read(), kind().as_deref(), style(), genre().as_deref(), from(), to(), this_year);
         let gone = rejected.read();
+        let not_for_me = disliked.read();
         let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
         let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|i| seen.contains(i));
-        out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(m)).collect::<Vec<_>>()
+        out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(m) && !not_for_me.contains(&brain::id(m))).collect::<Vec<_>>()
     });
     let resolved_pair = use_memo(move || {
         let list = pool.read();
         let resolve = |m: Option<Media>| m.map(|m| list.iter().find(|x| x.key() == m.key() || rules::title_key(x) == rules::title_key(&m)).cloned().unwrap_or(m));
-        let (l,r) = pair(); (resolve(l),resolve(r))
+        let (l, r) = pair(); (resolve(l), resolve(r))
     });
-    // Embed beyond the first trailer-ready titles. Otherwise a matching title deeper in the
-    // catalogue cannot challenge one that happened to finish verification first.
+    // Embed beyond the first trailer-ready titles, so a matching title deeper in the catalogue
+    // can challenge one that happened to finish verification first.
     let _embedding_prefetch = use_resource(move || {
         let candidates = filtered();
         async move {
@@ -101,11 +169,32 @@ pub fn Picks() -> Element {
             }
         }
     });
+    // The projection follows the catalogue: fitted once enough titles are embedded, refitted as
+    // it grows (the brain replays everything into the new space).
+    let mut space_bucket = use_signal(|| 0usize);
+    use_effect(move || {
+        let n = verified.read().len();
+        if !brain_ready() { return; }
+        let bucket = n / 40 + 1;
+        if *space_bucket.peek() >= bucket { return; }
+        space_bucket.set(bucket);
+        let (current, items) = { let b = brain.peek(); (b.space.clone(), b.item_embeddings()) };
+        spawn(async move {
+            if let Some(space) = brain::refresh_space(current, items).await {
+                let list = pool.peek().clone();
+                let mut b = brain.write();
+                b.set_space(Some(space));
+                b.refresh_items(&list);
+                brain::persist(&mut b, None);
+            }
+        });
+    });
     // The verified part of a list, when it still offers a choice beyond `exclude`.
     let prefer = move |list: &[Media], exclude: &[String]| -> Vec<Media> {
         let ok = verified.peek();
+        let skip: HashSet<&str> = exclude.iter().map(String::as_str).collect();
         let ready: Vec<Media> = list.iter().filter(|m| ok.contains(&m.key())).cloned().collect();
-        if ready.iter().filter(|m| !exclude.contains(&m.key())).count() >= 2 { ready } else { list.to_vec() }
+        if ready.iter().filter(|m| !brain::excluded(m, &skip)).count() >= 2 { ready } else { list.to_vec() }
     };
     // Check the candidates ahead of the duel, a dozen at a time.
     use_effect(move || {
@@ -128,7 +217,7 @@ pub fn Picks() -> Element {
         }
     });
     // A rare genre: ask the catalogs that declare it for more titles.
-    let mut fetched_genres = use_signal(HashSet::<String>::new);
+    let mut fetched = use_signal(HashSet::<String>::new);
     let catalog_genres = use_resource(|| async { backend::catalog_genres().await });
     let mut enriching = use_signal(|| false);
     // Few candidates for these filters: ask the catalogs that declare the genre, then TMDB
@@ -137,8 +226,8 @@ pub fn Picks() -> Element {
         let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
         if g.is_none() && k.is_none() && st == Style::Both && f.is_none() && t.is_none() { return; }
         let combo = format!("{g:?}|{k:?}|{st:?}|{f:?}|{t:?}");
-        if filtered.read().len() >= 8 || fetched_genres.peek().contains(&combo) { return; }
-        fetched_genres.write().insert(combo);
+        if filtered.read().len() >= 8 || fetched.peek().contains(&combo) { return; }
+        fetched.write().insert(combo);
         enriching.set(true);
         spawn(async move {
             let mut more = match &g { Some(g) => backend::genre_candidates(g).await, None => Vec::new() };
@@ -148,119 +237,147 @@ pub fn Picks() -> Element {
             enriching.set(false);
         });
     });
+    // An endless duel needs fresh titles: when few unseen ones are left for these filters, two
+    // more random catalogue pages (a few times a night).
+    let mut growth = use_signal(|| 0u32);
+    use_effect(move || {
+        let list = filtered.read();
+        let seen = shown.read();
+        let unseen = list.iter().filter(|m| !seen.contains(&m.key())).count();
+        if loading() || !pool_complete() || enriching() || unseen >= 8 || *growth.peek() >= MAX_GROWTH { return; }
+        *growth.write() += 1;
+        enriching.set(true);
+        let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
+        spawn(async move {
+            let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 30) as u32).collect();
+            let mut more = backend::tmdb_candidates(g.clone(), k.clone(), st, f, t, pages).await;
+            if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(g, st, f, t).await); }
+            pool.with_mut(|p| rules::merge(p, more));
+            enriching.set(false);
+        });
+    });
 
-    // A fresh duel whenever the candidates or filters change.
+    let mut notify = move |text: String| {
+        let id = backend::rand_u64();
+        toast.set(Some((id, text)));
+        spawn(async move { backend::sleep(2800).await; if toast.peek().as_ref().map(|t| t.0) == Some(id) { toast.set(None); } });
+    };
+    // Titles TMDB recommends for one you kept, liked or played: the pool grows toward your taste.
+    let mut expanded = use_signal(HashSet::<String>::new);
+    let mut expand = move |m: Media| {
+        let id = brain::id(&m);
+        if !backend::tmdb_ready() || expanded.peek().contains(&id) { return; }
+        expanded.write().insert(id);
+        spawn(async move { let more = backend::tmdb_related(&m).await; if !more.is_empty() { pool.with_mut(|p| rules::merge(p, more)); } });
+    };
+    // Never offered again in this run as a new card: what was shown, kept or starred, under any
+    // of its names (another source can list the same title under another key). Only a reshuffle,
+    // once every title for these filters was shown, or a new night brings them back.
+    let avoid = move || -> Vec<String> {
+        let mut ex = shown.peek().clone();
+        ex.extend(kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities));
+        ex
+    };
+    let shortlisted = move || -> Vec<String> { kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities).collect() };
+    let mut mark_shown = move |m: &Option<Media>| {
+        let Some(m) = m else { return };
+        let mut list = shown.write();
+        for name in brain::identities(m) { if !list.contains(&name) { list.push(name); } }
+    };
+
+    // Two fresh cards, each the favourite of one plausible taste. When every title for these
+    // filters was shown tonight, another lap begins (the shortlist stays out of it).
     let mut start_duel = move || {
         let list = filtered.peek().clone();
-        { let mut t = taste.write(); t.session.clear(); t.session_vibe.clear(); }
-        let t = taste.peek().clone();
-        // Opening pair: drawn at random from the dozen best fits, so no visit starts the same.
-        let list = prefer(&list, &[]);
-        let first = backend::next_challenger(&list, &t, &[], 12);
-        let second = first.as_ref().and_then(|a| {
-            // The opening pair differs in genre where possible, so the first choice says something.
-            let different: Vec<Media> = list.iter().filter(|m| m.key() != a.key() && !m.genres.iter().any(|g| a.genres.contains(g))).cloned().collect();
-            backend::next_challenger(if different.is_empty() { &list } else { &different }, &t, &[a.key()], 12)
-        });
-        shown.set([&first, &second].iter().filter_map(|m| m.as_ref().map(Media::key)).collect());
-        round.set(0);
-        evidence.set(Default::default());
-        crate::picks_decision::audit("start", None, None, &evidence.peek(), None, list.len());
-        // A single match is the answer: show it as the pick rather than "nothing matches".
-        if let (Some(only), None) = (&first, &second) {
-            if *pool_complete.peek() && !*enriching.peek() { winner.set(Some(only.clone())); pair.set((None, None)); return; }
+        let ex = avoid();
+        let mut next = brain.peek().opening_pair(&prefer(&list, &ex), &ex);
+        if next.1.is_none() && *pool_complete.peek() && !*enriching.peek() {
+            let lap = shortlisted();
+            let again = brain.peek().opening_pair(&prefer(&list, &lap), &lap);
+            if again.1.is_some() || next.0.is_none() {
+                if !shown.peek().is_empty() { notify("You've seen every title for these filters: reshuffling".into()); }
+                shown.set(Vec::new());
+                next = again;
+            }
         }
-        pair.set((first, second));
-        winner.set(None);
+        mark_shown(&next.0);
+        mark_shown(&next.1);
+        streak.set(0);
+        pair.set(next);
     };
     // A new duel when a filter changes; a restored one is kept until then.
     use_effect(move || {
         let _ = (kind(), style(), genre(), from(), to(), hide_watched());
-        if loading() { return; }
+        if loading() || !brain_ready() { return; }
         if *restored.peek() { restored.set(false); return; }
         start_duel();
     });
-    // Progress can change while the player or title page is open. A restored pair or final
-    // winner must obey Hide watched too, not just newly drawn challengers.
+    // Progress can change while the player or title page is open. Cards on screen must obey
+    // Hide watched too, not just newly drawn ones.
     use_effect(move || {
-        if !hide_watched() || loading() { return; }
+        if !hide_watched() || loading() || !brain_ready() { return; }
         let Some(seen) = watched.read().clone() else { return };
-        let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m))
-            || m.raw["imdb_id"].as_str().is_some_and(|id| seen.contains(id));
-        let (left,right) = pair.peek().clone();
-        let final_pick = winner.peek().clone();
-        if left.iter().chain(right.iter()).chain(final_pick.iter()).any(finished) { start_duel(); }
+        let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|id| seen.contains(id));
+        let (left, right) = pair.peek().clone();
+        if left.iter().chain(right.iter()).any(finished) { start_duel(); }
     });
-    // Remember the duel as it goes.
+    // Remember tonight as it goes.
     use_effect(move || {
         let (left, right) = pair();
-        backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genre: genre(), from: from_text(), to: to_text(), round: round(),
-            evidence: evidence(), session: taste().session, session_vibe: taste().session_vibe, shown: shown(), left, right, winner: winner() });
+        backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genre: genre(), from: from_text(), to: to_text(),
+            night: night(), last: backend::now_secs(), round: round(), streak: streak(), shown: shown(), left, right, kept: kept(), starred: starred() });
     });
+    // The first pair, once there is something to choose from.
     use_effect(move || {
         let n = filtered.read().len();
-        let complete = pool_complete();
-        let growing = enriching();
         let (l, r) = pair.peek().clone();
-        let waiting = (l.is_none() || r.is_none()) && winner.peek().is_none();
-        let lone = winner.peek().is_some() && *round.peek() == 0;
-        if !loading() && ((n >= 2 && ((waiting && shown.peek().len() <= 1) || lone))
-            || (n == 1 && complete && !growing && waiting && *round.peek() == 0)) { start_duel(); }
+        if !loading() && brain_ready() && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
     });
-
     // Style is an invariant of visible cards, including restored cards enriched later.
     use_effect(move || {
-        let list = filtered();
-        let (l,r) = resolved_pair();
+        let (l, r) = resolved_pair();
         let st = style();
-        let invalid = l.iter().chain(r.iter()).any(|m| !rules::style_matches(m,st));
-        let final_invalid = winner().is_some_and(|m| {
-            let all = pool.read();
-            let canonical = all.iter().find(|x| x.key() == m.key() || rules::title_key(x) == rules::title_key(&m)).unwrap_or(&m);
-            !rules::style_matches(canonical,st)
-        });
-        let waiting_empty = l.is_none() && r.is_none() && winner.peek().is_none() && *round.peek() > 0;
-        if !invalid && !final_invalid && !waiting_empty { return; }
-        let mut exclude = shown.peek().clone();
-        let mut replace = |m: Option<Media>| {
-            if m.as_ref().is_some_and(|m| rules::style_matches(m,st)) { return m; }
-            let next = backend::next_challenger(&list,&taste.peek(),&exclude,3);
-            if let Some(m) = &next { exclude.push(m.key()); }
+        if !brain_ready() || !l.iter().chain(r.iter()).any(|m| !rules::style_matches(m, st)) { return; }
+        let list = filtered.peek().clone();
+        let mut ex = avoid();
+        let mut replace = |m: Option<Media>, other: &Option<Media>| {
+            if m.as_ref().is_some_and(|m| rules::style_matches(m, st)) { return m; }
+            let next = match other { Some(o) => brain.peek().challenger(&list, &ex, o), None => brain.peek().opening_pair(&list, &ex).0 };
+            if let Some(n) = &next { ex.extend(brain::identities(n)); }
             next
         };
-        let (l,r) = (replace(l),replace(r));
-        shown.set(exclude);pair.set((l,r));
-        if final_invalid { winner.set(None); }
+        let left = replace(l, &r);
+        let right = replace(r, &left);
+        mark_shown(&left);
+        mark_shown(&right);
+        pair.set((left, right));
     });
 
-    // Keep one side: learn, then bring a challenger to the other side (or crown the winner).
+    // Keep one side: the brain learns, then the card you kept meets its strongest plausible
+    // rival. A card that keeps winning joins the shortlist and makes room for two new titles.
     let mut keep = move |left: bool| {
         let (l, r) = resolved_pair.peek().clone();
-        let (Some(kept), Some(dropped)) = (if left { (l.clone(), r.clone()) } else { (r.clone(), l.clone()) }) else { return };
-        // Not while a card is still being checked (a key press could pick a card you cannot see).
-        if !verified.peek().contains(&kept.key()) || !verified.peek().contains(&dropped.key())
-            || !rules::style_matches(&kept,*style.peek()) || !rules::style_matches(&dropped,*style.peek()) { return; }
-        let mut t = taste.peek().clone();
-        let mut e = evidence.peek().clone();
-        let candidates = filtered.peek().clone();
-        let (suggested, before) = e.choose(&mut t, &kept, &dropped, &candidates, *pool_complete.peek() && !*enriching.peek());
-        backend::save_taste(&t);
-        taste.set(t.clone());
-        let done = (*round.peek()).saturating_add(1);
-        round.set(done);
-        crate::picks_decision::audit("keep", Some(&kept), Some(&dropped), &e, before, candidates.len());
-        evidence.set(e);
-        if suggested { winner.set(Some(kept)); return; }
-        let mut exclude = shown.peek().clone();
-        let challenger = backend::challenger_against(&filtered.peek(), &t, &exclude, &kept, done);
-        if let Some(c) = &challenger { exclude.push(c.key()); }
-        shown.set(exclude);
-        match challenger {
-            Some(c) => pair.set(if left { (Some(kept), Some(c)) } else { (Some(c), Some(kept)) }),
-            // A background catalogue fetch can still provide the next opponent. Do not
-            // turn a temporarily small pool into an early result.
-            None => pair.set(if left { (Some(kept), None) } else { (None, Some(kept)) }),
+        let (Some(won), Some(lost)) = (if left { (l.clone(), r.clone()) } else { (r.clone(), l.clone()) }) else { return };
+        if !verified.peek().contains(&won.key()) || !verified.peek().contains(&lost.key())
+            || !rules::style_matches(&won, *style.peek()) || !rules::style_matches(&lost, *style.peek()) { return; }
+        { let mut b = brain.write(); let e = b.keep(&won, &lost); brain::persist(&mut b, Some(&e)); }
+        *round.write() += 1;
+        let wins = if kept.peek().first().is_some_and(|k| k.key() == won.key()) { *streak.peek() + 1 } else { 1 };
+        kept.with_mut(|k| { k.retain(|x| x.key() != won.key()); k.insert(0, won.clone()); k.truncate(40); });
+        if wins == 2 { expand(won.clone()); }
+        if wins >= GRADUATE {
+            starred.with_mut(|s| if !has(s, &won) { s.insert(0, won.clone()); });
+            notify(format!("{} won {GRADUATE} in a row and joins your shortlist", won.name));
+            expand(won.clone());
+            start_duel();
+            return;
         }
+        streak.set(wins);
+        let ex = avoid();
+        let list = filtered.peek().clone();
+        let challenger = brain.peek().challenger(&prefer(&list, &ex), &ex, &won);
+        mark_shown(&challenger);
+        pair.set(if left { (Some(won), challenger) } else { (challenger, Some(won)) });
     };
     // Keeping is seen before it happens: the kept card steps forward, the other steps back
     // (style.css, .keep-left/.keep-right), then the duel moves on. Presses meanwhile are ignored.
@@ -271,26 +388,31 @@ pub fn Picks() -> Element {
             l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())) };
         if !ready { return; }
         leaving.set(Some(left));
-        spawn(async move { backend::sleep(280).await; keep(left); leaving.set(None); });
+        spawn(async move { backend::sleep(300).await; keep(left); leaving.set(None); });
     };
 
-    // A kept title waiting for the catalogue to catch up retains all duel evidence.
+    // A kept card waiting for an opponent gets one as soon as the catalogue offers it; if every
+    // title was shown, another lap.
     use_effect(move || {
         let list = filtered();
-        let complete = pool_complete();
-        let growing = enriching();
-        let (l,r) = pair();
-        if loading() || winner().is_some() || round() == 0 { return; }
-        let (kept,left) = match (l,r) { (Some(m),None) => (m,true), (None,Some(m)) => (m,false), _ => return };
-        let mut exclude = shown.peek().clone();
-        if let Some(c) = backend::challenger_against(&list, &taste.peek(), &exclude, &kept, *round.peek()) {
-            exclude.push(c.key()); shown.set(exclude);
-            pair.set(if left { (Some(kept),Some(c)) } else { (Some(c),Some(kept)) });
-        } else if complete && !growing {
-            evidence.write().reason = "exhausted".into();
-            crate::picks_decision::audit("exhausted", Some(&kept), None, &evidence.peek(), None, list.len());
-            winner.set(Some(kept));
+        let (complete, growing) = (pool_complete(), enriching());
+        let (l, r) = pair();
+        if loading() || !brain_ready() { return; }
+        let (kept_card, left) = match (l, r) { (Some(m), None) => (m, true), (None, Some(m)) => (m, false), _ => return };
+        let ex = avoid();
+        let mut challenger = brain.peek().challenger(&prefer(&list, &ex), &ex, &kept_card);
+        if challenger.is_none() && complete && !growing {
+            let lap = shortlisted();
+            challenger = brain.peek().challenger(&list, &lap, &kept_card);
+            if challenger.is_some() {
+                notify("You've seen every title for these filters: reshuffling".into());
+                shown.set(Vec::new());
+                mark_shown(&Some(kept_card.clone()));
+            }
         }
+        let Some(c) = challenger else { return };
+        mark_shown(&Some(c.clone()));
+        pair.set(if left { (Some(kept_card), Some(c)) } else { (Some(c), Some(kept_card)) });
     });
 
     // A card on screen that turns out to lack a poster or trailer gives its place to another
@@ -308,92 +430,134 @@ pub fn Picks() -> Element {
                     Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
                 }
                 let (l, r) = pair.peek().clone();
-                let on_screen = if left { l } else { r };
+                let on_screen = if left { l.clone() } else { r.clone() };
                 if on_screen.map(|x| x.key()) != Some(m.key()) { return; }
-                let mut exclude = shown.peek().clone();
-                let t = taste.peek().clone();
-                // Nothing else to offer: show it anyway rather than an empty side.
-                let opponent = if left { pair.peek().1.clone() } else { pair.peek().0.clone() };
-                let challenger = match opponent {
-                    Some(opponent) => backend::challenger_against(&filtered.peek(), &t, &exclude, &opponent, *round.peek()),
-                    None => backend::next_challenger(&prefer(&filtered.peek(), &exclude), &t, &exclude, 3),
+                let ex = avoid();
+                let list = filtered.peek().clone();
+                let opponent = if left { r } else { l };
+                let next = match &opponent {
+                    Some(o) => brain.peek().challenger(&prefer(&list, &ex), &ex, o),
+                    None => brain.peek().opening_pair(&prefer(&list, &ex), &ex).0,
                 };
-                let Some(c) = challenger else { verified.write().insert(m.key()); return };
-                exclude.push(c.key());
-                shown.set(exclude);
+                // Nothing else to offer: show it anyway rather than an empty side.
+                let Some(c) = next else { verified.write().insert(m.key()); return };
+                mark_shown(&Some(c.clone()));
                 pair.with_mut(|p| if left { p.0 = Some(c) } else { p.1 = Some(c) });
             });
         }
     });
 
-    // Skipping is not a dislike. Neither clears tonight's direction, leaving lasting taste intact.
+    // Skip: two other cards, nothing learned. Neither: both are below what tonight wants (a
+    // lesson for tonight only), then two other cards.
     let mut change_pair = move |neither: bool| {
-        if winner.peek().is_some() || loading() { return; }
-        let (left, right) = pair.peek().clone();
-        if left.iter().chain(right.iter()).any(|m| !verified.peek().contains(&m.key())) { return; }
-        if neither { let mut t = taste.write(); t.session.clear(); t.session_vibe.clear(); }
-        let t = taste.peek().clone();
-        let list = filtered.peek().clone();
-        let mut exclude = shown.peek().clone();
-        let current: Vec<String> = left.iter().chain(right.iter()).map(Media::key).collect();
-        let alternative: Vec<Media> = if neither {
-            list.iter().filter(|m| !left.iter().chain(right.iter()).any(|old| old.genres.iter().any(|g| m.genres.contains(g)))).cloned().collect()
-        } else { list.clone() };
-        let first = backend::next_challenger(&alternative, &t, &exclude, 12)
-            .or_else(|| backend::next_challenger(&list, &t, &exclude, 12))
-            .or_else(|| backend::next_challenger(&list, &t, &current, 12));
-        // All other titles exhausted: leave the visible pair available rather than replaying it as a vote.
-        let Some(first) = first else { return };
-        if !exclude.contains(&first.key()) { exclude.push(first.key()); }
-        let second = backend::next_challenger(&alternative, &t, &exclude, 12)
-            .or_else(|| backend::next_challenger(&list, &t, &exclude, 12))
-            .or_else(|| { let mut avoid = current; avoid.push(first.key()); backend::next_challenger(&list, &t, &avoid, 12) });
-        if let Some(m) = &second { if !exclude.contains(&m.key()) { exclude.push(m.key()); } }
-        shown.set(exclude);
-        // A skipped comparison supplies no stability evidence.
-        let choices = evidence.peek().choices;
-        evidence.set(crate::picks_decision::Evidence { choices, ..Default::default() });
-        crate::picks_decision::audit(if neither { "neither" } else { "skip" }, None, None, &evidence.peek(), None, list.len());
-        match second {
-            Some(second) => pair.set((Some(first), Some(second))),
-            None => { evidence.write().reason = "exhausted".into(); winner.set(Some(first)); }
-        }
+        if loading() || !brain_ready() || leaving.peek().is_some() { return; }
+        let (l, r) = resolved_pair.peek().clone();
+        if l.iter().chain(r.iter()).any(|m| !verified.peek().contains(&m.key())) { return; }
+        if neither { if let (Some(a), Some(b)) = (&l, &r) { let mut br = brain.write(); let e = br.neither(a, b); brain::persist(&mut br, Some(&e)); } }
+        start_duel();
     };
-    let mut continue_duel = move || {
-        let Some(w) = winner.peek().clone() else { return };
-        let mut exclude = shown.peek().clone();
-        let challenger = backend::challenger_against(&filtered.peek(), &taste.peek(), &exclude, &w, 0);
-        let Some(c) = challenger else {
-            if !*pool_complete.peek() || *enriching.peek() {
-                evidence.write().resume();
-                crate::picks_decision::audit("continue_wait", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
-                pair.set((Some(w),None)); winner.set(None);
-                return;
+    // Playing from Picks is the strongest yes there is.
+    let played = move |m: Media| {
+        { let mut b = brain.write(); let e = b.play(&m); brain::persist(&mut b, Some(&e)); }
+        expand(m);
+    };
+    // Like and Not for me on a card are the library's own (the same as on the title page). Not
+    // for me takes the card away for good; a like also stars it for tonight.
+    let rate = move |m: Media, value: i64| {
+        spawn(async move {
+            if backend::feedback(&m, value).await.is_err() { notify("Couldn't save that. Try again.".into()); return; }
+            *shell.picks_dirty.write() += 1;
+            if value > 0 {
+                starred.with_mut(|s| if !has(s, &m) { s.insert(0, m.clone()); });
+                notify(format!("Liked {}: more like it from now on", m.name));
+                expand(m.clone());
             }
-            evidence.write().reason = "exhausted".into();
-            crate::picks_decision::audit("continue_exhausted", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
+            if value < 0 {
+                kept.with_mut(|k| k.retain(|x| x.key() != m.key()));
+                starred.with_mut(|s| s.retain(|x| x.key() != m.key()));
+                notify(format!("{} won't come back", m.name));
+                let (l, r) = pair.peek().clone();
+                let side = if l.as_ref().is_some_and(|x| x.key() == m.key()) { Some(true) } else if r.as_ref().is_some_and(|x| x.key() == m.key()) { Some(false) } else { None };
+                if let Some(left) = side {
+                    let mut ex = avoid();
+                    ex.extend(brain::identities(&m));
+                    let list: Vec<Media> = filtered.peek().iter().filter(|x| x.key() != m.key()).cloned().collect();
+                    let other = if left { r } else { l };
+                    let next = match &other {
+                        Some(o) => brain.peek().challenger(&prefer(&list, &ex), &ex, o),
+                        None => brain.peek().opening_pair(&prefer(&list, &ex), &ex).0,
+                    };
+                    mark_shown(&next);
+                    streak.set(0);
+                    pair.with_mut(|p| if left { p.0 = next } else { p.1 = next });
+                }
+            }
+        });
+    };
+    // A mood is a direction in the titles' space: the words are embedded by the same local model
+    // and steer tonight until turned off. The cards are redrawn so the change shows at once.
+    let mut toggle_mood = move |words: String, phrase: Option<String>| {
+        if *mood_busy.peek() { return; }
+        let on = brain.peek().moods().iter().any(|m| m.eq_ignore_ascii_case(&words));
+        if on {
+            { let mut b = brain.write(); let e = b.set_mood(&words, None); brain::persist(&mut b, Some(&e)); }
+            start_duel();
             return;
-        };
-        exclude.push(c.key());
-        shown.set(exclude);
-        evidence.write().resume();
-        crate::picks_decision::audit("continue", Some(&w), None, &evidence.peek(), None, filtered.peek().len());
-        pair.set((Some(w), Some(c)));
-        winner.set(None);
+        }
+        mood_busy.set(true);
+        spawn(async move {
+            match crate::picks_ai::embed_query(phrase.as_deref().unwrap_or(&words)).await {
+                Ok(e) => {
+                    { let mut b = brain.write(); let ev = b.set_mood(&words, Some(e)); brain::persist(&mut b, Some(&ev)); }
+                    start_duel();
+                }
+                Err(_) => notify("The local AI couldn't read that mood".into()),
+            }
+            mood_busy.set(false);
+        });
+    };
+    // Every mood off at once (each is set aside in the log; tonight is replayed without them).
+    let mut clear_moods = move || {
+        let on = brain.peek().moods();
+        if on.is_empty() { return; }
+        {
+            let mut b = brain.write();
+            for words in on { let e = b.set_mood(&words, None); brain::persist(&mut b, Some(&e)); }
+        }
+        start_duel();
+    };
+    let mut add_mood = move || {
+        let words: String = mood_text.peek().trim().chars().take(80).collect();
+        if words.is_empty() { return; }
+        mood_text.set(String::new());
+        toggle_mood(words, None);
+    };
+    let mut new_night = move || {
+        let id = new_night_id();
+        night.set(id);
+        brain.write().set_session(id);
+        kept.set(Vec::new()); starred.set(Vec::new()); shown.set(Vec::new()); round.set(0); streak.set(0);
+        slot.set(None);
+        notify("A new night: starting from your lasting taste".into());
+        start_duel();
+    };
+    let unstar = move |m: Media| {
+        starred.with_mut(|s| s.retain(|x| x.key() != m.key()));
+        kept.with_mut(|k| k.retain(|x| x.key() != m.key()));
     };
     use_effect(move || {
         let Some(command) = (shell.pick_command)() else { return };
         shell.pick_command.set(None);
         if slot.peek().is_some() { return; }
         match command {
-            PickCommand::Left if winner.peek().is_none() => choose(true),
-            PickCommand::Right if winner.peek().is_none() => choose(false),
+            PickCommand::Left => choose(true),
+            PickCommand::Right => choose(false),
             PickCommand::Skip => change_pair(false),
             PickCommand::Neither => change_pair(true),
-            PickCommand::Continue => continue_duel(),
-            _ => {}
         }
     });
+
+    // ------------------------------------------------------------ what the screen shows
 
     // Only genres that can make a duel: at least two titles, or a catalog that can fetch more.
     let genres: Vec<(String, usize, bool)> = {
@@ -405,128 +569,245 @@ pub fn Picks() -> Element {
             .filter(|(_, n, more)| *n >= 2 || *more).collect()
     };
     let years = year_span(&from_text(), &to_text());
-    let mut toggle_slot = move |s: Slot| slot.set(if slot() == Some(s) { None } else { Some(s) });
     let type_options: [(Option<&'static str>, &'static str); 3] = [(None, "Everything"), (Some("movie"), "Films"), (Some("series"), "Series")];
-    let pair_ready = { let (l,r) = pair(); l.as_ref().zip(r.as_ref()).is_some_and(|(l,r)| verified.read().contains(&l.key()) && verified.read().contains(&r.key())) };
     let style_options: [(Style, &'static str); 3] = [(Style::Live, "Live action"), (Style::Animation, "Animation"), (Style::Both, "Live action and animation")];
+    // The chip always says what is on screen, the style included (Live action is the default,
+    // not "no filter"); it lights up only when something differs from the defaults.
+    let summary: Vec<String> = [
+        kind().map(|k| if k == "movie" { "Films".to_owned() } else { "Series".to_owned() }),
+        Some(match style() { Style::Live => "Live action", Style::Animation => "Animation", Style::Both => "Live action and animation" }.to_owned()),
+        genre(), years.clone(),
+    ].into_iter().flatten().collect();
+    let customised = kind().is_some() || style() != Style::Live || genre().is_some() || years.is_some();
+    let pair_ready = { let (l, r) = pair(); l.as_ref().zip(r.as_ref()).is_some_and(|(l, r)| verified.read().contains(&l.key()) && verified.read().contains(&r.key())) };
+    let ai_failed = !verified.read().is_empty() && crate::picks_ai::failed();
+
+    let reference = use_memo(move || brain.read().reference(&filtered.read()));
+    let b = brain.read();
+    let votes = b.votes_tonight();
+    let leaning: Vec<String> = b.leaning().into_iter().map(|(l, _)| l).collect();
+    let moods = b.moods();
+    let learning = if votes == 0 && moods.is_empty() { 0.0 } else { b.learning(&filtered.read(), &reference.read()) };
+    let lamps = ((learning * 5.0).ceil() as usize).min(5);
+    let kept_now = kept.read().clone();
+    let champion = kept_now.first().map(Media::key).filter(|_| streak() > 0);
+    let card = |m: &Media| -> CardInfo {
+        CardInfo {
+            matching: (votes > 0 || !moods.is_empty()).then(|| (b.match_of(m, &reference.read()) * 100.0).round().clamp(1.0, 99.0) as u8),
+            why: b.why(m, &kept_now).map(|w| w.text()),
+            feels: b.feels(m),
+            wins: if champion.as_deref() == Some(&m.key()) { streak() } else { 0 },
+            liked: liked_ids.read().contains(&brain::id(m)),
+        }
+    };
+    let (rl, rr) = resolved_pair();
+    let infos = (rl.as_ref().map(card), rr.as_ref().map(card));
+    let shortlist: Vec<(Media, bool, u8)> = {
+        let stars = starred.read();
+        let mut all: Vec<Media> = stars.clone();
+        for m in kept_now.iter() { if !has(&all, m) { all.push(m.clone()); } }
+        b.ranked(&all).into_iter().take(8).map(|m| {
+            let pct = (b.match_of(&m, &reference.read()) * 100.0).round().clamp(1.0, 99.0) as u8;
+            let star = has(&stars, &m);
+            (m, star, pct)
+        }).collect()
+    };
+    drop(b);
+    let waiting = loading() || !brain_ready() || (hide_watched() && watched.read().is_none());
+    let growing = !pool_complete() || enriching();
 
     rsx! {
         div { class: "duel",
             div { class: "duel-bar",
-                div { class: "duel-progress",
-                    if winner().is_some() { span { class: "display duel-round", "Your pick" } }
-                    if winner().is_none() {
-                        icons::IconButton { label: "Change pair without voting (S)", class: "glass small", disabled: loading() || !pair_ready, onclick: move |_| change_pair(false), icons::Refresh {} }
-                        icons::IconButton { label: "Neither: change direction (N)", class: "glass small", disabled: loading() || !pair_ready, onclick: move |_| change_pair(true), icons::Close {} }
+                div { class: "night",
+                    div { class: "night-head",
+                        h1 { class: "display night-title", "Tonight" }
+                        if votes > 0 { span { class: "night-count tnum", "{votes} " if votes == 1 { "vote" } else { "votes" } } }
+                        span { class: "learn", role: "img", aria_label: "How well Picks knows tonight: {lamps} of 5", title: "How well Picks knows tonight",
+                            for i in 0..5 { i { class: if i < lamps { "on" } else { "" } } }
+                        }
+                    }
+                    div { class: "night-mood",
+                        if !leaning.is_empty() {
+                            span { class: "dim", "Leaning" }
+                            for l in leaning.iter() { span { class: "lean", "{l}" } }
+                        } else if votes == 0 {
+                            span { class: "dim", "Keep the one you'd rather watch. Picks learns as you go." }
+                        } else {
+                            span { class: "dim", "Getting to know tonight…" }
+                        }
+                        for m in moods.iter() {
+                            button { class: "lean set", title: "Drop this mood", onclick: { let m = m.clone(); move |_| toggle_mood(m.clone(), None) },
+                                icons::Sparkles {} span { "{m}" } icons::Close {} }
+                        }
                     }
                 }
                 div { class: "chips",
-                    div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
-                        i { class: "slider", aria_hidden: "true" }
-                        for (value, label) in type_options {
-                            button { class: if kind().as_deref() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{kind().as_deref() == value}",
-                                aria_label: "{label}", title: "{label}", onclick: move |_| kind.set(value.map(str::to_owned)),
-                                match value { None => rsx! { icons::Grid {} }, Some("movie") => rsx! { icons::Film {} }, _ => rsx! { icons::Tv {} } }
-                            }
-                        }
+                    button { class: if slot() == Some(Slot::Mood) || !moods.is_empty() { "chip-btn glass on" } else { "chip-btn glass" },
+                        disabled: ai_failed, title: if ai_failed { "Moods need the local AI" } else { "Set tonight's mood" },
+                        onclick: move |_| slot.set(if slot() == Some(Slot::Mood) { None } else { Some(Slot::Mood) }), icons::Sparkles {} span { "Mood" } }
+                    button { class: if slot() == Some(Slot::Filters) || customised { "chip-btn glass on" } else { "chip-btn glass" }, title: "Filters: {summary.join(\", \")}",
+                        onclick: move |_| slot.set(if slot() == Some(Slot::Filters) { None } else { Some(Slot::Filters) }),
+                        icons::Sliders {}
+                        span { class: "filter-summary", {summary.join(" · ")} }
                     }
-                    // Style beside type: animated films and series are still films and series.
-                    div { class: "segmented glass", role: "radiogroup", aria_label: "Style",
-                        i { class: "slider", aria_hidden: "true" }
-                        for (value, label) in style_options {
-                            button { class: if style() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{style() == value}",
-                                aria_label: "{label}", title: "{label}", onclick: move |_| style.set(value),
-                                match value { Style::Live => rsx! { icons::Camera {} }, Style::Animation => rsx! { icons::Blossom {} }, Style::Both => rsx! { icons::Layers {} } }
-                            }
-                        }
-                    }
-                    button { class: if slot() == Some(Slot::Genre) || genre().is_some() { "chip-btn glass on" } else { "chip-btn glass" }, aria_label: "Genre", title: "Genre",
-                        onclick: move |_| toggle_slot(Slot::Genre), icons::Tag {} if let Some(g) = genre() { span { "{g}" } } }
-                    button { class: if slot() == Some(Slot::Years) || years.is_some() { "chip-btn glass on" } else { "chip-btn glass" }, aria_label: "Years", title: "Years",
-                        onclick: move |_| toggle_slot(Slot::Years), icons::Calendar {} if let Some(y) = years.clone() { span { class: "tnum", "{y}" } } }
-                    button { class: if hide_watched() { "chip-btn glass on" } else { "chip-btn glass" }, role: "switch", aria_checked: "{hide_watched()}",
-                        aria_label: "Hide completed titles", title: if hide_watched() { "Hiding completed titles; unfinished series stay available" } else { "Showing completed titles too" },
-                        onclick: move |_| {
-                            let on = !hide_watched();
-                            backend::save_settings(&backend::Settings { picks_hide_watched: on, ..backend::load_settings() });
-                            hide_watched.set(on);
-                        },
-                        icons::EyeOff {} }
-                    StartOver { on_reset: move |_| { backend::reset_taste(); taste.set(Taste::default()); start_duel(); } }
+                    button { class: "chip-btn glass", title: "New night: forget tonight's votes and moods (lasting taste stays)", onclick: move |_| new_night(),
+                        icons::Moon {} span { "New night" } }
                 }
             }
             match slot() {
-                Some(Slot::Genre) => rsx! {
-                    div { class: "popover glass", role: "radiogroup", aria_label: "Genre",
-                        button { class: if genre().is_none() { "option on" } else { "option" }, onclick: move |_| { genre.set(None); slot.set(None); }, "Any" }
-                        for (g, _n, more) in genres {
-                            button { class: if genre().as_deref() == Some(g.as_str()) { "option on" } else { "option" },
-                                title: if more { "More from your catalogs" } else { "" },
-                                onclick: { let g = g.clone(); move |_| { genre.set(Some(g.clone())); slot.set(None); } },
-                                "{g}" }
+                Some(Slot::Mood) => rsx! {
+                    div { class: "popover glass mood-pop", role: "group", aria_label: "Tonight's mood",
+                        p { class: "pop-note", "Pick a mood or describe one. Picks leans toward it all night; tap again to drop it." }
+                        div { class: "pop-options",
+                            for (label, phrase) in brain::MOODS {
+                                button { class: if moods.iter().any(|m| m == label) { "option on" } else { "option" }, disabled: mood_busy(),
+                                    onclick: move |_| toggle_mood(label.to_owned(), Some(phrase.to_owned())), "{label}" }
+                            }
+                        }
+                        div { class: "mood-input",
+                            input { class: "mood-text", r#type: "text", maxlength: "80", placeholder: "Describe a mood: “slow-burn heist in the snow”", aria_label: "Describe a mood", value: "{mood_text}",
+                                onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Enter { add_mood(); } },
+                                oninput: move |e| mood_text.set(e.value()) }
+                            button { class: "pill accent", disabled: mood_busy() || mood_text().trim().is_empty(), onclick: move |_| add_mood(), icons::Sparkles {} span { "Add" } }
+                        }
+                        div { class: "pop-row end",
+                            if !moods.is_empty() {
+                                button { class: "pill glass", disabled: mood_busy(), onclick: move |_| clear_moods(), icons::Undo {} span { "Clear moods" } }
+                            }
+                            button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
                         }
                     }
                 },
-                Some(Slot::Years) => rsx! {
-                    div { class: "popover glass years",
-                        input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "From", aria_label: "From year", value: "{from_text}",
-                            onkeydown: move |e| e.stop_propagation(), oninput: move |e| from_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
-                        span { class: "dim", "–" }
-                        input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "To", aria_label: "To year", value: "{to_text}",
-                            onkeydown: move |e| e.stop_propagation(), oninput: move |e| to_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
-                        icons::IconButton { label: "Done", class: "glass small", onclick: move |_| slot.set(None), icons::Check {} }
+                Some(Slot::Filters) => rsx! {
+                    div { class: "popover glass filters-pop", role: "group", aria_label: "Filters",
+                        div { class: "pop-row",
+                            div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
+                                i { class: "slider", aria_hidden: "true" }
+                                for (value, label) in type_options {
+                                    button { class: if kind().as_deref() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{kind().as_deref() == value}",
+                                        aria_label: "{label}", title: "{label}", onclick: move |_| kind.set(value.map(str::to_owned)),
+                                        match value { None => rsx! { icons::Grid {} }, Some("movie") => rsx! { icons::Film {} }, _ => rsx! { icons::Tv {} } }
+                                    }
+                                }
+                            }
+                            // Style beside type: animated films and series are still films and series.
+                            div { class: "segmented glass", role: "radiogroup", aria_label: "Style",
+                                i { class: "slider", aria_hidden: "true" }
+                                for (value, label) in style_options {
+                                    button { class: if style() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{style() == value}",
+                                        aria_label: "{label}", title: "{label}", onclick: move |_| style.set(value),
+                                        match value { Style::Live => rsx! { icons::Camera {} }, Style::Animation => rsx! { icons::Blossom {} }, Style::Both => rsx! { icons::Layers {} } }
+                                    }
+                                }
+                            }
+                            button { class: if hide_watched() { "chip-btn glass on" } else { "chip-btn glass" }, role: "switch", aria_checked: "{hide_watched()}",
+                                title: if hide_watched() { "Hiding completed titles; unfinished series stay available" } else { "Showing completed titles too" },
+                                onclick: move |_| {
+                                    let on = !hide_watched();
+                                    backend::save_settings(&backend::Settings { picks_hide_watched: on, ..backend::load_settings() });
+                                    hide_watched.set(on);
+                                },
+                                icons::EyeOff {} span { "Hide watched" } }
+                        }
+                        div { class: "pop-row years",
+                            span { class: "pop-label", icons::Calendar {} "Years" }
+                            input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "From", aria_label: "From year", value: "{from_text}",
+                                onkeydown: move |e| e.stop_propagation(), oninput: move |e| from_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
+                            span { class: "dim", "–" }
+                            input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "To", aria_label: "To year", value: "{to_text}",
+                                onkeydown: move |e| e.stop_propagation(), oninput: move |e| to_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
+                        }
+                        div { class: "pop-options", role: "radiogroup", aria_label: "Genre",
+                            button { class: if genre().is_none() { "option on" } else { "option" }, onclick: move |_| genre.set(None), "Any genre" }
+                            for (g, _n, more) in genres {
+                                button { class: if genre().as_deref() == Some(g.as_str()) { "option on" } else { "option" },
+                                    title: if more { "More from your catalogs" } else { "" },
+                                    onclick: { let g = g.clone(); move |_| genre.set(Some(g.clone())) },
+                                    "{g}" }
+                            }
+                        }
+                        div { class: "pop-row end",
+                            if customised {
+                                button { class: "pill glass", onclick: move |_| { kind.set(None); style.set(Style::Live); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); },
+                                    icons::Undo {} span { "Clear filters" } }
+                            }
+                            button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
+                        }
                     }
                 },
                 None => rsx! {},
             }
 
-            if !verified.read().is_empty() && crate::picks_ai::failed() {
-                p { class: "picks-ai-status", role: "status", "Local AI unavailable. Using catalogue preferences." }
+            if ai_failed {
+                p { class: "picks-ai-status", role: "status", "Local AI unavailable. Picks is using genres, years and ratings only." }
             }
 
-            if loading() || (hide_watched() && watched.read().is_none())
-                || (winner().is_none() && ((pair().0.is_some() != pair().1.is_some())
-                    || ((!pool_complete() || enriching()) && pair().0.is_none()))) {
-                div { class: "duel-cards", div { class: "duel-card skeleton-card" } div { class: "duel-card skeleton-card" } }
-            } else if let Some(pick) = winner() {
-                for pick in [pick.clone()] { FinalPick { key: "{pick.key()}", media: pick.clone(),
-                    reason: match evidence().reason.as_str() {
-                        "pause" => "Your choice so far. Keep exploring if it’s not quite right.",
-                        "stable" => "Your choices keep pointing here.",
-                        "exhausted" => "No new challengers in these filters.",
-                        _ if round() == 0 => "The only match for these filters.",
-                        _ => "Your choice from the titles explored.",
-                    }.to_owned(),
-                    on_continue: move |_| continue_duel(),
-                    on_reset: move |_| { backend::reset_taste(); taste.set(Taste::default()); start_duel(); } } }
+            if waiting || (rl.is_none() && rr.is_none() && growing) {
+                div { class: "duel-cards", div { class: "duel-card skeleton-card" } span { class: "versus display", aria_hidden: "true", "vs" } div { class: "duel-card skeleton-card" } }
+            } else if rl.is_none() && rr.is_none() {
+                div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Search {} } p { "Nothing matches these filters" }
+                    button { class: "pill glass", onclick: move |_| { kind.set(None); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); }, icons::Undo {} span { "Clear filters" } } } }
             } else {
-                match resolved_pair() {
-                    (Some(l), Some(r)) => rsx! {
-                        div { class: match leaving() { Some(true) => "duel-cards keep-left", Some(false) => "duel-cards keep-right", None => "duel-cards" },
-                            // A key only renews a component inside a list: a new title must get a new card.
-                            // A card shows once its poster and trailer are confirmed.
-                            if verified.read().contains(&l.key()) && rules::style_matches(&l,style()) {
-                                for m in [l.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "left", on_keep: move |_| choose(true) } }
-                            } else { div { class: "duel-card skeleton-card" } }
-                            span { class: "versus display", aria_hidden: "true", "or" }
-                            if verified.read().contains(&r.key()) && rules::style_matches(&r,style()) {
-                                for m in [r.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "right", on_keep: move |_| choose(false) } }
-                            } else { div { class: "duel-card skeleton-card" } }
-                        }
-                    },
-                    _ => rsx! {
-                        div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Search {} } p { "Nothing matches these filters" }
-                            button { class: "pill glass", onclick: move |_| { kind.set(None); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); }, icons::Undo {} span { "Clear filters" } } } }
-                    },
+                div { class: match leaving() { Some(true) => "duel-cards keep-left", Some(false) => "duel-cards keep-right", None => "duel-cards" },
+                    // A key only renews a component inside a list: a new title must get a new card.
+                    // A card shows once its poster and trailer are confirmed.
+                    {side(rl.clone(), infos.0.clone(), "left", verified.read().clone(), style(), growing,
+                        EventHandler::new(move |_| choose(true)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
+                    span { class: "versus display", aria_hidden: "true", "vs" }
+                    {side(rr.clone(), infos.1.clone(), "right", verified.read().clone(), style(), growing,
+                        EventHandler::new(move |_| choose(false)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
                 }
+            }
+
+            div { class: "duel-foot",
+                div { class: "duel-moves",
+                    button { class: "pill glass", disabled: waiting || !pair_ready, title: "Two other titles; nothing is learned (S)", onclick: move |_| change_pair(false),
+                        icons::Next {} span { "Skip" } kbd { class: "keycap small-cap light", "S" } }
+                    button { class: "pill glass", disabled: waiting || !pair_ready, title: "Neither appeals tonight: Picks steers away from both (N)", onclick: move |_| change_pair(true),
+                        icons::Close {} span { "Neither" } kbd { class: "keycap small-cap light", "N" } }
+                }
+                div { class: "shortlist", role: "list", aria_label: "Tonight's shortlist",
+                    span { class: "shortlist-label", icons::Trophy {} span { "Shortlist" } }
+                    if shortlist.is_empty() {
+                        span { class: "shortlist-empty dim", "Titles you keep land here, best first." }
+                    }
+                    for (m, star, pct) in shortlist {
+                        ShortItem { key: "{m.key()}", media: m.clone(), star, pct, on_play: played, on_remove: unstar }
+                    }
+                }
+            }
+
+            if let Some((_, text)) = toast() {
+                div { class: "toast glass", role: "status", icons::Sparkles {} span { "{text}" } }
             }
         }
     }
 }
 
-/// One side of the duel: artwork, facts, synopsis, trailer, keep.
+/// What the brain says about a card.
+#[derive(Clone, Debug, PartialEq, Default)]
+struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>, wins: u32, liked: bool }
+
+/// One side of the duel: the card once checked, else a placeholder (or a note when nothing else
+/// matches these filters).
+#[allow(clippy::too_many_arguments)]
+fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: HashSet<String>, style: Style, growing: bool,
+    on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
+    match m {
+        Some(m) if verified.contains(&m.key()) && rules::style_matches(&m, style) => rsx! {
+            for m in [m] { DuelCard { key: "{m.key()}", media: m.clone(), side, info: info.clone().unwrap_or_default(), on_keep, on_play, on_rate } }
+        },
+        None if !growing => rsx! {
+            div { class: "duel-card lone-note glass", p { class: "dim", "No other title matches these filters. Widen them for a duel." } }
+        },
+        _ => rsx! { div { class: "duel-card skeleton-card" } },
+    }
+}
+
+/// One side of the duel: artwork, the brain's read on it, facts, synopsis and the ways on.
 #[component]
-fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Element {
+fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
     let shell = use_context::<Shell>();
     let mut meta = use_signal(|| None::<TitleMeta>);
     let m = media.clone();
@@ -540,16 +821,39 @@ fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Elem
     let accent_src = backdrop.clone();
     let accent = use_resource(use_reactive!(|accent_src| async move { backend::accent(accent_src).await }));
     let card_style = accent().flatten().map(|c| format!("--lamp: {c}")).unwrap_or_default();
-    let trailer = facts.as_ref().map(|f| f.trailers.clone()).filter(|t| !t.is_empty())
-        .or_else(|| art().map(|a| a.trailers.into_iter().map(|k| backend::Trailer { youtube: Some(k), url: None }).collect::<Vec<_>>()).filter(|t| !t.is_empty()));
+    // TMDB's official trailers first; the add-on's only where TMDB has none. The theatre also
+    // offers the title's other videos.
+    let trailer = Some(backend::official_first(&art().map(|a| a.trailers).unwrap_or_default(), &facts.as_ref().map(|f| f.trailers.clone()).unwrap_or_default()))
+        .filter(|t| !t.is_empty());
+    let videos = art().map(|a| a.videos).unwrap_or_default();
+    let about = crate::About::of(&media, facts.as_ref(), art().as_ref());
     let director = facts.as_ref().and_then(|f| f.directors.first().cloned());
     let arrow = if side == "left" { "←" } else { "→" };
-    let open = media.clone();
+    let (open, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone());
+    let liked = info.liked;
     rsx! {
         article { class: "duel-card {side}", style: "{card_style}", aria_label: "{media.name}",
             if !backdrop.is_empty() { img { class: "duel-art", src: "{backdrop}", alt: "" } }
             button { class: "duel-hit", aria_label: "Keep {media.name} ({arrow})", onclick: move |_| on_keep.call(()) }
+            div { class: "card-top",
+                div { class: "card-badges",
+                    // The badge stays put while the number moves: the digits roll in and the meter
+                    // glides to the new value (no blink).
+                    if let Some(p) = info.matching { span { class: "match-badge glass", style: "--fill: {p}%", title: "How likely you'd pick this over a typical title tonight",
+                        span { class: "match-num tnum", for v in [p] { span { key: "{v}", class: "roll", "{v}%" } } }
+                        span { class: "match-word", "match" }
+                        i { class: "match-meter", aria_hidden: "true" } } }
+                    if info.wins > 0 { span { class: "streak glass", key: "{info.wins}", title: "Wins in a row tonight", icons::Trophy {} span { class: "tnum", "{info.wins}" } } }
+                }
+                div { class: "card-rate",
+                    icons::IconButton { label: if liked { "Liked: tap to undo" } else { "Like" }, class: if liked { "glass small on" } else { "glass small" }, pressed: liked,
+                        onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((like.clone(), if liked { 0 } else { 1 })) }, icons::Heart {} }
+                    icons::IconButton { label: "Not for me: never show it again", class: "glass small",
+                        onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((dislike.clone(), -1)) }, icons::ThumbDown {} }
+                }
+            }
             div { class: "duel-copy",
+                if let Some(why) = info.why.clone() { p { class: "card-why", span { class: "lamp", icons::Sparkles {} } span { "{why}" } } }
                 match logo.filter(|_| !logo_failed()) {
                     Some(src) => rsx! { img { class: "duel-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
                     None => rsx! { h2 { class: "display duel-title", "{media.name}" } },
@@ -560,12 +864,13 @@ fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Elem
                     if !media.year.is_empty() { span { class: "fact", icons::Calendar {} span { class: "tnum", "{media.year}" } } }
                     if !media.genres.is_empty() { span { class: "fact", icons::Tag {} span { {media.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ")} } } }
                 }
-                if !media.description.is_empty() { p { class: "duel-synopsis clamp-3", "{media.description}" } }
+                if !info.feels.is_empty() { p { class: "feels", span { class: "dim", "Feels" } for f in info.feels.iter() { span { class: "feel", "{f}" } } } }
                 if let Some(d) = director { p { class: "duel-credit", span { class: "dim", icons::Clapper {} } span { "{d}" } } }
                 div { class: "duel-actions",
-                    button { class: "pill accent", title: "Keep this ({arrow})", onclick: move |e| { e.stop_propagation(); on_keep.call(()) }, icons::Check {} span { "Keep this" } kbd { class: "keycap small-cap", "{arrow}" } }
-                    CardPlayButton { media: media.clone(), episodes: facts.as_ref().map(|f| f.episodes.clone()).unwrap_or_default() }
-                    if let Some(t) = trailer { icons::IconButton { label: "Trailer", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} } }
+                    button { class: "pill accent", title: "Keep this ({arrow})", onclick: move |e| { e.stop_propagation(); on_keep.call(()) }, icons::Check {} span { "Keep" } kbd { class: "keycap small-cap", "{arrow}" } }
+                    CardPlayButton { media: media.clone(), episodes: facts.as_ref().map(|f| f.episodes.clone()).unwrap_or_default(), on_play: move |_| on_play.call(play.clone()) }
+                    if let Some(t) = trailer { icons::IconButton { label: "Trailer and videos", class: "glass",
+                        onclick: move |_| crate::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None), icons::Clapper {} } }
                     icons::IconButton { label: "Details", class: "glass", onclick: move |_| { let mut s = shell; s.opened.set(Some(open.clone())) }, icons::Info {} }
                 }
             }
@@ -573,10 +878,32 @@ fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Elem
     }
 }
 
-/// One playback control for both duel cards and the final pick. Fresh stored progress wins
-/// over catalogue metadata; clicking it never casts a duel vote or changes the selected card.
+/// One title on tonight's shortlist: its art, how well it matches, and play.
 #[component]
-fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default)] accent: bool) -> Element {
+fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on_remove: EventHandler<Media>) -> Element {
+    let mut shell = use_context::<Shell>();
+    let art = crate::home::use_artwork(&media);
+    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
+    let (open, remove, play) = (media.clone(), media.clone(), media.clone());
+    rsx! {
+        div { class: "short-item glass", role: "listitem",
+            button { class: "short-open", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
+                if !backdrop.is_empty() { img { src: "{backdrop}", alt: "", loading: "lazy" } }
+                span { class: "short-name", if star { span { class: "lamp", icons::Star {} } } span { "{media.name}" } }
+                span { class: "short-bar", style: "--fill: {pct}%", aria_label: "{pct}% match" }
+            }
+            div { class: "short-actions",
+                CardPlayButton { media: media.clone(), episodes: Vec::new(), compact: true, on_play: move |_| on_play.call(play.clone()) }
+                icons::IconButton { label: "Remove from the shortlist", class: "glass small", onclick: move |_| on_remove.call(remove.clone()), icons::Close {} }
+            }
+        }
+    }
+}
+
+/// One playback control for duel cards and the shortlist. Fresh stored progress wins over
+/// catalogue metadata; clicking it never casts a duel vote, but tells the brain (`on_play`).
+#[component]
+fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default)] compact: bool, #[props(default)] on_play: Option<EventHandler<()>>) -> Element {
     let shell = use_context::<Shell>();
     let progress_media = media.clone();
     let progress = use_resource(move || {
@@ -585,49 +912,26 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
         async move {
             let stored = backend::stored(&m).await.unwrap_or(m);
             let seen = if stored.kind == "movie" { HashSet::new() } else { backend::watched_episodes(&stored).await };
-            (stored,seen)
+            (stored, seen)
         }
     });
-    let target = progress.read().as_ref().and_then(|(m,seen)| rules::card_playback(m,&episodes,seen,backend::now_secs()));
+    // The shortlist has no episode list at hand; the title page resolves the episode instead.
+    let target = progress.read().as_ref().and_then(|(m, seen)| rules::card_playback(m, &episodes, seen, backend::now_secs()))
+        .or_else(|| (compact && media.kind != "movie").then(|| rules::CardPlayback { video: String::new(), label: "Play".into() }));
     let label = target.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| "Play".into());
-    let media = progress.read().as_ref().map(|(m,_)| m.clone()).unwrap_or(media);
+    let media = progress.read().as_ref().map(|(m, _)| m.clone()).unwrap_or(media);
+    let go = move |e: MouseEvent| {
+        e.stop_propagation();
+        let Some(target) = &target else { return };
+        if let Some(h) = &on_play { h.call(()); }
+        if target.video.is_empty() { let mut s = shell; s.opened.set(Some(media.clone())); }
+        else { crate::title::play_from_card(shell, media.clone(), target.video.clone()); }
+    };
     rsx! {
-        button { class: if accent { "pill accent play-big" } else { "pill glass" }, disabled: target.is_none(),
-            title: "Play or resume this title", onclick: move |e| { e.stop_propagation();
-                if let Some(target) = &target { crate::title::play_from_card(shell,media.clone(),target.video.clone()); }
-            }, icons::Play {} span { "{label}" }
-        }
-    }
-}
-
-/// The winner, with why, and the ways on: watch it, or keep refining, or start over.
-#[component]
-fn FinalPick(media: Media, reason: String, on_continue: EventHandler<()>, on_reset: EventHandler<()>) -> Element {
-    let mut shell = use_context::<Shell>();
-    let mut meta = use_signal(|| None::<TitleMeta>);
-    let m = media.clone();
-    use_hook(move || { spawn(async move { if let Ok(t) = backend::title_meta(&m).await { meta.set(Some(t)); } }); });
-    let art = crate::home::use_artwork(&media);
-    let trailer = meta().map(|f| f.trailers).filter(|t| !t.is_empty())
-        .or_else(|| art().map(|a| a.trailers.into_iter().map(|k| backend::Trailer { youtube: Some(k), url: None }).collect::<Vec<_>>()).filter(|t| !t.is_empty()));
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
-    let (play, open) = (media.clone(), media.clone());
-    rsx! {
-        article { class: "final-pick", aria_label: "Your pick: {media.name}",
-            if !backdrop.is_empty() { img { class: "final-art", src: "{backdrop}", alt: "" } }
-            div { class: "final-copy",
-                p { class: "reason", span { class: "lamp", icons::Sparkles {} } span { "{reason}" } }
-                h1 { class: "display pick-title", "{media.name}" }
-                p { class: "meta", "{media.meta_line(true)}" if !media.genres.is_empty() { span { class: "dim", ", {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(\", \")}" } } }
-                if !media.description.is_empty() { p { class: "synopsis clamp-3", "{media.description}" } }
-                div { class: "title-actions",
-                    CardPlayButton { media: play.clone(), episodes: meta().map(|m| m.episodes).unwrap_or_default(), accent: true }
-                    if let Some(t) = trailer { icons::IconButton { label: "Trailer", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} } }
-                    icons::IconButton { label: "Details", class: "glass", onclick: move |_| shell.opened.set(Some(open.clone())), icons::Info {} }
-                    icons::IconButton { label: "Keep exploring (C)", class: "glass", onclick: move |_| on_continue.call(()), icons::ArrowRight {} }
-                    StartOver { on_reset: move |_| on_reset.call(()) }
-                }
-            }
+        if compact {
+            icons::IconButton { label: "{label}", class: "glass small", onclick: go, icons::Play {} }
+        } else {
+            button { class: "pill glass", title: "Play or resume this title", onclick: go, icons::Play {} span { "{label}" } }
         }
     }
 }

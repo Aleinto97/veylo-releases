@@ -130,6 +130,7 @@ pub fn TitlePage(media: Media) -> Element {
         spawn(async move { if backend::set_watched(&m, next).await.is_err() { watched.set(!next); } else { *shell.picks_dirty.write() += 1; } });
     });
 
+    let art = crate::home::use_artwork(&media);
     // Keys from the app root: P play/resume, L like, D not for me, S save, W already watched, T trailer, O sources.
     let (k_media, k_m2) = (media.clone(), media.clone());
     use_effect(move || {
@@ -145,7 +146,13 @@ pub fn TitlePage(media: Media) -> Element {
                 spawn(async move { if backend::feedback(&m, next).await.is_ok() { *shell.picks_dirty.write() += 1; } else { liked.set(before); } }); }
             's' => toggle_save.call(()),
             'w' if film => toggle_watched.call(()),
-            't' => if let Load::Ready(m) = &*meta.peek() { if !m.trailers.is_empty() { crate::play_trailers(shell, m.trailers.clone()); } },
+            't' => if let Load::Ready(m) = &*meta.peek() {
+                let videos = art.peek().clone().map(|a| a.videos).unwrap_or_default();
+                if !m.trailers.is_empty() || !videos.is_empty() {
+                    let about = crate::About::of(&k_media, Some(m), art.peek().as_ref());
+                    crate::watch_videos(shell, about, videos, m.trailers.clone(), None);
+                }
+            },
             'o' if film => chooser.set(Some(Chooser { video: k_media.id.clone(), label: None })),
             _ => {}
         }
@@ -153,7 +160,6 @@ pub fn TitlePage(media: Media) -> Element {
     let facts = match meta() { Load::Ready(m) => Some(m), _ => None };
     let year = media.year.clone();
     let film = !episodic(&media);
-    let art = crate::home::use_artwork(&media);
     let logo = art().and_then(|a| a.logo)
         .or_else(|| facts.as_ref().map(|m| m.logo.clone()).filter(|l| !l.is_empty()))
         .or_else(|| media.raw["logo"].as_str().map(str::to_owned).filter(|l| !l.is_empty()));
@@ -162,8 +168,8 @@ pub fn TitlePage(media: Media) -> Element {
     let mut lamp = shell.lamp_source;
     let lamp_src = backdrop.clone();
     use_effect(use_reactive!(|lamp_src| if *lamp.peek() != lamp_src { lamp.set(lamp_src); }));
-    let trailer = facts.as_ref().map(|m| m.trailers.clone()).filter(|t| !t.is_empty());
     let production = art().unwrap_or_default();
+    let trailer = facts.as_ref().map(|m| m.trailers.clone()).filter(|t| !t.is_empty() || !production.videos.is_empty());
     // The backdrop the page opened with stays the first frame; a better one arriving later (TMDB's
     // text-free art) dissolves in over it instead of replacing it.
     let first = use_hook(|| backdrop.clone());
@@ -244,7 +250,9 @@ pub fn TitlePage(media: Media) -> Element {
                             }
                         }
                         if let Some(t) = trailer {
-                            icons::IconButton { label: "Trailer (T)", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} }
+                            icons::IconButton { label: "Trailer and videos (T)", class: "glass",
+                                onclick: { let (about, videos) = (crate::About::of(&media, facts.as_ref(), Some(&production)), production.videos.clone());
+                                    move |_| crate::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None) }, icons::Clapper {} }
                         }
                         if film {
                             icons::IconButton { label: "Choose a source", class: "glass", onclick: { let id = media.id.clone(); move |_| chooser.set(Some(Chooser { video: id.clone(), label: None })) }, icons::List {} }
@@ -271,7 +279,7 @@ pub fn TitlePage(media: Media) -> Element {
                             posters: production.season_posters.clone(),
                             on_play: move |(id, label): (String, String)| autoplay.call((id, Some(label))),
                             on_sources: move |(id, label): (String, String)| chooser.set(Some(Chooser { video: id, label: Some(label) })) } }
-                        Videos { videos: production.videos.clone() }
+                        Videos { videos: production.videos.clone(), about: crate::About::of(&media, Some(&m), Some(&production)), trailers: m.trailers.clone() }
                         Credits { meta: m.clone(), production: production.clone() }
                     },
                 }
@@ -307,8 +315,7 @@ fn start(shell: Shell, media: &Media, video: &str, title: &str, src: Source, nex
 /// `at`: where the previous, failed source stopped, so the next one carries on from there.
 #[allow(clippy::too_many_arguments)]
 fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>, rest: Vec<Source>, at: Option<i64>) {
-    let resume = at.filter(|p| *p > 0).unwrap_or_else(|| (backend::in_progress(media) && (media.last_video_id.as_deref() == Some(video) || media.kind == "movie"))
-        .then_some(media.position_ms).unwrap_or(0));
+    let resume = at.filter(|p| *p > 0).unwrap_or_else(|| if backend::in_progress(media) && (media.last_video_id.as_deref() == Some(video) || media.kind == "movie") { media.position_ms } else { 0 });
     let full_title = title.to_owned();
     let subtitle = if video != media.id { media.name.clone() } else { media.meta_line(true) };
     let title = title.strip_prefix(&format!("{} ", media.name)).filter(|_| video != media.id).unwrap_or(title).to_owned();
@@ -622,22 +629,24 @@ fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> E
 
 /// The production's videos (trailers, featurettes, behind the scenes) as a row of thumbnails.
 #[component]
-fn Videos(videos: Vec<backend::Video>) -> Element {
+fn Videos(videos: Vec<backend::Video>, about: crate::About, trailers: Vec<backend::Trailer>) -> Element {
     let shell = use_context::<Shell>();
     rsx! {
         if !videos.is_empty() {
             section { class: "videos",
                 div { class: "group-head", span { class: "group-icon", icons::Clapper {} } span { class: "group-name", "Videos" } }
                 div { class: "video-row",
-                    for v in videos {
+                    for v in videos.iter().cloned() {
                         button { key: "{v.youtube}", class: "video", aria_label: "Play {v.name}",
-                            onclick: { let k = v.youtube.clone(); move |_| crate::play_trailers(shell, vec![backend::Trailer { youtube: Some(k.clone()), url: None }]) },
+                            onclick: { let (k, all, a, tr) = (v.youtube.clone(), videos.clone(), about.clone(), trailers.clone());
+                                move |_| crate::watch_videos(shell, a.clone(), all.clone(), tr.clone(), Some(k.clone())) },
                             span { class: "video-thumb",
                                 img { src: "https://i.ytimg.com/vi/{v.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }
                                 span { class: "ep-play", icons::Play {} }
                             }
                             span { class: "video-name", "{v.name}" }
-                            span { class: "video-kind dim", "{v.kind}" }
+                            span { class: if v.official { "video-kind official" } else { "video-kind dim" },
+                                {crate::Clip { youtube: String::new(), name: String::new(), kind: v.kind.clone(), official: v.official }.label()} }
                         }
                     }
                 }

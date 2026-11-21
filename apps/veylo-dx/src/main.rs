@@ -5,12 +5,12 @@ mod addons;
 #[cfg(target_os = "android")]
 mod android;
 mod backend;
+mod brain;
 mod engine;
 mod home;
 mod library;
 mod icons;
 mod picks;
-mod picks_decision;
 mod picks_ai;
 mod picks_metadata;
 mod picks_rules;
@@ -58,7 +58,52 @@ pub struct Accent(pub Signal<String>);
 
 /// Keyboard commands routed from the window to the Picks screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PickCommand { Left, Right, Skip, Neither, Continue }
+pub enum PickCommand { Left, Right, Skip, Neither }
+
+/// One video in the theatre: a YouTube id, its name and kind ("Trailer", "Teaser", ...).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Clip { pub youtube: String, pub name: String, pub kind: String, pub official: bool }
+
+/// The in-app video player: whose videos they are, the videos and the one playing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Theatre { pub about: About, pub clips: Vec<Clip>, pub at: usize }
+
+/// The title the videos belong to, from what its page or card already loaded: its logo and
+/// backdrop, year, runtime, certificate and genres, rating, tagline, director and leading cast.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct About {
+    pub title: String, pub backdrop: String, pub logo: Option<String>,
+    pub facts: Vec<String>, pub rating: Option<String>, pub tagline: Option<String>,
+    pub director: Option<(String, Vec<String>)>, pub cast: Vec<String>,
+}
+
+impl About {
+    pub fn of(media: &Media, meta: Option<&backend::TitleMeta>, art: Option<&backend::Artwork>) -> Self {
+        let filled = |s: &str| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
+        let genres: Vec<String> = media.genres.iter().take(2).cloned().collect();
+        let facts = [filled(&media.year), meta.and_then(|m| filled(&m.runtime)), art.and_then(|a| a.certificate.clone()),
+            Some(genres.join(", ")).filter(|g| !g.is_empty())].into_iter().flatten().collect();
+        // Key crew from TMDB (directed or created by), else the add-on's directors.
+        let director = art.and_then(|a| a.crew.iter().find(|(role, _)| role.starts_with("Directed") || role.starts_with("Created")).cloned())
+            .or_else(|| meta.filter(|m| !m.directors.is_empty()).map(|m| ("Directed by".to_owned(), m.directors.iter().take(2).cloned().collect())));
+        let cast: Vec<String> = art.map(|a| a.cast.iter().take(4).map(|p| p.name.clone()).collect::<Vec<_>>()).filter(|c| !c.is_empty())
+            .or_else(|| meta.map(|m| m.cast.iter().take(4).cloned().collect())).unwrap_or_default();
+        About {
+            title: media.name.clone(),
+            backdrop: art.and_then(|a| a.backdrop.clone()).unwrap_or_else(|| media.backdrop().to_owned()),
+            logo: art.and_then(|a| a.logo.clone()).or_else(|| meta.and_then(|m| filled(&m.logo))),
+            facts, rating: meta.and_then(|m| filled(&m.rating)), tagline: art.and_then(|a| a.tagline.clone()), director, cast,
+        }
+    }
+}
+
+impl Clip {
+    /// What the clip is, in words: "Official trailer", "Teaser", "Behind the scenes".
+    pub fn label(&self) -> String {
+        let kind = if self.kind == "Behind the Scenes" { "Behind the scenes".to_owned() } else if self.kind.is_empty() { "Video".to_owned() } else { self.kind.clone() };
+        if self.official && matches!(self.kind.as_str(), "Trailer" | "Teaser") { format!("Official {}", kind.to_lowercase()) } else { kind }
+    }
+}
 
 /// Shared shell state, provided once at the root.
 #[derive(Clone, Copy)]
@@ -67,8 +112,8 @@ pub struct Shell {
     /// What the player is doing, shown as a status line; None when idle.
     pub player_status: Signal<Option<PlayerStatus>>,
     pub search_open: Signal<bool>,
-    /// A YouTube trailer playing in the in-app trailer sheet (video id).
-    pub trailer: Signal<Option<(Vec<String>, usize)>>,
+    /// A title's videos playing in the in-app theatre (trailers, teasers, featurettes).
+    pub trailer: Signal<Option<Theatre>>,
     /// The app's shortcuts sheet.
     pub shortcuts_open: Signal<bool>,
     /// A key pressed on the title page (play, like, save, ...).
@@ -314,7 +359,36 @@ fn Shell_() -> Element {
                 e.prevent_default();
                 go(tab, opened, search_open, Tab::ALL[c.parse::<usize>().unwrap_or(1) - 1]);
             }
+            Key::Escape if shortcuts_open() && shell.trailer.read().is_some() => shortcuts_open.set(false),
             Key::Escape if shell.trailer.read().is_some() => { let mut t = shell.trailer; t.set(None); }
+            // In the theatre, ← and → step through the title's videos.
+            Key::ArrowLeft | Key::ArrowRight if shell.trailer.read().is_some() => {
+                e.prevent_default();
+                let back = e.key() == Key::ArrowLeft;
+                let mut t = shell.trailer;
+                t.with_mut(|t| if let Some(t) = t { let n = t.clips.len().max(1); t.at = if back { (t.at + n - 1) % n } else { (t.at + 1) % n }; });
+            }
+            // The rest are YouTube's own keys, so they behave the same with focus inside the video:
+            // Space or K play/pause, J and L ten seconds back and on, M mute, F full screen; plus
+            // 1–9 to jump to a video, Y to open it on YouTube and ? for the list.
+            Key::Character(c) if shell.trailer.read().is_some() && !ctrl && !e.modifiers().alt() => {
+                let key = c.to_lowercase();
+                let mut t = shell.trailer;
+                match key.as_str() {
+                    " " | "k" => { e.prevent_default(); theatre_command("toggle"); }
+                    "j" => theatre_command("back"),
+                    "l" => theatre_command("forward"),
+                    "m" => theatre_command("mute"),
+                    "f" => theatre_command("full"),
+                    "y" => if let Some(id) = t.peek().as_ref().and_then(|t| t.clips.get(t.at)).map(|c| c.youtube.clone()) { open_external(&format!("https://www.youtube.com/watch?v={id}")); },
+                    "?" => shortcuts_open.set(!shortcuts_open()),
+                    d if d.len() == 1 && ("1"..="9").contains(&d) => {
+                        let i = d.parse::<usize>().unwrap_or(1) - 1;
+                        t.with_mut(|t| if let Some(t) = t { if i < t.clips.len() { t.at = i; } });
+                    }
+                    _ => {}
+                }
+            }
             Key::Escape if shortcuts_open() => shortcuts_open.set(false),
             Key::Escape if search_open() => search_open.set(false),
             Key::Escape if opened.read().is_some() => opened.set(None),
@@ -330,7 +404,6 @@ fn Shell_() -> Element {
             Key::ArrowRight => { e.prevent_default(); pick_command.set(Some(PickCommand::Right)); }
             Key::Character(c) if c.eq_ignore_ascii_case("s") => { e.prevent_default(); pick_command.set(Some(PickCommand::Skip)); }
             Key::Character(c) if c.eq_ignore_ascii_case("n") => { e.prevent_default(); pick_command.set(Some(PickCommand::Neither)); }
-            Key::Character(c) if c.eq_ignore_ascii_case("c") => { e.prevent_default(); pick_command.set(Some(PickCommand::Continue)); }
             _ => {}
         }
     };
@@ -445,7 +518,7 @@ fn Shell_() -> Element {
             if shortcuts_open() { AppShortcuts {} }
             // Windows and Android install releases; Linux builds from source.
             if cfg!(any(windows, target_os = "android")) { updater::UpdateNotice {} }
-            if let Some((ids, at)) = (shell.trailer)() { for id in [ids[at.min(ids.len() - 1)].clone()] { TrailerSheet { key: "{id}", id, more: ids.len() > 1 } } }
+            if let Some(theatre) = (shell.trailer)() { TheatreSheet { theatre } }
         }
     }
 }
@@ -634,6 +707,10 @@ fn AppShortcuts() -> Element {
     let mut rows: Vec<(&[&str], &str)> = Vec::new();
     let context = if shell.pending().is_some() {
         rows.push((&["Esc"], "Cancel opening")); "Opening"
+    } else if let Some(t) = (shell.trailer)() {
+        rows.extend([(&["Space", "K"][..], "Play or pause"), (&["J", "L"][..], "10 seconds back or on"), (&["M"][..], "Mute or unmute"), (&["F"][..], "Full screen")]);
+        if t.clips.len() > 1 { rows.extend([(&["←", "→"][..], "Previous or next video"), (&["1–9"][..], "Jump to a video")]); }
+        rows.extend([(&["Y"][..], "Open on YouTube"), (&["Esc"][..], "Close the videos")]); "Videos"
     } else if (shell.search_open)() {
         rows.extend([(&["Enter"][..], "Search"), (&["Esc"][..], "Close search")]); "Search"
     } else if let Some(media) = shell.opened.read().as_ref() {
@@ -642,8 +719,8 @@ fn AppShortcuts() -> Element {
         rows.push((&["Esc"], "Back")); "Title"
     } else {
         if (shell.tab)() == Tab::Picks {
-            rows.extend([(&["←", "→"][..], "Keep the left or right card"), (&["S"][..], "Change pair without voting"),
-                (&["N"][..], "Neither: change direction"), (&["C"][..], "Keep exploring after a suggestion")]);
+            rows.extend([(&["←", "→"][..], "Keep the left or right card"), (&["S"][..], "Skip: two other titles, nothing learned"),
+                (&["N"][..], "Neither: steer away from both")]);
         }
         (shell.tab)().title()
     };
@@ -673,38 +750,156 @@ fn AppShortcuts() -> Element {
     }
 }
 
-/// Trailers play in the app: a direct file in the player, else YouTube in the trailer sheet,
-/// which can move on to the next one (some are blocked in some countries).
-pub fn play_trailers(mut shell: Shell, trailers: Vec<backend::Trailer>) {
-    if let Some(url) = trailers.iter().find_map(|t| t.url.clone()) {
-        start_playback(shell, player::PlayRequest { title: "Trailer".into(), url, ..Default::default() }, None); return;
+/// A title's videos in the in-app theatre, starting at `start` (a YouTube id) or the best one.
+/// TMDB's videos lead (official trailers first); the add-on's YouTube trailers follow as
+/// alternatives. With no YouTube video at all, an add-on's direct trailer file plays in the player.
+pub fn watch_videos(mut shell: Shell, about: About, videos: Vec<backend::Video>, trailers: Vec<backend::Trailer>, start: Option<String>) {
+    let mut clips: Vec<Clip> = videos.into_iter().map(|v| Clip { youtube: v.youtube, name: v.name, kind: v.kind, official: v.official }).collect();
+    for id in trailers.iter().filter_map(|t| t.youtube.clone()) {
+        if !clips.iter().any(|c| c.youtube == id) {
+            let n = clips.iter().filter(|c| c.kind == "Trailer").count();
+            clips.push(Clip { youtube: id, name: if n == 0 { "Trailer".into() } else { format!("Trailer {}", n + 1) }, kind: "Trailer".into(), official: false });
+        }
     }
-    let ids: Vec<String> = trailers.into_iter().filter_map(|t| t.youtube).collect();
-    if !ids.is_empty() { shell.trailer.set(Some((ids, 0))); }
+    if clips.is_empty() {
+        if let Some(url) = trailers.iter().find_map(|t| t.url.clone()) {
+            start_playback(shell, player::PlayRequest { title: format!("{}: trailer", about.title), url, ..Default::default() }, None);
+        }
+        return;
+    }
+    let at = start.and_then(|s| clips.iter().position(|c| c.youtube == s)).unwrap_or(0);
+    shell.trailer.set(Some(Theatre { about, clips, at }));
 }
 
-/// A YouTube trailer inside the app: the official embed in a glass sheet; nothing autoplays
-/// until it is opened, and closing it stops it.
+/// Drive the theatre's YouTube embed through its player API (postMessage). The embed reports its
+/// state, time and mute back (`theatre_listen`), so toggles and seeks start from what it is doing.
+fn theatre_command(command: &'static str) {
+    document::eval(&format!(r#"(() => {{
+        const f = document.querySelector('.theatre iframe'); if (!f || !f.contentWindow) return;
+        const s = window.__veyloYt || (window.__veyloYt = {{}});
+        const post = (func, args) => f.contentWindow.postMessage(JSON.stringify({{ event: 'command', func, args: args || [] }}), '*');
+        switch ('{command}') {{
+            case 'toggle': post(s.state === 1 ? 'pauseVideo' : 'playVideo'); s.state = s.state === 1 ? 2 : 1; break;
+            case 'back': post('seekTo', [Math.max(0, (s.time || 0) - 10), true]); s.time = Math.max(0, (s.time || 0) - 10); break;
+            case 'forward': post('seekTo', [(s.time || 0) + 10, true]); s.time = (s.time || 0) + 10; break;
+            case 'mute': post(s.muted ? 'unMute' : 'mute'); s.muted = !s.muted; break;
+            case 'full': {{ const go = f.requestFullscreen || f.webkitRequestFullscreen; if (go) go.call(f); break; }}
+        }}
+    }})()"#));
+}
+
+/// Listen to the embed's reports once per app, and keep asking the current embed to report
+/// (a new video is a new embed).
+fn theatre_listen() {
+    document::eval(r#"(() => {
+        if (window.__veyloYtListening) return;
+        window.__veyloYtListening = true;
+        window.__veyloYt = {};
+        window.addEventListener('message', e => {
+            if (!/youtube/.test(e.origin || '')) return;
+            let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (_) { return; }
+            const s = window.__veyloYt;
+            if (d && d.event === 'onStateChange') s.state = d.info;
+            if (d && d.event === 'infoDelivery' && d.info) {
+                if ('playerState' in d.info) s.state = d.info.playerState;
+                if ('currentTime' in d.info) s.time = d.info.currentTime;
+                if ('muted' in d.info) s.muted = d.info.muted;
+            }
+        });
+        setInterval(() => {
+            const f = document.querySelector('.theatre iframe');
+            if (f && f.contentWindow) f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'veylo' }), '*');
+        }, 1000);
+    })()"#);
+}
+
+/// The theatre: the official YouTube embed large, what is playing and its kind, and every video of
+/// the title as a strip of thumbnails to switch between. Nothing autoplays until it is opened, and
+/// closing it stops it.
 #[component]
-fn TrailerSheet(id: String, more: bool) -> Element {
+fn TheatreSheet(theatre: Theatre) -> Element {
     let mut shell = use_context::<Shell>();
-    let src = format!("https://www.youtube-nocookie.com/embed/{id}?autoplay=1&playsinline=1&rel=0&modestbranding=1");
+    let n = theatre.clips.len();
+    let at = theatre.at.min(n.saturating_sub(1));
+    let clip = theatre.clips[at].clone();
+    let mut go = move |to: usize| shell.trailer.with_mut(|t| if let Some(t) = t { t.at = to; });
+    let link = format!("https://www.youtube.com/watch?v={}", clip.youtube);
+    let about = theatre.about.clone();
+    let mut logo_failed = use_signal(|| false);
+    use_hook(theatre_listen);
     rsx! {
-        div { class: "scrim trailer-scrim", onclick: move |_| shell.trailer.set(None),
-            section { class: "trailer-sheet glass", role: "dialog", aria_label: "Trailer", onclick: move |e| e.stop_propagation(),
-                div { class: "trailer-frame",
-                    iframe { src: "{src}", title: "Trailer", allow: "autoplay; encrypted-media; picture-in-picture; fullscreen", allowfullscreen: "true",
-                        referrerpolicy: "strict-origin-when-cross-origin" }
-                }
-                div { class: "sheet-head",
-                    span { class: "group-icon", icons::Clapper {} }
-                    span { class: "group-name", "Trailer" }
-                    if more {
-                        button { class: "pill glass", title: "Try the next trailer", onclick: move |_| shell.trailer.with_mut(|t| if let Some((ids, at)) = t { *at = (*at + 1) % ids.len(); }),
-                            icons::Next {} span { "Another trailer" } }
+        div { class: "scrim theatre-scrim", onclick: move |_| shell.trailer.set(None),
+            if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{about.backdrop}", alt: "" } }
+            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}", onclick: move |e| e.stop_propagation(),
+                // The video is the main actor: it takes all the room the side column leaves.
+                div { class: "theatre-stage",
+                    div { class: "trailer-frame",
+                        // A new video gets a new frame (a key only renews an element inside a list).
+                        for id in [clip.youtube.clone()] {
+                            iframe { key: "{id}", src: "https://www.youtube-nocookie.com/embed/{id}?autoplay=1&playsinline=1&rel=0&modestbranding=1&enablejsapi=1", title: "{clip.name}",
+                                allow: "autoplay; encrypted-media; picture-in-picture; fullscreen", allowfullscreen: "true", referrerpolicy: "strict-origin-when-cross-origin" }
+                        }
                     }
-                    icons::IconButton { label: "Open on YouTube", class: "glass", onclick: { let id = id.clone(); move |_| open_external(&format!("https://www.youtube.com/watch?v={id}")) }, icons::Link {} }
-                    icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| shell.trailer.set(None), icons::Close {} }
+                }
+                aside { class: "theatre-side",
+                    div { class: "theatre-tools",
+                        if n > 1 {
+                            icons::IconButton { label: "Previous video (←)", class: "glass small", onclick: move |_| go((at + n - 1) % n), icons::ArrowLeft {} }
+                            span { class: "theatre-count tnum", "{at + 1} / {n}" }
+                            icons::IconButton { label: "Next video (→)", class: "glass small", onclick: move |_| go((at + 1) % n), icons::ArrowRight {} }
+                        }
+                        span { class: "theatre-spacer" }
+                        icons::IconButton { label: "Open on YouTube", class: "glass small", onclick: move |_| open_external(&link), icons::Link {} }
+                        icons::IconButton { label: "Close (Esc)", class: "glass small", onclick: move |_| shell.trailer.set(None), icons::Close {} }
+                    }
+                    div { class: "theatre-titles",
+                        match about.logo.clone().filter(|_| !logo_failed()) {
+                            Some(src) => rsx! { img { class: "theatre-logo", src: "{src}", alt: "{about.title}", onerror: move |_| logo_failed.set(true) } },
+                            None => rsx! { h2 { class: "display theatre-title", "{about.title}" } },
+                        }
+                        div { class: "theatre-facts",
+                            if let Some(r) = about.rating.clone() { span { class: "theatre-rating", icons::Star {} span { class: "tnum", "{r}" } } }
+                            for f in about.facts.iter() { span { "{f}" } }
+                        }
+                    }
+                    div { class: "theatre-now",
+                        span { class: if clip.official { "theatre-kind official" } else { "theatre-kind" },
+                            if clip.official { icons::Check {} } else { icons::Clapper {} } span { {clip.label()} } }
+                        if !clip.name.is_empty() && clip.name != clip.label() { span { class: "theatre-name", "{clip.name}" } }
+                    }
+                    if let Some(t) = about.tagline.clone() { p { class: "theatre-tagline", "“{t}”" } }
+                    if about.director.is_some() || !about.cast.is_empty() {
+                        div { class: "theatre-credits",
+                            if let Some((role, names)) = about.director.clone() { p { span { class: "dim", "{role} " } {names.join(", ")} } }
+                            if !about.cast.is_empty() { p { span { class: "dim", "With " } {about.cast.join(", ")} } }
+                        }
+                    }
+                    if n > 1 {
+                        div { class: "theatre-list", role: "list", aria_label: "All videos",
+                            for (i, c) in theatre.clips.iter().cloned().enumerate() {
+                                button { key: "{c.youtube}", class: if i == at { "theatre-clip on" } else { "theatre-clip" }, role: "listitem",
+                                    aria_current: if i == at { "true" } else { "false" }, aria_label: "{c.label()}: {c.name}", onclick: move |_| go(i),
+                                    span { class: "theatre-thumb",
+                                        img { src: "https://i.ytimg.com/vi/{c.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }
+                                        if i == at { span { class: "now-playing", icons::Play {} } }
+                                        if i < 9 { kbd { class: "keycap clip-key", aria_hidden: "true", "{i + 1}" } }
+                                    }
+                                    span { class: "theatre-clip-text",
+                                        span { class: "theatre-clip-name", "{c.name}" }
+                                        span { class: if c.official { "theatre-clip-kind official" } else { "theatre-clip-kind" }, {c.label()} }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // The keys, at a glance (? lists them all).
+                    div { class: "theatre-keys", aria_hidden: "true",
+                        span { kbd { class: "keycap", "Space" } "Play" }
+                        span { kbd { class: "keycap", "J" } kbd { class: "keycap", "L" } "10 s" }
+                        span { kbd { class: "keycap", "M" } "Mute" }
+                        span { kbd { class: "keycap", "F" } "Full" }
+                        if n > 1 { span { kbd { class: "keycap", "←" } kbd { class: "keycap", "→" } "Videos" } }
+                    }
                 }
             }
         }

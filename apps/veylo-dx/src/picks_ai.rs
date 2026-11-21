@@ -41,11 +41,11 @@ impl Cache {
     }
 }
 /// Unit vectors have components in [-1, 1]; 16 bits keep cosine error far below ranking noise.
-fn pack(vector: &[f32]) -> String {
+pub(crate) fn pack(vector: &[f32]) -> String {
     let bytes: Vec<u8> = vector.iter().flat_map(|x| ((x.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect();
     STANDARD.encode(bytes)
 }
-fn unpack(text: &str) -> Option<Vec<f32>> {
+pub(crate) fn unpack(text: &str) -> Option<Vec<f32>> {
     let bytes = STANDARD.decode(text).ok()?;
     (bytes.len() == DIM * 2).then(|| bytes.chunks_exact(2).map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32767.0).collect())
 }
@@ -56,6 +56,35 @@ static EMBEDDER: Mutex<Option<Result<Embedder, String>>> = Mutex::new(None);
 static FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
 fn cache() -> &'static RwLock<Cache> { CACHE.get_or_init(Default::default) }
+
+/// The saved embeddings, read once, before the model is first needed: Picks reads vectors (the
+/// brain's projection, similarity) long before anything new is embedded.
+fn ensure_cache() {
+    static LOADED: OnceLock<()> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        #[cfg(not(test))]
+        {
+            let loaded = read_cache(&backend::backend_data_dir().join(CACHE_FILE));
+            if let Ok(mut c) = cache().write() { for key in loaded.order.iter() { if let Some(v) = loaded.map.get(key) { if !c.contains_key(key) { c.insert(key.clone(), v.clone()); } } } }
+        }
+    });
+}
+
+/// bge's instruction for short queries matched against passages (the synopses).
+const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
+fn query_key(text: &str) -> String { format!("{MODEL_VERSION}-q-{:x}", Sha256::digest(text.trim().to_lowercase().as_bytes())) }
+
+/// A short description (a mood) in the titles' space, if already embedded.
+pub fn query_embedding(text: &str) -> Option<Vec<f32>> {
+    ensure_cache();
+    cache().read().ok()?.get(&query_key(text)).cloned()
+}
+
+/// Every title embedding kept, for fitting the brain's projection (queries left out).
+pub fn all_embeddings() -> Vec<Vec<f32>> {
+    ensure_cache();
+    cache().read().map(|c| c.map.iter().filter(|(k, _)| !k.contains("-q-")).map(|(_, v)| v.clone()).collect()).unwrap_or_default()
+}
 
 /// The text a title is embedded from. No genres: they are separate taste features, and leaving
 /// them out lets synopsis and keywords decide the similarity on their own.
@@ -81,6 +110,7 @@ fn parts(m: &Media) -> Option<Parts> { Parts::new(m, &picks_metadata::cached(m))
 /// The title's embedding, if computed. While refreshed enrichment is still being embedded, the
 /// vector from the unenriched text keeps serving.
 pub fn embedding(m: &Media) -> Option<Vec<f32>> {
+    ensure_cache();
     let cache = cache().read().ok()?;
     let full = parts(m)?;
     cache.get(&full.key()).cloned().or_else(|| {
@@ -163,6 +193,17 @@ impl Embedder {
     }
     fn embed(&mut self, parts: &Parts) -> Result<Vec<f32>> {
         let ids = self.input_ids(parts)?;
+        self.run(ids)
+    }
+    /// A short text on its own (a mood), within the token budget.
+    fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
+        let body = self.encode(text)?;
+        let mut ids = vec![self.cls];
+        ids.extend(&body[..body.len().min(MAX_TOKENS - 2)]);
+        ids.push(self.sep);
+        self.run(ids)
+    }
+    fn run(&mut self, ids: Vec<i64>) -> Result<Vec<f32>> {
         let len = ids.len();
         let outputs = self.session.run(ort::inputs![
             "input_ids" => Tensor::from_array(([1, len], ids))?,
@@ -233,22 +274,17 @@ fn save_soon(path: PathBuf) {
     });
 }
 
-/// Called only from title verification. Serialize inference off the UI executor; cached titles
-/// never rerun. A failed runtime is reported to the UI and retried on the next app launch.
-pub async fn embed(m: &Media) -> Result<()> {
-    picks_metadata::load().await;
-    let Some(parts) = parts(m) else { return Ok(()) };
-    let id = parts.key();
-    if cache().read().ok().is_some_and(|c| c.contains_key(&id)) { return Ok(()); }
+/// Serialize inference off the UI executor, on the one shared session. A failed runtime is
+/// reported to the UI and retried on the next app launch.
+async fn with_embedder<T: Send + 'static>(work: impl FnOnce(&mut Embedder, PathBuf) -> Result<T> + Send + 'static) -> Result<T> {
     backend::on_runtime(async move {
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> Result<T> {
             let mut state = EMBEDDER.lock().map_err(|_| anyhow!("Embedder lock"))?;
             let dir = backend::backend_data_dir();
-            let cache_path = dir.join(CACHE_FILE);
             if state.is_none() {
                 // The earlier classifier's score cache is of no further use.
                 let _ = std::fs::remove_file(dir.join("picks-traits-v1.json"));
-                *cache().write().map_err(|_| anyhow!("Embedding cache lock"))? = read_cache(&cache_path);
+                ensure_cache();
                 *state = Some(paths().and_then(|(dir, runtime)| Embedder::open(&dir, &runtime)).map_err(|e| e.to_string()));
             }
             let embedder = match state.as_mut().unwrap() {
@@ -259,13 +295,40 @@ pub async fn embed(m: &Media) -> Result<()> {
                     return Err(anyhow!(error.clone()));
                 }
             };
-            if cache().read().map_err(|_| anyhow!("Embedding cache lock"))?.contains_key(&id) { return Ok(()); }
-            let vector = embedder.embed(&parts)?;
-            cache().write().map_err(|_| anyhow!("Embedding cache lock"))?.insert(id, vector);
-            save_soon(cache_path);
-            Ok(())
+            work(embedder, dir.join(CACHE_FILE))
         }).await.map_err(|_| anyhow!("Inference worker stopped"))?
     }).await?
+}
+
+/// Embed a title (from verification and prefetch); cached titles never rerun.
+pub async fn embed(m: &Media) -> Result<()> {
+    picks_metadata::load().await;
+    let Some(parts) = parts(m) else { return Ok(()) };
+    let id = parts.key();
+    ensure_cache();
+    if cache().read().ok().is_some_and(|c| c.contains_key(&id)) { return Ok(()); }
+    with_embedder(move |embedder, cache_path| {
+        if cache().read().map_err(|_| anyhow!("Embedding cache lock"))?.contains_key(&id) { return Ok(()); }
+        let vector = embedder.embed(&parts)?;
+        cache().write().map_err(|_| anyhow!("Embedding cache lock"))?.insert(id, vector);
+        save_soon(cache_path);
+        Ok(())
+    }).await
+}
+
+/// Embed a short description (a mood word or what you typed) as a search query.
+pub async fn embed_query(text: &str) -> Result<Vec<f32>> {
+    if let Some(v) = query_embedding(text) { return Ok(v); }
+    let clean = picks_metadata::clean(text, 300);
+    ensure!(!clean.is_empty(), "Nothing to embed");
+    let id = query_key(text);
+    with_embedder(move |embedder, cache_path| {
+        if let Some(v) = cache().read().map_err(|_| anyhow!("Embedding cache lock"))?.get(&id) { return Ok(v.clone()); }
+        let vector = embedder.embed_text(&format!("{QUERY_PREFIX}{clean}"))?;
+        cache().write().map_err(|_| anyhow!("Embedding cache lock"))?.insert(id, vector.clone());
+        save_soon(cache_path);
+        Ok(vector)
+    }).await
 }
 
 /// Metadata requests stay outside verification/playback; inference itself remains local.

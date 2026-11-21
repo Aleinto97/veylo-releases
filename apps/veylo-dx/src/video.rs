@@ -162,6 +162,12 @@ mod imp {
     /// A GDK symbol by name (the backend-specific getters are not in gtk-rs).
     unsafe fn gdk_fn(name: &CStr) -> *mut c_void { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }
 
+    /// A looked-up symbol as the function-pointer type its use site names.
+    unsafe fn symbol<F: Copy>(p: *mut c_void) -> F {
+        assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*mut c_void>(), "a symbol is one pointer");
+        std::mem::transmute_copy(&p)
+    }
+
     // ------------------------------------------------------------ GL entry points
 
     struct Gl {
@@ -186,9 +192,9 @@ mod imp {
             let get = |name: &CStr| { let p = lookup(name.as_ptr()); (!p.is_null()).then_some(p) };
             Some(Gl {
                 lookup,
-                clear_color: std::mem::transmute::<*mut c_void, _>(get(c"glClearColor")?),
-                clear: std::mem::transmute::<*mut c_void, _>(get(c"glClear")?),
-                get_integerv: std::mem::transmute::<*mut c_void, _>(get(c"glGetIntegerv")?),
+                clear_color: symbol(get(c"glClearColor")?),
+                clear: symbol(get(c"glClear")?),
+                get_integerv: symbol(get(c"glGetIntegerv")?),
             })
         }).as_ref()
     }
@@ -406,7 +412,7 @@ mod imp {
         unsafe fn egl() -> Result<Egl, String> {
             let h = libc::dlopen(c"libEGL.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
             if h.is_null() { return Err("libEGL missing".into()); }
-            macro_rules! f { ($n:literal) => {{ let p = libc::dlsym(h, $n.as_ptr()); if p.is_null() { return Err(format!("{:?} missing", $n)); } std::mem::transmute(p) }}; }
+            macro_rules! f { ($n:literal) => {{ let p = libc::dlsym(h, $n.as_ptr()); if p.is_null() { return Err(format!("{:?} missing", $n)); } symbol(p) }}; }
             Ok(Egl {
                 get_display: f!(c"eglGetDisplay"), initialize: f!(c"eglInitialize"), bind_api: f!(c"eglBindAPI"),
                 choose_config: f!(c"eglChooseConfig"), create_context: f!(c"eglCreateContext"),

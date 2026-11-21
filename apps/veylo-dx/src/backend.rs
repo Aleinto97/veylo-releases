@@ -186,7 +186,7 @@ impl Media {
         (0..bytes.len().saturating_sub(3)).find_map(|i| {
             let slice = &self.year.get(i..i + 4)?;
             let boundary_before = i == 0 || !bytes[i - 1].is_ascii_digit();
-            let boundary_after = bytes.get(i + 4).map_or(true, |b| !b.is_ascii_digit());
+            let boundary_after = bytes.get(i + 4).is_none_or(|b| !b.is_ascii_digit());
             (boundary_before && boundary_after && slice.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| slice.parse().ok())
                 .flatten()
@@ -1115,6 +1115,18 @@ pub async fn earlier_part(m: &Media, watched: &HashSet<String>) -> Option<Media>
     None
 }
 
+/// The trailers to play for a Picks card: TMDB's videos (official trailers first) when TMDB has
+/// any, the add-on's YouTube trailers after them as alternatives; the add-on's own list (direct
+/// links included) only when TMDB has none.
+pub fn official_first(tmdb: &[String], addon: &[Trailer]) -> Vec<Trailer> {
+    if tmdb.is_empty() { return addon.to_vec(); }
+    let mut out: Vec<Trailer> = tmdb.iter().map(|k| Trailer { youtube: Some(k.clone()), url: None }).collect();
+    for t in addon {
+        if t.youtube.is_some() && !out.iter().any(|o| o.youtube == t.youtube) { out.push(Trailer { youtube: t.youtube.clone(), url: None }); }
+    }
+    out
+}
+
 /// Whether a title can stand in a duel: a poster to show and a trailer to watch.
 pub async fn duel_ready(m: &Media) -> Option<Media> {
     if posters(m).is_empty() { return None; }
@@ -1124,6 +1136,10 @@ pub async fn duel_ready(m: &Media) -> Option<Media> {
     for genre in meta.genres { if !ready.genres.contains(&genre) { ready.genres.push(genre); } }
     ready = crate::picks_rules::tidy(ready);
     ready.raw["genres"] = json!(ready.genres);
+    // A catalogue's "Animation" can be wrong; TMDB's genres decide when TMDB knows the title.
+    if let Some(art) = artwork(&ready).await.filter(|a| a.tmdb.is_some() && !a.genres.is_empty()) {
+        crate::picks_rules::settle_style(&mut ready, art.genres.iter().any(|g| g.eq_ignore_ascii_case("Animation")));
+    }
     Some(ready)
 }
 
@@ -1144,9 +1160,7 @@ pub async fn search(query: String) -> Result<SearchOutcome> {
         if retired_addon(&s(group, "addon_url")) { continue; }
         out.catalogs += 1;
         let addon = s(group, "addon_name");
-        if group.get("error").is_some() {
-            if !out.failed.contains(&addon) { out.failed.push(addon.clone()); }
-        }
+        if group.get("error").is_some() && !out.failed.contains(&addon) { out.failed.push(addon.clone()); }
         for m in metas(group, &s(group, "addon_url")) {
             if !out.results.iter().any(|(_, r)| r.key() == m.key()) {
                 out.results.push((addon.clone(), m));
@@ -1500,7 +1514,7 @@ pub struct Person { pub name: String, pub role: String, pub photo: Option<String
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Studio { pub name: String, pub logo: String }
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct Video { pub youtube: String, pub name: String, pub kind: String }
+pub struct Video { pub youtube: String, pub name: String, pub kind: String, pub official: bool }
 
 const TMDB_IMG: &str = "https://image.tmdb.org/t/p";
 
@@ -1553,9 +1567,14 @@ fn production(details: &Value, kind: &str, backdrop: Option<&str>) -> Artwork {
         .map(|l| s(l, "english_name")).filter(|x| !x.is_empty());
     let season_posters = details["seasons"].as_array().into_iter().flatten()
         .filter_map(|x| Some((x["season_number"].as_i64()?, img("w185", &x["poster_path"])?))).collect();
-    let videos = details["videos"]["results"].as_array().into_iter().flatten()
+    // The production's own videos first: official trailers, teasers, clips, then the rest.
+    let rank = |kind: &str| match kind { "Trailer" => 4, "Teaser" => 3, "Clip" => 2, "Featurette" => 1, _ => 0 };
+    let mut videos: Vec<Video> = details["videos"]["results"].as_array().into_iter().flatten()
         .filter(|v| v["site"] == "YouTube" && matches!(v["type"].as_str(), Some("Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip")))
-        .take(10).map(|v| Video { youtube: s(v, "key"), name: s(v, "name"), kind: s(v, "type") }).filter(|v| !v.youtube.is_empty()).collect();
+        .map(|v| Video { youtube: s(v, "key"), name: s(v, "name"), kind: s(v, "type"), official: v["official"].as_bool().unwrap_or(false) })
+        .filter(|v| !v.youtube.is_empty()).collect();
+    videos.sort_by_key(|v| std::cmp::Reverse((v.official, rank(&v.kind))));
+    videos.truncate(12);
     Artwork { stills, tagline: Some(s(details, "tagline")).filter(|t| !t.is_empty()), cast, crew, studios, certificate, language, season_posters, videos, ..Artwork::default() }
 }
 
@@ -1613,7 +1632,8 @@ pub async fn artwork(m: &Media) -> Option<Artwork> {
     let images = &details["images"];
     let mut videos: Vec<&Value> = details["videos"]["results"].as_array().into_iter().flatten()
         .filter(|v| v["site"] == "YouTube" && (v["type"] == "Trailer" || v["type"] == "Teaser")).collect();
-    videos.sort_by_key(|v| std::cmp::Reverse((v["type"] == "Trailer", v["official"].as_bool().unwrap_or(false), v["iso_639_1"] == "en", v["size"].as_i64().unwrap_or(0))));
+    // The production's own videos first: official trailers, then official teasers, then the rest.
+    videos.sort_by_key(|v| std::cmp::Reverse((v["official"].as_bool().unwrap_or(false), v["type"] == "Trailer", v["iso_639_1"] == "en", v["size"].as_i64().unwrap_or(0))));
     let trailers: Vec<String> = videos.iter().filter_map(|v| v["key"].as_str().map(str::to_owned)).collect();
     let backdrop = best_image(&images["backdrops"], &[None, Some("en")]).map(|p| format!("https://image.tmdb.org/t/p/w1280{p}"));
     let art = Artwork {
@@ -1635,7 +1655,9 @@ pub async fn artwork(m: &Media) -> Option<Artwork> {
 /// Whether TMDB can be asked (a key is set).
 pub fn tmdb_ready() -> bool { tmdb_key().is_some() }
 
-static TMDB_GENRES: OnceLock<Mutex<HashMap<String, Vec<(i64, String)>>>> = OnceLock::new();
+/// TMDB genre ids and names, per "movie" or "tv".
+type GenreLists = HashMap<String, Vec<(i64, String)>>;
+static TMDB_GENRES: OnceLock<Mutex<GenreLists>> = OnceLock::new();
 
 /// TMDB's genre list for "movie" or "tv", cached.
 async fn tmdb_genre_list(kind: &str) -> Vec<(i64, String)> {
@@ -1658,7 +1680,6 @@ pub async fn tmdb_candidates(genre: Option<String>, kind: Option<String>, style:
     let mut out = Vec::new();
     for tk in kinds {
         let genres = tmdb_genre_list(tk).await;
-        let names = |ids: &[i64]| ids.iter().filter_map(|id| genres.iter().find(|(g, _)| g == id).map(|(_, n)| n.clone())).collect::<Vec<_>>();
         let mut query: Vec<(&'static str, String)> = vec![("sort_by", "popularity.desc".into()), ("vote_count.gte", "80".into()), ("include_adult", "false".into())];
         let mut with_genres: Vec<i64> = Vec::new();
         let mut with_keywords: Vec<i64> = Vec::new();
@@ -1698,62 +1719,86 @@ pub async fn tmdb_candidates(genre: Option<String>, kind: Option<String>, style:
             let Some(v) = tmdb(format!("discover/{tk}"), q).await else { break };
             results.extend(v["results"].as_array().cloned().unwrap_or_default());
         }
-        // IMDb ids (and, for a series, the years it aired) for every result at once.
-        let ids: Vec<i64> = results.iter().filter_map(|r| r["id"].as_i64()).collect();
-        let kind_path = tk.to_owned();
-        let found: HashMap<i64, (String, String)> = on_runtime(async move {
-            let mut set = tokio::task::JoinSet::new();
-            // At most eight TMDB requests at a time (it rate-limits bursts).
-            let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-            for id in ids {
-                let kp = kind_path.clone();
-                let gate = gate.clone();
-                set.spawn(async move {
-                    let _permit = gate.acquire_owned().await;
-                    if kp == "tv" {
-                        let d = tmdb(format!("tv/{id}"), vec![("append_to_response", "external_ids".into())]).await;
-                        (id, d.and_then(|d| {
-                            let imdb = d["external_ids"]["imdb_id"].as_str()?.to_owned();
-                            let first = d["first_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default().to_owned();
-                            let last = d["last_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default();
-                            let running = d["in_production"].as_bool().unwrap_or(false);
-                            let years = if first.is_empty() { String::new() } else if running { format!("{first}–") } else if last.is_empty() || last == first { first } else { format!("{first}–{last}") };
-                            Some((imdb, years))
-                        }))
-                    } else {
-                        (id, tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(|i| (i.to_owned(), String::new()))))
-                    }
-                });
-            }
-            let mut found = HashMap::new();
-            while let Some(done) = set.join_next().await {
-                if let Ok((id, Some((imdb, years)))) = done { if imdb.starts_with("tt") { found.insert(id, (imdb, years)); } }
-            }
-            found
-        }).await.unwrap_or_default();
-        for r in &results {
-            let Some((imdb, years)) = r["id"].as_i64().and_then(|id| found.get(&id).cloned()) else { continue };
-            let ids: Vec<i64> = r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
-            let mut genre_names: Vec<String> = names(&ids);
-            if let Some(g) = &genre { if !genre_names.iter().any(|n| crate::picks_rules::has_genre_name(n, g)) { genre_names.push(g.clone()); } }
-            // Japanese animation is anime.
-            if ids.contains(&16) && r["original_language"] == "ja" { genre_names.push("Anime".into()); }
-            let date = r[if tk == "movie" { "release_date" } else { "first_air_date" }].as_str().unwrap_or_default();
-            let release = if years.is_empty() { date.get(..4).unwrap_or_default().to_owned() } else { years };
-            let meta = json!({
-                "id": imdb, "type": if tk == "movie" { "movie" } else { "series" },
-                "name": r[if tk == "movie" { "title" } else { "name" }].as_str().unwrap_or("Untitled"),
-                "description": r["overview"].as_str().unwrap_or_default(),
-                "releaseInfo": release,
-                "poster": r["poster_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w500{p}")).unwrap_or_default(),
-                "background": r["backdrop_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")).unwrap_or_default(),
-                "genres": genre_names, "imdbRating": r["vote_average"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_default(),
-                "tmdb_id": r["id"],
-            });
-            if let Some(m) = Media::from_json(&meta, CINEMETA) { out.push(crate::picks_rules::tidy(m)); }
-        }
+        out.extend(tmdb_titles(tk, results, genre.as_deref()).await);
     }
     out
+}
+
+/// TMDB results (Discover, recommendations) as Cinemeta titles, so they open and play like any
+/// other: IMDb ids looked up together, a series with the years it aired. `genre` is added to a
+/// title that lacks it (a keyword match). Titles without an IMDb id are skipped.
+async fn tmdb_titles(tk: &str, results: Vec<Value>, genre: Option<&str>) -> Vec<Media> {
+    let genres = tmdb_genre_list(tk).await;
+    let names = |ids: &[i64]| ids.iter().filter_map(|id| genres.iter().find(|(g, _)| g == id).map(|(_, n)| n.clone())).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    // IMDb ids (and, for a series, the years it aired) for every result at once.
+    let ids: Vec<i64> = results.iter().filter_map(|r| r["id"].as_i64()).collect();
+    let kind_path = tk.to_owned();
+    let found: HashMap<i64, (String, String)> = on_runtime(async move {
+        let mut set = tokio::task::JoinSet::new();
+        // At most eight TMDB requests at a time (it rate-limits bursts).
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        for id in ids {
+            let kp = kind_path.clone();
+            let gate = gate.clone();
+            set.spawn(async move {
+                let _permit = gate.acquire_owned().await;
+                if kp == "tv" {
+                    let d = tmdb(format!("tv/{id}"), vec![("append_to_response", "external_ids".into())]).await;
+                    (id, d.and_then(|d| {
+                        let imdb = d["external_ids"]["imdb_id"].as_str()?.to_owned();
+                        let first = d["first_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default().to_owned();
+                        let last = d["last_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default();
+                        let running = d["in_production"].as_bool().unwrap_or(false);
+                        let years = if first.is_empty() { String::new() } else if running { format!("{first}–") } else if last.is_empty() || last == first { first } else { format!("{first}–{last}") };
+                        Some((imdb, years))
+                    }))
+                } else {
+                    (id, tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(|i| (i.to_owned(), String::new()))))
+                }
+            });
+        }
+        let mut found = HashMap::new();
+        while let Some(done) = set.join_next().await {
+            if let Ok((id, Some((imdb, years)))) = done { if imdb.starts_with("tt") { found.insert(id, (imdb, years)); } }
+        }
+        found
+    }).await.unwrap_or_default();
+    for r in &results {
+        let Some((imdb, years)) = r["id"].as_i64().and_then(|id| found.get(&id).cloned()) else { continue };
+        let ids: Vec<i64> = r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+        let mut genre_names: Vec<String> = names(&ids);
+        if let Some(g) = genre { if !genre_names.iter().any(|n| crate::picks_rules::has_genre_name(n, g)) { genre_names.push(g.to_owned()); } }
+        // Japanese animation is anime.
+        if ids.contains(&16) && r["original_language"] == "ja" { genre_names.push("Anime".into()); }
+        let date = r[if tk == "movie" { "release_date" } else { "first_air_date" }].as_str().unwrap_or_default();
+        let release = if years.is_empty() { date.get(..4).unwrap_or_default().to_owned() } else { years };
+        let meta = json!({
+            "id": imdb, "type": if tk == "movie" { "movie" } else { "series" },
+            "name": r[if tk == "movie" { "title" } else { "name" }].as_str().unwrap_or("Untitled"),
+            "description": r["overview"].as_str().unwrap_or_default(),
+            "releaseInfo": release,
+            "poster": r["poster_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w500{p}")).unwrap_or_default(),
+            "background": r["backdrop_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")).unwrap_or_default(),
+            "genres": genre_names, "imdbRating": r["vote_average"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_default(),
+            "tmdb_id": r["id"],
+        });
+        if let Some(m) = Media::from_json(&meta, CINEMETA) { out.push(crate::picks_rules::tidy(m)); }
+    }
+    out
+}
+
+/// Titles TMDB recommends for one you kept or liked: the pool grows toward your taste.
+pub async fn tmdb_related(m: &Media) -> Vec<Media> {
+    if !tmdb_ready() { return Vec::new(); }
+    let Some((kind, id)) = artwork(m).await.and_then(|a| a.tmdb) else { return Vec::new() };
+    let Some(v) = tmdb(format!("{kind}/{id}/recommendations"), vec![("page", "1".into())]).await else { return Vec::new() };
+    // Formats (reality, news, soap, talk) and kids' series are never offered; skip their lookups.
+    let results: Vec<Value> = v["results"].as_array().into_iter().flatten()
+        .filter(|r| !r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).any(|g| [10764, 10763, 10766, 10767, 10762].contains(&g)))
+        .filter(|r| r["vote_count"].as_i64().unwrap_or(0) >= 50)
+        .take(12).cloned().collect();
+    tmdb_titles(&kind, results, None).await
 }
 
 fn tvmaze_genres(s: &Value) -> Vec<String> {
@@ -1863,163 +1908,6 @@ pub(crate) async fn picks_keywords(m: &Media) -> Option<Vec<String>> {
 
 // ---------------------------------------------------------------- picks duel
 
-/// Taste learned from duels, saved between sessions until reset: weights per genre, type and
-/// decade, a direction in synopsis-embedding space, and titles set aside (discarded or turned
-/// down as a final pick).
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct Taste {
-    pub genres: HashMap<String, f64>,
-    pub kinds: HashMap<String, f64>,
-    pub decades: HashMap<String, f64>,
-    pub set_aside: Vec<String>,
-    pub duels: u32,
-    /// Lasting direction in embedding space; empty until two embedded titles were compared.
-    pub vibe: Vec<f32>,
-    /// Tonight’s preferences; persisted with the duel, never in the permanent profile.
-    pub session: HashMap<String, f64>,
-    pub session_vibe: Vec<f32>,
-}
-
-/// An embedding difference is small next to a one-hot genre feature; scaling it lets a single
-/// duel steer the vibe as strongly as it steers genres. The norm caps keep long duels bounded.
-const VIBE_GAIN: f64 = 4.0;
-const VIBE_CAP: f64 = 1.5;
-const SESSION_VIBE_CAP: f64 = 2.5;
-
-fn dot(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() { return 0.0; }
-    a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum()
-}
-fn step(vector: &mut Vec<f32>, direction: &[f32], rate: f64, cap: f64) {
-    if vector.len() != direction.len() { *vector = vec![0.0; direction.len()]; }
-    for (x, d) in vector.iter_mut().zip(direction) { *x += (rate * f64::from(*d)) as f32; }
-    let norm = dot(vector, vector).sqrt();
-    if norm > cap { for x in vector.iter_mut() { *x = (f64::from(*x) * cap / norm) as f32; } }
-}
-
-fn decade(m: &Media) -> Option<String> { m.first_year().map(|y| format!("{}s", y / 10 * 10)) }
-
-impl Taste {
-    /// Metadata remains useful while a synopsis is missing or the model is unavailable.
-    pub fn fit(&self, m: &Media) -> f64 {
-        let vibe = crate::picks_ai::embedding(m).map_or(0.0, |e| self.vibe_fit(&e));
-        self.fit_features(&taste_features(m)) + vibe
-    }
-    /// The learned directions are sums of embedding differences, so an average title scores
-    /// about zero and an unembedded one stays comparable to an embedded one.
-    fn vibe_fit(&self, embedding: &[f32]) -> f64 { dot(&self.vibe, embedding) + dot(&self.session_vibe, embedding) }
-    fn fit_features(&self, features: &HashMap<String, f64>) -> f64 {
-        features.iter().map(|(key, value)| {
-            let persistent = if let Some(g) = key.strip_prefix("genre:") { self.genres.get(g) }
-                else if let Some(k) = key.strip_prefix("kind:") { self.kinds.get(k) }
-                else if let Some(d) = key.strip_prefix("decade:") { self.decades.get(d) }
-                else { None }.copied().unwrap_or(0.0).clamp(-4.0, 4.0);
-            (persistent + self.session.get(key).copied().unwrap_or(0.0)) * value
-        }).sum()
-    }
-    /// Pairwise logistic update: a loss means "less than this opponent", not "disliked".
-    /// Shared features cancel; temporary preferences learn faster than lasting taste.
-    pub fn learn(&mut self, kept: &Media, dropped: &Media) {
-        let mut difference = taste_features(kept);
-        for (key, value) in taste_features(dropped) { *difference.entry(key).or_default() -= value; }
-        let vibe: Option<Vec<f32>> = crate::picks_ai::embedding(kept).zip(crate::picks_ai::embedding(dropped))
-            .map(|(a, b)| a.iter().zip(&b).map(|(x, y)| x - y).collect());
-        let margin = (self.fit_features(&difference) + vibe.as_deref().map_or(0.0, |d| self.vibe_fit(d))).clamp(-20.0, 20.0);
-        let error = 1.0 / (1.0 + margin.exp());
-        for (key, value) in difference {
-            if value.abs() < 1e-9 { continue; }
-            let current = self.session.entry(key.clone()).or_default();
-            *current = (*current + 0.8 * error * value).clamp(-4.0, 4.0);
-            let map = if key.starts_with("genre:") { &mut self.genres }
-                else if key.starts_with("kind:") { &mut self.kinds }
-                else { &mut self.decades };
-            let current = map.entry(key.split_once(':').unwrap().1.to_owned()).or_default();
-            *current = (*current + 0.12 * error * value).clamp(-4.0, 4.0);
-        }
-        if let Some(direction) = vibe {
-            step(&mut self.session_vibe, &direction, 0.8 * error * VIBE_GAIN, SESSION_VIBE_CAP);
-            step(&mut self.vibe, &direction, 0.12 * error * VIBE_GAIN, VIBE_CAP);
-        }
-        self.duels = self.duels.saturating_add(1);
-    }
-
-}
-
-/// Use exactly the same feature scaling for prediction and learning.
-fn taste_features(m: &Media) -> HashMap<String, f64> {
-    let mut features = HashMap::new();
-    let norm = (m.genres.len().max(1) as f64).sqrt();
-    for genre in &m.genres { features.insert(format!("genre:{}", genre.to_lowercase()), 1.0 / norm); }
-    features.insert(format!("kind:{}", m.kind), 0.5);
-    if let Some(decade) = decade(m) { features.insert(format!("decade:{decade}"), 0.5); }
-    features
-}
-
-/// Broad opening selection, then a winner-aware selection for subsequent rounds.
-pub fn next_challenger(pool: &[Media], taste: &Taste, exclude: &[String], spread: usize) -> Option<Media> {
-    choose_challenger(pool, taste, exclude, spread, None)
-}
-pub fn challenger_against(pool: &[Media], taste: &Taste, exclude: &[String], incumbent: &Media, round: u32) -> Option<Media> {
-    let progress = (round as f64 / 10.0).clamp(0.0, 1.0);
-    // Periodically test a different direction instead of following resemblance forever.
-    if round > 0 && round % 3 == 0 {
-        let different: Vec<Media> = pool.iter().filter(|m| !m.genres.iter().any(|g| incumbent.genres.contains(g))).cloned().collect();
-        if let Some(m) = choose_challenger(&different, taste, exclude, 3, None) { return Some(m); }
-    }
-    choose_challenger(pool, taste, exclude, if progress >= 0.7 { 1 } else { 3 }, Some((incumbent, progress)))
-}
-/// How strongly resemblance to the title just kept steers the next card, and how close to the
-/// best score another card must be to share the random draw.
-const SIMILARITY_WEIGHT: f64 = 1.5;
-const TIE_MARGIN: f64 = 0.6;
-fn choose_challenger(pool: &[Media], taste: &Taste, exclude: &[String], spread: usize, duel: Option<(&Media, f64)>) -> Option<Media> {
-    let n = pool.len().max(1) as f64;
-    let winner_vibe = duel.and_then(|(winner, _)| crate::picks_ai::embedding(winner));
-    let score = |aside: bool| {
-        let eligible: Vec<(usize, &Media)> = pool.iter().enumerate()
-            .filter(|(_, m)| !exclude.contains(&m.key()) && duel.is_none_or(|(winner, _)| winner.key() != m.key())
-                && (aside || !taste.set_aside.contains(&m.key())))
-            .collect();
-        let similarity: Vec<Option<f64>> = eligible.iter().map(|(_, m)| {
-            let kept = winner_vibe.as_ref()?;
-            crate::picks_ai::embedding(m).map(|e| crate::picks_ai::cosine(kept, &e))
-        }).collect();
-        // Embedding cosines of all titles sit in a narrow band; only how a card compares with
-        // the other candidates tells the likeliest next card apart.
-        let known: Vec<f64> = similarity.iter().flatten().copied().collect();
-        let mean = known.iter().sum::<f64>() / known.len().max(1) as f64;
-        let spread_of = (known.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / known.len().max(1) as f64).sqrt();
-        eligible.iter().zip(similarity).map(|((i, m), similarity)| {
-            let fit = taste.fit(m);
-            let mut score = (n - *i as f64) / n * 0.35 + fit;
-            if let Some((winner, progress)) = duel {
-                match similarity {
-                    // Follow the actual choice immediately; exploration stays inside that direction.
-                    Some(s) if known.len() >= 2 && spread_of > 1e-4 => score += SIMILARITY_WEIGHT * ((s - mean) / spread_of).clamp(-2.0, 2.0),
-                    Some(_) => {}
-                    None => {
-                        let a = taste_features(winner);
-                        let b = taste_features(m);
-                        let dot: f64 = a.iter().map(|(k, v)| v * b.get(k).unwrap_or(&0.0)).sum();
-                        let norm = (a.values().map(|v| v * v).sum::<f64>() * b.values().map(|v| v * v).sum::<f64>()).sqrt();
-                        if norm > 0.0 { score += 0.5 * (dot / norm).clamp(0.0, 1.0); }
-                    }
-                }
-                let gap = (fit - taste.fit(winner)).clamp(-20.0, 20.0);
-                let p = 1.0 / (1.0 + (-gap).exp());
-                score += (1.0 - progress) * 0.15 * 4.0 * p * (1.0 - p);
-            }
-            (score, *m)
-        }).collect::<Vec<_>>()
-    };
-    let mut scored = score(false);
-    if scored.is_empty() { scored = score(true); }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
-    let best = scored.first()?.0;
-    let close = scored.iter().take(spread.max(1)).take_while(|(score, _)| *score >= best - TIE_MARGIN).count();
-    scored.get((rand_u64() as usize) % close.max(1)).map(|(_, m)| (*m).clone())
-}
-
 /// Genres some installed catalog can be asked for (lower-case), e.g. Cinemeta's genre list.
 pub async fn catalog_genres() -> HashSet<String> {
     let Ok(v) = exec(json!({"op":"addons"})).await else { return HashSet::new() };
@@ -2059,43 +1947,19 @@ pub async fn genre_candidates(genre: &str) -> Vec<Media> {
     out
 }
 
-/// An embedding-space vector, or empty if it is not exactly the current dimension of finite numbers.
-fn vector(v: &Value) -> Vec<f32> {
-    let values: Option<Vec<f32>> = v.as_array().map(|a| a.iter().map(|x| x.as_f64().filter(|x| x.is_finite()).map(|x| x as f32)).collect::<Option<_>>()).flatten();
-    values.filter(|x| x.len() == crate::picks_ai::DIM).unwrap_or_default()
-}
-
-fn duel_path() -> PathBuf { backend().data_dir.join("picks-taste.json") }
-
-pub fn load_taste() -> Taste {
-    let Ok(v) = std::fs::read_to_string(duel_path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else { return Taste::default() };
-    let map = |k: &str| v[k].as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f))).collect()).unwrap_or_default();
-    Taste { genres: map("genres"), kinds: map("kinds"), decades: map("decades"),
-        // A direction only means something in the embedding space it was learned in.
-        vibe: if v["space_version"] == crate::picks_ai::SPACE_VERSION { vector(&v["vibe"]) } else { Vec::new() },
-        session: HashMap::new(), session_vibe: Vec::new(),
-        // Version 1 set aside every duel loser; those were relative choices, not dislikes.
-        set_aside: if v["profile_version"] == 2 { v["set_aside"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect() } else { Vec::new() },
-        duels: v["duels"].as_u64().unwrap_or(0) as u32 }
-}
-
-pub fn save_taste(t: &Taste) {
-    let _ = std::fs::write(duel_path(), json!({"profile_version": 2, "space_version": crate::picks_ai::SPACE_VERSION, "genres": t.genres, "kinds": t.kinds, "decades": t.decades, "vibe": t.vibe, "set_aside": t.set_aside, "duels": t.duels}).to_string());
-}
-
-pub fn reset_taste() { let _ = std::fs::remove_file(duel_path()); let _ = std::fs::remove_file(duel_state_path()); }
-
 fn duel_state_path() -> PathBuf { backend().data_dir.join("picks-duel.json") }
 
-/// A duel in progress, kept across tabs and restarts until its filters change or you start over.
+/// Tonight in Picks, kept across tabs and restarts: the filters, the night it belongs to, the
+/// cards on screen and what you kept and starred.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DuelState {
     pub kind: Option<String>, pub style: String, pub genre: Option<String>, pub from: String, pub to: String,
-    pub round: u32, pub shown: Vec<String>,
-    pub evidence: crate::picks_decision::Evidence,
-    pub session: HashMap<String, f64>,
-    pub session_vibe: Vec<f32>,
-    pub left: Option<Media>, pub right: Option<Media>, pub winner: Option<Media>,
+    /// The night (the brain's session) and when it was last played.
+    pub night: u64, pub last: i64,
+    pub round: u32, pub streak: u32, pub shown: Vec<String>,
+    pub left: Option<Media>, pub right: Option<Media>,
+    /// Titles kept at least once tonight, and the ones that won their way onto the shortlist.
+    pub kept: Vec<Media>, pub starred: Vec<Media>,
 }
 
 /// A title as JSON that `Media::from_json` reads back unchanged.
@@ -2110,26 +1974,31 @@ fn media_json(m: &Media) -> Value {
 
 pub fn save_duel(d: &DuelState) {
     let m = |x: &Option<Media>| x.as_ref().map(media_json).unwrap_or(Value::Null);
-    let _ = std::fs::write(duel_state_path(), json!({"kind": d.kind, "style": d.style, "genre": d.genre, "from": d.from, "to": d.to, "round": d.round,
-        "evidence": d.evidence.encode(), "session": d.session, "session_vibe": d.session_vibe, "shown": d.shown, "left": m(&d.left), "right": m(&d.right), "winner": m(&d.winner)}).to_string());
+    let list = |l: &[Media]| l.iter().map(media_json).collect::<Vec<_>>();
+    let _ = std::fs::write(duel_state_path(), json!({"version": 3, "kind": d.kind, "style": d.style, "genre": d.genre, "from": d.from, "to": d.to,
+        "night": d.night.to_string(), "last": d.last, "round": d.round, "streak": d.streak, "shown": d.shown,
+        "left": m(&d.left), "right": m(&d.right), "kept": list(&d.kept), "starred": list(&d.starred)}).to_string());
 }
 
 pub fn load_duel() -> Option<DuelState> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(duel_state_path()).ok()?).ok()?;
     let m = |k: &str| (!v[k].is_null()).then(|| Media::from_json(&v[k], "")).flatten();
-    let d = DuelState {
+    let list = |k: &str| v[k].as_array().into_iter().flatten().filter_map(|x| Media::from_json(x, "")).collect::<Vec<_>>();
+    // An earlier duel's suggested pick carries on as the card you kept.
+    let winner = m("winner");
+    Some(DuelState {
         // "anime" was a type before Style existed: it is the Animation style now.
         kind: v["kind"].as_str().filter(|k| *k != "anime").map(str::to_owned),
         style: if v["kind"] == "anime" { "animation".into() } else { v["style"].as_str().unwrap_or("live").to_owned() },
         genre: v["genre"].as_str().map(str::to_owned),
-        from: s(&v, "from"), to: s(&v, "to"), round: v["round"].as_u64().unwrap_or(0) as u32,
-        evidence: crate::picks_decision::Evidence::decode(&v["evidence"]),
+        from: s(&v, "from"), to: s(&v, "to"),
+        night: v["night"].as_str().and_then(|n| n.parse().ok()).unwrap_or(0), last: v["last"].as_i64().unwrap_or(0),
+        round: v["round"].as_u64().unwrap_or(0) as u32, streak: v["streak"].as_u64().unwrap_or(0) as u32,
         shown: v["shown"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
-        session: v["session"].as_object().map(|o| o.iter().filter_map(|(k,v)| v.as_f64().map(|v| (k.clone(), v.clamp(-4.0, 4.0)))).collect()).unwrap_or_default(),
-        session_vibe: vector(&v["session_vibe"]),
-        left: m("left"), right: m("right"), winner: m("winner"),
-    };
-    (d.winner.is_some() || (d.left.is_some() && d.right.is_some())).then_some(d)
+        left: m("left").or_else(|| winner.clone()), right: m("right"),
+        kept: { let mut k = list("kept"); if let Some(w) = winner { if !k.iter().any(|x| x.key() == w.key()) { k.push(w); } } k },
+        starred: list("starred"),
+    })
 }
 
 /// IMDb (or add-on) ids of titles you finished, whichever add-on they were watched from.
@@ -2599,7 +2468,17 @@ mod tests {
         let sdr = src("Film 2160p SDR REMUX 90 GB");
         let order: Vec<_> = play_order_for(&[sdr.clone(), small, big], None, None).into_iter().map(|s| s.size_bytes).collect();
         assert_eq!(order, [Some(50_000_000_000), Some(5_000_000_000), Some(90_000_000_000)]);
-        assert_eq!(play_order_for(&[sdr.clone()], None, None), [sdr]);
+        assert_eq!(play_order_for(std::slice::from_ref(&sdr), None, None), [sdr]);
+    }
+
+    #[test]
+    fn picks_trailers_are_tmdb_s_official_ones_first() {
+        let addon = vec![Trailer { youtube: None, url: Some("https://x.invalid/trailer.mp4".into()) }, Trailer { youtube: Some("fan".into()), url: None }];
+        let tmdb = vec!["official".to_owned(), "teaser".to_owned()];
+        let list = official_first(&tmdb, &addon);
+        assert_eq!(list.iter().map(|t| t.youtube.clone().unwrap()).collect::<Vec<_>>(), ["official", "teaser", "fan"]);
+        assert!(list.iter().all(|t| t.url.is_none()), "an add-on link must not jump ahead of TMDB's trailers");
+        assert_eq!(official_first(&[], &addon), addon);
     }
 
     #[test]
@@ -2609,98 +2488,6 @@ mod tests {
             "https://images.metahub.space/poster/medium/tt6262770/img"]);
         let k = Media::from_json(&json!({"id":"kitsu:1","name":"Anime","type":"anime","poster":"https://images.example/k.jpg"}), "a").unwrap();
         assert_eq!(posters(&k), ["https://images.example/k.jpg"]);
-    }
-
-    #[test]
-    fn duels_learn_from_what_is_kept() {
-        let a = media("Space Saga", "movie", "2014", "Sci-Fi");
-        let b = media("Quiet Drama", "movie", "1995", "Drama");
-        let c = media("Star Voyage", "movie", "2016", "Sci-Fi");
-        let mut t = Taste::default();
-        t.learn(&a, &b);
-        assert!(t.fit(&c) > t.fit(&b));
-        assert!(!t.set_aside.contains(&b.key()));
-        // The challenger is never one already shown or set aside.
-        let pool = vec![b.clone(), c.clone(), a.clone()];
-        assert_eq!(next_challenger(&pool, &t, &[a.key()], 1).map(|m| m.id), Some("Star Voyage".to_owned()));
-    }
-
-    #[test]
-    fn duels_do_not_reinforce_shared_traits_or_ban_the_loser() {
-        let a = media("First", "movie", "2014", "Drama");
-        let b = media("Second", "movie", "2016", "Drama");
-        let mut t = Taste::default();
-        for _ in 0..20 { t.learn(&a, &b); }
-        assert!(t.genres.is_empty() && t.kinds.is_empty() && t.decades.is_empty());
-        assert!(t.session.is_empty() && t.set_aside.is_empty());
-        assert_eq!(challenger_against(&[a.clone(), b.clone()], &t, &[], &a, 4).unwrap().id, b.id);
-    }
-
-    #[test]
-    fn long_duels_keep_preferences_bounded() {
-        let a = media("Space", "movie", "2014", "Sci-Fi");
-        let b = media("Drama", "series", "1995", "Drama");
-        let mut t = Taste::default();
-        for _ in 0..10000 { t.learn(&a, &b); }
-        assert!(t.genres.values().chain(t.kinds.values()).chain(t.session.values()).all(|v| v.is_finite() && v.abs() <= 4.0));
-        assert!(t.fit(&a) > t.fit(&b));
-        assert!(challenger_against(&[a.clone()], &t, &[], &a, 1).is_none());
-    }
-
-    #[test]
-    fn next_card_follows_the_kept_title_despite_popularity_old_taste_and_randomness() {
-        let axis = |main: usize, side: usize| {
-            let mut v = vec![0.0f32; crate::picks_ai::DIM];
-            v[main] = 1.0;
-            v[side] = 0.1;
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            v.iter().map(|x| x / norm).collect::<Vec<_>>()
-        };
-        let make = |name: &str, main: usize, side: usize| {
-            let mut m = media(name, "series", "2020", "Animation");
-            m.description = format!("An isolated test synopsis with sufficient detail for {name}.");
-            crate::picks_ai::cache_test_embedding(&m, axis(main, side));
-            m
-        };
-        let kept = make("test kept dark", 0, 2);
-        let dark = make("test dark challenger", 0, 3);
-        let light = make("test light challenger", 1, 4);
-        let mut taste = Taste::default();
-        // A historic liking for the other direction does not cancel the choice made tonight.
-        taste.vibe = axis(1, 4).iter().map(|x| x * 1.5).collect();
-        let pool = vec![light.clone(), dark.clone(), kept.clone()];
-        for round in 1..5 {
-            for _ in 0..20 {
-                assert_eq!(challenger_against(&pool, &taste, &[], &kept, round).unwrap().id, dark.id);
-            }
-        }
-        // The same behavior works in the other direction; nothing names a dark genre.
-        let other_light = make("test another light challenger", 1, 5);
-        let pool = vec![dark.clone(), other_light.clone()];
-        assert_eq!(challenger_against(&pool, &Taste::default(), &[], &light, 1).unwrap().id, other_light.id);
-        // Exhausted matches still respect exclusions and let the duel continue.
-        assert_eq!(challenger_against(&[dark.clone(), light.clone()], &taste, &[dark.key()], &kept, 1).unwrap().id, light.id);
-    }
-
-    #[test]
-    fn duels_move_the_vibe_toward_the_kept_title_and_stay_bounded() {
-        let axis = |main: usize| { let mut v = vec![0.0f32; crate::picks_ai::DIM]; v[main] = 1.0; v };
-        let make = |name: &str, main: usize| {
-            let mut m = media(name, "series", "2020", "Drama");
-            m.description = format!("An isolated vibe test synopsis with sufficient detail for {name}.");
-            crate::picks_ai::cache_test_embedding(&m, axis(main));
-            m
-        };
-        let (kept, dropped) = (make("vibe kept", 10), make("vibe dropped", 11));
-        let (like_kept, like_dropped) = (make("vibe like kept", 10), make("vibe like dropped", 11));
-        let mut t = Taste::default();
-        t.learn(&kept, &dropped);
-        assert!(t.fit(&like_kept) > t.fit(&like_dropped));
-        assert!(t.genres.is_empty(), "A shared genre cancels out");
-        for _ in 0..10000 { t.learn(&kept, &dropped); }
-        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-        assert!(norm(&t.vibe) <= VIBE_CAP + 1e-3 && norm(&t.session_vibe) <= SESSION_VIBE_CAP + 1e-3);
-        assert!(t.fit(&like_kept).is_finite());
     }
 
     #[test]
