@@ -25,6 +25,11 @@ try {
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $bitmap.Size)
     $bitmap.Save([IO.Path]::GetFullPath($Shot), [System.Drawing.Imaging.ImageFormat]::Png)
+    # A screen of one or two colours means nothing was drawn.
+    $colours = @{}
+    for ($x = 0; $x -lt $bitmap.Width; $x += 16) { for ($y = 0; $y -lt $bitmap.Height; $y += 16) { $colours[$bitmap.GetPixel($x, $y).ToArgb()] = 1 } }
+    if ($colours.Count -le 2) { throw "The screenshot is blank ($($colours.Count) colours): the window drew nothing." }
+    Write-Host "Screenshot has at least $($colours.Count) colours."
     $graphics.Dispose(); $bitmap.Dispose()
     Write-Host "Veylo ran for $Seconds s; screenshot: $Shot"
 } finally {
