@@ -149,16 +149,20 @@ fn player(data: &std::path::Path) -> Result<String> {
 }
 
 /// TLS works with the bundled roots, and the release channel answers (and has this platform's file).
+/// Uses github.com's own release links: the API's anonymous rate limit is shared by every CI runner.
 fn network() -> Result<String> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let body: serde_json::Value = runtime.block_on(async {
-        let response = reqwest::Client::builder().user_agent("veylo-dx").timeout(Duration::from_secs(20)).build()?
-            .get(format!("https://api.github.com/repos/{}/releases/latest", updater::REPO))
-            .header("Accept", "application/vnd.github+json").send().await?.error_for_status()?;
-        Ok::<_, anyhow::Error>(response.json().await?)
+    let base = format!("https://github.com/{}/releases/latest", updater::REPO);
+    let (tag, has_asset) = runtime.block_on(async {
+        let client = reqwest::Client::builder().user_agent("veylo-dx").timeout(Duration::from_secs(30)).build()?;
+        let latest = client.get(&base).send().await?.error_for_status()?;
+        let tag = latest.url().path().rsplit('/').next().unwrap_or("?").to_owned();
+        let has_asset = match updater::ASSET {
+            Some(asset) => client.get(format!("{base}/download/{asset}")).header("Range", "bytes=0-0").send().await?.status().is_success(),
+            None => false,
+        };
+        Ok::<_, anyhow::Error>((tag, has_asset))
     })?;
-    let tag = body["tag_name"].as_str().unwrap_or("?");
-    let has_asset = updater::ASSET.is_some_and(|a| body["assets"].as_array().into_iter().flatten().any(|x| x["name"] == a));
     Ok(format!("TLS ok; latest release {tag}{}", match updater::ASSET {
         Some(a) if has_asset => format!(" has {a}"),
         Some(a) => format!(" has no {a} yet"),
