@@ -1,7 +1,9 @@
 # Dioxus prototype of the Veylo shell (Search and Picks), all Rust + CSS.
 # Deliberately its own workspace: it must not touch the Android workspace's
 # manifest or Cargo.lock, which the APK packaging guard watches.
+# Its two crates live in crates/ beside the shared ones but belong to this workspace.
 [workspace]
+members = [".", "../../crates/video-surface", "../../crates/picture-check"]
 
 [package]
 name = "veylo-dx"
@@ -36,6 +38,8 @@ url = "2"
 libmpv2 = { version = "7.0.1", default-features = false }
 libmpv2-sys = "4.0.1"
 libc = "0.2"
+# The clip of known colour bars and the check that a screenshot shows it (CI's picture test).
+veylo-picture-check = { path = "../../crates/picture-check" }
 
 [build-dependencies]
 # Windows: the app icon inside veylo-dx.exe (windows/veylo.rc); a no-op for other targets.
@@ -45,25 +49,13 @@ embed-resource = "3"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
 
-# Linux: the GL area under the WebView that mpv renders into (src/video.rs); the same gtk as wry's.
+# Desktop: the picture under the WebView, one path per OS (crates/video-surface, used by src/video.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+veylo-video-surface = { path = "../../crates/video-surface" }
+
+# Linux: the GTK window and web view handed to the picture's crate; the same gtk as wry's.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
-# Wayland: the picture on its own subsurface under the window (src/video.rs), on GTK's connection.
-wayland-client = "0.31"
-wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-egl = "0.32"
-
-# macOS: the picture under the WebView, drawn by mpv's render API into a Core Animation OpenGL layer
-# (src/video.rs), and the screen's EDR (HDR) headroom (src/display.rs); the same objc2 crates wry uses.
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.3"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSScreen", "NSGraphics", "NSApplication", "objc2-quartz-core"] }
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAOpenGLLayer", "CATransaction", "objc2-open-gl", "objc2-core-graphics", "objc2-core-video", "objc2-core-foundation"] }
-objc2-open-gl = { version = "0.3.2", default-features = false, features = ["std", "CGLTypes", "CGLCurrent", "CGLRenderers"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor", "CGColorSpace"] }
-objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
 
 # Android: JNI for the files folder and the Media3 player activity (android/kotlin).
 [target.'cfg(target_os = "android")'.dependencies]

@@ -2,10 +2,12 @@
 # Launch check for the desktop app on macOS and Linux (CI): start Veylo with a fresh, temporary
 # library, let it run, fail if it exits or panics, and save a screenshot of the screen.
 #
-#   tools/ci/launch-check.sh <veylo-dx executable> <screenshot.png> [seconds] [--demo]
+#   tools/ci/launch-check.sh <veylo-dx executable> <screenshot.png> [seconds] [--demo | --bars]
 #
-# --demo also plays the test stream at launch (VEYLO_DX_PLAY_DEMO). VEYLO_EXPECT_LOG=<text> also
-# requires that line in the app's output. Linux needs an X display:
+# --demo also plays the test stream at launch (VEYLO_DX_PLAY_DEMO). --bars is the picture test: it
+# plays six colour bars, and the screenshot (what the OS really shows) must show them, in order
+# (`veylo-dx --check-picture`, crates/picture-check). VEYLO_EXPECT_LOG=<text> also requires that
+# line in the app's output. Linux needs an X display:
 # run it under `xvfb-run -a -s "-screen 0 1440x900x24"`.
 set -euo pipefail
 exe=$1 shot=$2 seconds=${3:-25}
@@ -15,6 +17,7 @@ pid=
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$data"' EXIT
 export VEYLO_DX_DATA="$data"
 [ "${4:-}" = --demo ] && export VEYLO_DX_PLAY_DEMO=1
+[ "${4:-}" = --bars ] && export VEYLO_DX_PLAY_DEMO=bars
 mkdir -p "$(dirname "$shot")"
 
 "$exe" >"$log" 2>&1 &
@@ -45,5 +48,9 @@ if command -v identify >/dev/null; then
     colours=$(identify -format %k "$shot")
     if [ "$colours" -le 2 ]; then echo "The screenshot is blank ($colours colours): the window drew nothing." >&2; exit 1; fi
     echo "Screenshot has $colours colours."
+fi
+if [ "${4:-}" = --bars ]; then
+    grep -F "picture path" "$log" || echo "Veylo logged no picture path." >&2
+    "$exe" --check-picture "$shot" || exit 1
 fi
 exit 0

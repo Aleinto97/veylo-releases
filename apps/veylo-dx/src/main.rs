@@ -193,6 +193,25 @@ fn print_sources(kind: &str, id: &str, pack: Option<usize>) {
 /// Developer command: `veylo-dx --addons` runs the start-up add-on setup (key adoption,
 /// replacing website installs, update check) and prints names and versions; never links.
 #[cfg(not(target_os = "android"))]
+/// `veylo-dx --check-picture <screenshot.png> [--report <file>]`: does a screenshot taken while the
+/// colour-bar clip plays (VEYLO_DX_PLAY_DEMO=bars) show its six bars? CI's picture test
+/// (tools/ci/launch-check.*). The report file is for Windows, where a GUI build's output can get lost.
+#[cfg(not(target_os = "android"))]
+fn check_picture(path: &str, report: Option<&str>) -> i32 {
+    let result = image::open(path).map_err(|e| format!("can't read {path}: {e}")).and_then(|image| {
+        let image = image.to_rgb8();
+        let (w, h) = image.dimensions();
+        veylo_picture_check::find_bars(image.as_raw(), w as usize, h as usize, 3)
+    });
+    let (line, code) = match result {
+        Ok(found) => (format!("PASS  picture    {}", found.summary()), 0),
+        Err(e) => (format!("FAIL  picture    {e}"), 1),
+    };
+    println!("{line}");
+    if let Some(report) = report { let _ = std::fs::write(report, format!("{line}\n")); }
+    code
+}
+
 fn print_addons() {
     if let Err(e) = backend::init() { eprintln!("{e:#}"); return; }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -218,6 +237,10 @@ fn launch_desktop() {
     if args.get(1).map(String::as_str) == Some("--sources") && args.len() >= 4 { print_sources(&args[2], &args[3], args.get(4).and_then(|n| n.parse().ok())); return; }
     if args.get(1).map(String::as_str) == Some("--addons") { print_addons(); return; }
     if args.get(1).map(String::as_str) == Some("--self-test") { std::process::exit(selftest::run(&args[2..])); }
+    if args.get(1).map(String::as_str) == Some("--check-picture") && args.len() >= 3 {
+        let report = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1));
+        std::process::exit(check_picture(&args[2], report.map(String::as_str)));
+    }
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
     // WebKitGTK's DMA-BUF renderer repaints only damaged tiles of a transparent page, so the
     // controls over the player's picture would tear; its shared-memory renderer repaints cleanly.
@@ -311,6 +334,14 @@ fn Shell_() -> Element {
             let clip = std::env::temp_dir().join("veylo-demo-hdr.mp4");
             if std::fs::write(&clip, selftest::HDR_CLIP).is_ok() {
                 start_playback(shell, player::PlayRequest { title: "HDR10 test clip".into(), subtitle: "Test player".into(), url: clip.to_string_lossy().into_owned(), ..Default::default() }, None);
+            }
+            return;
+        }
+        // VEYLO_DX_PLAY_DEMO=bars plays six colour bars, for CI's picture test (--check-picture).
+        if std::env::var("VEYLO_DX_PLAY_DEMO").as_deref() == Ok("bars") {
+            let clip = std::env::temp_dir().join("veylo-colour-bars.y4m");
+            if std::fs::write(&clip, veylo_picture_check::y4m(180)).is_ok() {
+                start_playback(shell, player::PlayRequest { title: "Colour bars".into(), subtitle: "Picture test".into(), url: clip.to_string_lossy().into_owned(), ..Default::default() }, None);
             }
             return;
         }
