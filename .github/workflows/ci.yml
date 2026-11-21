@@ -87,7 +87,9 @@ jobs:
           powershell -ExecutionPolicy Bypass -File windows/fetch-mpv.ps1
           python ../../tools/picks-ai/fetch.py windows-x64
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      # crates/video-surface's tests (path order, fallback memory) run on Linux: on its own it doesn't
+      # link this OS's libmpv, which only the app's build script finds. Clippy still checks it here.
+      - run: cargo test --locked --workspace --exclude veylo-video-surface
       - run: cargo build --locked --release
       - name: Package (as tools/release.sh does)
         run: |
@@ -152,7 +154,9 @@ jobs:
           key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-macos-arm64
       - run: python3 ../../tools/picks-ai/fetch.py macos-arm64
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      # crates/video-surface's tests (path order, fallback memory) run on Linux: on its own it doesn't
+      # link this OS's libmpv, which only the app's build script finds. Clippy still checks it here.
+      - run: cargo test --locked --workspace --exclude veylo-video-surface
       - name: Build Veylo.app (fails if it still needs Homebrew)
         run: ../../tools/build-macos.sh
       - name: Install with install.sh
