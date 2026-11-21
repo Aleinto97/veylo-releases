@@ -47,18 +47,32 @@ jobs:
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
-      - name: Diagnose, plain WebKitGTK on Xvfb (temporary)
+      - name: Diagnose, WebKitGTK like Veylo's window on Xvfb (temporary)
         continue-on-error: true
         run: |
           sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 >/dev/null
-          printf '%s\n' 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("WebKit2","4.1")' \
-            'from gi.repository import Gtk, WebKit2' \
-            'w=Gtk.Window(); v=WebKit2.WebView(); w.add(v); w.set_default_size(800,600)' \
-            'v.load_html("<body style=\"background:#c33;color:#fff;font-size:60px\">Hello WebKit</body>","about:blank")' \
-            'w.show_all(); Gtk.main()' > /tmp/wk.py
+          cat > /tmp/wk.py <<'EOF'
+          import sys, gi
+          gi.require_version("Gtk", "3.0"); gi.require_version("WebKit2", "4.1")
+          from gi.repository import Gtk, Gdk, WebKit2
+          mode = sys.argv[1]
+          w = Gtk.Window(); w.set_default_size(800, 600)
+          if "rgba" in mode:
+              w.set_visual(w.get_screen().get_rgba_visual()); w.set_app_paintable(True)
+          v = WebKit2.WebView()
+          if "clear" in mode:
+              v.set_background_color(Gdk.RGBA(0, 0, 0, 0))
+          v.load_html('<body style="background:#c33;color:#fff;font-size:60px">Hello WebKit</body>', "about:blank")
+          if "glarea" in mode:
+              o = Gtk.Overlay(); a = Gtk.GLArea(); a.set_has_alpha(False); a.set_auto_render(False)
+              o.add(a); o.add_overlay(v); w.add(o)
+          else:
+              w.add(v)
+          w.show_all(); Gtk.main()
+          EOF
           mkdir -p ../../screenshots
-          for env in "X=1" "WEBKIT_DISABLE_COMPOSITING_MODE=1"; do
-            xvfb-run -a -s "-screen 0 1024x768x24" sh -c "env $env timeout 60 python3 /tmp/wk.py & sleep 45; import -window root ../../screenshots/diag-webkit-${env%%=*}.png; identify -format '$env: %k colours\n' ../../screenshots/diag-webkit-${env%%=*}.png"
+          for mode in plain rgba glarea rgba-glarea rgba-clear; do
+            xvfb-run -a -s "-screen 0 1024x768x24" sh -c "WEBKIT_DISABLE_DMABUF_RENDERER=1 timeout 50 python3 /tmp/wk.py $mode >/dev/null 2>&1 & sleep 35; import -window root ../../screenshots/diag-$mode.png; identify -format '$mode: %k colours\n' ../../screenshots/diag-$mode.png"
           done
       # The runner has no desktop portal: GTK waits 25 s for it before the window opens. WebKitGTK
       # paints nothing on this virtual X server (it does on a real one), so a blank screenshot only warns:
