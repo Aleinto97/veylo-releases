@@ -121,7 +121,7 @@ jobs:
           path: dist/veylo-windows-x64.zip
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: apps/veylo-dx
