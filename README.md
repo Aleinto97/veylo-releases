@@ -12,8 +12,7 @@ A quiet, all-Rust media client for Android tablets and the Linux, Windows and ma
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
   under the page through a bridge per OS (`video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
-  mpv's own child window on Windows. On macOS mpv shows the picture in a window of its own for now (mpv can't draw
-  inside another app's view there; an in-window renderer is still to come).
+  mpv's own child window on Windows, a Core Animation OpenGL layer on macOS (HDR through EDR on screens that have it).
 
 ## Install
 
@@ -77,7 +76,7 @@ cargo build --release   # target\release\veylo-dx.exe, with libmpv-2.dll copied 
 
 macOS (Apple silicon, with Homebrew): `brew install mpv dylibbundler`, then `cargo run --release` in `apps/veylo-dx`
 runs it against Homebrew's libmpv, and `tools/build-macos.sh` builds the self-contained `Veylo.app` that releases ship
-(`dist/veylo-macos-arm64.zip`: libmpv, FFmpeg and MoltenVK inside, signed ad hoc).
+(`dist/veylo-macos-arm64.zip`: libmpv and FFmpeg inside, signed ad hoc).
 
 Ship `veylo-dx.exe` together with `libmpv-2.dll` and the complete `picks-ai/` directory from the build output. From Linux, `cargo xwin build --target x86_64-pc-windows-msvc --release`
 cross-builds the same with `VEYLO_MPV_DIR` pointing at the extracted mpv files.

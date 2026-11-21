@@ -6,7 +6,7 @@
 # Runs on a Mac (GitHub Actions' macos runner, or yours). Needs Rust, Python 3 and Homebrew with
 #   brew install mpv dylibbundler
 # The app carries everything it loads: libmpv with FFmpeg and their libraries (Contents/Frameworks),
-# MoltenVK for mpv's Vulkan renderer, and the Picks model and ONNX Runtime (Contents/Resources).
+# and the Picks model and ONNX Runtime (Contents/Resources). mpv draws through OpenGL (src/video.rs).
 # It is signed ad hoc (no Apple Developer ID): install.sh downloads it with curl, which macOS doesn't
 # quarantine, so Gatekeeper doesn't block it. The build fails if any library still points into Homebrew.
 set -euo pipefail
@@ -78,21 +78,9 @@ search=(-s "$brew_prefix/lib")
 for formula in mpv $(brew deps mpv); do search+=(-s "$(brew --prefix "$formula")/lib"); done
 dylibbundler -of -b -x "$contents/MacOS/veylo-dx" -d "$contents/Frameworks" -p @executable_path/../Frameworks/ \
     "${search[@]}" < /dev/null >/dev/null
-# mpv's renderer uses Vulkan: bring MoltenVK (the driver) and its manifest; main.rs points the loader at it.
-if moltenvk=$(brew --prefix molten-vk 2>/dev/null) && [ -f "$moltenvk/lib/libMoltenVK.dylib" ]; then
-    cp "$moltenvk/lib/libMoltenVK.dylib" "$contents/Frameworks/"
-    chmod u+w "$contents/Frameworks/libMoltenVK.dylib"
-    install_name_tool -id @executable_path/../Frameworks/libMoltenVK.dylib "$contents/Frameworks/libMoltenVK.dylib"
-    dylibbundler -of -b -x "$contents/Frameworks/libMoltenVK.dylib" -d "$contents/Frameworks" -p @executable_path/../Frameworks/ \
-        "${search[@]}" < /dev/null >/dev/null
-    mkdir -p "$contents/Resources/vulkan/icd.d"
-    printf '{\n  "file_format_version": "1.0.0",\n  "ICD": { "library_path": "../../../Frameworks/libMoltenVK.dylib", "api_version": "1.2.0" }\n}\n' \
-        > "$contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
-fi
-
 # Licences of what the bundle carries (mpv, FFmpeg; ONNX Runtime and the model ship theirs in picks-ai).
 mkdir -p "$contents/Resources/licenses"
-for formula in mpv ffmpeg molten-vk; do
+for formula in mpv ffmpeg; do
     prefix=$(brew --prefix "$formula" 2>/dev/null) || continue
     for f in "$prefix"/LICENSE* "$prefix"/COPYING* "$prefix"/Copyright*; do
         [ -f "$f" ] && cp "$f" "$contents/Resources/licenses/$formula-$(basename "$f")"

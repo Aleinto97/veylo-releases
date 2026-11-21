@@ -215,15 +215,6 @@ fn launch_desktop() {
         const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
     }
-    // macOS: the player's Vulkan driver (MoltenVK) travels inside Veylo.app (tools/build-macos.sh).
-    #[cfg(target_os = "macos")]
-    if let Some(app) = updater::app_bundle() {
-        let icd = app.join("Contents/Resources/vulkan/icd.d/MoltenVK_icd.json");
-        if icd.is_file() && std::env::var_os("VK_DRIVER_FILES").is_none() && std::env::var_os("VK_ICD_FILENAMES").is_none() {
-            std::env::set_var("VK_DRIVER_FILES", &icd);
-            std::env::set_var("VK_ICD_FILENAMES", &icd);
-        }
-    }
     if args.get(1).map(String::as_str) == Some("--sources") && args.len() >= 4 { print_sources(&args[2], &args[3], args.get(4).and_then(|n| n.parse().ok())); return; }
     if args.get(1).map(String::as_str) == Some("--addons") { print_addons(); return; }
     if args.get(1).map(String::as_str) == Some("--self-test") { std::process::exit(selftest::run(&args[2..])); }
@@ -238,7 +229,8 @@ fn launch_desktop() {
         .with_min_inner_size(LogicalSize::new(360.0, 560.0))
         // WebKitGTK draws a transparent page only in a window with an alpha visual, chosen at creation:
         // the player's picture shows through it (video.rs). The page paints its own black otherwise.
-        .with_transparent(cfg!(any(target_os = "linux", target_os = "windows")));
+        // macOS: a transparent window is what stops the WKWebView drawing a background of its own.
+        .with_transparent(cfg!(any(target_os = "linux", target_os = "windows", target_os = "macos")));
     // Windows: the title bar and taskbar show the app icon (the exe carries it for Explorer: windows/veylo.rc).
     #[cfg(windows)]
     let window = window.with_window_icon(window_icon());

@@ -1,6 +1,7 @@
 //! What the screen Veylo is on can show, read from the system each time it is asked (a window
 //! can move to another monitor, and Windows HDR can be switched on or off at any time):
-//! Android's display HDR types, Windows' DXGI output for the window's monitor. Linux draws
+//! Android's display HDR types, Windows' DXGI output for the window's monitor, the EDR headroom of the
+//! Mac's screen. Linux draws
 //! through GTK, which can't hand HDR to the compositor, so its picture is always SDR.
 use crate::engine::Screen;
 
@@ -68,7 +69,17 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+/// macOS: EDR. A screen that can show values above SDR white (headroom over 1.0, an XDR or HDR
+/// display) gets HDR as PQ through the video layer (video.rs); its nits aren't public, so none are named.
+#[cfg(target_os = "macos")]
+mod imp {
+    pub fn screen() -> Option<super::Screen> {
+        let headroom = crate::video::potential_headroom();
+        (headroom > 0.0).then(|| super::Screen { hdr10: headroom > 1.0, hlg: headroom > 1.0, ..Default::default() })
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos")))]
 mod imp {
     pub fn screen() -> Option<super::Screen> { None }
 }
