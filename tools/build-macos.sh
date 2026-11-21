@@ -99,13 +99,18 @@ for formula in mpv ffmpeg molten-vk; do
     done
 done
 
-# Nothing may still load from Homebrew: it isn't on other Macs.
+# ONNX Runtime is opened by path (picks_ai.rs): its own name only has to be valid.
+install_name_tool -id @loader_path/libonnxruntime.dylib "$contents/Resources/picks-ai/runtime/libonnxruntime.dylib"
+
+# Nothing may still load from Homebrew: it isn't on other Macs. (A library's first entry is its own name.)
 leaks=0
 while IFS= read -r -d '' file; do
     file -b "$file" | grep -q 'Mach-O' || continue
-    if otool -L "$file" | tail -n +2 | grep -E "$brew_prefix|/usr/local/|@rpath" >/dev/null; then
+    own=$(otool -D "$file" | tail -n +2)
+    outside=$(otool -L "$file" | tail -n +2 | awk '{print $1}' | grep -v -x -F "${own:-//}" | grep -E "$brew_prefix|/usr/local/|@rpath" || true)
+    if [ -n "$outside" ]; then
         echo "Still linked outside the bundle: ${file#"$work"/}" >&2
-        otool -L "$file" | tail -n +2 | grep -E "$brew_prefix|/usr/local/|@rpath" >&2
+        echo "$outside" >&2
         leaks=1
     fi
 done < <(find "$app" -type f -print0)
