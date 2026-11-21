@@ -491,7 +491,8 @@ mod imp {
         let label = GL.lock().ok().and_then(|g| g.as_ref().map(|g| g.label)).unwrap_or("?");
         let pq = render_pixel(clip, &[("target-prim", "bt.2020"), ("target-trc", "pq"), ("target-peak", "1000")])?;
         let sdr = render_pixel(clip, &[("target-prim", "bt.709"), ("target-trc", "bt.1886")])?;
-        let ok = |p: &[f32; 4]| p[..3].iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)) && p[..3].iter().any(|c| *c > 0.0);
+        // A float target keeps a hair of rounding either side of 0..1.
+        let ok = |p: &[f32; 4]| p[..3].iter().all(|c| c.is_finite() && (-0.01..=1.01).contains(c)) && p[..3].iter().any(|c| *c > 0.05);
         if !ok(&pq) || !ok(&sdr) { return Err(format!("the rendered pictures look wrong (PQ {pq:?}, SDR {sdr:?})")); }
         let diff = pq[..3].iter().zip(&sdr[..3]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         if diff < 0.05 { return Err(format!("PQ and SDR output are the same picture ({pq:?}): mpv didn't send PQ")); }
