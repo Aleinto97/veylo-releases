@@ -673,6 +673,9 @@ fn skip_commentary(live: &Live) {
 /// the panel's peak (read again, the window may have moved), and SDR output goes back to mpv's own.
 fn follow_target(live: &Live) -> bool {
     let target: String = live.mpv.get_property("video-target-params/gamma").unwrap_or_default();
+    // macOS: mpv's render API doesn't report it; the video layer knows what it asked for.
+    #[cfg(target_os = "macos")]
+    let target = if target.is_empty() && live.state().loaded { crate::video::sent_transfer().to_owned() } else { target };
     if target.is_empty() || live.state().target_transfer == target { return false; }
     #[cfg(target_os = "windows")]
     {
