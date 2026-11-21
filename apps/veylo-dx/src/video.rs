@@ -26,6 +26,9 @@ pub fn check(mpv: &libmpv2::Mpv) -> Result<String, String> { imp::check(mpv) }
 /// macOS self-test: an HDR10 clip rendered as PQ through the picture's pipeline; the screen's EDR.
 #[cfg(target_os = "macos")]
 pub fn hdr_check(clip: &str) -> Result<String, String> { imp::hdr_check(clip) }
+/// macOS: the transfer the picture goes out with ("pq" in HDR), for the player's details.
+#[cfg(target_os = "macos")]
+pub fn sent_transfer() -> &'static str { imp::sent_transfer() }
 /// macOS: the most EDR headroom the window's screen can reach (1.0: SDR only; 0: not read yet).
 #[cfg(target_os = "macos")]
 pub fn potential_headroom() -> f64 { imp::potential_headroom() }
@@ -476,18 +479,32 @@ mod imp {
         eprintln!("veylo: HDR output on: PQ {primaries} to an EDR layer, headroom {headroom:.1}, peak {peak} nits");
     }
 
-    /// Self-test: mpv renders an HDR10 clip as PQ through this module's GL context into a 16-bit
-    /// float target (what the layer shows), and the main screen's EDR headroom says whether this Mac
-    /// can show it as HDR. Runs without a window; call on the main thread.
+    /// Self-test: mpv renders an HDR10 clip through this module's GL context into a 16-bit float
+    /// target (what the layer shows), once as PQ (what an EDR screen gets) and once tone-mapped to SDR:
+    /// the PQ picture must keep the clip's code values, the SDR one must differ. The main screen's EDR
+    /// headroom says whether this Mac can show HDR. Runs without a window; call on the main thread.
     pub fn hdr_check(clip: &str) -> Result<String, String> {
         let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
         let _app = objc2_app_kit::NSApplication::sharedApplication(mtm);
         let (now, potential) = headroom_of(objc2_app_kit::NSScreen::mainScreen(mtm).as_deref());
         let (_, _, float) = gl().ok_or("no OpenGL context")?;
         let label = GL.lock().ok().and_then(|g| g.as_ref().map(|g| g.label)).unwrap_or("?");
+        let pq = render_pixel(clip, &[("target-prim", "bt.2020"), ("target-trc", "pq"), ("target-peak", "1000")])?;
+        let sdr = render_pixel(clip, &[("target-prim", "bt.709"), ("target-trc", "bt.1886")])?;
+        let ok = |p: &[f32; 4]| p[..3].iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)) && p[..3].iter().any(|c| *c > 0.0);
+        if !ok(&pq) || !ok(&sdr) { return Err(format!("the rendered pictures look wrong (PQ {pq:?}, SDR {sdr:?})")); }
+        let diff = pq[..3].iter().zip(&sdr[..3]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        if diff < 0.05 { return Err(format!("PQ and SDR output are the same picture ({pq:?}): mpv didn't send PQ")); }
+        Ok(format!("HDR10 clip rendered as PQ BT.2020 (pixel {:.2}/{:.2}/{:.2}; SDR {:.2}/{:.2}/{:.2}) on the {label} context, {} target; screen EDR headroom {now:.1} (up to {potential:.1}): {}",
+            pq[0], pq[1], pq[2], sdr[0], sdr[1], sdr[2], if float { "float" } else { "8-bit" },
+            if potential > 1.0 { "HDR shows as HDR on this screen" } else { "this screen is SDR only, HDR is tone-mapped" }))
+    }
+
+    /// Play `clip` with mpv rendering into an offscreen RGBA16F target on our context; one pixel of the fifth frame.
+    fn render_pixel(clip: &str, target: &[(&str, &str)]) -> Result<[f32; 4], String> {
         let mpv = libmpv2::Mpv::with_initializer(|o| {
-            for (k, v) in [("config", "no"), ("terminal", "no"), ("vo", "libmpv"), ("ao", "null"), ("keep-open", "yes"), ("hwdec", "auto-safe"),
-                ("icc-profile", ""), ("target-prim", "bt.2020"), ("target-trc", "pq"), ("target-peak", "1000")] { o.set_property(k, v)?; }
+            for (k, v) in [("config", "no"), ("terminal", "no"), ("vo", "libmpv"), ("ao", "null"), ("keep-open", "yes"), ("hwdec", "no"),
+                ("icc-profile", ""), ("dither-depth", "no")].iter().chain(target) { o.set_property(k, *v)?; }
             Ok(())
         }).map_err(|e| format!("mpv: {e}"))?;
         let render = unsafe { create_render_for(mpv.ctx.as_ptr())? };
@@ -526,21 +543,16 @@ mod imp {
                     frames += 1;
                 }); }
             }
-            let gamma: String = mpv.get_property("video-target-params/gamma").unwrap_or_default();
-            let prim: String = mpv.get_property("video-target-params/primaries").unwrap_or_default();
             let source: String = mpv.get_property("video-params/gamma").unwrap_or_default();
             if source != "pq" { return Err(format!("the HDR clip read as {source}, not PQ")); }
-            if gamma != "pq" || prim != "bt.2020" { return Err(format!("mpv sent {gamma}/{prim}, not PQ/BT.2020")); }
-            if !pixel[..3].iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)) || pixel[..3].iter().all(|c| *c == 0.0) {
-                return Err(format!("the rendered picture looks wrong (pixel {pixel:?})"));
-            }
-            Ok(format!("mpv rendered the HDR10 clip as PQ BT.2020 on the {label} context ({} target){}; screen EDR headroom {now:.1} (up to {potential:.1}): {}",
-                if float { "float" } else { "8-bit" }, format_args!(", pixel {:.2}/{:.2}/{:.2}", pixel[0], pixel[1], pixel[2]),
-                if potential > 1.0 { "HDR shows as HDR here" } else { "this screen is SDR only, HDR is tone-mapped" }))
+            Ok(pixel)
         })();
         unsafe { with_context(|| { sys::mpv_render_context_free(render); glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &tex); }); }
         result
     }
+
+    /// What goes to the screen, for the player's details (mpv's own report is empty with the render API).
+    pub fn sent_transfer() -> &'static str { if HDR_MODE.load(Ordering::Acquire) != 0 { "pq" } else { "bt.1886" } }
 
     pub fn set_fullscreen(on: bool) {
         let w = dioxus::desktop::window();
