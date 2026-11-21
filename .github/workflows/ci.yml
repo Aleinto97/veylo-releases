@@ -31,7 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev xvfb imagemagick
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev xvfb x11-utils imagemagick
         working-directory: .
       - uses: Swatinem/rust-cache@v2
         with:
@@ -47,15 +47,9 @@ jobs:
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
+      # The runner has no desktop portal: GTK waits 25 s for it before the window opens.
       - name: Launch check
-        run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png
-      - name: Diagnose (temporary)
-        if: always()
-        continue-on-error: true
-        run: |
-          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'G_MESSAGES_DEBUG=all WEBKIT_DEBUG=all VEYLO_DX_DATA=$(mktemp -d) timeout 30 target/debug/veylo-dx > ../../screenshots/diag-full.log 2>&1; echo exit=$?' || true
-          wc -l ../../screenshots/diag-full.log
-          grep -i -E "webkit|web process|crash|fail|error|egl|gbm|bwrap|denied|abort" ../../screenshots/diag-full.log | grep -v -i "a11y\|AT-SPI\|portal" | head -60
+        run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png 60
       - uses: actions/upload-artifact@v4
         if: always()
         with:
