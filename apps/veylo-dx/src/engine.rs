@@ -215,7 +215,7 @@ impl Live {
     pub fn render_dolby_vision(&self) {
         self.update(|s| { s.direct = false; true });
         let _ = self.mpv.set_property("hwdec", "no");
-        let _ = self.mpv.set_property("vo", if cfg!(any(target_os = "android", target_os = "windows")) { "gpu-next" } else { "libmpv" });
+        let _ = self.mpv.set_property("vo", if cfg!(any(target_os = "android", target_os = "windows", target_os = "macos")) { "gpu-next" } else { "libmpv" });
     }
     pub fn set_online_segments(&self, found: Vec<Segment>) {
         self.update(|s| { let c = s.online_segments != found; s.online_segments = found; c });
@@ -307,7 +307,18 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
             // applied once mpv really sends HDR10 (`follow_target`), never to SDR output.
             let _ = o.set_property("target-colorspace-hint", if hdr_output { "yes" } else { "no" });
         }
-        #[cfg(not(any(target_os = "android", target_os = "windows")))]
+        // macOS: mpv shows the picture in a window of its own, with its usual keys (Space, arrows, F, Q):
+        // it can't draw inside another app's view there (no `wid`), and the in-window renderer is still to come.
+        #[cfg(target_os = "macos")]
+        {
+            o.set_property("vo", "gpu-next")?;
+            o.set_property("hwdec", "auto-safe")?;
+            o.set_property("demuxer-max-bytes", "256MiB")?;
+            o.set_property("title", req.title.as_str())?;
+            o.set_property("input-default-bindings", true)?;
+            o.set_property("input-vo-keyboard", true)?;
+        }
+        #[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos")))]
         {
             o.set_property("vo", "libmpv")?;
             o.set_property("hwdec", "auto-safe")?;

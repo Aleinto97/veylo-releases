@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=android/kotlin");
     println!("cargo:rerun-if-env-changed=WRY_ANDROID_KOTLIN_FILES_OUT_DIR");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") { return windows(); }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") { return macos(); }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") { return; }
     // The Rust player links mpv-android's libmpv (android/fetch-mpv.sh), packaged below.
     let abi_dir = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() { Ok("aarch64") => "arm64-v8a", _ => "" };
@@ -93,6 +94,21 @@ fn windows() {
     }
 }
 
+/// macOS: link Homebrew's libmpv (`brew install mpv`), or VEYLO_MPV_DIR. A packaged Veylo.app
+/// carries its own copy and every library it needs (tools/build-macos.sh).
+fn macos() {
+    println!("cargo:rerun-if-env-changed=VEYLO_MPV_DIR");
+    println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
+    let dirs: Vec<std::path::PathBuf> = match std::env::var_os("VEYLO_MPV_DIR") {
+        Some(dir) => vec![dir.into()],
+        None => std::env::var_os("HOMEBREW_PREFIX").map(|p| std::path::PathBuf::from(p).join("lib")).into_iter()
+            .chain(["/opt/homebrew/lib", "/usr/local/lib"].map(std::path::PathBuf::from)).collect(),
+    };
+    let found = dirs.iter().find(|d| d.join("libmpv.dylib").exists() || d.join("libmpv.2.dylib").exists());
+    let dir = found.unwrap_or_else(|| panic!("libmpv for macOS is missing: run `brew install mpv` (or set VEYLO_MPV_DIR)"));
+    println!("cargo:rustc-link-search=native={}", dir.display());
+}
+
 /// The APK carries the same model/tokenizer as desktop, plus the Android CPU runtime.
 /// Fail the build if assets are absent: released apps must never silently omit local AI.
 fn stage_picks_ai() {
@@ -104,11 +120,12 @@ fn stage_picks_ai() {
         ("linux", "aarch64") => "linux-aarch64",
         ("linux", "x86_64") => "linux-x64",
         ("windows", "x86_64") => "windows-x64",
+        ("macos", "aarch64") => "macos-arm64",
         _ => panic!("Picks inference runtime has not been packaged for {os}/{arch}"),
     };
     let root = Path::new("picks-ai");
     let native = root.join(target);
-    let library = if os == "windows" { "onnxruntime.dll" } else { "libonnxruntime.so" };
+    let library = match os.as_str() { "windows" => "onnxruntime.dll", "macos" => "libonnxruntime.dylib", _ => "libonnxruntime.so" };
     for file in [root.join("model/model.onnx"), root.join("model/tokenizer.json"), native.join(library)] {
         assert!(file.is_file(), "Missing {}: run python3 ../../tools/picks-ai/fetch.py {target} from apps/veylo-dx", file.display());
     }

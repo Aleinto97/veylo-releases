@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build Veylo for Windows (cargo-xwin) and Android (dx) on Linux and publish both as a release of the
-# public repo, where people install them and the app finds updates (apps/veylo-dx/src/updater.rs).
+# Build Veylo for Windows (cargo-xwin) and Android (dx) on Linux and publish them, with the macOS app
+# built on a Mac (tools/build-macos.sh, passed in through VEYLO_EXTRA_ASSETS), as a release of the public repo, where people install them and the app finds updates (apps/veylo-dx/src/updater.rs).
 #
 #   tools/release.sh ["notes"]            build, then publish v<version> (gh logged in, or GH_TOKEN)
 #   VEYLO_PUBLISH=0 tools/release.sh      build only; the files stay in dist/ (or VEYLO_OUT)
@@ -14,7 +14,8 @@
 # updates an installed app from an APK signed with the same key, so it must never change:
 #   VEYLO_KEYSTORE            the keystore (default ~/.config/veylo/release.jks, alias "veylo")
 #   VEYLO_KEYSTORE_PASS       its password, or VEYLO_KEYSTORE_PASS_FILE (default ~/.config/veylo/release.pass)
-# Uploaded: veylo-dx.exe + libmpv-2.dll (zip) and the APK. Never settings, keys, local paths or source.
+# Uploaded: veylo-dx.exe + libmpv-2.dll (zip), the APK, and every file in VEYLO_EXTRA_ASSETS (a folder,
+# e.g. veylo-macos-arm64.zip); all pass the privacy check below. Never settings, keys, local paths or source.
 set -euo pipefail
 REPO=${VEYLO_REPO:-Aleinto97/veylo-releases}
 WIN_ASSET=veylo-windows-x64.zip
@@ -25,7 +26,11 @@ app="$root/apps/veylo-dx"
 out_dir=${VEYLO_OUT:-$root/dist}
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$app/Cargo.toml" | head -1)
 tag="v$version"
-notes=${1:-"Veylo $version for Windows and Android."}
+notes=${1:-"Veylo $version for Windows, macOS and Android."}
+extra=()
+if [ -n "${VEYLO_EXTRA_ASSETS:-}" ]; then
+    for f in "$VEYLO_EXTRA_ASSETS"/*; do [ -f "$f" ] && extra+=("$f"); done
+fi
 if [ "$publish" = 1 ] && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
     echo "$tag is already released: bump version in apps/veylo-dx/Cargo.toml first." >&2; exit 1
 fi
@@ -94,6 +99,7 @@ rm -f "$stage/$APK_ASSET.idsig"
 # ---------------------------------------------------------------- privacy check
 # Unpack everything that will be public and refuse if a key from your settings.json or your home path is inside.
 mkdir -p "$work/check" && cp -r "$work/win/"* "$work/check/" && bsdtar -xf "$stage/$APK_ASSET" -C "$work/check"
+for f in ${extra[@]+"${extra[@]}"}; do mkdir -p "$work/check/extra/$(basename "$f")" && bsdtar -xf "$f" -C "$work/check/extra/$(basename "$f")"; done
 settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
 python3 - "$settings" "$HOME" "$work/check" <<'PY'
 import json, os, sys
@@ -111,9 +117,9 @@ for dirpath, _, files in os.walk(folder):
 print("Privacy check: no keys or local paths in the release files.")
 PY
 
-mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$out_dir/"
+mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$stage/$APK_ASSET" ${extra[@]+"${extra[@]}"} "$out_dir/"
 if [ "$publish" != 1 ]; then echo "Built $tag (not published): $out_dir"; exit 0; fi
 # On Actions the tag goes on the commit that was built.
 target=(); [ -n "${GITHUB_SHA:-}" ] && target=(--target "$GITHUB_SHA")
-gh release create "$tag" "$stage/$WIN_ASSET" "$stage/$APK_ASSET" --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
+gh release create "$tag" "$stage/$WIN_ASSET" "$stage/$APK_ASSET" ${extra[@]+"${extra[@]}"} --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
 echo "Published $tag (Android versionCode $version_code): installs and in-app updates now get it."
