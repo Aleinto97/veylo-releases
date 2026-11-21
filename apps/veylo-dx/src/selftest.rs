@@ -145,7 +145,12 @@ fn player(data: &std::path::Path) -> Result<String> {
     }
     ensure!(codecs == ("h264".into(), "aac".into()), "tracks are {codecs:?}, expected h264 and aac");
     ensure!(size == (320, 240), "decoded picture is {}x{}, expected 320x240", size.0, size.1);
-    Ok(format!("{version} (FFmpeg {ffmpeg}) played H.264 {}x{} and AAC to the end", size.0, size.1))
+    // macOS: the picture goes through mpv's render API on an OpenGL context of the app's (video.rs).
+    #[cfg(target_os = "macos")]
+    let picture = format!("; {}", crate::video::check(&mpv).map_err(|e| anyhow!("video layer: {e}"))?);
+    #[cfg(not(target_os = "macos"))]
+    let picture = String::new();
+    Ok(format!("{version} (FFmpeg {ffmpeg}) played H.264 {}x{} and AAC to the end{picture}", size.0, size.1))
 }
 
 /// TLS works with the bundled roots, and the release channel answers (and has this platform's file).
