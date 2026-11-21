@@ -53,15 +53,9 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sudo apt-get install -y x11-utils >/dev/null
-          try() {
-            echo "=== $1"
-            xvfb-run -a -s "-screen 0 1440x900x24" sh -c "$2 VEYLO_DX_DATA=\$(mktemp -d) timeout 25 target/debug/veylo-dx > /tmp/v.log 2>&1 & sleep 20; xwininfo -root -tree | grep -i veylo; import -window root ../../screenshots/diag-$3.png; identify -format '%k colours\n' ../../screenshots/diag-$3.png; wait; grep -v -i 'a11y\|AT-SPI' /tmp/v.log | head -25"
-          }
-          try "no accessibility bridge" "NO_AT_BRIDGE=1 GTK_A11Y=none" noa11y
-          try "debug messages" "G_MESSAGES_DEBUG=all" debug
-          echo "=== dbus session"
-          dbus-run-session -- xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'VEYLO_DX_DATA=$(mktemp -d) target/debug/veylo-dx & sleep 20; xwininfo -root -tree | grep -i veylo; import -window root ../../screenshots/diag-dbus.png; identify -format "%k colours\n" ../../screenshots/diag-dbus.png'
+          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'G_MESSAGES_DEBUG=all WEBKIT_DEBUG=all VEYLO_DX_DATA=$(mktemp -d) timeout 30 target/debug/veylo-dx > ../../screenshots/diag-full.log 2>&1; echo exit=$?' || true
+          wc -l ../../screenshots/diag-full.log
+          grep -i -E "webkit|web process|crash|fail|error|egl|gbm|bwrap|denied|abort" ../../screenshots/diag-full.log | grep -v -i "a11y\|AT-SPI\|portal" | head -60
       - uses: actions/upload-artifact@v4
         if: always()
         with:
