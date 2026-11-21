@@ -47,11 +47,19 @@ jobs:
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
-      - name: Diagnose under a compositing manager (temporary)
+      - name: Diagnose the blank window (temporary)
         continue-on-error: true
         run: |
           sudo apt-get install -y xcompmgr >/dev/null
-          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'xcompmgr & sleep 1; VEYLO_DX_DATA=$(mktemp -d) target/debug/veylo-dx & sleep 50; xwininfo -root -tree | head -20; import -window root ../../screenshots/diag-xcompmgr.png; identify -format "%k colours\n" ../../screenshots/diag-xcompmgr.png'
+          mkdir -p ../../screenshots
+          try() {
+            echo "=== $1"
+            xvfb-run -a -s "-screen 0 1440x900x24" sh -c "$2; VEYLO_DX_DATA=\$(mktemp -d) $3 target/debug/veylo-dx >/dev/null 2>&1 & sleep 50; import -window root ../../screenshots/diag-$4.png; identify -format '%k colours\n' ../../screenshots/diag-$4.png"
+          }
+          try "compositor" "xcompmgr & sleep 1" "" xcompmgr
+          try "no WebKit compositing" "true" "WEBKIT_DISABLE_COMPOSITING_MODE=1" nocomp
+          try "both" "xcompmgr & sleep 1" "WEBKIT_DISABLE_COMPOSITING_MODE=1" both
+          try "software GL" "true" "LIBGL_ALWAYS_SOFTWARE=1 GDK_DEBUG=gl-disable" nogl
       # The runner has no desktop portal: GTK waits 25 s for it before the window opens.
       - name: Launch check
         run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png 60
