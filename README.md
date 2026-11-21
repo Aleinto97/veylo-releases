@@ -4,7 +4,10 @@
 
 A quiet, all-Rust media client for Android tablets and the Linux and Windows desktop, built with [Dioxus](https://dioxuslabs.com).
 
-- **Home**: an artwork-lit marquee, continue watching and catalogues.
+- **Home**: Tonight's pick (why it was chosen, Play, Not tonight and the next picks), then today's charts from
+  [BetterPosters](https://btttr.cc) and your add-ons' catalogues. The top bar shows what is on the player: one tap carries on.
+- **Title pages**: the film's own logo, stills, tagline, chart rank, studios, cast and crew, season art, trailers, and an
+  episode grid that splits long seasons into ranges.
 - **Picks**: a two-card duel that learns your taste from metadata and local synopsis embeddings, separates tonight’s mood from lasting preferences, and hides what you have watched.
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
