@@ -23,6 +23,9 @@ pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
 /// macOS self-test: the OpenGL context the picture uses, and mpv's renderer on it.
 #[cfg(target_os = "macos")]
 pub fn check(mpv: &libmpv2::Mpv) -> Result<String, String> { imp::check(mpv) }
+/// macOS self-test: an HDR10 clip rendered as PQ through the picture's pipeline; the screen's EDR.
+#[cfg(target_os = "macos")]
+pub fn hdr_check(clip: &str) -> Result<String, String> { imp::hdr_check(clip) }
 /// macOS: the most EDR headroom the window's screen can reach (1.0: SDR only; 0: not read yet).
 #[cfg(target_os = "macos")]
 pub fn potential_headroom() -> f64 { imp::potential_headroom() }
@@ -142,7 +145,7 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::NSObject;
     use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowOrderingMode};
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSScreen, NSView, NSWindow, NSWindowOrderingMode};
     use objc2_core_graphics::{CGColor, CGColorSpace};
     use objc2_core_video::CVTimeStamp;
     use objc2_open_gl::{CGLChoosePixelFormat, CGLContextObj, CGLCreateContext, CGLLockContext, CGLPixelFormatAttribute as A,
@@ -159,10 +162,28 @@ mod imp {
         fn glGetIntegerv(name: u32, data: *mut i32);
         fn glClearColor(r: f32, g: f32, b: f32, a: f32);
         fn glClear(mask: u32);
+        // The self-test's offscreen target.
+        fn glGenFramebuffers(n: i32, ids: *mut u32);
+        fn glBindFramebuffer(target: u32, id: u32);
+        fn glDeleteFramebuffers(n: i32, ids: *const u32);
+        fn glGenTextures(n: i32, ids: *mut u32);
+        fn glBindTexture(target: u32, id: u32);
+        fn glDeleteTextures(n: i32, ids: *const u32);
+        fn glTexImage2D(target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, kind: u32, data: *const c_void);
+        fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, texture: u32, level: i32);
+        fn glCheckFramebufferStatus(target: u32) -> u32;
+        fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, data: *mut c_void);
     }
     const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
     const GL_VIEWPORT: u32 = 0x0BA2;
     const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+    const GL_FRAMEBUFFER: u32 = 0x8D40;
+    const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+    const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+    const GL_TEXTURE_2D: u32 = 0x0DE1;
+    const GL_RGBA16F: i32 = 0x881A;
+    const GL_RGBA: u32 = 0x1908;
+    const GL_FLOAT: u32 = 0x1406;
 
     /// The session being drawn and mpv's renderer for it (created with our GL context current).
     /// `_live` keeps mpv's core alive until the renderer is freed (mpv requires that order).
@@ -361,9 +382,16 @@ mod imp {
     /// The window's screen: its EDR headroom now, and the most it can reach.
     fn read_headroom() {
         let screen = window().and_then(|w| w.screen());
-        let (now, potential) = screen.map_or((1.0, 1.0), |s| (s.maximumExtendedDynamicRangeColorComponentValue(), s.maximumPotentialExtendedDynamicRangeColorComponentValue()));
+        let (now, potential) = headroom_of(screen.as_deref());
         HEADROOM.store(now.to_bits(), Ordering::Release);
         POTENTIAL.store(potential.to_bits(), Ordering::Release);
+    }
+
+    /// A screen's EDR headroom (now, most). Developer option: VEYLO_DX_EDR=<headroom> pretends the
+    /// screen has that much (CI's Macs have no HDR screen), to run the HDR path anywhere.
+    fn headroom_of(screen: Option<&NSScreen>) -> (f64, f64) {
+        if let Some(fake) = std::env::var("VEYLO_DX_EDR").ok().and_then(|v| v.parse::<f64>().ok()) { return (fake, fake); }
+        screen.map_or((1.0, 1.0), |s| (s.maximumExtendedDynamicRangeColorComponentValue(), s.maximumPotentialExtendedDynamicRangeColorComponentValue()))
     }
     /// Read fresh on the main thread; elsewhere what the last read found.
     pub fn potential_headroom() -> f64 {
@@ -420,9 +448,9 @@ mod imp {
         let primaries: String = live.mpv.get_property("video-params/primaries").unwrap_or_default();
         let gamma: String = live.mpv.get_property("video-params/gamma").unwrap_or_default();
         let headroom = f64::from_bits(HEADROOM.load(Ordering::Acquire)).max(f64::from_bits(POTENTIAL.load(Ordering::Acquire)));
-        let float = gl().is_some_and(|g| g.2);
+        // PQ code values fit any buffer; a 16-bit float one (when the GPU gives it) only bands less.
         let mode = match (gamma.as_str(), primaries.as_str()) {
-            _ if !float || headroom <= 1.0 || !crate::backend::hdr_output() => 0,
+            _ if headroom <= 1.0 || !crate::backend::hdr_output() => 0,
             ("pq" | "hlg", "bt.2020") => 1,
             ("pq" | "hlg", "display-p3") => 2,
             _ => 0,
@@ -431,6 +459,7 @@ mod imp {
         let Ok(layer) = LAYER.lock() else { return };
         let Some(layer) = layer.as_ref() else { return };
         if mode == 0 {
+            eprintln!("veylo: HDR output off ({gamma}/{primaries} video, EDR headroom {headroom:.1})");
             set_edr(&layer.0, None);
             for (k, v) in [("target-trc", "auto"), ("target-prim", "auto"), ("target-peak", "auto")] { let _ = live.mpv.set_property(k, v); }
             return;
@@ -444,6 +473,73 @@ mod imp {
         let _ = live.mpv.set_property("target-prim", primaries.as_str());
         let _ = live.mpv.set_property("target-trc", "pq");
         let _ = live.mpv.set_property("target-peak", peak);
+        eprintln!("veylo: HDR output on: PQ {primaries} to an EDR layer, headroom {headroom:.1}, peak {peak} nits");
+    }
+
+    /// Self-test: mpv renders an HDR10 clip as PQ through this module's GL context into a 16-bit
+    /// float target (what the layer shows), and the main screen's EDR headroom says whether this Mac
+    /// can show it as HDR. Runs without a window; call on the main thread.
+    pub fn hdr_check(clip: &str) -> Result<String, String> {
+        let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
+        let _app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        let (now, potential) = headroom_of(objc2_app_kit::NSScreen::mainScreen(mtm).as_deref());
+        let (_, _, float) = gl().ok_or("no OpenGL context")?;
+        let label = GL.lock().ok().and_then(|g| g.as_ref().map(|g| g.label)).unwrap_or("?");
+        let mpv = libmpv2::Mpv::with_initializer(|o| {
+            for (k, v) in [("config", "no"), ("terminal", "no"), ("vo", "libmpv"), ("ao", "null"), ("keep-open", "yes"), ("hwdec", "auto-safe"),
+                ("icc-profile", ""), ("target-prim", "bt.2020"), ("target-trc", "pq"), ("target-peak", "1000")] { o.set_property(k, v)?; }
+            Ok(())
+        }).map_err(|e| format!("mpv: {e}"))?;
+        let render = unsafe { create_render_for(mpv.ctx.as_ptr())? };
+        let (w, h) = (320, 240);
+        let (mut fbo, mut tex) = (0u32, 0u32);
+        let complete = unsafe { with_context(|| {
+            glGenTextures(1, &mut tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, std::ptr::null());
+            glGenFramebuffers(1, &mut fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+        }) };
+        let result = (|| {
+            if complete != Some(true) { return Err("no 16-bit float render target".to_owned()); }
+            mpv.command("loadfile", &[clip]).map_err(|e| format!("loadfile: {e}"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let (mut frames, mut pixel) = (0, [0f32; 4]);
+            while frames < 5 {
+                if std::time::Instant::now() > deadline { return Err(format!("only {frames} frames rendered in 20 s")); }
+                let _ = mpv.wait_event(0.02);
+                unsafe { with_context(|| {
+                    if sys::mpv_render_context_update(render) & sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64 == 0 { return; }
+                    let mut target = sys::mpv_opengl_fbo { fbo: fbo as i32, w, h, internal_format: GL_RGBA16F };
+                    let (mut flip, mut depth) = (0i32, 16i32);
+                    let mut params = [
+                        sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_FBO, data: &mut target as *mut _ as *mut c_void },
+                        sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y, data: &mut flip as *mut _ as *mut c_void },
+                        sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_DEPTH, data: &mut depth as *mut _ as *mut c_void },
+                        sys::mpv_render_param { type_: 0, data: null_mut() },
+                    ];
+                    sys::mpv_render_context_render(render, params.as_mut_ptr());
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glReadPixels(w / 4, h / 2, 1, 1, GL_RGBA, GL_FLOAT, pixel.as_mut_ptr().cast());
+                    frames += 1;
+                }); }
+            }
+            let gamma: String = mpv.get_property("video-target-params/gamma").unwrap_or_default();
+            let prim: String = mpv.get_property("video-target-params/primaries").unwrap_or_default();
+            let source: String = mpv.get_property("video-params/gamma").unwrap_or_default();
+            if source != "pq" { return Err(format!("the HDR clip read as {source}, not PQ")); }
+            if gamma != "pq" || prim != "bt.2020" { return Err(format!("mpv sent {gamma}/{prim}, not PQ/BT.2020")); }
+            if !pixel[..3].iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)) || pixel[..3].iter().all(|c| *c == 0.0) {
+                return Err(format!("the rendered picture looks wrong (pixel {pixel:?})"));
+            }
+            Ok(format!("mpv rendered the HDR10 clip as PQ BT.2020 on the {label} context ({} target){}; screen EDR headroom {now:.1} (up to {potential:.1}): {}",
+                if float { "float" } else { "8-bit" }, format_args!(", pixel {:.2}/{:.2}/{:.2}", pixel[0], pixel[1], pixel[2]),
+                if potential > 1.0 { "HDR shows as HDR here" } else { "this screen is SDR only, HDR is tone-mapped" }))
+        })();
+        unsafe { with_context(|| { sys::mpv_render_context_free(render); glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &tex); }); }
+        result
     }
 
     pub fn set_fullscreen(on: bool) {

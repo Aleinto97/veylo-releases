@@ -30,6 +30,7 @@ pub fn run(args: &[String]) -> i32 {
     check("store", store());
     check("picks-ai", picks());
     check("player", player(&data));
+    check("hdr", hdr(&data));
     if online {
         check("network", network());
     }
@@ -151,6 +152,35 @@ fn player(data: &std::path::Path) -> Result<String> {
     #[cfg(not(target_os = "macos"))]
     let picture = String::new();
     Ok(format!("{version} (FFmpeg {ffmpeg}) played H.264 {}x{} and AAC to the end{picture}", size.0, size.1))
+}
+
+/// One second of HDR10: 10-bit H.264, PQ, BT.2020, with mastering metadata (FFmpeg's testsrc2).
+pub const HDR_CLIP: &[u8] = include_bytes!("../assets/selftest-hdr.mp4");
+
+/// HDR video is recognised as HDR (PQ, BT.2020, 10-bit) wherever it plays; on macOS it is also
+/// rendered as PQ through the picture's own pipeline, and the screen's EDR headroom is reported.
+fn hdr(data: &std::path::Path) -> Result<String> {
+    std::fs::create_dir_all(data)?;
+    let clip = data.join("selftest-hdr.mp4");
+    std::fs::write(&clip, HDR_CLIP)?;
+    let mpv = Mpv::with_initializer(|o| {
+        for (k, v) in [("config", "no"), ("terminal", "no"), ("vo", "null"), ("ao", "null"), ("keep-open", "yes")] { o.set_property(k, v)?; }
+        Ok(())
+    }).map_err(|e| anyhow!("mpv couldn't start: {e}"))?;
+    mpv.command("loadfile", &[clip.to_string_lossy().as_ref()]).map_err(|e| anyhow!("loadfile: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let params = loop {
+        ensure!(Instant::now() < deadline, "the HDR clip didn't start in 20 s");
+        if let Some(Ok(Event::VideoReconfig)) = mpv.wait_event(0.5) {
+            let p = |n: &str| mpv.get_property::<String>(&format!("video-params/{n}")).unwrap_or_default();
+            if !p("gamma").is_empty() { break (p("gamma"), p("primaries"), p("pixelformat")); }
+        }
+    };
+    ensure!(params.0 == "pq" && params.1 == "bt.2020", "the HDR10 clip read as {}/{}", params.0, params.1);
+    #[cfg(target_os = "macos")]
+    return crate::video::hdr_check(&clip.to_string_lossy()).map_err(|e| anyhow!("{e}"));
+    #[cfg(not(target_os = "macos"))]
+    Ok(format!("HDR10 recognised: PQ, BT.2020, {}", params.2))
 }
 
 /// TLS works with the bundled roots, and the release channel answers (and has this platform's file).

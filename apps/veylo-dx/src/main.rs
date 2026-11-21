@@ -305,6 +305,15 @@ fn Shell_() -> Element {
             start_playback(shell, player::PlayRequest { title: text("title"), subtitle: "Test player".into(), url: text("url"),
                 hdr: Some(text("hdr")).filter(|h| !h.is_empty()), ..Default::default() }, None);
         }
+        // VEYLO_DX_PLAY_DEMO=hdr plays the self-test's HDR10 clip instead (macOS: with VEYLO_DX_EDR=4 on a Mac without HDR).
+        #[cfg(not(target_os = "android"))]
+        if std::env::var("VEYLO_DX_PLAY_DEMO").as_deref() == Ok("hdr") {
+            let clip = std::env::temp_dir().join("veylo-demo-hdr.mp4");
+            if std::fs::write(&clip, selftest::HDR_CLIP).is_ok() {
+                start_playback(shell, player::PlayRequest { title: "HDR10 test clip".into(), subtitle: "Test player".into(), url: clip.to_string_lossy().into_owned(), ..Default::default() }, None);
+            }
+            return;
+        }
         if std::env::var_os("VEYLO_DX_PLAY_DEMO").is_some() {
             start_playback(shell, player::PlayRequest { title: "Sintel trailer".into(), subtitle: "Test player".into(), url: backend::DEMO_STREAM.into(), ..Default::default() }, None);
         }

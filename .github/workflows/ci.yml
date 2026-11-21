@@ -157,6 +157,15 @@ jobs:
         continue-on-error: true
         working-directory: .
         run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-player.png 40 --demo
+      # HDR through the window: the HDR10 clip on a pretend EDR screen (VEYLO_DX_EDR; the runner's
+      # display is SDR): the layer must switch to PQ and keep drawing.
+      - name: Launch check, HDR10 through the video layer
+        working-directory: .
+        env:
+          VEYLO_DX_PLAY_DEMO: hdr
+          VEYLO_DX_EDR: "4"
+          VEYLO_EXPECT_LOG: "HDR output on: PQ bt.2020"
+        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-hdr.png 20
       - name: Crash reports
         if: always()
         working-directory: .
