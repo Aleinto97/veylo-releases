@@ -53,11 +53,15 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          for v in "LIBGL_ALWAYS_SOFTWARE=1" "WEBKIT_DISABLE_COMPOSITING_MODE=1" "GDK_DEBUG=gl-disable" "VEYLO_DIAG=none"; do
-            echo "=== $v"
-            env "$v" xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx "../../screenshots/diag-${v%%=*}.png" 20 || true
-          done
-          glxinfo -B 2>/dev/null | head -5 || true
+          sudo apt-get install -y x11-utils openbox >/dev/null
+          echo "=== control: xmessage"
+          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'xmessage -center "control window" & sleep 3; import -window root ../../screenshots/diag-control.png; identify -format "%k colours\n" ../../screenshots/diag-control.png'
+          echo "=== window tree with Veylo"
+          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'VEYLO_DX_DATA=$(mktemp -d) target/debug/veylo-dx & sleep 20; xwininfo -root -tree | head -40; import -window root ../../screenshots/diag-tree.png; identify -format "%k colours\n" ../../screenshots/diag-tree.png'
+          echo "=== with a window manager"
+          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'openbox & sleep 1; VEYLO_DX_DATA=$(mktemp -d) target/debug/veylo-dx & sleep 20; import -window root ../../screenshots/diag-wm.png; identify -format "%k colours\n" ../../screenshots/diag-wm.png'
+          echo "=== no WebKit sandbox"
+          xvfb-run -a -s "-screen 0 1440x900x24" sh -c 'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VEYLO_DX_DATA=$(mktemp -d) target/debug/veylo-dx & sleep 20; import -window root ../../screenshots/diag-nosandbox.png; identify -format "%k colours\n" ../../screenshots/diag-nosandbox.png'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
