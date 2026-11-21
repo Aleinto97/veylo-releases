@@ -5,7 +5,8 @@
 //! Linux, X11: a GtkGLArea below the WebKit view.
 //! Android: a SurfaceView below the WebView (VeyloVideo.kt), handed to mpv as its window.
 //! Windows: mpv's own child window inside the app window, kept below the WebView2.
-//! macOS: not yet: mpv opens a window of its own beside the app's (engine.rs).
+//! macOS: a Core Animation OpenGL layer below the WKWebView, filled by mpv's render API; EDR (HDR)
+//!   on screens with headroom.
 use crate::engine::Live;
 use std::sync::Arc;
 
@@ -20,6 +21,9 @@ pub fn layout(live: &Live) { imp::layout(live) }
 pub fn install() { imp::install() }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
+/// macOS: the most EDR headroom the window's screen can reach (1.0: SDR only; 0: not read yet).
+#[cfg(target_os = "macos")]
+pub fn potential_headroom() -> f64 { imp::potential_headroom() }
 /// Windows: the app window, for the screen's HDR state (display.rs).
 #[cfg(target_os = "windows")]
 pub fn hwnd() -> Option<isize> {
@@ -118,10 +122,320 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // Apple marks OpenGL deprecated; it remains the API mpv's renderer offers on macOS.
+mod imp {
+    //! macOS: mpv can't draw into another app's view there (no `wid`), so it draws through its render
+    //! API into a Core Animation OpenGL layer of ours, on a view placed below the WKWebView inside the
+    //! same window (the way IINA and other libmpv players on macOS do it). The WebView doesn't draw a
+    //! background (main.rs makes the window transparent): the page paints its own black, and nothing
+    //! while a title plays. HDR: on a screen with EDR headroom the layer turns EDR with a PQ colour
+    //! space and mpv sends PQ to it; anywhere else mpv tone-maps to SDR.
+    //!
+    //! Threads: AppKit work on the main thread (attach, detach); Core Animation asks `canDraw`/`draw` on
+    //! its own thread with our GL context current; mpv's update callback only raises a flag.
+    use super::*;
+    use dioxus::desktop::tao::platform::macos::WindowExtMacOS;
+    use libmpv2_sys as sys;
+    use objc2::rc::Retained;
+    use objc2::runtime::NSObject;
+    use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowOrderingMode};
+    use objc2_core_graphics::{CGColor, CGColorSpace};
+    use objc2_core_video::CVTimeStamp;
+    use objc2_open_gl::{CGLChoosePixelFormat, CGLContextObj, CGLCreateContext, CGLLockContext, CGLPixelFormatAttribute as A,
+        CGLPixelFormatObj, CGLRetainContext, CGLRetainPixelFormat, CGLSetCurrentContext, CGLGetCurrentContext, CGLUnlockContext};
+    use objc2_quartz_core::{CALayer, CAOpenGLLayer, CATransaction};
+    use std::cell::RefCell;
+    use std::ffi::{c_char, c_void};
+    use std::ptr::{null_mut, NonNull};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    #[link(name = "OpenGL", kind = "framework")]
+    extern "C" {
+        fn glGetIntegerv(name: u32, data: *mut i32);
+        fn glClearColor(r: f32, g: f32, b: f32, a: f32);
+        fn glClear(mask: u32);
+    }
+    const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+    const GL_VIEWPORT: u32 = 0x0BA2;
+    const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+
+    /// The session being drawn and mpv's renderer for it (created with our GL context current).
+    /// `_live` keeps mpv's core alive until the renderer is freed (mpv requires that order).
+    struct Session { _live: Arc<Live>, render: *mut sys::mpv_render_context }
+    // SAFETY: the renderer is only used under RENDER's lock with our GL context current.
+    unsafe impl Send for Session {}
+    static RENDER: Mutex<Option<Session>> = Mutex::new(None);
+
+    /// One GL pixel format and context for the app's lifetime, shared with the layer.
+    struct Gl { format: CGLPixelFormatObj, context: CGLContextObj, float: bool }
+    // SAFETY: CGL objects are reference-counted C objects usable from any thread under CGLLockContext.
+    unsafe impl Send for Gl {}
+    static GL: Mutex<Option<Gl>> = Mutex::new(None);
+
+    /// mpv has a new frame; or the layer must redraw (new session, resize) whatever mpv says.
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+    /// The screen's EDR headroom, read on the main thread at attach (f64 bits); 1.0 is SDR only.
+    static HEADROOM: AtomicU64 = AtomicU64::new(0);
+    static POTENTIAL: AtomicU64 = AtomicU64::new(0);
+    /// What the layer and mpv are set to: 0 SDR, 1 PQ in BT.2020, 2 PQ in Display P3.
+    static HDR_MODE: AtomicU64 = AtomicU64::new(0);
+
+    /// The video layer, for HDR changes from the engine thread (layer properties are thread-safe in
+    /// an explicit CATransaction).
+    struct SendLayer(Retained<VideoLayer>);
+    // SAFETY: only Core Animation's thread-safe property setters are used from other threads.
+    unsafe impl Send for SendLayer {}
+    static LAYER: Mutex<Option<SendLayer>> = Mutex::new(None);
+    thread_local! { static VIEW: RefCell<Option<Retained<NSView>>> = const { RefCell::new(None) }; }
+
+    define_class!(
+        // SAFETY: CAOpenGLLayer may be subclassed; the overrides keep its contracts (retained returns).
+        #[unsafe(super(CAOpenGLLayer, CALayer, NSObject))]
+        #[name = "VeyloVideoLayer"]
+        struct VideoLayer;
+
+        impl VideoLayer {
+            #[unsafe(method(copyCGLPixelFormatForDisplayMask:))]
+            fn copy_pixel_format(&self, _mask: u32) -> CGLPixelFormatObj {
+                match gl() { Some((format, _, _)) => unsafe { CGLRetainPixelFormat(format) }, None => null_mut() }
+            }
+
+            #[unsafe(method(copyCGLContextForPixelFormat:))]
+            fn copy_context(&self, _pf: CGLPixelFormatObj) -> CGLContextObj {
+                match gl() { Some((_, context, _)) => unsafe { CGLRetainContext(context) }, None => null_mut() }
+            }
+
+            #[unsafe(method(canDrawInCGLContext:pixelFormat:forLayerTime:displayTime:))]
+            fn can_draw(&self, _ctx: CGLContextObj, _pf: CGLPixelFormatObj, _t: f64, _ts: *const CVTimeStamp) -> bool {
+                wants_frame()
+            }
+
+            #[unsafe(method(drawInCGLContext:pixelFormat:forLayerTime:displayTime:))]
+            fn draw(&self, ctx: CGLContextObj, pf: CGLPixelFormatObj, t: f64, ts: *const CVTimeStamp) {
+                unsafe { draw_frame(); }
+                // The superclass flushes the frame to the layer.
+                unsafe { let _: () = msg_send![super(self), drawInCGLContext: ctx, pixelFormat: pf, forLayerTime: t, displayTime: ts]; }
+            }
+        }
+    );
+
+    /// The pixel format and context, created once: 16-bit float colour (what EDR needs) on an OpenGL 3.2
+    /// core profile when the GPU offers it, else 8-bit, else the legacy profile.
+    fn gl() -> Option<(CGLPixelFormatObj, CGLContextObj, bool)> {
+        let mut gl = GL.lock().ok()?;
+        if gl.is_none() {
+            let base = |profile: u32| vec![A::CGLPFAOpenGLProfile.0, profile, A::CGLPFAAccelerated.0, A::CGLPFADoubleBuffer.0, A::CGLPFAAllowOfflineRenderers.0];
+            let float = [base(0x3200), vec![A::CGLPFAColorSize.0, 64, A::CGLPFAColorFloat.0]].concat();
+            for (attrs, is_float) in [(float, true), (base(0x3200), false), (base(0x1000), false)] {
+                let mut attrs: Vec<A> = attrs.into_iter().map(A).collect();
+                attrs.push(A(0));
+                let (mut format, mut count): (CGLPixelFormatObj, i32) = (null_mut(), 0);
+                unsafe { CGLChoosePixelFormat(NonNull::new_unchecked(attrs.as_mut_ptr()), NonNull::from(&mut format), NonNull::from(&mut count)); }
+                if format.is_null() { continue; }
+                let mut context: CGLContextObj = null_mut();
+                unsafe { CGLCreateContext(format, null_mut(), NonNull::from(&mut context)); }
+                if context.is_null() { continue; }
+                *gl = Some(Gl { format, context, float: is_float });
+                break;
+            }
+        }
+        gl.as_ref().map(|g| (g.format, g.context, g.float))
+    }
+
+    unsafe extern "C" fn proc_address(_: *mut c_void, name: *const c_char) -> *mut c_void { libc::dlsym(libc::RTLD_DEFAULT, name) }
+    unsafe extern "C" fn on_update(_: *mut c_void) { PENDING.store(true, Ordering::Release); }
+
+    /// Run `f` with our GL context locked and current (main thread), restoring whatever was current.
+    unsafe fn with_context<T>(f: impl FnOnce() -> T) -> Option<T> {
+        let (_, context, _) = gl()?;
+        CGLLockContext(context);
+        let previous = CGLGetCurrentContext();
+        CGLSetCurrentContext(context);
+        let out = f();
+        CGLSetCurrentContext(previous);
+        CGLUnlockContext(context);
+        Some(out)
+    }
+
+    fn wants_frame() -> bool {
+        let Ok(session) = RENDER.lock() else { return false };
+        let Some(s) = session.as_ref() else { return DIRTY.swap(false, Ordering::AcqRel) };
+        let dirty = DIRTY.swap(false, Ordering::AcqRel);
+        let frame = PENDING.swap(false, Ordering::AcqRel)
+            && unsafe { sys::mpv_render_context_update(s.render) } & sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64 != 0;
+        dirty || frame
+    }
+
+    unsafe fn draw_frame() {
+        let (mut fbo, mut viewport) = (0i32, [0i32; 4]);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &mut fbo);
+        glGetIntegerv(GL_VIEWPORT, viewport.as_mut_ptr());
+        let float = gl().is_some_and(|g| g.2);
+        let session = RENDER.lock();
+        match session.as_ref().ok().and_then(|s| s.as_ref()) {
+            Some(s) => {
+                let mut target = sys::mpv_opengl_fbo { fbo, w: viewport[2], h: viewport[3], internal_format: 0 };
+                let (mut flip, mut depth): (i32, i32) = (1, if float { 16 } else { 8 });
+                let mut params = [
+                    sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_FBO, data: &mut target as *mut _ as *mut c_void },
+                    sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y, data: &mut flip as *mut _ as *mut c_void },
+                    sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_DEPTH, data: &mut depth as *mut _ as *mut c_void },
+                    sys::mpv_render_param { type_: 0, data: null_mut() },
+                ];
+                sys::mpv_render_context_render(s.render, params.as_mut_ptr());
+            }
+            None => { glClearColor(0.0, 0.0, 0.0, 1.0); glClear(GL_COLOR_BUFFER_BIT); }
+        }
+    }
+
+    /// mpv's renderer on our context; it must exist before mpv opens the file (vo=libmpv).
+    unsafe fn create_render(live: &Live) -> Result<*mut sys::mpv_render_context, String> {
+        with_context(|| {
+            let mut init = sys::mpv_opengl_init_params { get_proc_address: Some(proc_address), get_proc_address_ctx: null_mut() };
+            let mut params = [
+                sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE, data: sys::MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void },
+                sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: &mut init as *mut _ as *mut c_void },
+                sys::mpv_render_param { type_: 0, data: null_mut() },
+            ];
+            let mut render: *mut sys::mpv_render_context = null_mut();
+            let err = sys::mpv_render_context_create(&mut render, live.mpv.ctx.as_ptr(), params.as_mut_ptr());
+            if err < 0 { return Err(format!("mpv renderer: error {err}")); }
+            sys::mpv_render_context_set_update_callback(render, Some(on_update), null_mut());
+            Ok(render)
+        }).unwrap_or_else(|| Err("no OpenGL context".into()))
+    }
+
+    /// The video view under the WebView, created once per window.
+    fn view(mtm: MainThreadMarker) -> Option<Retained<NSView>> {
+        if let Some(v) = VIEW.with(|v| v.borrow().clone()) { return Some(v); }
+        let window = window()?;
+        let content = window.contentView()?;
+        let layer: Retained<VideoLayer> = unsafe { msg_send![VideoLayer::class(), new] };
+        layer.setAsynchronous(true);
+        layer.setNeedsDisplayOnBoundsChange(true);
+        layer.setContentsScale(window.backingScaleFactor());
+        layer.setBackgroundColor(Some(&CGColor::new_generic_gray(0.0, 1.0)));
+        if gl().is_some_and(|g| g.2) { layer.setContentsFormat(unsafe { objc2_quartz_core::kCAContentsFormatRGBA16Float }); }
+        let view = NSView::initWithFrame(NSView::alloc(mtm), content.bounds());
+        view.setLayer(Some(&layer));
+        view.setWantsLayer(true);
+        view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        // Below every other subview: the WebView stays on top and keeps every click.
+        content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
+        view.setHidden(true);
+        *LAYER.lock().ok()? = Some(SendLayer(layer));
+        VIEW.with(|v| *v.borrow_mut() = Some(view.clone()));
+        Some(view)
+    }
+
+    fn window() -> Option<Retained<NSWindow>> {
+        let ptr = dioxus::desktop::window().window.ns_window();
+        // SAFETY: tao's NSWindow pointer is valid while the window lives; retain our own reference.
+        unsafe { Retained::retain(ptr as *mut NSWindow) }
+    }
+
+    /// The window's screen: its EDR headroom now, and the most it can reach.
+    fn read_headroom() {
+        let screen = window().and_then(|w| w.screen());
+        let (now, potential) = screen.map_or((1.0, 1.0), |s| (s.maximumExtendedDynamicRangeColorComponentValue(), s.maximumPotentialExtendedDynamicRangeColorComponentValue()));
+        HEADROOM.store(now.to_bits(), Ordering::Release);
+        POTENTIAL.store(potential.to_bits(), Ordering::Release);
+    }
+    /// Read fresh on the main thread; elsewhere what the last read found.
+    pub fn potential_headroom() -> f64 {
+        if MainThreadMarker::new().is_some() { read_headroom(); }
+        f64::from_bits(POTENTIAL.load(Ordering::Acquire))
+    }
+
+    pub fn attach(live: &Arc<Live>) {
+        free_render();
+        let ready = MainThreadMarker::new().and_then(view).map(|view| {
+            read_headroom();
+            match unsafe { create_render(live) } {
+                Ok(render) => {
+                    if let Ok(mut s) = RENDER.lock() { *s = Some(Session { _live: live.clone(), render }); }
+                    HDR_MODE.store(0, Ordering::Release);
+                    if let Ok(layer) = LAYER.lock() { if let Some(l) = layer.as_ref() { set_edr(&l.0, None); } }
+                    DIRTY.store(true, Ordering::Release);
+                    view.setHidden(false);
+                    true
+                }
+                Err(e) => { eprintln!("veylo: video layer: {e}"); false }
+            }
+        });
+        if ready != Some(true) { eprintln!("veylo: no video layer; playing without a picture"); }
+        live.mark_ready();
+    }
+
+    /// Free mpv's renderer (before mpv itself, which our Session keeps alive until then).
+    fn free_render() {
+        let Some(session) = RENDER.lock().ok().and_then(|mut s| s.take()) else { return };
+        unsafe { with_context(|| sys::mpv_render_context_free(session.render)); }
+        drop(session);
+    }
+
+    pub fn detach() {
+        free_render();
+        VIEW.with(|v| if let Some(v) = v.borrow().as_ref() { v.setHidden(true); });
+        DIRTY.store(true, Ordering::Release);
+        set_fullscreen(false);
+    }
+
+    /// The layer's colour space and EDR, in one explicit transaction (safe from any thread).
+    fn set_edr(layer: &VideoLayer, pq: Option<&objc2_core_foundation::CFString>) {
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        layer.setWantsExtendedDynamicRangeContent(pq.is_some());
+        let space = pq.and_then(|name| CGColorSpace::with_name(Some(name)));
+        layer.setColorspace(space.as_deref());
+        CATransaction::commit();
+    }
+
+    /// The video's format is known (or changed): HDR video on an EDR screen goes out as PQ.
+    pub fn layout(live: &Live) {
+        let primaries: String = live.mpv.get_property("video-params/primaries").unwrap_or_default();
+        let gamma: String = live.mpv.get_property("video-params/gamma").unwrap_or_default();
+        let headroom = f64::from_bits(HEADROOM.load(Ordering::Acquire)).max(f64::from_bits(POTENTIAL.load(Ordering::Acquire)));
+        let float = gl().is_some_and(|g| g.2);
+        let mode = match (gamma.as_str(), primaries.as_str()) {
+            _ if !float || headroom <= 1.0 || !crate::backend::hdr_output() => 0,
+            ("pq" | "hlg", "bt.2020") => 1,
+            ("pq" | "hlg", "display-p3") => 2,
+            _ => 0,
+        };
+        if HDR_MODE.swap(mode, Ordering::AcqRel) == mode { return; }
+        let Ok(layer) = LAYER.lock() else { return };
+        let Some(layer) = layer.as_ref() else { return };
+        if mode == 0 {
+            set_edr(&layer.0, None);
+            for (k, v) in [("target-trc", "auto"), ("target-prim", "auto"), ("target-peak", "auto")] { let _ = live.mpv.set_property(k, v); }
+            return;
+        }
+        // SAFETY: CoreGraphics' colour space names are immutable statics.
+        let name = unsafe { if mode == 1 { objc2_core_graphics::kCGColorSpaceITUR_2100_PQ } else { objc2_core_graphics::kCGColorSpaceDisplayP3_PQ } };
+        set_edr(&layer.0, Some(name));
+        // EDR 1.0 is SDR white (203 nits by BT.2408); mpv tone-maps what the screen can't reach.
+        let peak = (headroom * 203.0).round().clamp(203.0, 10000.0) as i64;
+        let _ = live.mpv.set_property("icc-profile", "");
+        let _ = live.mpv.set_property("target-prim", primaries.as_str());
+        let _ = live.mpv.set_property("target-trc", "pq");
+        let _ = live.mpv.set_property("target-peak", peak);
+    }
+
+    pub fn set_fullscreen(on: bool) {
+        let w = dioxus::desktop::window();
+        w.window.set_fullscreen(on.then_some(dioxus::desktop::tao::window::Fullscreen::Borderless(None)));
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod imp {
     use super::*;
-    // macOS: no picture bridge under the page yet; mpv shows the picture in its own window (engine.rs).
+    // No picture bridge on this OS: mpv still plays the sound.
     pub fn attach(live: &Arc<Live>) { live.mark_ready(); }
     pub fn detach() {}
     pub fn layout(_live: &Live) {}
