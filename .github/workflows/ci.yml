@@ -47,41 +47,8 @@ jobs:
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
-      - name: Diagnose, WebKitGTK like Veylo's window on Xvfb (temporary)
-        continue-on-error: true
-        run: |
-          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 >/dev/null
-          cat > /tmp/wk.py <<'EOF'
-          import sys, gi
-          gi.require_version("Gtk", "3.0"); gi.require_version("WebKit2", "4.1")
-          from gi.repository import Gtk, Gdk, WebKit2
-          mode = sys.argv[1]
-          w = Gtk.Window(); w.set_default_size(800, 600)
-          if "rgba" in mode:
-              w.set_visual(w.get_screen().get_rgba_visual()); w.set_app_paintable(True)
-          v = WebKit2.WebView()
-          if "clear" in mode:
-              v.set_background_color(Gdk.RGBA(0, 0, 0, 0))
-          v.load_html('<body style="background:#c33;color:#fff;font-size:60px">Hello WebKit</body>', "about:blank")
-          if "glarea" in mode:
-              o = Gtk.Overlay(); a = Gtk.GLArea(); a.set_has_alpha(False); a.set_auto_render(False)
-              o.add(a); o.add_overlay(v); w.add(o)
-          else:
-              w.add(v)
-          w.show_all(); Gtk.main()
-          EOF
-          mkdir -p ../../screenshots
-          for mode in plain rgba glarea rgba-glarea rgba-clear; do
-            xvfb-run -a -s "-screen 0 1024x768x24" sh -c "WEBKIT_DISABLE_DMABUF_RENDERER=1 timeout 50 python3 /tmp/wk.py $mode >/dev/null 2>&1 & sleep 35; import -window root ../../screenshots/diag-$mode.png; identify -format '$mode: %k colours\n' ../../screenshots/diag-$mode.png"
-          done
-      # The runner has no desktop portal: GTK waits 25 s for it before the window opens. WebKitGTK
-      # paints nothing on this virtual X server (it does on a real one), so a blank screenshot only warns:
-      # the check still fails if the app exits or panics.
+      # The runner has no desktop portal: GTK waits 25 s for it before the window opens.
       - name: Launch check
-        env:
-          VEYLO_ALLOW_BLANK: "1"
-          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
-          GDK_DEBUG: gl-disable
         run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png 60
       - uses: actions/upload-artifact@v4
         if: always()
@@ -138,7 +105,7 @@ jobs:
       - name: Launch check
         working-directory: .
         run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-home.png
-      # The runner has no GPU (Direct3D 11 runs on WARP): informative, it doesn't fail the build.
+      # Plays a stream from the web on a runner without a GPU (Direct3D 11 on WARP): informative only.
       - name: Launch check, playing the test stream
         continue-on-error: true
         working-directory: .
@@ -185,7 +152,7 @@ jobs:
       - name: Launch check
         working-directory: .
         run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-home.png
-      # The runner is a VM without a real GPU: informative, it doesn't fail the build.
+      # Plays a stream from the web on a VM without a real GPU (basic OpenGL): informative only.
       - name: Launch check, playing the test stream
         continue-on-error: true
         working-directory: .

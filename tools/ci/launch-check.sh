@@ -39,11 +39,7 @@ echo "Veylo ran for $seconds s; screenshot: $shot"
 # A screen of one or two colours means nothing was drawn (where ImageMagick can count them).
 if command -v identify >/dev/null; then
     colours=$(identify -format %k "$shot")
-    if [ "$colours" -le 2 ]; then
-        # VEYLO_ALLOW_BLANK=1: where the page can't paint (WebKitGTK on a virtual X server), only warn.
-        if [ -n "${VEYLO_ALLOW_BLANK:-}" ]; then echo "::warning::The screenshot is blank ($colours colours); the app kept running."; exit 0; fi
-        echo "The screenshot is blank ($colours colours): the window drew nothing." >&2; exit 1
-    fi
+    if [ "$colours" -le 2 ]; then echo "The screenshot is blank ($colours colours): the window drew nothing." >&2; exit 1; fi
     echo "Screenshot has $colours colours."
 fi
 exit 0

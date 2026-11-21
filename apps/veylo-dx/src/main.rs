@@ -293,9 +293,6 @@ fn Shell_() -> Element {
         player_key: Signal::new(None),
         play_ticket: Signal::new(0),
     });
-    // Linux: the GL area the player draws into goes under the WebView once, before anything plays.
-    #[cfg(target_os = "linux")]
-    use_hook(video::install);
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
         #[cfg(target_os = "android")]
