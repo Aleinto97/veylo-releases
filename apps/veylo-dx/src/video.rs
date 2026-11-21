@@ -2,7 +2,9 @@
 //! plays, so the Dioxus controls (player_ui.rs) float over the video on every platform.
 //! Linux, Wayland: a subsurface of the window placed below it, filled by mpv's render API on its
 //!   own EGL context and thread; the compositor blends the page over the picture (no copies).
-//! Linux, X11: a GtkGLArea below the WebKit view.
+//! Linux, X11: a GtkGLArea below the WebKit view, put in place when the first title plays: a window
+//!   holding a GL area is composited through GL, and where GL can't draw (software GL, some VMs) the
+//!   whole page would stay black.
 //! Android: a SurfaceView below the WebView (VeyloVideo.kt), handed to mpv as its window.
 //! Windows: mpv's own child window inside the app window, kept below the WebView2.
 //! macOS: a Core Animation OpenGL layer below the WKWebView, filled by mpv's render API; EDR (HDR)
@@ -16,9 +18,6 @@ pub fn attach(live: &Arc<Live>) { imp::attach(live) }
 pub fn detach() { imp::detach() }
 /// The picture's aspect or fit changed (any thread).
 pub fn layout(live: &Live) { imp::layout(live) }
-/// Desktop: once per window, before anything plays.
-#[cfg(target_os = "linux")]
-pub fn install() { imp::install() }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
 /// macOS self-test: the OpenGL context the picture uses, and mpv's renderer on it.
@@ -477,7 +476,6 @@ mod imp {
 
     fn wayland() -> bool { gtk::gdk::Display::default().is_some_and(|d| d.type_().name().contains("Wayland")) }
 
-    pub fn install() { if !wayland() { glarea::install(); } }
     pub fn attach(live: &Arc<Live>) {
         let ok = if wayland() { subsurface::attach(live) } else { glarea::attach(live) };
         if ok { let _ = dioxus::desktop::window().webview.set_background_color((0, 0, 0, 0)); }
@@ -859,6 +857,8 @@ mod imp {
             VIDEO.with(|v| {
                 let mut v = v.borrow_mut();
                 let Some(v) = v.as_mut() else { return false };
+                // Just put in place: realize it now, which creates its GL context.
+                v.area.realize();
                 v.area.make_current();
                 if let Some(e) = v.area.error() { eprintln!("veylo: GL unavailable: {e}"); return false; }
                 let native = gtk::gdk::Display::default().map(|d| unsafe {
