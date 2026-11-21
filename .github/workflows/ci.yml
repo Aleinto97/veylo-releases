@@ -49,6 +49,15 @@ jobs:
         run: ./target/debug/veylo-dx --self-test --online
       - name: Launch check
         run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png
+      - name: Diagnose (temporary)
+        if: always()
+        continue-on-error: true
+        run: |
+          for v in "LIBGL_ALWAYS_SOFTWARE=1" "WEBKIT_DISABLE_COMPOSITING_MODE=1" "GDK_DEBUG=gl-disable" "VEYLO_DIAG=none"; do
+            echo "=== $v"
+            env "$v" xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx "../../screenshots/diag-${v%%=*}.png" 20 || true
+          done
+          glxinfo -B 2>/dev/null | head -5 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -32,8 +32,14 @@ fi
 
 case "$(uname -s)" in
     Darwin) screencapture -x "$shot" ;;
-    *) import -window root "$shot" ;;
+    *) import -window root "$shot"; xwininfo -root -tree 2>/dev/null | grep -i -E 'veylo|tao|child' | head -20 || true ;;
 esac
 echo "Veylo ran for $seconds s; screenshot: $shot"
 [ -s "$log" ] && { echo "Its output:"; cat "$log"; }
+# A screen of one or two colours means nothing was drawn (where ImageMagick can count them).
+if command -v identify >/dev/null; then
+    colours=$(identify -format %k "$shot")
+    if [ "$colours" -le 2 ]; then echo "The screenshot is blank ($colours colours): the window drew nothing." >&2; exit 1; fi
+    echo "Screenshot has $colours colours."
+fi
 exit 0
