@@ -190,9 +190,6 @@ fn print_sources(kind: &str, id: &str, pack: Option<usize>) {
     });
 }
 
-/// Developer command: `veylo-dx --addons` runs the start-up add-on setup (key adoption,
-/// replacing website installs, update check) and prints names and versions; never links.
-#[cfg(not(target_os = "android"))]
 /// `veylo-dx --check-picture <screenshot.png> [--report <file>]`: does a screenshot taken while the
 /// colour-bar clip plays (VEYLO_DX_PLAY_DEMO=bars) show its six bars? CI's picture test
 /// (tools/ci/launch-check.*). The report file is for Windows, where a GUI build's output can get lost.
@@ -212,6 +209,9 @@ fn check_picture(path: &str, report: Option<&str>) -> i32 {
     code
 }
 
+/// Developer command: `veylo-dx --addons` runs the start-up add-on setup (key adoption,
+/// replacing website installs, update check) and prints names and versions; never links.
+#[cfg(not(target_os = "android"))]
 fn print_addons() {
     if let Err(e) = backend::init() { eprintln!("{e:#}"); return; }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
