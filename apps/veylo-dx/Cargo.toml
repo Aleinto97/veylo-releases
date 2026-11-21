@@ -60,7 +60,7 @@ objc2 = "0.6.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSGeometry"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSScreen", "NSGraphics", "objc2-quartz-core"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAOpenGLLayer", "CATransaction", "objc2-open-gl", "objc2-core-graphics", "objc2-core-video", "objc2-core-foundation"] }
-objc2-open-gl = { version = "0.3.2", default-features = false, features = ["std", "CGLTypes", "CGLCurrent"] }
+objc2-open-gl = { version = "0.3.2", default-features = false, features = ["std", "CGLTypes", "CGLCurrent", "CGLRenderers"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor", "CGColorSpace"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }

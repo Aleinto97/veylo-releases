@@ -47,6 +47,19 @@ jobs:
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
+      - name: Diagnose, plain WebKitGTK on Xvfb (temporary)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 >/dev/null
+          printf '%s\n' 'import gi; gi.require_version("Gtk","3.0"); gi.require_version("WebKit2","4.1")' \
+            'from gi.repository import Gtk, WebKit2' \
+            'w=Gtk.Window(); v=WebKit2.WebView(); w.add(v); w.set_default_size(800,600)' \
+            'v.load_html("<body style=\"background:#c33;color:#fff;font-size:60px\">Hello WebKit</body>","about:blank")' \
+            'w.show_all(); Gtk.main()' > /tmp/wk.py
+          mkdir -p ../../screenshots
+          for env in "X=1" "WEBKIT_DISABLE_COMPOSITING_MODE=1"; do
+            xvfb-run -a -s "-screen 0 1024x768x24" sh -c "env $env timeout 60 python3 /tmp/wk.py & sleep 45; import -window root ../../screenshots/diag-webkit-${env%%=*}.png; identify -format '$env: %k colours\n' ../../screenshots/diag-webkit-${env%%=*}.png"
+          done
       # The runner has no desktop portal: GTK waits 25 s for it before the window opens. WebKitGTK
       # paints nothing on this virtual X server (it does on a real one), so a blank screenshot only warns:
       # the check still fails if the app exits or panics.
