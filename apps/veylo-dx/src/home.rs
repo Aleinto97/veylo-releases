@@ -1,5 +1,5 @@
-//! Home, ported from HomeScreen.kt: the featured title's marquee, Continue
-//! watching, then each add-on catalog as a quiet poster shelf.
+//! Home: each catalog as a quiet poster shelf. What you are watching lives in the Library, and
+//! the last thing you played waits top right (main.rs, LastPlayed).
 use crate::{backend::{self, CatalogRow, Media}, icons, player::PlayRequest, Shell};
 use dioxus::prelude::*;
 
@@ -12,8 +12,10 @@ pub fn Home() -> Element {
     let mut rows = use_signal(Vec::<(CatalogRow, Shelf)>::new);
     let mut rows_error = use_signal(|| None::<String>);
     let mut library = use_signal(Vec::<Media>::new);
-    let mut picks = use_signal(Vec::<Media>::new);
     let mut loading = use_signal(|| true);
+    // Tonight's pick and the next few behind it; "Not tonight" steps through them.
+    let mut tonight = use_signal(Vec::<Media>::new);
+    let mut skipped = use_signal(|| 0usize);
 
     let load_row = move |row: CatalogRow| {
         spawn(async move {
@@ -40,30 +42,32 @@ pub fn Home() -> Element {
             }
             Err(e) => rows_error.set(Some(format!("{e:#}"))),
         }
-        if let Ok(p) = backend::picks().await { picks.set(p.items); }
+        // Tonight's pick: Picks' first recommendation you have neither watched nor started.
+        if let Ok(p) = backend::picks().await { tonight.set(p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(6).collect()); }
         loading.set(false);
     });
 
     let continuing: Vec<Media> = library.read().iter().filter(|m| backend::in_progress(m)).cloned().collect();
-    // What you are watching, else a pick for you, else the first catalog title (featuredTitle in Kotlin).
-    let featured = continuing.first().cloned()
-        .or_else(|| picks.read().first().cloned())
-        .or_else(|| rows.read().iter().find_map(|(_, s)| match s { Shelf::Ready(items) => items.first().cloned(), _ => None }));
-    let featured_resumes = featured.as_ref().is_some_and(|f| continuing.first().is_some_and(|c| c.key() == f.key()));
-
+    // The room takes its light from what you are watching.
     let mut lamp = shell.lamp_source;
-    // The marquee lends the accent from the artwork it shows; with none, the lamp goes neutral.
-    let none_featured = featured.is_none();
-    use_effect(use_reactive!(|none_featured| if none_featured && !lamp.peek().is_empty() { lamp.set(String::new()); }));
+    let queue: Vec<Media> = { let all = tonight.read(); if all.is_empty() { Vec::new() } else { (0..all.len()).map(|i| all[(skipped() + i) % all.len()].clone()).collect() } };
+    let room = continuing.first().or(queue.first()).map(|m| m.backdrop().to_owned()).unwrap_or_default();
+    use_effect(use_reactive!(|room| if *lamp.peek() != room { lamp.set(room); }));
 
     rsx! {
         div { class: "home",
-            if let Some(media) = featured.clone() {
-                for media in [media] { Marquee { key: "{media.key()}", media, resumes: featured_resumes } }
-            } else {
-                div { class: "bar-clearance" }
-            }
+            div { class: "bar-clearance" }
             div { class: "shelves",
+                if let Some(m) = queue.first().cloned() {
+                    section { class: "shelf",
+                        SectionHeader { title: "Tonight's pick" }
+                        for m in [m] {
+                            TonightsPick { key: "{m.key()}", media: m.clone(), also: queue.iter().skip(1).take(3).cloned().collect::<Vec<_>>(),
+                                can_skip: queue.len() > 1, on_skip: move |_| skipped += 1 }
+                        }
+                    }
+                }
+
                 if loading() && rows.read().is_empty() { SkeletonStrip {} }
                 if let Some(error) = rows_error() {
                     section { class: "shelf",
@@ -100,6 +104,75 @@ pub fn Home() -> Element {
     }
 }
 
+/// One title Picks chose for you: its backdrop and logo, and why. The card opens it; the button
+/// goes on to Picks.
+#[component]
+fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHandler<()>) -> Element {
+    let mut shell = use_context::<Shell>();
+    let art = use_artwork(&media);
+    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
+    let logo = art().and_then(|a| a.logo).or_else(|| media.raw["logo"].as_str().map(str::to_owned)).filter(|l| !l.is_empty());
+    let mut logo_failed = use_signal(|| false);
+    // The film's own line when it has one, else the start of its synopsis.
+    let blurb = art().and_then(|a| a.tagline).filter(|t| !t.is_empty()).unwrap_or_else(|| media.description.clone());
+    let runtime = backend::s(&media.raw, "runtime");
+    let rating = backend::s(&media.raw, "imdbRating");
+    let facts: Vec<String> = [media.year.clone(), media.genres.first().cloned().unwrap_or_default(), runtime]
+        .into_iter().filter(|s| !s.is_empty()).collect();
+    let (open, open_art, play) = (media.clone(), media.clone(), media.clone());
+    rsx! {
+        div { class: "tonight glass",
+            button { class: "tonight-art card-art wide", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open_art.clone())),
+                if !backdrop.is_empty() { img { src: "{backdrop}", alt: "" } }
+            }
+            div { class: "tonight-copy",
+                if !media.reason.is_empty() { span { class: "tonight-why", icons::Sparkles {} span { "{media.reason}" } } }
+                button { class: "bare tonight-title", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
+                    match logo.filter(|_| !logo_failed()) {
+                        Some(src) => rsx! { img { class: "tonight-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
+                        None => rsx! { span { class: "display tonight-name", "{media.name}" } },
+                    }
+                }
+                span { class: "tonight-facts",
+                    for f in facts { span { "{f}" } }
+                    if !rating.is_empty() { span { class: "tonight-rating", icons::Star {} "{rating}" } }
+                }
+                if !blurb.is_empty() { p { class: "tonight-blurb", "{blurb}" } }
+                div { class: "tonight-actions",
+                    button { class: "pill tonight-play", onclick: move |_| crate::title::resume_now(shell, play.clone()), icons::Play {} span { "Play" } }
+                    if can_skip {
+                        button { class: "orb glass", aria_label: "Not tonight", title: "Not tonight", onclick: move |_| on_skip.call(()), icons::Refresh {} }
+                    }
+                    button { class: "orb glass", aria_label: "More picks", title: "More picks", onclick: move |_| { shell.opened.set(None); shell.tab.set(crate::Tab::Picks); }, icons::ArrowRight {} }
+                }
+            }
+            if !also.is_empty() {
+                div { class: "tonight-also",
+                    span { class: "micro dim", "Or" }
+                    div { class: "tonight-also-row",
+                        for m in also {
+                            AlsoTonight { key: "{m.key()}", media: m.clone() }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A small poster behind Tonight's pick. The poster carries the title; no name under it.
+#[component]
+fn AlsoTonight(media: Media) -> Element {
+    let mut shell = use_context::<Shell>();
+    let src = backend::posters(&media).into_iter().next().unwrap_or_default();
+    let m = media.clone();
+    rsx! {
+        button { class: "card-art tonight-alt", aria_label: "Open {media.name}", title: "{media.name}", onclick: move |_| shell.opened.set(Some(m.clone())),
+            if !src.is_empty() { img { src: "{src}", alt: "" } } else { span { class: "initial", "{media.name}" } }
+        }
+    }
+}
+
 #[component]
 fn SectionHeader(title: String, #[props(default)] meta: Option<String>) -> Element {
     rsx! {
@@ -110,51 +183,6 @@ fn SectionHeader(title: String, #[props(default)] meta: Option<String>) -> Eleme
     }
 }
 
-/// The one bold moment of the app: the featured backdrop edge to edge, its logo
-/// (or its name in Archivo) bottom-left with what is needed to carry on.
-#[component]
-fn Marquee(media: Media, resumes: bool) -> Element {
-    let mut shell = use_context::<Shell>();
-    let art = use_artwork(&media);
-    let logo = art().and_then(|a| a.logo).unwrap_or_else(|| media.raw["logo"].as_str().unwrap_or_default().to_owned());
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
-    // The accent comes from the very image on screen (TMDB's once it arrives).
-    let mut lamp = shell.lamp_source;
-    use_effect(use_reactive!(|backdrop| if *lamp.peek() != backdrop { lamp.set(backdrop); }));
-    let mut logo_failed = use_signal(|| false);
-    let context = if resumes { backend::resume_context(&media) } else {
-        [media.year.clone(), backend::type_label(&media.kind).to_lowercase()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
-    };
-    let fraction = backend::progress_fraction(&media);
-    let open = media.clone();
-    let resume = media.clone();
-    rsx! {
-        section { class: "marquee", aria_label: "Featured",
-            if !backdrop.is_empty() { img { class: "marquee-art", src: "{backdrop}", alt: "" } }
-            div { class: "marquee-copy",
-                if !logo.is_empty() && !logo_failed() {
-                    img { class: "marquee-logo", src: "{logo}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) }
-                } else {
-                    h1 { class: "display marquee-title", "{media.name}" }
-                }
-                if !context.is_empty() { p { class: "marquee-meta", "{context}" } }
-                if resumes && media.duration_ms > 0 {
-                    div { class: "progress-line", role: "progressbar", aria_valuenow: "{(fraction * 100.0).round()}", aria_valuemin: "0", aria_valuemax: "100",
-                        div { style: "width: {fraction * 100.0}%" } }
-                }
-                div { class: "actions",
-                    if resumes {
-                        // Resume plays at once (the automatic choice); Details opens the page.
-                        button { class: "pill accent", onclick: move |_| crate::title::resume_now(shell, resume.clone()), icons::Play {} span { "Resume" } }
-                        icons::IconButton { label: "Details", class: "glass", onclick: move |_| shell.opened.set(Some(open.clone())), icons::Info {} }
-                    } else {
-                        button { class: "pill accent", onclick: move |_| shell.opened.set(Some(open.clone())), icons::Info {} span { "Details" } }
-                    }
-                }
-            }
-        }
-    }
-}
 
 /// Upright poster with the name under it (PosterCard on touch screens). A broken
 /// image falls back to the other artwork, then to the initial: never an empty card.
@@ -172,12 +200,12 @@ pub fn PosterCard(media: Media) -> Element {
             div { class: "card-art tall",
                 match art {
                     Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", onerror: move |_| index += 1 } },
-                    None => rsx! { span { class: "initial display", "{media.name.chars().next().unwrap_or(' ').to_uppercase()}" } },
+                    // The poster carries the title; only when no image works is the name written.
+                    None => rsx! { span { class: "initial display", "{media.name}" } },
                 }
                 if done { span { class: "watched", aria_label: "Watched", icons::Check {} } }
                 if fraction > 0.0 && !done { div { class: "card-progress", div { style: "width: {fraction * 100.0}%" } } }
             }
-            span { class: "card-title", "{media.name}" }
         }
     }
 }

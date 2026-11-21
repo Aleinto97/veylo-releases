@@ -42,6 +42,13 @@ pub fn TitlePage(media: Media) -> Element {
     let mut chooser = use_signal(|| None::<Chooser>);
     let mut logo_failed = use_signal(|| false);
     let mut busy = use_signal(|| None::<String>);
+    // Its place in today's chart (BetterPosters), shown as a fact.
+    let mut rank = use_signal(|| None::<u64>);
+    let for_rank = media.clone();
+    use_hook(move || { spawn(async move { rank.set(backend::today_rank(&for_rank).await); }); });
+    // The backdrop dissolves through the production's own frames, slowly.
+    let mut frame = use_signal(|| 0usize);
+    use_future(move || async move { loop { backend::sleep(9000).await; *frame.write() += 1; } });
 
     let for_meta = media.clone();
     use_hook(move || {
@@ -156,18 +163,37 @@ pub fn TitlePage(media: Media) -> Element {
     let lamp_src = backdrop.clone();
     use_effect(use_reactive!(|lamp_src| if *lamp.peek() != lamp_src { lamp.set(lamp_src); }));
     let trailer = facts.as_ref().map(|m| m.trailers.clone()).filter(|t| !t.is_empty());
+    let production = art().unwrap_or_default();
+    // The backdrop the page opened with stays the first frame; a better one arriving later (TMDB's
+    // text-free art) dissolves in over it instead of replacing it.
+    let first = use_hook(|| backdrop.clone());
+    let mut frames: Vec<String> = vec![first.clone(), backdrop.clone()];
+    for s in &production.stills { frames.push(s.clone()); }
+    let mut unique = std::collections::HashSet::new();
+    frames.retain(|f| unique.insert(f.clone()));
+    frames.retain(|f| !f.is_empty());
+    let arrived = backdrop != first && !first.is_empty();
+    use_effect(use_reactive!(|arrived| if arrived && *frame.peek() == 0 { frame.set(1); }));
+    let on_frame = if frames.is_empty() { 0 } else { frame() % frames.len() };
+    // Only logos that read as white idents (see backend::idents).
+    let mut idents = use_signal(Vec::<backend::Studio>::new);
+    let studios = production.studios.clone();
+    use_effect(use_reactive!(|studios| { spawn(async move { idents.set(backend::idents(studios).await); }); }));
 
     rsx! {
         article { class: "title-page", aria_label: "{media.name}",
             section { class: "title-hero",
-                if !backdrop.is_empty() { img { class: "title-art", src: "{backdrop}", alt: "" } }
-                crate::home::PosterArt { media: media.clone(), class: "title-poster".to_string() }
+                for (i, src) in frames.iter().enumerate() {
+                    img { key: "{src}", class: if i == on_frame { "title-art on" } else { "title-art" }, src: "{src}", alt: "" }
+                }
                 div { class: "title-copy",
                     match logo.filter(|_| !logo_failed()) {
                         Some(src) => rsx! { img { class: "title-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
                         None => rsx! { h1 { class: "display title-name", "{media.name}" } },
                     }
+                    if let Some(t) = production.tagline.clone() { p { class: "tagline", "{t}" } }
                     div { class: "facts",
+                        if let Some(r) = rank() { span { class: "fact today", title: "Most watched today on TMDB (BetterPosters)", icons::Trophy {} span { class: "tnum", "#{r} today" } } }
                         if let Some(r) = facts.as_ref().map(|m| m.rating.clone()).filter(|r| !r.is_empty()) {
                             span { class: "fact", title: "IMDb rating", span { class: "lamp", icons::Star {} } span { class: "tnum", "{r}" } }
                         }
@@ -179,7 +205,8 @@ pub fn TitlePage(media: Media) -> Element {
                             match media.kind.as_str() { "movie" => rsx! { icons::Film {} }, "series" => rsx! { icons::Tv {} }, _ => rsx! { icons::Blossom {} } }
                             span { "{backend::type_label(&media.kind)}" }
                         }
-                        if !media.genres.is_empty() { span { class: "fact", title: "Genres", icons::Tag {} span { {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", ")} } } }
+                        if !media.genres.is_empty() { span { class: "fact genres", title: media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", "), icons::Tag {} span { {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", ")} } } }
+                        if let Some(c) = production.certificate.clone() { span { class: "fact cert", title: "Certificate", "{c}" } }
                     }
                     div { class: "title-actions",
                         // A series carries on where you are: the started episode, else the one after the last you watched.
@@ -228,15 +255,24 @@ pub fn TitlePage(media: Media) -> Element {
 
             div { class: "title-body",
                 if !media.description.is_empty() { p { class: "title-synopsis", "{media.description}" } }
+                else if let Some(d) = facts.as_ref().map(|m| m.description.clone()).filter(|d| !d.is_empty()) { p { class: "title-synopsis", "{d}" } }
+                // The studios and networks behind it, as quiet idents.
+                if !idents().is_empty() {
+                    div { class: "studios", aria_label: "Made by",
+                        for st in idents() { img { key: "{st.logo}", src: "{st.logo}", alt: "{st.name}", title: "{st.name}" } }
+                    }
+                }
 
                 match meta() {
                     Load::Loading => rsx! { div { class: "rows", for i in 0..3 { div { key: "{i}", class: "row skeleton-row" } } } },
                     Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
                     Load::Ready(m) => rsx! {
                         if !film { Episodes { list: m.episodes.clone(), media: media.clone(), season: season, last: media.last_video_id.clone(), busy: busy(), seen: seen,
+                            posters: production.season_posters.clone(),
                             on_play: move |(id, label): (String, String)| autoplay.call((id, Some(label))),
                             on_sources: move |(id, label): (String, String)| chooser.set(Some(Chooser { video: id, label: Some(label) })) } }
-                        Credits { meta: m.clone() }
+                        Videos { videos: production.videos.clone() }
+                        Credits { meta: m.clone(), production: production.clone() }
                     },
                 }
             }
@@ -313,6 +349,15 @@ fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source
 pub fn resume_now(mut shell: Shell, media: Media) {
     if media.kind == "movie" { let id = media.id.clone(); play_next(shell, media, id, None); return; }
     match media.last_video_id.clone() {
+        // The last episode is finished: carry on with the one after it, not that episode again.
+        Some(video) if media.video_watched => {
+            spawn(async move {
+                let list = backend::title_meta(&media).await.map(|m| m.episodes).unwrap_or_default();
+                let next = next_episode(&list, &video).map(|e| e.id).unwrap_or(video);
+                let label = backend::episode_label(&next);
+                play_next(shell, media, next, label);
+            });
+        }
         Some(video) => {
             // The label comes from the video id's own season/episode numbers (series:season:episode).
             let label = backend::episode_label(&video);
@@ -356,15 +401,21 @@ fn play_next(mut shell: Shell, media: Media, video: String, label: Option<String
     });
 }
 
-/// Season chips, then the season's episodes. Tapping an episode plays it with the
+/// Episodes shown at once; a longer season gets range chips (divisible by 2, 3 and 4 columns).
+const EPISODE_PAGE: usize = 24;
+
+/// Season chips, then the season's episodes as a grid. Tapping an episode plays it with the
 /// automatic choice; its list icon opens the manual chooser instead.
 #[component]
 fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last: Option<String>, busy: Option<String>,
-            seen: Signal<std::collections::HashSet<String>>, on_play: EventHandler<(String, String)>, on_sources: EventHandler<(String, String)>) -> Element {
+            seen: Signal<std::collections::HashSet<String>>, on_play: EventHandler<(String, String)>, on_sources: EventHandler<(String, String)>,
+            #[props(default)] posters: std::collections::HashMap<i64, String>) -> Element {
     let mut shell = use_context::<Shell>();
     let mut season = season;
     // TMDB stills for the shown season, used where the add-on gives no thumbnail.
     let mut stills = use_signal(std::collections::HashMap::<i64, String>::new);
+    // The range of a long season you chose, for that season; otherwise the one with your next episode.
+    let mut range = use_signal(|| None::<(Option<i64>, usize)>);
     let for_stills = media.clone();
     use_effect(move || {
         let Some(n) = season() else { return };
@@ -398,9 +449,31 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
     let season_ids: Vec<String> = shown.iter().map(|e| e.id.clone()).collect();
     let season_done = !season_ids.is_empty() && season_ids.iter().all(|id| seen.read().contains(id));
     let season_name = match season() { Some(0) => "Extras".to_string(), Some(n) => format!("Season {n}"), None => String::new() };
+    // Where you are in this season: the episode you stopped in, else the one after the last you
+    // watched, else the first you haven't seen.
+    let next_index = { let s = seen.read(); let at = last.as_ref().and_then(|l| shown.iter().position(|e| &e.id == l));
+        match at { Some(i) if !s.contains(&shown[i].id) => Some(i), Some(i) if i + 1 < shown.len() => Some(i + 1), _ => shown.iter().position(|e| !s.contains(&e.id)) } };
+    let next_id = next_index.map(|i| shown[i].id.clone());
+    let pages = shown.len().div_ceil(EPISODE_PAGE);
+    let current = match range() { Some((s, p)) if s == season() && p < pages => p, _ => next_index.map(|i| i / EPISODE_PAGE).unwrap_or(0) };
+    let visible: Vec<Episode> = shown.iter().skip(current * EPISODE_PAGE).take(EPISODE_PAGE).cloned().collect();
     rsx! {
         section { class: "episodes-block",
-            if seasons.len() > 1 {
+            // Each season by its own poster when the production has them, else a chip.
+            if seasons.len() > 1 && seasons.iter().any(|n| posters.contains_key(n)) {
+                div { class: "season-cards", role: "radiogroup", aria_label: "Season",
+                    for n in seasons.clone() {
+                        button { key: "{n}", class: if season() == Some(n) { "season-card on" } else { "season-card" },
+                            role: "radio", aria_checked: "{season() == Some(n)}", onclick: move |_| season.set(Some(n)),
+                            div { class: "sp",
+                                if let Some(src) = posters.get(&n) { img { src: "{src}", alt: "", loading: "lazy" } }
+                                else { span { class: "display", if n == 0 { "Extras" } else { "{n}" } } }
+                            }
+                            span { if n == 0 { "Extras" } else { "Season {n}" } }
+                        }
+                    }
+                }
+            } else if seasons.len() > 1 {
                 div { class: "season-chips", role: "radiogroup", aria_label: "Season",
                     for n in seasons {
                         button { class: if season() == Some(n) { "chip-btn glass on small-chip" } else { "chip-btn glass small-chip" },
@@ -417,9 +490,37 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                     span { "{season_name} watched" }
                 }
             }
-            div { class: "ep-list",
-                for e in shown.clone() {
-                    div { key: "{e.id}", class: if last.as_deref() == Some(e.id.as_str()) { "ep-card glass last" } else { "ep-card glass" },
+            if pages > 1 {
+                // A long season in ranges of 24; the dot marks the range holding your next episode.
+                div { class: "range-chips", role: "radiogroup", aria_label: "Episodes",
+                    for p in 0..pages {
+                        {
+                            let chunk = &shown[p * EPISODE_PAGE..((p + 1) * EPISODE_PAGE).min(shown.len())];
+                            let (first, to) = (chunk[0].number, chunk[chunk.len() - 1].number);
+                            let here = next_index.is_some_and(|i| i / EPISODE_PAGE == p);
+                            rsx! {
+                                button { class: if p == current { "range on" } else { "range" }, role: "radio", aria_checked: "{p == current}",
+                                    aria_label: "Episodes {first} to {to}", onclick: move |_| range.set(Some((season(), p))),
+                                    span { class: "tnum", "{first}–{to}" }
+                                    if here { i { class: "range-dot", title: "Up next is here" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Keyed by season and range, so a new page of episodes lifts in.
+            for k in [format!("{:?}-{current}", season())] {
+            div { key: "{k}", class: "ep-grid",
+                for (i, e) in visible.iter().cloned().enumerate() {
+                    {
+                    let done = seen.read().contains(&e.id);
+                    let is_last = last.as_deref() == Some(e.id.as_str());
+                    let is_next = next_id.as_deref() == Some(e.id.as_str());
+                    let ids: Vec<String> = shown.iter().filter(|x| if done { x.number >= e.number } else { x.number <= e.number }).map(|x| x.id.clone()).collect();
+                    rsx! {
+                    div { key: "{e.id}", style: "--i: {i.min(8)}",
+                        class: format!("ep-tile glass{}{}{}", if is_next { " next" } else { "" }, if done { " seen" } else { "" }, if is_last { " last" } else { "" }),
                         button { class: "ep-main", disabled: busy.is_some(),
                             aria_label: "Play episode {e.number}: {e.title}",
                             onclick: { let (id, l) = (e.id.clone(), format!("S{} E{}", e.season, e.number)); move |_| on_play.call((id.clone(), l.clone())) },
@@ -427,39 +528,39 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                                 if let Some(src) = Some(e.thumbnail.clone()).filter(|t| !t.is_empty()).or_else(|| stills.read().get(&e.number).cloned()) {
                                     img { src: "{src}", alt: "", loading: "lazy" }
                                 }
+                                if is_next { span { class: "ep-next", "Up next" } }
                                 span { class: "ep-play", if busy.as_deref() == Some(e.id.as_str()) { span { class: "spinner" } } else { icons::Play {} } }
                             }
                             div { class: "ep-copy",
                                 div { class: "ep-head",
                                     span { class: "tag q tnum", "E{e.number}" }
                                     span { class: "ep-name", "{e.title}" }
-                                    if last.as_deref() == Some(e.id.as_str()) { span { class: "lamp", title: "Last watched", icons::History {} } }
+                                    if is_last { span { class: "lamp", title: "Last watched", icons::History {} } }
                                 }
                                 if !e.overview.is_empty() { p { class: "ep-overview clamp-2", "{e.overview}" } }
-                                if !e.released.is_empty() { span { class: "ep-date dim tnum", "{backend::date_label(&e.released)}" } }
                             }
                         }
-                        {
-                            let done = seen.read().contains(&e.id);
-                            let ids: Vec<String> = shown.iter().filter(|x| if done { x.number >= e.number } else { x.number <= e.number }).map(|x| x.id.clone()).collect();
-                            rsx! {
-                                icons::IconButton { label: if done { format!("Watched E{}: unmark it and later episodes", e.number) } else { format!("Watched up to E{}", e.number) },
-                                    class: if done { "small ep-seen on" } else { "small ep-seen" }, pressed: done,
-                                    onclick: move |_| mark.call((ids.clone(), !done)), icons::Check {} }
-                            }
+                        div { class: "ep-foot",
+                            span { class: "ep-date dim tnum", if !e.released.is_empty() { "{backend::date_label(&e.released)}" } }
+                            icons::IconButton { label: if done { format!("Watched E{}: unmark it and later episodes", e.number) } else { format!("Watched up to E{}", e.number) },
+                                class: if done { "small ep-seen on" } else { "small ep-seen" }, pressed: done,
+                                onclick: move |_| mark.call((ids.clone(), !done)), icons::Check {} }
+                            icons::IconButton { label: "Choose a source", class: "small",
+                                onclick: { let (id, l) = (e.id.clone(), format!("S{} E{}", e.season, e.number)); move |_| on_sources.call((id.clone(), l.clone())) },
+                                icons::List {} }
                         }
-                        icons::IconButton { label: "Choose a source", class: "small",
-                            onclick: { let (id, l) = (e.id.clone(), format!("S{} E{}", e.season, e.number)); move |_| on_sources.call((id.clone(), l.clone())) },
-                            icons::List {} }
+                    }
+                    }
                     }
                 }
+            }
             }
         }
     }
 }
 
 #[component]
-fn Credits(meta: TitleMeta) -> Element {
+fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> Element {
     let mut shell = use_context::<Shell>();
     let row = |label: &'static str, icon: Element, names: Vec<String>| rsx! {
         if !names.is_empty() {
@@ -477,15 +578,70 @@ fn Credits(meta: TitleMeta) -> Element {
     let fact = |label: &'static str, icon: Element, value: String| rsx! {
         if !value.is_empty() { div { class: "credit-row", span { class: "credit-icon", title: label, aria_label: label, {icon} } span { class: "credit-text", "{value}" } } }
     };
+    // The real cast, with their photos and parts, when TMDB has them; else the add-on's names.
+    let faces = production.cast.iter().any(|p| p.photo.is_some());
+    let crew = !production.crew.is_empty();
+    let language = production.language.clone().unwrap_or_else(|| meta.language.clone());
     rsx! {
+        if faces {
+            section { class: "people-block",
+                div { class: "group-head", span { class: "group-icon", icons::Users {} } span { class: "group-name", "Cast" } }
+                div { class: "people",
+                    for p in production.cast.clone() {
+                        button { key: "{p.name}", class: "person", title: "Search {p.name}",
+                            onclick: { let n = p.name.clone(); move |_| { shell.search_query.set(Some(n.clone())); shell.search_open.set(true); } },
+                            span { class: "face",
+                                if let Some(src) = p.photo.clone() { img { src: "{src}", alt: "", loading: "lazy" } }
+                                else { span { class: "display", "{p.name.chars().next().unwrap_or(' ')}" } }
+                            }
+                            span { class: "person-name", "{p.name}" }
+                            if !p.role.is_empty() { span { class: "person-role dim", "{p.role}" } }
+                        }
+                    }
+                }
+            }
+        }
+        if crew {
+            dl { class: "crew",
+                for (label, names) in production.crew.clone() {
+                    div { key: "{label}", dt { "{label}" } dd { {names.join(", ")} } }
+                }
+            }
+        }
         section { class: "credits",
-            {row("Director", rsx! { icons::Clapper {} }, meta.directors.clone())}
-            {row("Cast", rsx! { icons::Users {} }, meta.cast.clone())}
-            {row("Writers", rsx! { icons::Pen {} }, meta.writers.clone())}
+            if !crew { {row("Director", rsx! { icons::Clapper {} }, meta.directors.clone())} }
+            if !faces { {row("Cast", rsx! { icons::Users {} }, meta.cast.clone())} }
+            if !crew { {row("Writers", rsx! { icons::Pen {} }, meta.writers.clone())} }
             {fact("Released", rsx! { icons::Calendar {} }, meta.released.clone())}
             {fact("Country", rsx! { icons::Globe {} }, meta.country.clone())}
-            {fact("Language", rsx! { icons::Speech {} }, meta.language.clone())}
+            {fact("Language", rsx! { icons::Speech {} }, language)}
             {fact("Awards", rsx! { icons::Trophy {} }, meta.awards.clone())}
+        }
+    }
+}
+
+/// The production's videos (trailers, featurettes, behind the scenes) as a row of thumbnails.
+#[component]
+fn Videos(videos: Vec<backend::Video>) -> Element {
+    let shell = use_context::<Shell>();
+    rsx! {
+        if !videos.is_empty() {
+            section { class: "videos",
+                div { class: "group-head", span { class: "group-icon", icons::Clapper {} } span { class: "group-name", "Videos" } }
+                div { class: "video-row",
+                    for v in videos {
+                        button { key: "{v.youtube}", class: "video", aria_label: "Play {v.name}",
+                            onclick: { let k = v.youtube.clone(); move |_| crate::play_trailers(shell, vec![backend::Trailer { youtube: Some(k.clone()), url: None }]) },
+                            span { class: "video-thumb",
+                                img { src: "https://i.ytimg.com/vi/{v.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }
+                                span { class: "ep-play", icons::Play {} }
+                            }
+                            span { class: "video-name", "{v.name}" }
+                            span { class: "video-kind dim", "{v.kind}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }

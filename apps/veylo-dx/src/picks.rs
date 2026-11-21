@@ -262,6 +262,17 @@ pub fn Picks() -> Element {
             None => pair.set(if left { (Some(kept), None) } else { (None, Some(kept)) }),
         }
     };
+    // Keeping is seen before it happens: the kept card steps forward, the other steps back
+    // (style.css, .keep-left/.keep-right), then the duel moves on. Presses meanwhile are ignored.
+    let mut leaving = use_signal(|| None::<bool>);
+    let mut choose = move |left: bool| {
+        if leaving.peek().is_some() { return; }
+        let ready = { let (l, r) = resolved_pair.peek().clone();
+            l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())) };
+        if !ready { return; }
+        leaving.set(Some(left));
+        spawn(async move { backend::sleep(280).await; keep(left); leaving.set(None); });
+    };
 
     // A kept title waiting for the catalogue to catch up retains all duel evidence.
     use_effect(move || {
@@ -375,8 +386,8 @@ pub fn Picks() -> Element {
         shell.pick_command.set(None);
         if slot.peek().is_some() { return; }
         match command {
-            PickCommand::Left if winner.peek().is_none() => keep(true),
-            PickCommand::Right if winner.peek().is_none() => keep(false),
+            PickCommand::Left if winner.peek().is_none() => choose(true),
+            PickCommand::Right if winner.peek().is_none() => choose(false),
             PickCommand::Skip => change_pair(false),
             PickCommand::Neither => change_pair(true),
             PickCommand::Continue => continue_duel(),
@@ -411,6 +422,7 @@ pub fn Picks() -> Element {
                 }
                 div { class: "chips",
                     div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
+                        i { class: "slider", aria_hidden: "true" }
                         for (value, label) in type_options {
                             button { class: if kind().as_deref() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{kind().as_deref() == value}",
                                 aria_label: "{label}", title: "{label}", onclick: move |_| kind.set(value.map(str::to_owned)),
@@ -420,6 +432,7 @@ pub fn Picks() -> Element {
                     }
                     // Style beside type: animated films and series are still films and series.
                     div { class: "segmented glass", role: "radiogroup", aria_label: "Style",
+                        i { class: "slider", aria_hidden: "true" }
                         for (value, label) in style_options {
                             button { class: if style() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{style() == value}",
                                 aria_label: "{label}", title: "{label}", onclick: move |_| style.set(value),
@@ -439,8 +452,7 @@ pub fn Picks() -> Element {
                             hide_watched.set(on);
                         },
                         icons::EyeOff {} }
-                    icons::IconButton { label: "Start over: forget what Picks learned", class: "glass small",
-                        onclick: move |_| { backend::reset_taste(); taste.set(Taste::default()); start_duel(); }, icons::Undo {} }
+                    StartOver { on_reset: move |_| { backend::reset_taste(); taste.set(Taste::default()); start_duel(); } }
                 }
             }
             match slot() {
@@ -490,15 +502,15 @@ pub fn Picks() -> Element {
             } else {
                 match resolved_pair() {
                     (Some(l), Some(r)) => rsx! {
-                        div { class: "duel-cards",
+                        div { class: match leaving() { Some(true) => "duel-cards keep-left", Some(false) => "duel-cards keep-right", None => "duel-cards" },
                             // A key only renews a component inside a list: a new title must get a new card.
                             // A card shows once its poster and trailer are confirmed.
                             if verified.read().contains(&l.key()) && rules::style_matches(&l,style()) {
-                                for m in [l.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "left", on_keep: move |_| keep(true) } }
+                                for m in [l.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "left", on_keep: move |_| choose(true) } }
                             } else { div { class: "duel-card skeleton-card" } }
                             span { class: "versus display", aria_hidden: "true", "or" }
                             if verified.read().contains(&r.key()) && rules::style_matches(&r,style()) {
-                                for m in [r.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "right", on_keep: move |_| keep(false) } }
+                                for m in [r.clone()] { DuelCard { key: "{m.key()}", media: m.clone(), side: "right", on_keep: move |_| choose(false) } }
                             } else { div { class: "duel-card skeleton-card" } }
                         }
                     },
@@ -538,7 +550,6 @@ fn DuelCard(media: Media, side: &'static str, on_keep: EventHandler<()>) -> Elem
             if !backdrop.is_empty() { img { class: "duel-art", src: "{backdrop}", alt: "" } }
             button { class: "duel-hit", aria_label: "Keep {media.name} ({arrow})", onclick: move |_| on_keep.call(()) }
             div { class: "duel-copy",
-                crate::home::PosterArt { media: media.clone(), class: "duel-poster".to_string() }
                 match logo.filter(|_| !logo_failed()) {
                     Some(src) => rsx! { img { class: "duel-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
                     None => rsx! { h2 { class: "display duel-title", "{media.name}" } },
@@ -604,7 +615,6 @@ fn FinalPick(media: Media, reason: String, on_continue: EventHandler<()>, on_res
     rsx! {
         article { class: "final-pick", aria_label: "Your pick: {media.name}",
             if !backdrop.is_empty() { img { class: "final-art", src: "{backdrop}", alt: "" } }
-            crate::home::PosterArt { media: media.clone(), class: "final-poster".to_string() }
             div { class: "final-copy",
                 p { class: "reason", span { class: "lamp", icons::Sparkles {} } span { "{reason}" } }
                 h1 { class: "display pick-title", "{media.name}" }
@@ -615,9 +625,28 @@ fn FinalPick(media: Media, reason: String, on_continue: EventHandler<()>, on_res
                     if let Some(t) = trailer { icons::IconButton { label: "Trailer", class: "glass", onclick: move |_| crate::play_trailers(shell, t.clone()), icons::Clapper {} } }
                     icons::IconButton { label: "Details", class: "glass", onclick: move |_| shell.opened.set(Some(open.clone())), icons::Info {} }
                     icons::IconButton { label: "Keep exploring (C)", class: "glass", onclick: move |_| on_continue.call(()), icons::ArrowRight {} }
-                    icons::IconButton { label: "Start over: forget what Picks learned", class: "glass", onclick: move |_| on_reset.call(()), icons::Undo {} }
+                    StartOver { on_reset: move |_| on_reset.call(()) }
                 }
             }
+        }
+    }
+}
+
+/// "Start over" forgets everything Picks learned and can't be undone, so the first press only
+/// asks. `labelled` is the Settings row's worded button; elsewhere an icon.
+#[component]
+pub fn StartOver(on_reset: EventHandler<()>, #[props(default)] labelled: bool) -> Element {
+    let mut armed = use_signal(|| false);
+    rsx! {
+        if armed() {
+            span { class: "confirm", role: "group", aria_label: "Forget what Picks learned?",
+                button { class: "pill forget-confirm", onclick: move |_| { armed.set(false); on_reset.call(()) }, icons::Trash {} span { "Forget taste" } }
+                icons::IconButton { label: "Keep it", class: "glass small", onclick: move |_| armed.set(false), icons::Close {} }
+            }
+        } else if labelled {
+            button { class: "pill glass", onclick: move |_| armed.set(true), icons::Undo {} span { "Start over" } }
+        } else {
+            icons::IconButton { label: "Start over: forget what Picks learned", class: "glass small", onclick: move |_| armed.set(true), icons::Trash {} }
         }
     }
 }
@@ -642,7 +671,6 @@ pub fn PosterButton(media: Media, on_press: EventHandler<Media>, #[props(default
                 }
                 if badge.is_some() { span { class: "badge", aria_hidden: "true", icons::Heart {} } }
             }
-            span { class: "poster-name", "{media.name}" }
             span { class: "poster-meta", "{media.meta_line(false)}" }
         }
     }

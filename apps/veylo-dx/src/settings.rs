@@ -62,11 +62,14 @@ pub fn SettingsPage() -> Element {
             h1 { class: "display title", "Settings" }
 
             section { class: "settings-block",
-                div { class: "group-head", span { class: "group-icon", icons::Grid {} } span { class: "group-name", "Posters" } }
+                div { class: "group-head", span { class: "group-icon", icons::Grid {} } span { class: "group-name", "Charts and posters" } }
                 div { class: "setting-row glass",
-                    div { class: "setting-copy", span { class: "setting-name", "Poster source" }
-                        span { class: "dim setting-about", "BetterPosters adds rating and genre tags; the add-on's poster is used when it has none" } }
-                    div { class: "segmented glass", role: "radiogroup", aria_label: "Poster source",
+                    div { class: "setting-copy", span { class: "setting-name", "Source" }
+                        span { class: "dim setting-about",
+                            if settings().better_posters { "BetterPosters: Trakt and TMDB charts on Home, posters with rating and genre tags, and fuller details. Cinemeta fills in when it can't answer." }
+                            else { "Your add-ons' own catalogs, posters and details" } } }
+                    div { class: "segmented glass", role: "radiogroup", aria_label: "Charts and posters source",
+                        i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "BetterPosters"), (false, "Add-on")] {
                             button { class: if settings().better_posters == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().better_posters == on}",
                                 onclick: move |_| { let next = backend::Settings { better_posters: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
@@ -103,7 +106,7 @@ pub fn SettingsPage() -> Element {
                 }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Learned taste" } span { class: "dim setting-about", "What Picks learned from your duels" } }
-                    button { class: "pill glass", onclick: move |_| backend::reset_taste(), icons::Undo {} span { "Start over" } }
+                    crate::picks::StartOver { labelled: true, on_reset: move |_| backend::reset_taste() }
                 }
             }
 
@@ -172,8 +175,8 @@ pub fn SettingsPage() -> Element {
                                         } else if let Some(r) = row.clone() {
                                             if let Some(v) = r.update.clone() {
                                                 { let r = r.clone(); rsx! { button { class: "pill accent", disabled: busy().is_some(), onclick: move |_| { let r = r.clone(); run(c.name().into(), Box::pin(async move { addons::update(&r).await })) }, icons::Refresh {} span { "Update to {v}" } } } }
-                                            } else { span { class: "pill static glass", icons::Check {} span { "Installed" } } }
-                                            button { class: "pill glass", disabled: busy().is_some(), onclick: move |_| { let r = r.clone(); run(c.name().into(), Box::pin(async move { addons::remove(&r).await })) }, icons::Trash {} span { "Remove" } }
+                                            } else { span { class: "market-status", icons::Check {} span { "Installed" } } }
+                                            button { class: "pill glass small", disabled: busy().is_some(), onclick: move |_| { let r = r.clone(); run(c.name().into(), Box::pin(async move { addons::remove(&r).await })) }, icons::Trash {} span { "Remove" } }
                                         } else {
                                             button { class: "pill accent", disabled: busy().is_some() || (c.needs_key() && settings().rd_key.is_none()),
                                                 title: if c.needs_key() && settings().rd_key.is_none() { "Add your Real-Debrid key first" } else { "" },
@@ -231,6 +234,7 @@ fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
                     div { class: "setting-copy", span { class: "setting-name", "HDR output" }
                         span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when Windows HDR is on. Always SDR tone-maps them, for screens whose HDR looks washed out. Applies from the next video." } }
                     div { class: "segmented glass", role: "radiogroup", aria_label: "HDR output",
+                        i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "Automatic"), (false, "Always SDR")] {
                             button { class: if settings().hdr_output == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().hdr_output == on}",
                                 onclick: move |_| { let next = backend::Settings { hdr_output: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }

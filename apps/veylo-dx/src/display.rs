@@ -48,8 +48,8 @@ mod imp {
     /// The DXGI output showing Veylo's window: Windows HDR is on for it when its colour space is
     /// PQ/BT.2020 (what "Use HDR" switches); its peak luminance comes with it.
     pub fn screen() -> Option<Screen> {
-        use dioxus::desktop::tao::platform::windows::WindowExtWindows;
-        let hwnd = HWND(dioxus::desktop::window().window.hwnd() as *mut core::ffi::c_void);
+        // The shell's window, from its picture bridge (each shell has its own video.rs).
+        let hwnd = HWND(crate::video::hwnd()? as *mut core::ffi::c_void);
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
         for a in 0.. {

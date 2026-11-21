@@ -19,6 +19,12 @@ pub fn layout(live: &Live) { imp::layout(live) }
 pub fn install() { imp::install() }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
+/// Windows: the app window, for the screen's HDR state (display.rs).
+#[cfg(target_os = "windows")]
+pub fn hwnd() -> Option<isize> {
+    use dioxus::desktop::tao::platform::windows::WindowExtWindows;
+    Some(dioxus::desktop::window().window.hwnd() as isize)
+}
 
 #[cfg(target_os = "android")]
 mod imp {

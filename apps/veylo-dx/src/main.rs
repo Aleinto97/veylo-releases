@@ -15,6 +15,7 @@ mod picks_ai;
 mod picks_metadata;
 mod picks_rules;
 mod player;
+mod player_rules;
 mod player_ui;
 mod search;
 mod settings;
@@ -337,6 +338,74 @@ fn Shell_() -> Element {
     use_hook(|| { document::eval(r#"window.addEventListener('keydown', e => {
         if (e.target === document.body) { const a = document.querySelector('.app'); if (a) { a.focus(); a.dispatchEvent(new KeyboardEvent('keydown', e)); } }
     });"#); });
+    // The top bar gathers smoke once the page scrolls under it (style.css, .scrolled). Checked on
+    // scroll and, at most once a frame, when the page changes (a new tab or title starts at the top).
+    use_hook(|| { document::eval(r#"(() => {
+        const sync = () => { const p = document.querySelector('.page'); document.documentElement.classList.toggle('scrolled', !!p && p.scrollTop > 4); };
+        let queued = false;
+        const later = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; sync(); }); } };
+        document.addEventListener('scroll', e => { if (e.target.classList && e.target.classList.contains('page')) sync(); }, true);
+        new MutationObserver(later).observe(document.body, { childList: true, subtree: true });
+        // Opening a title: its backdrop opens out of the card you tapped (a clip that widens from
+        // the card's place to the whole hero). Nothing is stretched or swapped; the words lift in
+        // after (style.css). Remembered on tap, played when the page mounts.
+        let from = null;
+        document.addEventListener('click', e => {
+            const card = e.target.closest && e.target.closest('.card, .week-open');
+            const art = card && (card.querySelector('.card-art') || card);
+            from = art ? { r: art.getBoundingClientRect(), at: performance.now() } : null;
+        }, true);
+        const grow = () => {
+            const page = document.querySelector('.title-page');
+            if (!page || page.dataset.grown) return;
+            page.dataset.grown = '1';
+            // A title opens at its top, whatever the page behind it was scrolled to.
+            const scroller = document.querySelector('.page'); if (scroller) scroller.scrollTop = 0;
+            if (!from) return;
+            const f = from; from = null;
+            const hero = page.querySelector('.title-hero');
+            if (!hero || performance.now() - f.at > 1500 || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+            const h = hero.getBoundingClientRect(), clamp = (v, max) => Math.max(0, Math.min(v, max));
+            const top = clamp(f.r.top - h.top, h.height - 40), left = clamp(f.r.left - h.left, h.width - 40);
+            const bottom = clamp(h.bottom - f.r.bottom, h.height - top - 40), right = clamp(h.right - f.r.right, h.width - left - 40);
+            hero.style.clipPath = `inset(${top}px ${right}px ${bottom}px ${left}px round 8px)`;
+            hero.getBoundingClientRect();
+            hero.style.transition = 'clip-path .6s cubic-bezier(.16,1,.3,1)';
+            hero.style.clipPath = 'inset(0 0 0 0 round 0px)';
+            setTimeout(() => { hero.style.transition = ''; hero.style.clipPath = ''; }, 650);
+        };
+        // Selection pills slide: the dock's glass pill and each segmented control's thumb move to the
+        // selected item and take its width. Groups whose slider is placed get data-sliding, so the
+        // item's own fill steps aside (style.css); without this script the items keep their fill.
+        const slide = () => document.querySelectorAll('.dock, .segmented').forEach(g => {
+            const s = g.querySelector('.slider'), on = g.querySelector('.dock-tab.on, .seg.on');
+            if (!s) return;
+            if (!on) { s.style.opacity = '0'; return; }
+            const at = [on.offsetLeft, on.offsetTop, on.offsetWidth, on.offsetHeight];
+            if (s.dataset.at === at.join()) return;
+            const first = !s.dataset.at; s.dataset.at = at.join();
+            if (first) s.style.transition = 'none';
+            Object.assign(s.style, { left: at[0] + 'px', top: at[1] + 'px', width: at[2] + 'px', height: at[3] + 'px', opacity: '1' });
+            g.dataset.sliding = '';
+            if (first) requestAnimationFrame(() => requestAnimationFrame(() => { s.style.transition = ''; }));
+        });
+        addEventListener('resize', () => requestAnimationFrame(slide));
+        // A new tab slides in from the side you moved toward.
+        document.addEventListener('click', e => {
+            const t = e.target.closest && e.target.closest('.dock-tab');
+            if (!t) return;
+            const tabs = [...document.querySelectorAll('.dock-tab')], from = tabs.findIndex(x => x.classList.contains('on'));
+            document.documentElement.style.setProperty('--dir', tabs.indexOf(t) < from ? '-1' : '1');
+        }, true);
+        // Light on glass: a soft highlight follows the finger or pointer over a poster.
+        const glare = e => { const art = e.target.closest && e.target.closest('.card-art');
+            if (!art) return; const r = art.getBoundingClientRect();
+            art.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100).toFixed(1) + '%');
+            art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%'); };
+        document.addEventListener('pointermove', glare, { passive: true });
+        document.addEventListener('pointerdown', glare, { passive: true });
+        new MutationObserver(() => requestAnimationFrame(() => { grow(); slide(); })).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+    })();"#); });
 
     rsx! {
         style { {fonts} }
@@ -393,6 +462,8 @@ fn TopBar() -> Element {
             } else {
             span { class: "wordmark display", "Veylo" }
             nav { class: "dock glass", role: "tablist", aria_label: "Destinations",
+                // The pill that slides to the selected tab (positioned in the motion script below).
+                i { class: "slider", aria_hidden: "true" }
                 for t in Tab::ALL {
                     button {
                         class: if (shell.tab)() == t { "dock-tab on" } else { "dock-tab" },
@@ -414,6 +485,7 @@ fn TopBar() -> Element {
             }
             }
             span { class: "topbar-spacer" }
+            LastPlayed {}
             ShortcutButton {}
             icons::IconButton { label: "Search (Ctrl+K)", class: "glass", onclick: move |_| shell.search_open.set(true), icons::Search {} }
         }
@@ -501,6 +573,51 @@ pub fn open_external(url: &str) {
     { let _ = std::process::Command::new("open").arg(url).spawn(); }
     #[cfg(target_os = "windows")]
     { let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
+}
+
+/// The last thing you played, always top right: a play button ringed by how far you got (its
+/// name in the tooltip). One tap carries on at once (the player closes when you leave it).
+#[component]
+fn LastPlayed() -> Element {
+    let shell = use_context::<Shell>();
+    let last = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::viewing_history().await.ok().and_then(|l| l.into_iter().next()) } });
+    match last() {
+        Some(Some(seen)) => rsx! { for m in [seen.media] { LastPlayedButton { key: "{m.key()}", media: m.clone() } } },
+        _ => rsx! {},
+    }
+}
+
+#[component]
+fn LastPlayedButton(media: Media) -> Element {
+    let shell = use_context::<Shell>();
+    // A thin ring around the play button: how far you got. Only a title you are partway
+    // through resumes, so only then does the ring show progress.
+    const AROUND: f64 = 141.37; // 2π × 22.5
+    let resumes = backend::in_progress(&media);
+    let done = if resumes { (backend::progress_fraction(&media) * AROUND).clamp(0.0, AROUND) } else { 0.0 };
+    // One quiet line under the name: where you are, or what a tap will do.
+    let line = if resumes { Some(backend::resume_context(&media)).filter(|c| !c.is_empty() && c != "In progress").unwrap_or_else(|| "Carry on".into()) }
+        else if media.kind == "movie" { "Watch again".into() }
+        else if media.video_watched { "Next episode".into() }
+        else { "Carry on".into() };
+    let label = format!("{line}: {}", media.name);
+    let m = media.clone();
+    rsx! {
+        button { class: "last-played glass", title: "{label}", aria_label: "{label}",
+            onclick: move |_| title::resume_now(shell, m.clone()),
+            span { class: "lp-orb",
+                svg { class: "lp-ring", view_box: "0 0 48 48", "aria-hidden": "true",
+                    circle { class: "lp-track", cx: "24", cy: "24", r: "22.5" }
+                    if done > 0.0 { circle { class: "lp-done", cx: "24", cy: "24", r: "22.5", style: "stroke-dasharray: {done:.1} 200" } }
+                }
+                icons::Play {}
+            }
+            span { class: "lp-text",
+                span { class: "lp-name", "{media.name}" }
+                span { class: "lp-line", "{line}" }
+            }
+        }
+    }
 }
 
 /// The same discoverable control in the top bar and Search; player uses its own sheet.

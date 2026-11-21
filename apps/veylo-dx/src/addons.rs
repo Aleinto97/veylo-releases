@@ -205,6 +205,7 @@ pub async fn overview() -> Overview {
     let managed_url = |c: Curated, store: &Store| store.managed.get(c.id()).map(|m| s(m, "url"));
     let mut rows = Vec::new();
     for a in &addons {
+        if crate::backend::retired_addon(&s(a, "manifest_url")) { continue; }
         let version = s(a, "version");
         let key = seen_key(a);
         let update = match store.seen.get(&key) {

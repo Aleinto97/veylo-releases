@@ -19,7 +19,10 @@ use tokio::runtime::Runtime;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 const CINEMETA: &str = "https://v3-cinemeta.strem.io/manifest.json";
-const KITSU: &str = "https://anime-kitsu.strem.fun/manifest.json";
+/// Kitsu stays installed only so anime already in your Library keeps opening (its titles have
+/// Kitsu ids); it is no longer shown or browsed: Home, Search, Picks and Settings skip it.
+const KITSU_HOST: &str = "anime-kitsu.strem.fun";
+pub fn retired_addon(manifest_url: &str) -> bool { manifest_url.contains(KITSU_HOST) }
 const HISTORY_LIMIT: usize = 12;
 
 struct Backend {
@@ -223,8 +226,13 @@ pub fn group_label(kind: &str) -> String {
 /// Loads the bundled public catalogs so Picks has candidates to rank.
 /// Failures are tolerated: whatever arrives is still usable.
 pub async fn seed_catalogs() -> Vec<Media> {
-    let requests = [(CINEMETA, "movie", "top"), (CINEMETA, "series", "top"), (KITSU, "anime", "kitsu-anime-trending")];
+    let requests = [(CINEMETA, "movie", "top"), (CINEMETA, "series", "top")];
     let mut out = Vec::new();
+    if better_posters_on() {
+        for (kind, id) in [("movie", "trakt-trending"), ("series", "trakt-trending")] {
+            if let Some(v) = bp_get(format!("catalog/{kind}/{id}.json")).await { out.extend(bp_titles(&v, CINEMETA)); }
+        }
+    }
     for (addon, kind, id) in requests {
         let req = json!({"op":"catalog","addon_url":addon,"type":kind,"id":id});
         if let Ok(v) = exec(req).await {
@@ -278,6 +286,7 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
     let mut raw = Vec::new();
     for addon in v["addons"].as_array().into_iter().flatten() {
         let url = s(addon, "manifest_url");
+        if retired_addon(&url) { continue; }
         let (aid, aname) = (s(addon, "id"), s(addon, "name"));
         let catalogs: Vec<&Value> = addon["catalogs"].as_array().into_iter().flatten().collect();
         let free = catalogs.iter().filter(|c| !catalog_needs_extra(c));
@@ -292,6 +301,17 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
         if let Some(c) = animation {
             raw.push(RawRow { key: format!("{url}|series|top|genre=Animation"), title: "Anime & animation".into(), addon_id: aid.clone(),
                 addon_name: aname.clone(), addon_url: url.clone(), kind: s(c, "type"), id: s(c, "id"), extra: Some(("genre".into(), "Animation".into())) });
+        }
+    }
+    // BetterPosters on: its charts lead Home in place of Cinemeta's own catalogs (Cinemeta's
+    // animation shelf stays). Its titles keep Cinemeta as their add-on (see bp_titles).
+    if better_posters_on() {
+        if let Some(cinemeta) = raw.iter().find(|r| r.addon_id == "com.linvo.cinemeta").map(|r| r.addon_url.clone()) {
+            raw.retain(|r| r.addon_id != "com.linvo.cinemeta" || r.extra.is_some());
+            let charts = BP_CHARTS.iter().map(|(kind, id, title)| RawRow { key: format!("{BP_ROW}{kind}|{id}"), title: (*title).into(),
+                addon_id: "community.betterposters".into(), addon_name: "BetterPosters".into(), addon_url: cinemeta.clone(),
+                kind: (*kind).into(), id: (*id).into(), extra: None });
+            raw.splice(0..0, charts);
         }
     }
     let shared: Vec<String> = raw.iter().map(|r| r.title.clone()).filter(|t| {
@@ -310,6 +330,12 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
 }
 
 pub async fn catalog(row: CatalogRow) -> Result<Vec<Media>> {
+    // A BetterPosters chart; Cinemeta's popular list of the same type when it can't answer.
+    if row.key.starts_with(BP_ROW) {
+        let titles = bp_get(format!("catalog/{}/{}.json", row.kind, row.id)).await.map(|v| bp_titles(&v, &row.addon_url)).unwrap_or_default();
+        if !titles.is_empty() { return Ok(titles); }
+        return Box::pin(catalog(CatalogRow { key: String::new(), id: "top".into(), ..row })).await;
+    }
     let mut req = json!({"op":"catalog","addon_url":row.addon_url,"type":row.kind,"id":row.id});
     if let Some((k, v)) = &row.extra { req["extra"] = json!({ k.as_str(): v }); }
     let v = exec(req).await?;
@@ -439,7 +465,7 @@ pub struct Episode {
     pub thumbnail: String, pub overview: String, pub released: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Trailer { pub youtube: Option<String>, pub url: Option<String> }
 
 /// Everything the title's add-on says about it; absent fields stay empty, never invented.
@@ -459,6 +485,8 @@ pub struct TitleMeta {
     pub cast: Vec<String>,
     pub trailers: Vec<Trailer>,
     pub episodes: Vec<Episode>,
+    /// The synopsis, for titles whose catalog entry had none.
+    pub description: String,
 }
 
 fn names(meta: &Value, field: &str, link_category: &str) -> Vec<String> {
@@ -504,8 +532,15 @@ fn episodes_from_meta(meta: &Value) -> Vec<Episode> {
 }
 
 pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
-    let v = exec(json!({"op":"meta","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await?;
-    let meta = v.get("meta").unwrap_or(&v);
+    let request = exec(json!({"op":"meta","type":media.kind,"id":media.id,"addon_url":media.addon_url}));
+    let (addon, bp) = tokio::join!(request, bp_meta(media));
+    let meta = match (addon, bp) {
+        (Ok(v), bp) => merge_meta(v.get("meta").cloned().unwrap_or(v), bp.as_ref()),
+        // A title Cinemeta doesn't know yet: BetterPosters alone.
+        (Err(_), Some(bp)) => bp,
+        (Err(e), None) => return Err(e),
+    };
+    let meta = &meta;
     let episodes = episodes_from_meta(meta);
     let mut trailers: Vec<Trailer> = Vec::new();
     for t in meta["trailerStreams"].as_array().into_iter().flatten() {
@@ -517,7 +552,8 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
         }
     }
     trailers.retain(|t| t.youtube.is_some() || t.url.is_some());
-    trailers.dedup();
+    let mut seen_trailers = HashSet::new();
+    trailers.retain(|t| seen_trailers.insert(t.clone()));
     // TMDB's trailers follow the add-on's, as alternatives where one is blocked or missing.
     let art = artwork(media).await;
     let mut genres: Vec<String> = meta["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect();
@@ -541,6 +577,7 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
         cast: names(meta, "cast", "Cast"),
         trailers,
         episodes,
+        description: s(meta, "description"),
     })
 }
 
@@ -1104,6 +1141,7 @@ pub async fn search(query: String) -> Result<SearchOutcome> {
     let v = exec(json!({"op":"search","query":query})).await?;
     let mut out = SearchOutcome::default();
     for group in v.get("groups").and_then(Value::as_array).into_iter().flatten() {
+        if retired_addon(&s(group, "addon_url")) { continue; }
         out.catalogs += 1;
         let addon = s(group, "addon_name");
         if group.get("error").is_some() {
@@ -1285,6 +1323,149 @@ pub fn posters(m: &Media) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------- BetterPosters
+
+/// BetterPosters (btttr.cc) is a public Stremio add-on: Trakt and TMDB charts, metadata and the
+/// tagged posters. Veylo reads it directly, with a short timeout, and never installs it: its
+/// titles keep Cinemeta as their add-on, so the Library, history and sources stay keyed as
+/// before, and Cinemeta answers whenever BetterPosters is slow or down. "Add-on" in Settings
+/// turns all of it off.
+const BP_BASE: &str = "https://btttr.cc";
+/// Home row keys that are BetterPosters charts.
+const BP_ROW: &str = "betterposters|";
+const BP_CHARTS: [(&str, &str, &str); 5] = [
+    ("movie", "trakt-trending", "Trending movies"), ("series", "trakt-trending", "Trending series"),
+    ("movie", "trakt-popular", "Popular movies"), ("series", "trakt-popular", "Popular series"),
+    ("movie", "tmdb-top", "Top rated movies"),
+];
+
+pub fn better_posters_on() -> bool { BETTER_POSTERS.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// Answers by path and when they came: kept 15 minutes, a failure 2 minutes, so a stalled
+/// server isn't asked again on every screen.
+type Answers = HashMap<String, (i64, Option<Value>)>;
+static BP_CACHE: OnceLock<Mutex<Answers>> = OnceLock::new();
+
+async fn bp_get(path: String) -> Option<Value> {
+    let cache = BP_CACHE.get_or_init(Default::default);
+    let now = now_secs();
+    if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
+        if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
+    }
+    let url = format!("{BP_BASE}/{path}");
+    let got = on_runtime(async move {
+        let response = backend().http.get(url).timeout(Duration::from_secs(8)).send().await.ok()?.error_for_status().ok()?;
+        response.json::<Value>().await.ok()
+    }).await.ok().flatten();
+    if let Ok(mut c) = cache.lock() { c.insert(path, (now, got.clone())); }
+    got
+}
+
+/// A chart's titles as Cinemeta titles (`origin`): only IMDb ids, which Cinemeta also serves.
+fn bp_titles(v: &Value, origin: &str) -> Vec<Media> {
+    v["metas"].as_array().into_iter().flatten()
+        .filter(|m| s(m, "id").starts_with("tt"))
+        .filter_map(|m| Media::from_json(m, origin))
+        .scan(HashSet::new(), |seen, m| Some(seen.insert(m.key()).then_some(m))).flatten().collect()
+}
+
+/// BetterPosters' metadata for a film or series with an IMDb id.
+async fn bp_meta(m: &Media) -> Option<Value> {
+    if !better_posters_on() || !matches!(m.kind.as_str(), "movie" | "series") { return None; }
+    let id = imdb_of(m)?;
+    bp_get(format!("meta/{}/{id}.json", m.kind)).await?.get("meta").filter(|v| v.is_object()).cloned()
+}
+
+fn filled(v: &Value) -> bool {
+    !(v.is_null() || v.as_str().is_some_and(|t| t.trim().is_empty()) || v.as_array().is_some_and(Vec::is_empty))
+}
+
+/// The add-on's metadata with BetterPosters' laid over it: BetterPosters wins where it has a
+/// value, its trailers and credits come first, and the add-on's episode list stays (its ids
+/// find sources and keep watched marks) with BetterPosters' titles, stills and synopses on it.
+fn merge_meta(mut meta: Value, bp: Option<&Value>) -> Value {
+    let Some(bp) = bp.filter(|b| b.is_object()) else { return meta };
+    if !meta.is_object() { return bp.clone(); }
+    for key in ["logo", "runtime", "imdbRating", "released", "country", "description", "genres", "director", "cast", "writer"] {
+        if let Some(v) = bp.get(key).filter(|v| filled(v)) { meta[key] = v.clone(); }
+    }
+    for key in ["trailers", "trailerStreams", "links"] {
+        let mut list: Vec<Value> = bp[key].as_array().cloned().unwrap_or_default();
+        list.extend(meta[key].as_array().cloned().unwrap_or_default());
+        if !list.is_empty() { meta[key] = Value::Array(list); }
+    }
+    let episodes: HashMap<String, &Value> = bp["videos"].as_array().into_iter().flatten().map(|e| (s(e, "id"), e)).collect();
+    match meta["videos"].as_array_mut().filter(|v| !v.is_empty()) {
+        Some(videos) => for e in videos {
+            if let Some(b) = episodes.get(&s(e, "id")) {
+                for key in ["title", "thumbnail", "overview"] {
+                    if let Some(v) = b.get(key).filter(|v| filled(v)) { e[key] = v.clone(); }
+                }
+            }
+        },
+        None => if !episodes.is_empty() { meta["videos"] = bp["videos"].clone(); },
+    }
+    meta
+}
+
+static IDENTS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+/// The studio logos that read as white idents: transparent around the mark. A logo printed on its
+/// own solid background would turn into a white box, so it is left out. Kept for the session.
+pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
+    let cache = IDENTS.get_or_init(Default::default);
+    let mut out = Vec::new();
+    for st in studios {
+        let known = cache.lock().ok().and_then(|c| c.get(&st.logo).copied());
+        let ok = match known {
+            Some(ok) => ok,
+            None => {
+                let ok = transparent_edges(st.logo.replace("/w185/", "/w92/")).await.unwrap_or(false);
+                if let Ok(mut c) = cache.lock() { c.insert(st.logo.clone(), ok); }
+                ok
+            }
+        };
+        if ok { out.push(st); }
+    }
+    out
+}
+
+/// Whether the logo is a mark on see-through ground: a transparent corner, and ink over less than
+/// about half of it (a solid plate with rounded corners is not an ident).
+async fn transparent_edges(url: String) -> Option<bool> {
+    let bytes = on_runtime(async move {
+        backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?.bytes().await.ok()
+    }).await.ok().flatten()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 { return None; }
+    let corner = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].iter().any(|&(x, y)| img.get_pixel(x, y)[3] < 128);
+    let ink = img.pixels().filter(|p| p[3] >= 128).count() as f64 / (w as f64 * h as f64);
+    Some(corner && ink < 0.55)
+}
+
+/// Its place in BetterPosters' "today" chart (TMDB's most watched today; 1 is the top), if it is in it.
+pub async fn today_rank(m: &Media) -> Option<u64> {
+    if !better_posters_on() { return None; }
+    let id = imdb_of(m)?;
+    let chart = if m.kind == "series" { "catalog/series/tmdb-today-shows.json" } else { "catalog/movie/tmdb-today.json" };
+    let v = bp_get(chart.into()).await?;
+    v["metas"].as_array()?.iter().find(|x| s(x, "id") == id).and_then(|x| x["_rank"].as_u64())
+}
+
+/// Without a TMDB key, BetterPosters lends the same TMDB backdrop, logo and trailers.
+async fn bp_artwork(m: &Media) -> Option<Artwork> {
+    let meta = bp_meta(m).await?;
+    let art = Artwork {
+        genres: meta["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect(),
+        backdrop: Some(s(&meta, "background")).filter(|u| u.starts_with("https://")),
+        logo: Some(s(&meta, "logo")).filter(|u| u.starts_with("https://")),
+        trailers: meta["trailers"].as_array().into_iter().flatten().map(|t| s(t, "source")).filter(|k| !k.is_empty()).collect(),
+        ..Artwork::default()
+    };
+    (art.backdrop.is_some() || art.logo.is_some()).then_some(art)
+}
+
 // ---------------------------------------------------------------- TMDB artwork
 
 /// Wide artwork from TMDB: a text-free backdrop and an English logo. Empty fields fall back
@@ -1299,6 +1480,83 @@ pub struct Artwork {
     pub tmdb: Option<(String, i64)>,
     /// The TMDB collection a film belongs to (a series of films), for "watch part 1 first".
     pub collection: Option<i64>,
+    /// The title page's own material from the real production, all from the same TMDB answer:
+    /// more official frames (textless), its tagline, cast with photos and parts, key crew,
+    /// studio and network logos, the certificate, the original language, each season's
+    /// poster and the videos (trailers, featurettes, behind the scenes).
+    pub stills: Vec<String>,
+    pub tagline: Option<String>,
+    pub cast: Vec<Person>,
+    pub crew: Vec<(String, Vec<String>)>,
+    pub studios: Vec<Studio>,
+    pub certificate: Option<String>,
+    pub language: Option<String>,
+    pub season_posters: HashMap<i64, String>,
+    pub videos: Vec<Video>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Person { pub name: String, pub role: String, pub photo: Option<String> }
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Studio { pub name: String, pub logo: String }
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Video { pub youtube: String, pub name: String, pub kind: String }
+
+const TMDB_IMG: &str = "https://image.tmdb.org/t/p";
+
+/// The production's own material from one TMDB details answer (see Artwork).
+fn production(details: &Value, kind: &str, backdrop: Option<&str>) -> Artwork {
+    let img = |size: &str, v: &Value| v.as_str().filter(|p| !p.is_empty()).map(|p| format!("{TMDB_IMG}/{size}{p}"));
+    let mut frames: Vec<&Value> = details["images"]["backdrops"].as_array().into_iter().flatten().filter(|i| i["iso_639_1"].is_null()).collect();
+    frames.sort_by(|a, b| b["vote_average"].as_f64().unwrap_or(0.0).partial_cmp(&a["vote_average"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let stills: Vec<String> = frames.iter().filter_map(|i| img("w1280", &i["file_path"])).filter(|u| Some(u.as_str()) != backdrop).take(4).collect();
+    let tv = kind == "tv";
+    let credits = if tv { &details["aggregate_credits"] } else { &details["credits"] };
+    let cast = credits["cast"].as_array().into_iter().flatten().take(15).map(|c| Person {
+        name: s(c, "name"),
+        role: if tv { c["roles"][0]["character"].as_str().unwrap_or_default().to_owned() } else { s(c, "character") },
+        photo: img("w185", &c["profile_path"]),
+    }).filter(|p| !p.name.is_empty()).collect();
+    let mut crew: Vec<(String, Vec<String>)> = Vec::new();
+    let mut credit = |label: &str, name: String| {
+        if name.is_empty() { return; }
+        match crew.iter_mut().find(|(l, _)| l == label) {
+            Some((_, names)) => if !names.contains(&name) && names.len() < 3 { names.push(name) },
+            None => crew.push((label.to_owned(), vec![name])),
+        }
+    };
+    for c in details["created_by"].as_array().into_iter().flatten() { credit("Created by", s(c, "name")); }
+    for c in credits["crew"].as_array().into_iter().flatten() {
+        let jobs: Vec<String> = if tv { c["jobs"].as_array().into_iter().flatten().map(|j| s(j, "job")).collect() } else { vec![s(c, "job")] };
+        for job in jobs {
+            let label = match job.as_str() { "Director" if !tv => "Directed by", "Screenplay" | "Writer" if !tv => "Written by",
+                "Original Music Composer" => "Music by", "Director of Photography" if !tv => "Cinematography by", _ => continue };
+            credit(label, s(c, "name"));
+        }
+    }
+    let order = ["Created by", "Directed by", "Written by", "Music by", "Cinematography by"];
+    crew.sort_by_key(|(l, _)| order.iter().position(|o| o == l));
+    let mut studios: Vec<Studio> = Vec::new();
+    for c in details["networks"].as_array().into_iter().flatten().chain(details["production_companies"].as_array().into_iter().flatten()) {
+        if let Some(logo) = img("w185", &c["logo_path"]) {
+            if studios.len() < 4 && !studios.iter().any(|x| x.name == s(c, "name")) { studios.push(Studio { name: s(c, "name"), logo }); }
+        }
+    }
+    let rated = |list: &Value, field: &dyn Fn(&Value) -> Option<String>| {
+        let all: Vec<&Value> = list["results"].as_array().into_iter().flatten().collect();
+        all.iter().find(|r| r["iso_3166_1"] == "US").and_then(|r| field(r)).or_else(|| all.iter().find_map(|r| field(r)))
+    };
+    let certificate = if tv { rated(&details["content_ratings"], &|r| Some(s(r, "rating")).filter(|x| !x.is_empty())) }
+        else { rated(&details["release_dates"], &|r| r["release_dates"].as_array().into_iter().flatten().map(|d| s(d, "certification")).find(|x| !x.is_empty())) };
+    let original = s(details, "original_language");
+    let language = details["spoken_languages"].as_array().into_iter().flatten().find(|l| l["iso_639_1"] == original.as_str())
+        .map(|l| s(l, "english_name")).filter(|x| !x.is_empty());
+    let season_posters = details["seasons"].as_array().into_iter().flatten()
+        .filter_map(|x| Some((x["season_number"].as_i64()?, img("w185", &x["poster_path"])?))).collect();
+    let videos = details["videos"]["results"].as_array().into_iter().flatten()
+        .filter(|v| v["site"] == "YouTube" && matches!(v["type"].as_str(), Some("Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip")))
+        .take(10).map(|v| Video { youtube: s(v, "key"), name: s(v, "name"), kind: s(v, "type") }).filter(|v| !v.youtube.is_empty()).collect();
+    Artwork { stills, tagline: Some(s(details, "tagline")).filter(|t| !t.is_empty()), cast, crew, studios, certificate, language, season_posters, videos, ..Artwork::default() }
 }
 
 static ARTWORK: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
@@ -1334,7 +1592,7 @@ fn best_image(list: &Value, languages: &[Option<&str>]) -> Option<String> {
 
 /// TMDB artwork for a title with an IMDb id; cached for the session. None without a key.
 pub async fn artwork(m: &Media) -> Option<Artwork> {
-    if !tmdb_ready() { return None; }
+    if !tmdb_ready() { return bp_artwork(m).await; }
     let imdb = imdb_of(m);
     let cache_key = imdb.clone().unwrap_or_else(|| format!("{}|{}", m.name.to_lowercase(), m.first_year().unwrap_or(0)));
     let cache = ARTWORK.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1350,22 +1608,25 @@ pub async fn artwork(m: &Media) -> Option<Artwork> {
     let found = match by_imdb { Some(x) => Some(x), None => tmdb_by_name(m).await };
     let (kind, id) = found?;
     // Images and videos in one request.
-    let details = tmdb(format!("{kind}/{id}"), vec![("append_to_response", "images,videos".into()), ("include_image_language", "en,null".into())]).await.unwrap_or_default();
+    let extra = if kind == "tv" { "images,videos,aggregate_credits,content_ratings" } else { "images,videos,credits,release_dates" };
+    let details = tmdb(format!("{kind}/{id}"), vec![("append_to_response", extra.into()), ("include_image_language", "en,null".into())]).await.unwrap_or_default();
     let images = &details["images"];
     let mut videos: Vec<&Value> = details["videos"]["results"].as_array().into_iter().flatten()
         .filter(|v| v["site"] == "YouTube" && (v["type"] == "Trailer" || v["type"] == "Teaser")).collect();
     videos.sort_by_key(|v| std::cmp::Reverse((v["type"] == "Trailer", v["official"].as_bool().unwrap_or(false), v["iso_639_1"] == "en", v["size"].as_i64().unwrap_or(0))));
     let trailers: Vec<String> = videos.iter().filter_map(|v| v["key"].as_str().map(str::to_owned)).collect();
+    let backdrop = best_image(&images["backdrops"], &[None, Some("en")]).map(|p| format!("https://image.tmdb.org/t/p/w1280{p}"));
     let art = Artwork {
         genres: details["genres"].as_array().into_iter().flatten().filter_map(|g| g["name"].as_str()).map(crate::picks_rules::canonical_genre).collect(),
         // Text-free backdrops first (no language), then English ones.
-        backdrop: best_image(&images["backdrops"], &[None, Some("en")]).map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
+        backdrop: backdrop.clone(),
         logo: best_image(&images["logos"], &[Some("en"), None]).map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
         poster: best_image(&images["posters"], &[Some("en"), None]).or_else(|| details["poster_path"].as_str().map(str::to_owned))
             .map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
         trailers,
         tmdb: Some((kind.to_owned(), id)),
         collection: details["belongs_to_collection"]["id"].as_i64(),
+        ..production(&details, kind, backdrop.as_deref())
     };
     if let Ok(mut c) = cache.lock() { c.insert(cache_key, art.clone()); }
     Some(art)
@@ -1763,6 +2024,7 @@ fn choose_challenger(pool: &[Media], taste: &Taste, exclude: &[String], spread: 
 pub async fn catalog_genres() -> HashSet<String> {
     let Ok(v) = exec(json!({"op":"addons"})).await else { return HashSet::new() };
     v["addons"].as_array().into_iter().flatten()
+        .filter(|a| !retired_addon(&s(a, "manifest_url")))
         .flat_map(|a| a["catalogs"].as_array().into_iter().flatten())
         .flat_map(|c| c["extra"].as_array().into_iter().flatten())
         .filter(|e| e["name"] == "genre")
@@ -1771,12 +2033,13 @@ pub async fn catalog_genres() -> HashSet<String> {
 }
 
 /// More candidates for a genre: every installed catalog that declares this genre as an option
-/// (Kitsu for anime genres such as Martial Arts, Cinemeta for its own), first page of each.
+/// (Cinemeta for its own, an installed anime add-on for genres such as Martial Arts), first page of each.
 pub async fn genre_candidates(genre: &str) -> Vec<Media> {
     let Ok(v) = exec(json!({"op":"addons"})).await else { return Vec::new() };
     let mut requests = Vec::new();
     for addon in v["addons"].as_array().into_iter().flatten() {
         let url = s(addon, "manifest_url");
+        if retired_addon(&url) { continue; }
         for c in addon["catalogs"].as_array().into_iter().flatten() {
             let extras: Vec<&Value> = c["extra"].as_array().into_iter().flatten().collect();
             // Only catalogs whose other extras are optional, and that list this genre.
@@ -2120,6 +2383,73 @@ mod subtitle_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_production_from_one_tmdb_answer() {
+        let movie = json!({"tagline": "A tagline", "original_language": "en", "spoken_languages": [{"iso_639_1": "en", "english_name": "English"}],
+            "images": {"backdrops": [{"iso_639_1": null, "file_path": "/a.jpg", "vote_average": 5.0}, {"iso_639_1": null, "file_path": "/b.jpg", "vote_average": 7.0}, {"iso_639_1": "en", "file_path": "/t.jpg", "vote_average": 9.0}]},
+            "credits": {"cast": [{"name": "Matt Damon", "character": "Odysseus", "profile_path": "/m.jpg"}],
+                "crew": [{"name": "Ludwig Göransson", "job": "Original Music Composer"}, {"name": "Christopher Nolan", "job": "Director"}, {"name": "Christopher Nolan", "job": "Screenplay"}]},
+            "production_companies": [{"name": "Universal", "logo_path": "/u.png"}, {"name": "No logo", "logo_path": null}],
+            "release_dates": {"results": [{"iso_3166_1": "GB", "release_dates": [{"certification": "12A"}]}, {"iso_3166_1": "US", "release_dates": [{"certification": ""}, {"certification": "PG-13"}]}]},
+            "videos": {"results": [{"site": "YouTube", "type": "Featurette", "key": "k1", "name": "Making of"}, {"site": "Vimeo", "type": "Trailer", "key": "v"}]}});
+        let a = production(&movie, "movie", Some("https://image.tmdb.org/t/p/w1280/b.jpg"));
+        assert_eq!(a.stills, ["https://image.tmdb.org/t/p/w1280/a.jpg"], "textless only, the backdrop not twice");
+        assert_eq!(a.tagline.as_deref(), Some("A tagline"));
+        assert_eq!(a.cast[0].role, "Odysseus");
+        assert_eq!(a.crew, [("Directed by".to_owned(), vec!["Christopher Nolan".to_owned()]), ("Written by".to_owned(), vec!["Christopher Nolan".to_owned()]),
+            ("Music by".to_owned(), vec!["Ludwig Göransson".to_owned()])]);
+        assert_eq!(a.studios.len(), 1);
+        assert_eq!(a.certificate.as_deref(), Some("PG-13"), "the US certificate first");
+        assert_eq!(a.language.as_deref(), Some("English"));
+        assert_eq!(a.videos.len(), 1);
+        let show = json!({"created_by": [{"name": "Graham Wagner"}], "networks": [{"name": "Prime Video", "logo_path": "/p.png"}],
+            "aggregate_credits": {"cast": [{"name": "Ella Purnell", "roles": [{"character": "Lucy MacLean"}], "profile_path": null}]},
+            "content_ratings": {"results": [{"iso_3166_1": "DE", "rating": "16"}]}, "seasons": [{"season_number": 1, "poster_path": "/s1.jpg"}, {"season_number": 2, "poster_path": null}]});
+        let b = production(&show, "tv", None);
+        assert_eq!(b.crew[0].0, "Created by");
+        assert_eq!(b.cast[0].role, "Lucy MacLean");
+        assert_eq!(b.cast[0].photo, None);
+        assert_eq!(b.certificate.as_deref(), Some("16"), "any country when the US has none");
+        assert_eq!(b.season_posters.len(), 1);
+        assert_eq!(b.studios[0].name, "Prime Video");
+    }
+
+    #[test]
+    fn better_posters_charts_stay_cinemeta_titles() {
+        let v = json!({"metas": [
+            {"id": "tt33764258", "type": "movie", "name": "The Odyssey", "poster": "https://btttr.cc/poster/movie/tt33764258/auto~gr.png", "runtime": "173 min"},
+            {"id": "tmdb:12", "type": "movie", "name": "TMDB only"},
+            {"id": "tt33764258", "type": "movie", "name": "The Odyssey"},
+        ]});
+        let titles = bp_titles(&v, CINEMETA);
+        assert_eq!(titles.len(), 1, "IMDb ids only, once each");
+        assert_eq!(titles[0].addon_url, CINEMETA, "keyed like the same title from Cinemeta");
+        assert_eq!(titles[0].raw["runtime"], "173 min");
+    }
+
+    #[test]
+    fn better_posters_metadata_over_the_addons() {
+        let addon = json!({"runtime": "1 min", "description": "Cinemeta's", "cast": ["A"], "trailers": [{"source": "x", "type": "Trailer"}],
+            "videos": [{"id": "tt1:1:1", "season": 1, "episode": 1, "name": "Pilot", "thumbnail": ""}, {"id": "tt1:1:2", "season": 1, "episode": 2, "name": "Two"}]});
+        let bp = json!({"runtime": "44 min", "description": "", "imdbRating": "8.2", "trailers": [{"source": "y", "type": "Trailer"}],
+            "videos": [{"id": "tt1:1:1", "title": "Pilot (BP)", "thumbnail": "https://image.tmdb.org/s.jpg"}, {"id": "tt1:9:9", "title": "Not in the add-on"}]});
+        let m = merge_meta(addon.clone(), Some(&bp));
+        assert_eq!(m["runtime"], "44 min");
+        assert_eq!(m["imdbRating"], "8.2");
+        assert_eq!(m["description"], "Cinemeta's", "empty BetterPosters fields never erase the add-on's");
+        assert_eq!(m["cast"], json!(["A"]));
+        assert_eq!(m["trailers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(m["trailers"][0]["source"], "y");
+        let videos = m["videos"].as_array().unwrap();
+        assert_eq!(videos.len(), 2, "the add-on's episode list stays");
+        assert_eq!(videos[0]["title"], "Pilot (BP)");
+        assert_eq!(videos[0]["thumbnail"], "https://image.tmdb.org/s.jpg");
+        assert_eq!(videos[1]["name"], "Two");
+        // Nothing from BetterPosters: the add-on's, unchanged. An add-on without episodes takes BetterPosters'.
+        assert_eq!(merge_meta(addon.clone(), None), addon);
+        assert_eq!(merge_meta(json!({"name": "X"}), Some(&bp))["videos"].as_array().map(Vec::len), Some(2));
+    }
 
     fn media(name: &str, kind: &str, year: &str, genre: &str) -> Media {
         Media::from_json(&json!({"id":name,"name":name,"type":kind,"releaseInfo":year,"genres":[genre]}), "a").unwrap()
