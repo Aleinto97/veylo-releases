@@ -2,7 +2,7 @@
 
 <img src="branding/veylo-icon.png" width="96" alt="Veylo">
 
-A quiet, all-Rust media client for Android tablets and the Linux and Windows desktop, built with [Dioxus](https://dioxuslabs.com).
+A quiet, all-Rust media client for Android tablets and the Linux, Windows and macOS desktop, built with [Dioxus](https://dioxuslabs.com).
 
 - **Home**: Tonight's pick (why it was chosen, Play, Not tonight and the next picks), then today's charts from
   [BetterPosters](https://btttr.cc) and your add-ons' catalogues. The top bar shows what is on the player: one tap carries on.
@@ -12,7 +12,8 @@ A quiet, all-Rust media client for Android tablets and the Linux and Windows des
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
   under the page through a bridge per OS (`video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
-  mpv's own child window on Windows.
+  mpv's own child window on Windows. On macOS mpv shows the picture in a window of its own for now (mpv can't draw
+  inside another app's view there; an in-window renderer is still to come).
 
 ## Install
 
@@ -25,6 +26,15 @@ irm https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.ps1 
 Veylo installs to `%LOCALAPPDATA%\Programs\Veylo` (no admin rights) with Start menu and desktop shortcuts. Running
 the command again reinstalls the latest version. To uninstall, delete that folder and the two shortcuts; your
 library is in `%LOCALAPPDATA%\veylo-dx`.
+
+**macOS** on Apple silicon (M1 or later): in Terminal run
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.sh | sh
+```
+
+Veylo installs to `/Applications` (or `~/Applications`) and opens. Running the command again reinstalls the latest
+version. To uninstall, move Veylo to the Bin; your library is in `~/Library/Application Support/veylo-dx`.
 
 **Android** 8 or later, 64-bit: on the device open
 https://github.com/Aleinto97/veylo-releases/releases/latest/download/veylo-android-arm64.apk, open the downloaded
@@ -41,6 +51,8 @@ Android the first Update asks you to allow Veylo to install apps: allow it, come
 | `crates/core/` | addon protocol, SQLite library/history, recommendations, subtitles |
 | `crates/media-proxy/` | token-scoped loopback media relay |
 | `crates/torrent/`, `crates/aio-meta/` | P2P and embedded metadata crates (not used by the app yet) |
+| `tools/build-macos.sh`, `tools/release.sh` | the macOS app bundle; the release build and publish |
+| `tools/ci/` | CI launch checks (start the app, screenshot it) |
 | `tools/media3-ffmpeg/` | reproducible build of the Media3 FFmpeg audio decoder (the app no longer ships it) |
 | `branding/` | logo sources |
 
@@ -63,15 +75,39 @@ powershell -ExecutionPolicy Bypass -File windows\fetch-mpv.ps1   # pinned libmpv
 cargo build --release   # target\release\veylo-dx.exe, with libmpv-2.dll copied beside it
 ```
 
+macOS (Apple silicon, with Homebrew): `brew install mpv dylibbundler`, then `cargo run --release` in `apps/veylo-dx`
+runs it against Homebrew's libmpv, and `tools/build-macos.sh` builds the self-contained `Veylo.app` that releases ship
+(`dist/veylo-macos-arm64.zip`: libmpv, FFmpeg and MoltenVK inside, signed ad hoc).
+
 Ship `veylo-dx.exe` together with `libmpv-2.dll` and the complete `picks-ai/` directory from the build output. From Linux, `cargo xwin build --target x86_64-pc-windows-msvc --release`
 cross-builds the same with `VEYLO_MPV_DIR` pointing at the extracted mpv files.
+
+## Testing on every OS
+
+`.github/workflows/ci.yml` runs on every push, natively on Linux, Windows and macOS: clippy and `cargo test`, then
+the self-test, and on Windows and macOS it also packages the app, installs it with `install.ps1` or `install.sh` and
+tests the installed copy. A launch check starts the app with an empty library, fails if it exits or panics, and keeps a
+screenshot (the run's **Artifacts**: `screenshots-<os>`, plus the Windows and macOS builds to try by hand).
+
+The self-test runs anywhere, without a window, on a temporary library (yours is never touched):
+
+```sh
+veylo-dx --self-test [--online] [--report <file>]
+```
+
+It checks the files the app loads (model, tokenizer, ONNX Runtime, libmpv), that the store saves and reads back,
+that the Picks model runs and its embeddings make sense, that libmpv plays a bundled H.264/AAC clip to the end and,
+with `--online`, TLS and the release channel. On a Mac it is `/Applications/Veylo.app/Contents/MacOS/veylo-dx
+--self-test`; on Windows `%LOCALAPPDATA%\Programs\Veylo\veylo-dx.exe --self-test`. CI runners have no real GPU, so
+what they can't judge is the picture itself: check playback by hand on real machines.
 
 ## Releases
 
 Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` builds Windows and Android on GitHub
-Actions (`.github/workflows/release.yml`, which runs `tools/release.sh`) and publishes them as a release here.
+Actions (`.github/workflows/release.yml`, which runs `tools/release.sh`), and macOS on a Mac runner
+(`tools/build-macos.sh`), and publishes them as a release here.
 Installed copies check this repo's latest release at launch and show **Veylo x.y is available — Update**
-(`apps/veylo-dx/src/updater.rs`): Windows replaces its files and restarts; Android downloads the APK and opens the
+(`apps/veylo-dx/src/updater.rs`): Windows and macOS replace their files and restart; Android downloads the APK and opens the
 system's "Update this app?" screen (`android/kotlin/VeyloUpdate.kt`).
 
 The APK is signed with Veylo's release key, kept out of the repo: in the `ANDROID_KEYSTORE_B64` and

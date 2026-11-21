@@ -5,6 +5,7 @@
 //! Linux, X11: a GtkGLArea below the WebKit view.
 //! Android: a SurfaceView below the WebView (VeyloVideo.kt), handed to mpv as its window.
 //! Windows: mpv's own child window inside the app window, kept below the WebView2.
+//! macOS: not yet: mpv opens a window of its own beside the app's (engine.rs).
 use crate::engine::Live;
 use std::sync::Arc;
 
@@ -120,7 +121,7 @@ mod imp {
 #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "windows")))]
 mod imp {
     use super::*;
-    // No picture bridge on this OS yet (macOS): mpv still plays the sound.
+    // macOS: no picture bridge under the page yet; mpv shows the picture in its own window (engine.rs).
     pub fn attach(live: &Arc<Live>) { live.mark_ready(); }
     pub fn detach() {}
     pub fn layout(_live: &Live) {}

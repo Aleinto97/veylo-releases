@@ -1,5 +1,13 @@
 name: build-and-test
 on: [push, pull_request, workflow_dispatch]
+# Every desktop OS runs the same suite on its own machine:
+#   1. clippy and the unit tests (cargo test), natively;
+#   2. `veylo-dx --self-test --online`: the shipped files, the store, the Picks model, libmpv/FFmpeg
+#      playing a real H.264/AAC clip, TLS and the update channel (apps/veylo-dx/src/selftest.rs);
+#   3. Windows and macOS: package the app as a release would, install it with the real installer
+#      (install.ps1, install.sh) and self-test the installed copy;
+#   4. a launch check: the app runs for a while without exiting or panicking, and a screenshot of it
+#      is kept with the run (Artifacts: screenshots-<os>), once on Home and once playing a test stream.
 jobs:
   core:
     runs-on: ubuntu-24.04
@@ -12,12 +20,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked -- --test-threads=2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-  app:
+
+  linux:
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/veylo-dx
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev xvfb imagemagick
+        working-directory: .
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/veylo-dx -> target
@@ -26,6 +41,128 @@ jobs:
         with:
           path: apps/veylo-dx/picks-ai
           key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-linux-x64
-      - run: python3 tools/picks-ai/fetch.py linux-x64
+      - run: python3 ../../tools/picks-ai/fetch.py linux-x64
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: cargo build --locked
+      - name: Self-test
+        run: ./target/debug/veylo-dx --self-test --online
+      - name: Launch check
+        run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-linux
+          path: screenshots/
+          if-no-files-found: ignore
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
         working-directory: apps/veylo-dx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai
+          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-windows-x64
+      - name: Fetch libmpv and the Picks assets
+        run: |
+          powershell -ExecutionPolicy Bypass -File windows/fetch-mpv.ps1
+          python ../../tools/picks-ai/fetch.py windows-x64
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Package (as tools/release.sh does)
+        run: |
+          $out = 'target/release'
+          New-Item -ItemType Directory -Force ../../dist | Out-Null
+          Compress-Archive -Force -Path "$out/veylo-dx.exe", "$out/libmpv-2.dll", "$out/picks-ai" -DestinationPath ../../dist/veylo-windows-x64.zip
+          Get-Item ../../dist/veylo-windows-x64.zip | Select-Object Name, Length
+      - name: Install with install.ps1
+        working-directory: .
+        run: |
+          $env:VEYLO_ZIP = (Resolve-Path dist/veylo-windows-x64.zip).Path
+          $env:VEYLO_NO_LAUNCH = '1'
+          ./install.ps1
+      - name: Self-test the installed copy
+        working-directory: .
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe'
+          $report = Join-Path $env:RUNNER_TEMP 'self-test.txt'
+          $p = Start-Process -FilePath $exe -ArgumentList '--self-test', '--online', '--report', $report -Wait -PassThru -NoNewWindow
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit $($p.ExitCode))" }
+      - name: Launch check
+        working-directory: .
+        run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-home.png
+      # The runner has no GPU (Direct3D 11 runs on WARP): informative, it doesn't fail the build.
+      - name: Launch check, playing the test stream
+        continue-on-error: true
+        working-directory: .
+        run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-player.png -Seconds 40 -Demo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-windows
+          path: screenshots/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veylo-windows-x64
+          path: dist/veylo-windows-x64.zip
+
+  macos:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: apps/veylo-dx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: brew install mpv dylibbundler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai
+          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-macos-arm64
+      - run: python3 ../../tools/picks-ai/fetch.py macos-arm64
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Build Veylo.app (fails if it still needs Homebrew)
+        run: ../../tools/build-macos.sh
+      - name: Install with install.sh
+        working-directory: .
+        run: VEYLO_ZIP=dist/veylo-macos-arm64.zip VEYLO_NO_LAUNCH=1 sh install.sh
+      - name: Self-test the installed copy
+        run: /Applications/Veylo.app/Contents/MacOS/veylo-dx --self-test --online
+      - name: Launch check
+        working-directory: .
+        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-home.png
+      # The runner is a VM without a real GPU: informative, it doesn't fail the build.
+      - name: Launch check, playing the test stream
+        continue-on-error: true
+        working-directory: .
+        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-player.png 40 --demo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-macos
+          path: screenshots/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veylo-macos-arm64
+          path: dist/veylo-macos-arm64.zip

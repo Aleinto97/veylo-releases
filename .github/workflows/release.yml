@@ -1,4 +1,4 @@
-# Builds Windows and Android and publishes them as a release of this repo whenever a push to main
+# Builds Windows, macOS and Android and publishes them as a release of this repo whenever a push to main
 # raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch and offer Update.
 # Run it by hand from the Actions tab with "publish" off to only build (the files become an artifact).
 # Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD.
@@ -22,9 +22,12 @@ env:
   NDK_VERSION: 28.2.13676358
   DX_VERSION: 0.7.10
 jobs:
-  release:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    outputs:
+      version: ${{ needs.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ needs.plan.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
       - name: Is this version new?
@@ -40,28 +43,57 @@ jobs:
             build=false
           fi
           { echo "version=$version"; echo "build=$build"; echo "publish=$PUBLISH"; } >> "$GITHUB_OUTPUT"
-      - if: steps.plan.outputs.build == 'true'
-        uses: dtolnay/rust-toolchain@stable
+
+  # Veylo.app is built on a Mac (tools/build-macos.sh) and handed to the release job.
+  macos:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: brew install mpv dylibbundler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+      - run: tools/build-macos.sh
+      - name: Self-test the app before it ships
+        run: |
+          ditto -x -k dist/veylo-macos-arm64.zip "$RUNNER_TEMP/app"
+          "$RUNNER_TEMP/app/Veylo.app/Contents/MacOS/veylo-dx" --self-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/veylo-macos-arm64.zip
+
+  release:
+    needs: [plan, macos]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-app
+          path: ${{ runner.temp }}/extra
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-pc-windows-msvc
-      - if: steps.plan.outputs.build == 'true'
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - if: steps.plan.outputs.build == 'true'
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/veylo-dx -> target
-      - if: steps.plan.outputs.build == 'true'
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-v1
-      - if: steps.plan.outputs.build == 'true'
-        uses: cargo-bins/cargo-binstall@main
+      - uses: cargo-bins/cargo-binstall@main
       - name: Tools
-        if: steps.plan.outputs.build == 'true'
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld llvm libarchive-tools zip
           cargo binstall -y --locked "dioxus-cli@$DX_VERSION" cargo-xwin
@@ -69,7 +101,6 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0" >/dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
       - name: Release key
-        if: steps.plan.outputs.build == 'true'
         env:
           KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 }}
         run: |
@@ -77,17 +108,17 @@ jobs:
           umask 077 && printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "VEYLO_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
       - name: Build and publish
-        if: steps.plan.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VEYLO_REPO: ${{ github.repository }}
-          VEYLO_PUBLISH: ${{ steps.plan.outputs.publish == 'true' && '1' || '0' }}
+          VEYLO_PUBLISH: ${{ needs.plan.outputs.publish == 'true' && '1' || '0' }}
           VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          VEYLO_EXTRA_ASSETS: ${{ runner.temp }}/extra
         run: tools/release.sh "$(git log -1 --format=%B)"
-      - if: steps.plan.outputs.build == 'true' && steps.plan.outputs.publish != 'true'
+      - if: needs.plan.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: veylo-${{ steps.plan.outputs.version }}
+          name: veylo-${{ needs.plan.outputs.version }}
           path: dist/
       - if: always()
         run: rm -f "$RUNNER_TEMP/release.jks"

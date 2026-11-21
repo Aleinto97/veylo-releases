@@ -52,7 +52,11 @@ fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(not(windows))]
+    // macOS: ~/Library/Application Support/veylo-dx.
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(not(any(windows, target_os = "macos")))]
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))

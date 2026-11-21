@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import io
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -26,6 +27,7 @@ RUNTIMES = {
     'linux-aarch64': 'runtimes/linux-arm64/native/libonnxruntime.so',
     'linux-x64': 'runtimes/linux-x64/native/libonnxruntime.so',
     'windows-x64': 'runtimes/win-x64/native/onnxruntime.dll',
+    'macos-arm64': 'runtimes/osx-arm64/native/libonnxruntime.dylib',
     'android-arm64': 'jni/arm64-v8a/libonnxruntime.so',
 }
 ASSETS = {
@@ -73,13 +75,20 @@ def prepare(target):
         prepare_windows_crt(dest)
     print('Prepared', target)
 
+def find_bsdtar():
+    # libarchive's tar reads the cabinets: bsdtar on Linux, the tar.exe that ships with Windows and macOS.
+    system_tar = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'tar.exe')
+    for path in [shutil.which('bsdtar'), shutil.which('tar'), system_tar]:
+        if path and os.path.isfile(path) and 'bsdtar' in subprocess.run([path, '--version'], capture_output=True, text=True).stdout:
+            return path
+    raise RuntimeError('Windows asset preparation requires bsdtar (libarchive-tools).')
+
 def prepare_windows_crt(dest):
     # App-local dependencies from Microsoft's pinned VC++ 2022 redistributable.
     # Extract only the four runtime DLLs ONNX Runtime imports, and retain its EULA.
     url = 'https://download.visualstudio.microsoft.com/download/pr/e9604e21-4b79-4096-a4b3-1b63d4b55b4d/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe'
     data = download(url, 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b').read_bytes()
-    if not shutil.which('bsdtar'):
-        raise RuntimeError('Windows asset preparation requires bsdtar (libarchive-tools).')
+    bsdtar = find_bsdtar()
     # This pinned WiX Burn executable has a UX cabinet and a payload cabinet.
     with tempfile.TemporaryDirectory(dir=DEST) as work:
         work = Path(work)
@@ -89,11 +98,11 @@ def prepare_windows_crt(dest):
             size = struct.unpack_from('<I', data, offset + 8)[0]
             cabinet = work / f'{offset}.cab'
             cabinet.write_bytes(data[offset:offset+size])
-            subprocess.run(['bsdtar', '-xf', str(cabinet), '-C', str(work)], check=True)
+            subprocess.run([bsdtar, '-xf', str(cabinet), '-C', str(work)], check=True)
         runtime_cabinet = work / 'a12'
         for name in ['msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll']:
             with open(dest / name, 'wb') as out:
-                subprocess.run(['bsdtar', '-xOf', str(runtime_cabinet), name + '_amd64'], stdout=out, check=True)
+                subprocess.run([bsdtar, '-xOf', str(runtime_cabinet), name + '_amd64'], stdout=out, check=True)
         shutil.copyfile(work / 'u4', dest / 'Microsoft-VC-Redist-License.rtf')
 
 if __name__ == '__main__':

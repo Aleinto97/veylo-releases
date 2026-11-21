@@ -1,19 +1,19 @@
-//! Updates from the public releases repo, on Windows and Android. At launch Veylo asks GitHub for
-//! the latest release; a newer one shows a notice, and Update downloads it and installs it:
-//! Windows swaps the files and restarts, Android hands the APK to the system installer.
+//! Updates from the public releases repo, on Windows, macOS and Android. At launch Veylo asks GitHub
+//! for the latest release; a newer one shows a notice, and Update downloads it and installs it:
+//! Windows and macOS swap the files and restart, Android hands the APK to the system installer.
 //! Only public release metadata is fetched: no account, key or setting is ever sent.
 use crate::icons;
 use anyhow::{anyhow, Context, Result};
 use dioxus::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The public repo: its releases are the builds (published by .github/workflows/release.yml).
 pub const REPO: &str = "Aleinto97/veylo-releases";
-/// This platform's release asset.
-#[cfg(target_os = "android")]
-pub const ASSET: &str = "veylo-android-arm64.apk";
-#[cfg(not(target_os = "android"))]
-pub const ASSET: &str = "veylo-windows-x64.zip";
+/// This platform's release asset; None where releases aren't installed (Linux builds from source).
+pub const ASSET: Option<&str> = if cfg!(target_os = "android") { Some("veylo-android-arm64.apk") }
+    else if cfg!(target_os = "windows") { Some("veylo-windows-x64.zip") }
+    else if cfg!(all(target_os = "macos", target_arch = "aarch64")) { Some("veylo-macos-arm64.zip") }
+    else { None };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release { pub version: String, url: String }
@@ -33,18 +33,20 @@ fn client() -> reqwest::Client {
 
 /// The latest release when it is newer than this build and has this platform's file; None offline or up to date.
 pub async fn check() -> Option<Release> {
-    crate::backend::on_runtime(async {
+    let asset = ASSET?;
+    crate::backend::on_runtime(async move {
         let body = client().get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
             .header("Accept", "application/vnd.github+json")
             .send().await.ok()?.error_for_status().ok()?.bytes().await.ok()?;
         let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
         let version = v["tag_name"].as_str()?.trim_start_matches('v').to_owned();
         if !newer(&version, env!("CARGO_PKG_VERSION")) { return None; }
-        let url = v["assets"].as_array()?.iter().find(|a| a["name"] == ASSET)?["browser_download_url"].as_str()?.to_owned();
+        let url = v["assets"].as_array()?.iter().find(|a| a["name"] == asset)?["browser_download_url"].as_str()?.to_owned();
         Some(Release { version, url })
     }).await.ok().flatten()
 }
 
+#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
 /// Stream the release file to `to` (an APK is ~150 MB: never held in memory).
 async fn download(url: String, to: PathBuf) -> Result<()> {
     crate::backend::on_runtime(async move {
@@ -62,12 +64,12 @@ async fn download(url: String, to: PathBuf) -> Result<()> {
 
 /// What Install led to, when it returns at all (Windows quits to swap its files).
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))] // Windows restarts instead of returning
+#[cfg_attr(not(target_os = "android"), allow(dead_code))] // Windows and macOS restart instead of returning
 pub enum Outcome { Installing, NeedsPermission }
 
 #[cfg(target_os = "android")]
 pub async fn install(release: Release) -> Result<Outcome> {
-    let apk = crate::android::files_dir()?.join("updates").join(ASSET);
+    let apk = crate::android::files_dir()?.join("updates").join(ASSET.context("No update for this platform")?);
     // Already downloaded (the viewer went to allow installs and came back): use it.
     let fresh = std::fs::metadata(&apk).map(|m| m.len() > 0).unwrap_or(false)
         && std::fs::read_to_string(apk.with_extension("version")).ok().as_deref() == Some(release.version.as_str());
@@ -82,7 +84,7 @@ pub async fn install(release: Release) -> Result<Outcome> {
 }
 
 /// Waits for Veylo to close, unpacks the new build over the old one and starts it again.
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "windows")]
 const APPLY: &str = r#"param([int]$ProcessId, [string]$Zip, [string]$Dest)
 try { Wait-Process -Id $ProcessId -Timeout 30 -ErrorAction SilentlyContinue } catch {}
 Start-Sleep -Milliseconds 500
@@ -94,12 +96,12 @@ Remove-Item -Recurse -Force (Split-Path $Zip) -ErrorAction SilentlyContinue
 "#;
 
 /// Download the release, hand it to the helper and quit so the files can be replaced.
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "windows")]
 pub async fn install(release: Release) -> Result<Outcome> {
     let exe = std::env::current_exe().context("Couldn't find Veylo's folder")?;
-    let dest: &Path = exe.parent().context("Couldn't find Veylo's folder")?;
+    let dest: &std::path::Path = exe.parent().context("Couldn't find Veylo's folder")?;
     let work = std::env::temp_dir().join(format!("veylo-update-{}", release.version));
-    let zip = work.join(ASSET);
+    let zip = work.join(ASSET.context("No update for this platform")?);
     let script = work.join("apply.ps1");
     download(release.url.clone(), zip.clone()).await?;
     std::fs::write(&script, APPLY).context("Couldn't save the update")?;
@@ -115,6 +117,45 @@ pub async fn install(release: Release) -> Result<Outcome> {
     helper.spawn().context("Couldn't start the updater")?;
     std::process::exit(0);
 }
+
+/// macOS: waits for Veylo to close, swaps Veylo.app for the new one and opens it again.
+#[cfg(target_os = "macos")]
+const APPLY_MAC: &str = r#"pid="$1"; zip="$2"; app="$3"
+for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+work=$(dirname "$zip")
+rm -rf "$work/new" && mkdir -p "$work/new" && ditto -x -k "$zip" "$work/new" || exit 1
+[ -d "$work/new/Veylo.app" ] || exit 1
+rm -rf "$app.old" && mv "$app" "$app.old" && mv "$work/new/Veylo.app" "$app" && rm -rf "$app.old"
+xattr -dr com.apple.quarantine "$app" 2>/dev/null
+open "$app"
+rm -rf "$work"
+"#;
+
+/// The Veylo.app this copy runs from (Veylo.app/Contents/MacOS/veylo-dx).
+#[cfg(target_os = "macos")]
+pub fn app_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let app = exe.ancestors().nth(3)?;
+    app.extension().is_some_and(|e| e == "app").then(|| app.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+pub async fn install(release: Release) -> Result<Outcome> {
+    let app = app_bundle().context("Only an installed Veylo.app can update itself: run the install command again")?;
+    let work = std::env::temp_dir().join(format!("veylo-update-{}", release.version));
+    let zip = work.join(ASSET.context("No update for this platform")?);
+    let script = work.join("apply.sh");
+    download(release.url.clone(), zip.clone()).await?;
+    std::fs::write(&script, APPLY_MAC).context("Couldn't save the update")?;
+    std::process::Command::new("/bin/sh").arg(&script).arg(std::process::id().to_string()).arg(&zip).arg(&app)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().context("Couldn't start the updater")?;
+    std::process::exit(0);
+}
+
+/// Linux builds from source: nothing to install (the notice never shows there).
+#[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos")))]
+pub async fn install(_release: Release) -> Result<Outcome> { Err(anyhow!("Update Veylo by building it again")) }
 
 #[derive(Clone, PartialEq)]
 enum Step { Offer, Later, Working, Permission, Failed(String) }
