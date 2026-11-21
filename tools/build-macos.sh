@@ -99,6 +99,16 @@ for formula in mpv ffmpeg molten-vk; do
     done
 done
 
+# dylibbundler can add the same rpath twice, and dyld refuses a binary that has one twice.
+while IFS= read -r -d '' file; do
+    file -b "$file" | grep -q 'Mach-O' || continue
+    otool -l "$file" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | sort | uniq -d | while IFS= read -r dup; do
+        while [ "$(otool -l "$file" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | grep -c -x -F "$dup")" -gt 1 ]; do
+            install_name_tool -delete_rpath "$dup" "$file" 2>/dev/null
+        done
+    done
+done < <(find "$app" -type f -print0)
+
 # ONNX Runtime is opened by path (picks_ai.rs): its own name only has to be valid.
 install_name_tool -id @loader_path/libonnxruntime.dylib "$contents/Resources/picks-ai/runtime/libonnxruntime.dylib"
 
