@@ -21,6 +21,9 @@ pub fn layout(live: &Live) { imp::layout(live) }
 pub fn install() { imp::install() }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
+/// macOS self-test: the OpenGL context the picture uses, and mpv's renderer on it.
+#[cfg(target_os = "macos")]
+pub fn check(mpv: &libmpv2::Mpv) -> Result<String, String> { imp::check(mpv) }
 /// macOS: the most EDR headroom the window's screen can reach (1.0: SDR only; 0: not read yet).
 #[cfg(target_os = "macos")]
 pub fn potential_headroom() -> f64 { imp::potential_headroom() }
@@ -170,7 +173,7 @@ mod imp {
     static RENDER: Mutex<Option<Session>> = Mutex::new(None);
 
     /// One GL pixel format and context for the app's lifetime, shared with the layer.
-    struct Gl { format: CGLPixelFormatObj, context: CGLContextObj, float: bool }
+    struct Gl { format: CGLPixelFormatObj, context: CGLContextObj, float: bool, label: &'static str }
     // SAFETY: CGL objects are reference-counted C objects usable from any thread under CGLLockContext.
     unsafe impl Send for Gl {}
     static GL: Mutex<Option<Gl>> = Mutex::new(None);
@@ -224,26 +227,42 @@ mod imp {
     );
 
     /// The pixel format and context, created once: 16-bit float colour (what EDR needs) on an OpenGL 3.2
-    /// core profile when the GPU offers it, else 8-bit, else the legacy profile.
+    /// core profile when the GPU offers it, then 8-bit, the legacy profile, any renderer, and last
+    /// Apple's software renderer (virtual machines without GPU OpenGL).
     fn gl() -> Option<(CGLPixelFormatObj, CGLContextObj, bool)> {
         let mut gl = GL.lock().ok()?;
         if gl.is_none() {
-            let base = |profile: u32| vec![A::CGLPFAOpenGLProfile.0, profile, A::CGLPFAAccelerated.0, A::CGLPFADoubleBuffer.0, A::CGLPFAAllowOfflineRenderers.0];
-            let float = [base(0x3200), vec![A::CGLPFAColorSize.0, 64, A::CGLPFAColorFloat.0]].concat();
-            for (attrs, is_float) in [(float, true), (base(0x3200), false), (base(0x1000), false)] {
+            let accelerated = |profile: u32| vec![A::CGLPFAOpenGLProfile.0, profile, A::CGLPFAAccelerated.0, A::CGLPFADoubleBuffer.0, A::CGLPFAAllowOfflineRenderers.0];
+            let float = [accelerated(0x3200), vec![A::CGLPFAColorSize.0, 64, A::CGLPFAColorFloat.0]].concat();
+            let any = vec![A::CGLPFAOpenGLProfile.0, 0x3200, A::CGLPFADoubleBuffer.0];
+            let software = vec![A::CGLPFAOpenGLProfile.0, 0x3200, A::CGLPFARendererID.0, objc2_open_gl::kCGLRendererGenericFloatID, A::CGLPFADoubleBuffer.0];
+            let candidates = [("float, accelerated", float, true), ("8-bit, accelerated", accelerated(0x3200), false),
+                ("8-bit, legacy profile", accelerated(0x1000), false), ("8-bit, any renderer", any, false), ("software", software, false)];
+            let mut tried = Vec::new();
+            for (label, attrs, is_float) in candidates {
                 let mut attrs: Vec<A> = attrs.into_iter().map(A).collect();
                 attrs.push(A(0));
                 let (mut format, mut count): (CGLPixelFormatObj, i32) = (null_mut(), 0);
-                unsafe { CGLChoosePixelFormat(NonNull::new_unchecked(attrs.as_mut_ptr()), NonNull::from(&mut format), NonNull::from(&mut count)); }
-                if format.is_null() { continue; }
+                let err = unsafe { CGLChoosePixelFormat(NonNull::new_unchecked(attrs.as_mut_ptr()), NonNull::from(&mut format), NonNull::from(&mut count)) };
+                if format.is_null() { tried.push(format!("{label}: pixel format error {}", err.0)); continue; }
                 let mut context: CGLContextObj = null_mut();
-                unsafe { CGLCreateContext(format, null_mut(), NonNull::from(&mut context)); }
-                if context.is_null() { continue; }
-                *gl = Some(Gl { format, context, float: is_float });
+                let err = unsafe { CGLCreateContext(format, null_mut(), NonNull::from(&mut context)) };
+                if context.is_null() { tried.push(format!("{label}: context error {}", err.0)); continue; }
+                *gl = Some(Gl { format, context, float: is_float, label });
                 break;
             }
+            if gl.is_none() { eprintln!("veylo: no OpenGL context ({})", tried.join("; ")); }
         }
         gl.as_ref().map(|g| (g.format, g.context, g.float))
+    }
+
+    /// Self-test: the GL context the picture would use, and mpv's renderer on it.
+    pub fn check(mpv: &libmpv2::Mpv) -> Result<String, String> {
+        gl().ok_or("no OpenGL context")?;
+        let label = GL.lock().ok().and_then(|g| g.as_ref().map(|g| g.label)).unwrap_or("?");
+        let render = unsafe { create_render_for(mpv.ctx.as_ptr())? };
+        unsafe { with_context(|| sys::mpv_render_context_free(render)); }
+        Ok(format!("OpenGL {label}; mpv's renderer starts on it"))
     }
 
     unsafe extern "C" fn proc_address(_: *mut c_void, name: *const c_char) -> *mut c_void { libc::dlsym(libc::RTLD_DEFAULT, name) }
@@ -293,7 +312,9 @@ mod imp {
     }
 
     /// mpv's renderer on our context; it must exist before mpv opens the file (vo=libmpv).
-    unsafe fn create_render(live: &Live) -> Result<*mut sys::mpv_render_context, String> {
+    unsafe fn create_render(live: &Live) -> Result<*mut sys::mpv_render_context, String> { create_render_for(live.mpv.ctx.as_ptr()) }
+
+    unsafe fn create_render_for(mpv: *mut sys::mpv_handle) -> Result<*mut sys::mpv_render_context, String> {
         with_context(|| {
             let mut init = sys::mpv_opengl_init_params { get_proc_address: Some(proc_address), get_proc_address_ctx: null_mut() };
             let mut params = [
@@ -302,7 +323,7 @@ mod imp {
                 sys::mpv_render_param { type_: 0, data: null_mut() },
             ];
             let mut render: *mut sys::mpv_render_context = null_mut();
-            let err = sys::mpv_render_context_create(&mut render, live.mpv.ctx.as_ptr(), params.as_mut_ptr());
+            let err = sys::mpv_render_context_create(&mut render, mpv, params.as_mut_ptr());
             if err < 0 { return Err(format!("mpv renderer: error {err}")); }
             sys::mpv_render_context_set_update_callback(render, Some(on_update), null_mut());
             Ok(render)
