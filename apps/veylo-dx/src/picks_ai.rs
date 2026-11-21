@@ -129,22 +129,47 @@ pub(crate) fn cache_test_embedding(media: &Media, vector: Vec<f32>) {
 
 pub fn failed() -> bool { FAILURE.lock().map(|f| f.is_some()).unwrap_or(true) }
 
+/// ONNX Runtime's native library on this platform.
+#[cfg_attr(all(target_os = "android", not(test)), allow(dead_code))]
+const RUNTIME_LIBRARY: &str = if cfg!(windows) { "onnxruntime.dll" } else if cfg!(target_os = "macos") { "libonnxruntime.dylib" } else { "libonnxruntime.so" };
+
+/// Desktop: `picks-ai/` beside the executable (Linux, Windows, a development build on macOS),
+/// or in the bundle's Resources inside Veylo.app (tools/build-macos.sh).
+#[cfg(not(target_os = "android"))]
+#[cfg_attr(test, allow(dead_code))]
+pub fn desktop_assets() -> Result<PathBuf> {
+    let exe_dir = std::env::current_exe()?.parent().ok_or_else(|| anyhow!("Executable directory"))?.to_path_buf();
+    let beside = exe_dir.join("picks-ai");
+    if cfg!(target_os = "macos") && !beside.is_dir() {
+        let bundled = exe_dir.join("../Resources/picks-ai");
+        if bundled.is_dir() { return Ok(bundled); }
+    }
+    Ok(beside)
+}
+
+/// The model, tokenizer and runtime the app would load (self-test).
+#[cfg(not(target_os = "android"))]
+pub fn asset_files() -> Result<Vec<PathBuf>> {
+    let (dir, runtime) = paths()?;
+    Ok(vec![dir.join("model.onnx"), dir.join("tokenizer.json"), runtime])
+}
+
 fn paths() -> Result<(PathBuf, PathBuf)> {
     #[cfg(test)]
     {
         let dir = std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai/model"));
-        let target = if cfg!(target_os = "android") { "android-arm64" } else if cfg!(windows) { "windows-x64" } else if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x64" };
-        let runtime = if std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").is_some() { dir.join("libonnxruntime.so") }
-            else { Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai").join(target).join(if cfg!(windows) { "onnxruntime.dll" } else { "libonnxruntime.so" }) };
+        let target = if cfg!(target_os = "android") { "android-arm64" } else if cfg!(windows) { "windows-x64" } else if cfg!(target_os = "macos") { "macos-arm64" }
+            else if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x64" };
+        let runtime = if std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").is_some() { dir.join(RUNTIME_LIBRARY) }
+            else { Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai").join(target).join(RUNTIME_LIBRARY) };
         Ok((dir, runtime))
     }
     #[cfg(all(not(test), target_os = "android"))]
     { crate::android::picks_ai_paths() }
     #[cfg(all(not(test), not(target_os = "android")))]
     {
-        let dir = std::env::current_exe()?.parent().ok_or_else(|| anyhow!("Executable directory"))?.join("picks-ai");
-        let library = if cfg!(windows) { "onnxruntime.dll" } else { "libonnxruntime.so" };
-        Ok((dir.clone(), dir.join("runtime").join(library)))
+        let dir = desktop_assets()?;
+        Ok((dir.clone(), dir.join("runtime").join(RUNTIME_LIBRARY)))
     }
 }
 

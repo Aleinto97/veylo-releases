@@ -23,3 +23,5 @@ __pycache__/
 # The new app (apps/veylo-dx) ignores its own target/ and fetched mpv libraries.
 settings.json
 /dist/
+# CI launch-check screenshots (tools/ci/).
+/screenshots/

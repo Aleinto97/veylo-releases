@@ -18,6 +18,8 @@ mod player;
 mod player_rules;
 mod player_ui;
 mod search;
+#[cfg(not(target_os = "android"))]
+mod selftest;
 mod settings;
 mod title;
 mod video;
@@ -211,8 +213,18 @@ fn launch_desktop() {
         const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
     }
+    // macOS: the player's Vulkan driver (MoltenVK) travels inside Veylo.app (tools/build-macos.sh).
+    #[cfg(target_os = "macos")]
+    if let Some(app) = updater::app_bundle() {
+        let icd = app.join("Contents/Resources/vulkan/icd.d/MoltenVK_icd.json");
+        if icd.is_file() && std::env::var_os("VK_DRIVER_FILES").is_none() && std::env::var_os("VK_ICD_FILENAMES").is_none() {
+            std::env::set_var("VK_DRIVER_FILES", &icd);
+            std::env::set_var("VK_ICD_FILENAMES", &icd);
+        }
+    }
     if args.get(1).map(String::as_str) == Some("--sources") && args.len() >= 4 { print_sources(&args[2], &args[3], args.get(4).and_then(|n| n.parse().ok())); return; }
     if args.get(1).map(String::as_str) == Some("--addons") { print_addons(); return; }
+    if args.get(1).map(String::as_str) == Some("--self-test") { std::process::exit(selftest::run(&args[2..])); }
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
     // WebKitGTK's DMA-BUF renderer repaints only damaged tiles of a transparent page, so the
     // controls over the player's picture would tear; its shared-memory renderer repaints cleanly.
@@ -516,8 +528,8 @@ fn Shell_() -> Element {
             if let Some(live) = (shell.player)() { player_ui::PlayerScreen { live } }
             if search_open() { search::SearchOverlay {} }
             if shortcuts_open() { AppShortcuts {} }
-            // Windows and Android install releases; Linux builds from source.
-            if cfg!(any(windows, target_os = "android")) { updater::UpdateNotice {} }
+            // Windows, macOS and Android install releases; Linux builds from source.
+            if updater::ASSET.is_some() { updater::UpdateNotice {} }
             if let Some(theatre) = (shell.trailer)() { TheatreSheet { theatre } }
         }
     }
