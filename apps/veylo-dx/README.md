@@ -22,11 +22,12 @@ cargo test           # search ranking, pick filters, history, artwork accent
   `backdrop-filter` is an enhancement only: WebKitGTK doesn't render it, so overlays
   carry their own blurred artwork.
 - Player: one Rust player on every OS, libmpv (`src/engine.rs`) with Dioxus controls (`src/player_ui.rs`);
-  only the picture's bridge differs (`src/video.rs`): Android a SurfaceView under the WebView
+  only the picture's bridge differs (`src/video.rs`, desktop paths in `crates/video-surface`): Android a SurfaceView under the WebView
   (`android/kotlin/VeyloVideo.kt`, MediaCodec), Linux a GL area or Wayland subsurface (VAAPI),
   Windows mpv's child window under WebView2 (D3D11). Progress is recorded through the core.
 - Sources: direct links play; torrents (P2P consent) and external links are shown, not played.
-- Dev options: `VEYLO_DX_PLAY_DEMO=1` (plays the test stream at launch), `VEYLO_DX_TAB=picks|library|settings`, `VEYLO_DX_SEARCH=<query>`,
+- Dev options: `VEYLO_DX_PLAY_DEMO=1` (plays the test stream at launch; `=bars` plays colour bars for
+  `veylo-dx --check-picture <screenshot.png>`), `VEYLO_DX_SKIP_PICTURE_PATH=wayland-subsurface` (try the next picture path), `VEYLO_DX_TAB=picks|library|settings`, `VEYLO_DX_SEARCH=<query>`,
   `VEYLO_DX_OPEN=<library title>`. In a title sheet, P plays the best source.
 
 ## Android

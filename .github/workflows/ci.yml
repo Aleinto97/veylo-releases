@@ -7,7 +7,11 @@ on: [push, pull_request, workflow_dispatch]
 #   3. Windows and macOS: package the app as a release would, install it with the real installer
 #      (install.ps1, install.sh) and self-test the installed copy;
 #   4. a launch check: the app runs for a while without exiting or panicking, and a screenshot of it
-#      is kept with the run (Artifacts: screenshots-<os>), once on Home and once playing a test stream.
+#      is kept with the run (Artifacts: screenshots-<os>), once on Home and once playing a test stream;
+#   5. the picture test: six colour bars play, and the screenshot must show them in order (what the
+#      OS really composes, not just "the window drew something"; crates/picture-check). It reports
+#      without failing the run until it has passed on each runner (they have no real GPU).
+# `--workspace` also covers the app's own crates: crates/video-surface and crates/picture-check.
 jobs:
   core:
     runs-on: ubuntu-24.04
@@ -42,14 +46,17 @@ jobs:
           path: apps/veylo-dx/picks-ai
           key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-linux-x64
       - run: python3 ../../tools/picks-ai/fetch.py linux-x64
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - run: cargo build --locked
       - name: Self-test
         run: ./target/debug/veylo-dx --self-test --online
       # The runner has no desktop portal: GTK waits 25 s for it before the window opens.
       - name: Launch check
         run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-home.png 60
+      - name: Picture test, colour bars on screen
+        continue-on-error: true
+        run: xvfb-run -a -s "-screen 0 1440x900x24" ../../tools/ci/launch-check.sh target/debug/veylo-dx ../../screenshots/linux-bars.png 60 --bars
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -79,8 +86,8 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File windows/fetch-mpv.ps1
           python ../../tools/picks-ai/fetch.py windows-x64
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - run: cargo build --locked --release
       - name: Package (as tools/release.sh does)
         run: |
@@ -105,6 +112,10 @@ jobs:
       - name: Launch check
         working-directory: .
         run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-home.png
+      - name: Picture test, colour bars on screen
+        continue-on-error: true
+        working-directory: .
+        run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-bars.png -Seconds 30 -Bars
       # Plays a stream from the web on a runner without a GPU (Direct3D 11 on WARP): informative only.
       - name: Launch check, playing the test stream
         continue-on-error: true
@@ -140,8 +151,8 @@ jobs:
           path: apps/veylo-dx/picks-ai
           key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-macos-arm64
       - run: python3 ../../tools/picks-ai/fetch.py macos-arm64
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - name: Build Veylo.app (fails if it still needs Homebrew)
         run: ../../tools/build-macos.sh
       - name: Install with install.sh
@@ -152,6 +163,10 @@ jobs:
       - name: Launch check
         working-directory: .
         run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-home.png
+      - name: Picture test, colour bars on screen
+        continue-on-error: true
+        working-directory: .
+        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-bars.png 30 --bars
       # Plays a stream from the web on a VM without a real GPU (basic OpenGL): informative only.
       - name: Launch check, playing the test stream
         continue-on-error: true

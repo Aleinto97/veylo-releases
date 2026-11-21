@@ -11,7 +11,7 @@ A quiet, all-Rust media client for Android tablets and the Linux, Windows and ma
 - **Picks**: an endless two-card duel run by one local taste model over synopsis embeddings: match scores, reasons, moods, a shortlist of tonight's winners, Like and Not for me on every card, and nothing shown twice in a night.
 - **Library**: saved titles and what you watched, with per-episode progress.
 - **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
-  under the page through a bridge per OS (`video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
+  under the page through a bridge per OS (`crates/video-surface`; Android's in `video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
   mpv's own child window on Windows, a Core Animation OpenGL layer on macOS (HDR through EDR on screens that have it).
 
 ## Install
@@ -49,6 +49,8 @@ Android the first Update asks you to allow Veylo to install apps: allow it, come
 | `apps/veylo-dx/` | the app (Dioxus UI, Android glue in `android/`, fonts in `assets/`) |
 | `crates/core/` | addon protocol, SQLite library/history, recommendations, subtitles |
 | `crates/media-proxy/` | token-scoped loopback media relay |
+| `crates/video-surface/` | the desktop picture under the page, one path per OS, with fallbacks (part of the app's workspace) |
+| `crates/picture-check/` | CI's picture test: a clip of colour bars and the check that a screenshot shows them (app's workspace) |
 | `crates/torrent/`, `crates/aio-meta/` | P2P and embedded metadata crates (not used by the app yet) |
 | `tools/build-macos.sh`, `tools/release.sh` | the macOS app bundle; the release build and publish |
 | `tools/ci/` | CI launch checks (start the app, screenshot it) |
