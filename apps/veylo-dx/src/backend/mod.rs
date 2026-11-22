@@ -772,6 +772,7 @@ pub async fn search(query: String) -> Result<SearchOutcome> {
 /// the title's words (leading "[site]" and "www.site - " tags and a first "The" aside) and has
 /// more after them; for a film, a year right after the title is within one of `year`. A line
 /// that is only the title says nothing (some add-ons print the requested title on its own line).
+/// A translated title may come first: "Kód 3 - Code 3 (2024)", "Код 3 / Code 3 (2025)".
 pub fn names_title(s: &Source, title: &str, year: Option<i32>) -> bool {
     fn words(text: &str) -> Vec<String> {
         let mut t = text.trim();
@@ -789,7 +790,11 @@ pub fn names_title(s: &Source, title: &str, year: Option<i32>) -> bool {
     let wanted = words(title);
     if wanted.is_empty() { return true; }
     let file = s.filename.rsplit(['/', '\\']).next().unwrap_or("");
-    std::iter::once(file).chain(s.description.lines()).any(|line| {
+    // Each line as it is, and what follows a " - " or " / " in it (after a translated title).
+    let lines = std::iter::once(file).chain(s.description.lines()).flat_map(|line| {
+        std::iter::once(line).chain([" - ", " / "].into_iter().filter_map(move |sep| line.split_once(sep).map(|(_, rest)| rest)))
+    });
+    lines.into_iter().any(|line| {
         let w = words(line);
         if w.len() <= wanted.len() || w[..wanted.len()] != wanted[..] { return false; }
         // What follows the title must not make it another one ("The Dark Knight Rises"): a year
@@ -1294,6 +1299,28 @@ mod tests {
         assert_eq!(Settings::default().stream_language.as_deref(), Some("english"));
     }
 
+    /// Code 3 (2025) as Real-Debrid had it cached on 2026-11-22: Play chose the 1080p telesync, a
+    /// copy filmed in a cinema, and passed over the 4K WEB-DL named with its Czech title first.
+    #[test]
+    fn cinema_copies_never_play_and_translated_titles_count() {
+        let rows = [("[RD+] Torrentio\n4k", "Code 3 2025 2160p WEBRip\n👤 32 💾 4.45 GB ⚙️ ThePirateBay"),
+            ("[RD+] Torrentio\n4k", "Kód 3 - Code 3 (2024)(CZ.EN)[2160p][WebDL] CZ-AAC2.0 EN-DDP5.1 SDR x265\n👤 20 💾 11.2 GB ⚙️ SkTorrent 🇬🇧 / 🇨🇿"),
+            ("[RD+] Torrentio\n1080p", "Codigo 3 (Code 3) (2024) [Bluray 1080p][Esp]\n👤 2 💾 6.28 GB ⚙️ MejorTorrent 🇪🇸"),
+            ("[RD+] Torrentio\nTeleSync", "Code 3 2025 1080p HDTS x264-RGB\n👤 9 💾 6.17 GB ⚙️ 1337x")];
+        let mut list: Vec<Source> = rows.iter().enumerate()
+            .map(|(i, (n, t))| source_of("Torrentio", &json!({"name": n, "title": t, "url": format!("https://x.invalid/{i}")}))).collect();
+        for s in &mut list { s.off_title = !names_title(s, "Code 3", Some(2025)); }
+        let order = play_order_for(&list, None, Some("english"));
+        assert_eq!(order.iter().map(|s| s.size.as_deref().unwrap_or("")).collect::<Vec<_>>(), ["11.2 GB", "4.45 GB", "6.28 GB"],
+            "the English 4K first; the telesync never");
+        for camera in ["Film 2025 1080p HDTS x264", "Film.2025.2160p.HDCAM.x265", "Film 2025 1080p TELESYNC", "Film.2025.1080p.HD-TC.x264",
+            "Film 2025 1080p CAMRip", "Film.2025.1080p.DVDSCR.x264", "Film 2025 2160p SCREENER"] {
+            assert!(!playable(&source_of("A", &json!({"url":"https://x.invalid/c","title": camera}))), "{camera}");
+        }
+        // A bare TS is also the MPEG-TS container: a labelled release in one still plays.
+        assert!(playable(&source_of("A", &json!({"url":"https://x.invalid/t","title":"Film.2025.2160p.UHD.BluRay.REMUX.HEVC.ts"}))));
+    }
+
     #[test]
     fn releases_of_other_titles_go_last() {
         let src = |file: &str, description: &str| source_of("A", &json!({"url":"https://x.invalid/a","behaviorHints":{"filename":file},"title":description}));
@@ -1323,6 +1350,10 @@ mod tests {
         assert!(names_title(&src("Schindler's List (1993) [1080p].mp4", ""), "Schindler\u{2019}s List", Some(1993)));
         assert!(names_title(&src("Fast.and.Furious.2009.1080p.mkv", ""), "Fast & Furious", Some(2009)));
         assert!(names_title(&src("Fast & Furious 2009 2160p.mkv", ""), "Fast & Furious", Some(2009)));
+        // A translated title first, then the film's own.
+        assert!(names_title(&src("", "Kód 3 - Code 3 (2024)(CZ.EN)[2160p][WebDL] CZ-AAC2.0 EN-DDP5.1 SDR x265"), "Code 3", Some(2025)));
+        assert!(names_title(&src("", "Код 3 / Code 3 (2025) WEB-DL-HEVC 2160p"), "Code 3", Some(2025)));
+        assert!(!names_title(&src("", "Code 37 - Season 1 (2011)"), "Code 3", Some(2025)));
         let mut native = src("Your.Name.2016.1080p.BluRay.mkv", "💾 8 GB");
         let mut off = other.clone();
         native.off_title = !names_title(&native, "Your Name", Some(2016));
