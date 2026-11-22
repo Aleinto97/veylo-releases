@@ -7,7 +7,7 @@ members = [".", "../../crates/video-surface", "../../crates/picture-check"]
 
 [package]
 name = "veylo-dx"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
