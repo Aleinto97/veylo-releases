@@ -1,6 +1,8 @@
-//! The audio tracks a video file declares in its header, read from its first bytes before it
-//! plays: Matroska (EBML Tracks) and MP4 (moov). Play uses them to choose a file that really has
-//! the audio language you set, as labels written by add-ons and scrapers are often wrong.
+//! What a video file declares in its header, read from its first bytes before it plays:
+//! Matroska (EBML Info and Tracks) and MP4 (moov). Play uses its audio tracks to choose a file
+//! that really has the audio language you set, and its picture (size, HDR, Dolby Vision,
+//! length) to rank files by what they are, as labels written by add-ons and scrapers are often
+//! wrong.
 
 /// One audio track: its language tag as the file has it ("eng", "it", "" when untagged or "und")
 /// and its name ("English commentary").
@@ -29,6 +31,54 @@ pub fn in_language(tracks: &[AudioTrack], key: &str) -> Option<bool> {
 pub fn primary_in_language(tracks: &[AudioTrack], key: &str) -> bool {
     tracks.iter().find(|t| !t.extra()).is_some_and(|t| crate::backend::track_in_language(&t.lang, key))
 }
+
+/// How the picture's brightness is coded: the HDR question. Unknown when the header doesn't say
+/// (many files leave it out; their label then decides).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Transfer { #[default] Unknown, Sdr, Pq, Hlg }
+
+impl Transfer {
+    /// ITU-T H.273 transfer characteristics, as Matroska and MP4 write them.
+    fn of(code: u64) -> Self { match code { 16 => Self::Pq, 18 => Self::Hlg, 1 | 6 | 14 | 15 => Self::Sdr, _ => Self::Unknown } }
+}
+
+/// A file's video as its header declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Picture {
+    pub width: u32,
+    pub height: u32,
+    pub transfer: Transfer,
+    /// The Dolby Vision profile when there is a Dolby Vision layer (5: Dolby Vision alone, with
+    /// no HDR10 picture under it; 7 and 8: over an HDR10 one).
+    pub dolby_vision: Option<u8>,
+    /// Its length, when the header gives a plausible one.
+    pub seconds: Option<f64>,
+}
+
+impl Picture {
+    /// The Play order's HDR scale (`hdr_tier`: HDR10+ 3, HDR 2, Dolby Vision alone 1, SDR 0) as far
+    /// as the header can tell; HDR10+ isn't in it (its metadata is in the frames). None: it can't.
+    pub fn hdr_tier(&self) -> Option<u8> {
+        match (self.transfer, self.dolby_vision) {
+            (_, Some(5)) => Some(1),
+            (Transfer::Pq | Transfer::Hlg, _) => Some(2),
+            (Transfer::Sdr, None) => Some(0),
+            _ => None,
+        }
+    }
+}
+
+/// The picture in a file's first bytes; None when its header isn't there or names no video.
+pub fn picture(head: &[u8]) -> Option<Picture> {
+    let p = if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) { matroska_picture(head) } else if head.get(4..8) == Some(b"ftyp") { mp4_picture(head) } else { None }?;
+    (p.width > 0 && p.height > 0).then_some(p)
+}
+
+/// A length only when it is a film's or an episode's: a minute to six hours.
+fn plausible(seconds: f64) -> Option<f64> { (60.0..=6.0 * 3600.0).contains(&seconds).then_some(seconds) }
+
+/// A Dolby Vision configuration record's profile.
+fn dv_profile(record: &[u8]) -> Option<u8> { record.get(2).map(|b| b >> 1) }
 
 /// How many bytes from the start of a file are read for its header.
 pub const HEAD_BYTES: usize = 1 << 20;
@@ -105,6 +155,71 @@ fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
 
 fn text(v: &[u8]) -> String { String::from_utf8_lossy(v).trim_end_matches('\0').trim().to_owned() }
 
+fn uint(v: &[u8]) -> u64 { v.iter().take(8).fold(0u64, |a, x| (a << 8) | *x as u64) }
+
+fn float(v: &[u8]) -> Option<f64> {
+    match v.len() { 4 => Some(f32::from_be_bytes(v.try_into().ok()?) as f64), 8 => Some(f64::from_be_bytes(v.try_into().ok()?)), _ => None }
+}
+
+/// Matroska's first video track (Tracks), with its colour and Dolby Vision mapping, and the
+/// length from Info.
+fn matroska_picture(head: &[u8]) -> Option<Picture> {
+    const SEGMENT: u64 = 0x1853_8067;
+    const INFO: u64 = 0x1549_A966;
+    const TRACKS: u64 = 0x1654_AE6B;
+    const CLUSTER: u64 = 0x1F43_B675;
+    let (_, seg_start, seg_end, _) = elements(head).into_iter().find(|e| e.0 == SEGMENT)?;
+    let segment = &head[seg_start..seg_end];
+    let mut seconds = None;
+    for (id, start, end, whole) in elements(segment) {
+        if id == CLUSTER { return None; }
+        if id == INFO && whole {
+            let info = &segment[start..end];
+            let (mut scale, mut duration) = (1_000_000u64, None);
+            for (id, s, e, _) in elements(info) {
+                match id { 0x2AD7B1 => scale = uint(&info[s..e]).max(1), 0x4489 => duration = float(&info[s..e]), _ => {} }
+            }
+            seconds = duration.and_then(|d| plausible(d * scale as f64 / 1e9));
+        }
+        if id != TRACKS { continue; }
+        if !whole { return None; }
+        let tracks = &segment[start..end];
+        for (_, s, e, _) in elements(tracks).into_iter().filter(|e| e.0 == 0xAE && e.3) {
+            let entry = &tracks[s..e];
+            let mut picture = Picture { seconds, ..Picture::default() };
+            let mut video = false;
+            for (id, s, e, _) in elements(entry) {
+                let v = &entry[s..e];
+                match id {
+                    0x83 => video = uint(v) == 1,
+                    0xE0 => for (id, s, e, _) in elements(v) {
+                        match id {
+                            0xB0 => picture.width = uint(&v[s..e]) as u32,
+                            0xBA => picture.height = uint(&v[s..e]) as u32,
+                            0x55B0 => if let Some((_, cs, ce, _)) = elements(&v[s..e]).into_iter().find(|c| c.0 == 0x55BA) {
+                                picture.transfer = Transfer::of(uint(&v[s..e][cs..ce]));
+                            },
+                            _ => {}
+                        }
+                    },
+                    // BlockAdditionMapping: a Dolby Vision configuration ("dvcC", "dvvC").
+                    0x41E4 => {
+                        let mapping = elements(v);
+                        let kind = mapping.iter().find(|m| m.0 == 0x41E7).map(|m| uint(&v[m.1..m.2]));
+                        if matches!(kind, Some(0x6476_6343 | 0x6476_7643)) {
+                            picture.dolby_vision = mapping.iter().find(|m| m.0 == 0x41ED).and_then(|m| dv_profile(&v[m.1..m.2]));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if video { return Some(picture); }
+        }
+        return None;
+    }
+    None
+}
+
 // ---------------------------------------------------------------- MP4
 
 /// The boxes in `b`: (type, payload start, payload end, whole). A box is whole when all of it is
@@ -154,6 +269,50 @@ fn mp4(head: &[u8]) -> Option<Vec<AudioTrack>> {
             .unwrap_or_default();
         Some(AudioTrack { lang: if lang == "und" || !lang.chars().all(|c| c.is_ascii_alphabetic() || c == '-') { String::new() } else { lang }, name })
     }).collect())
+}
+
+/// MP4's first video track: its sample entry's size, colour ("colr" nclx) and Dolby Vision
+/// configuration ("dvcC", "dvvC"), and the length from mvhd.
+fn mp4_picture(head: &[u8]) -> Option<Picture> {
+    let top = boxes(head);
+    let (_, ms, me, whole) = *top.iter().find(|b| &b.0 == b"moov")?;
+    if !whole { return None; }
+    let moov = &head[ms..me];
+    let seconds = boxes(moov).into_iter().find(|b| &b.0 == b"mvhd").and_then(|(_, s, e, _)| {
+        let h = &moov[s..e];
+        let (scale, duration) = if h.first() == Some(&1) { (uint(h.get(20..24)?), uint(h.get(24..32)?)) } else { (uint(h.get(12..16)?), uint(h.get(16..20)?)) };
+        (scale > 0).then(|| duration as f64 / scale as f64).and_then(plausible)
+    });
+    let child = |b: &[u8], kind: &[u8; 4]| boxes(b).into_iter().find(|x| &x.0 == kind).map(|(_, s, e, _)| (s, e));
+    boxes(moov).into_iter().filter(|b| &b.0 == b"trak").find_map(|(_, ts, te, _)| {
+        let trak = &moov[ts..te];
+        let (ds, de) = child(trak, b"mdia")?;
+        let mdia = &trak[ds..de];
+        let (hs, he) = child(mdia, b"hdlr")?;
+        if mdia[hs..he].get(8..12) != Some(b"vide") { return None; }
+        let (ns, ne) = child(mdia, b"minf")?;
+        let minf = &mdia[ns..ne];
+        let (ls, le) = child(minf, b"stbl")?;
+        let stbl = &minf[ls..le];
+        let (ss, se) = child(stbl, b"stsd")?;
+        // stsd: version and flags, entry count, then the sample entries.
+        let entries = stbl[ss..se].get(8..)?;
+        let (_, es, ee, _) = *boxes(entries).first()?;
+        let entry = &entries[es..ee];
+        let mut picture = Picture { seconds, ..Picture::default() };
+        picture.width = uint(entry.get(24..26)?) as u32;
+        picture.height = uint(entry.get(26..28)?) as u32;
+        // A visual sample entry's fields take 78 bytes; its own boxes follow.
+        for (kind, s, e, _) in boxes(entry.get(78..)?) {
+            let v = &entry[78 + s..78 + e];
+            match &kind {
+                b"colr" if v.get(..4) == Some(b"nclx") => picture.transfer = Transfer::of(uint(v.get(6..8).unwrap_or_default())),
+                b"dvcC" | b"dvvC" => picture.dolby_vision = dv_profile(v),
+                _ => {}
+            }
+        }
+        Some(picture)
+    })
 }
 
 #[cfg(test)]
@@ -232,6 +391,63 @@ mod tests {
         assert_eq!(in_language(&[t("ita", ""), t("eng", "")], "italian"), Some(true));
         assert!(primary_in_language(&[t("eng", "Commentary"), t("en", "")], "english"));
         assert!(!primary_in_language(&[t("rus", ""), t("eng", "")], "english"));
+    }
+
+    #[test]
+    fn matroska_picture_size_hdr_dolby_vision_and_length() {
+        let colour = el(&[0x55, 0xB0], &el(&[0x55, 0xBA], &[16]));
+        let mut video = el(&[0xB0], &[0x0F, 0x00]);
+        video.extend(el(&[0xBA], &[0x06, 0x48]));
+        video.extend(colour);
+        let mut entry = el(&[0x83], &[1]);
+        entry.extend(el(&[0xE0], &video));
+        let mut mapping = el(&[0x41, 0xE7], b"dvcC");
+        mapping.extend(el(&[0x41, 0xED], &[1, 0, 8 << 1, 0, 0x10]));
+        entry.extend(el(&[0x41, 0xE4], &mapping));
+        let mut info = el(&[0x2A, 0xD7, 0xB1], &[0x0F, 0x42, 0x40]);
+        info.extend(el(&[0x44, 0x89], &7_200_000.0f64.to_be_bytes()));
+        let mut segment = el(&[0x15, 0x49, 0xA9, 0x66], &info);
+        segment.extend(el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &entry)));
+        segment.extend(el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]));
+        let mut file = el(&[0x1A, 0x45, 0xDF, 0xA3], b"header");
+        file.extend(el(&[0x18, 0x53, 0x80, 0x67], &segment));
+        let p = picture(&file).unwrap();
+        assert_eq!((p.width, p.height, p.transfer, p.dolby_vision), (3840, 1608, Transfer::Pq, Some(8)));
+        assert_eq!(p.seconds, Some(7200.0));
+        assert_eq!(p.hdr_tier(), Some(2), "Dolby Vision 8 over HDR10");
+        assert_eq!(Picture { dolby_vision: Some(5), transfer: Transfer::Pq, ..p }.hdr_tier(), Some(1), "profile 5: Dolby Vision alone");
+        assert_eq!(Picture { transfer: Transfer::Sdr, dolby_vision: None, ..p }.hdr_tier(), Some(0));
+        assert_eq!(Picture { transfer: Transfer::Unknown, dolby_vision: None, ..p }.hdr_tier(), None, "the label decides");
+        // The audio-only fixture has no video size: no picture.
+        assert_eq!(picture(&mkv(&[(2, Some("eng"), "")])), None);
+    }
+
+    #[test]
+    fn mp4_picture_from_the_sample_entry() {
+        let mut entry = vec![0u8; 78];
+        entry[24..26].copy_from_slice(&1920u16.to_be_bytes());
+        entry[26..28].copy_from_slice(&800u16.to_be_bytes());
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend([0, 1, 0, 1, 0, 1, 0]);
+        entry.extend(bx(b"colr", &nclx));
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend(bx(b"avc1", &entry));
+        let stbl = bx(b"stbl", &bx(b"stsd", &stsd));
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend(b"vide");
+        hdlr.extend([0u8; 13]);
+        let mut mdia = bx(b"hdlr", &hdlr);
+        mdia.extend(bx(b"minf", &stbl));
+        let mut mvhd = vec![0u8; 12];
+        mvhd.extend(1000u32.to_be_bytes());
+        mvhd.extend(5_400_000u32.to_be_bytes());
+        mvhd.extend([0u8; 80]);
+        let mut moov = bx(b"mvhd", &mvhd);
+        moov.extend(bx(b"trak", &bx(b"mdia", &mdia)));
+        let mut file = bx(b"ftyp", b"isomiso2");
+        file.extend(bx(b"moov", &moov));
+        let p = picture(&file).unwrap();
+        assert_eq!((p.width, p.height, p.transfer, p.dolby_vision, p.seconds), (1920, 800, Transfer::Sdr, None, Some(5400.0)));
     }
 
     #[test]

@@ -46,9 +46,12 @@ pub struct Facts { pub resolution: String, pub picture: String, pub size: String
 
 /// The resolution class, by width as much as height: a widescreen film is stored cropped, so a
 /// 1080p scope film is 1920x800 and a 4K one 3840x1600, short of the class's usual height.
-pub fn resolution_label(width: i64, height: i64) -> String {
+pub fn resolution_label(width: i64, height: i64) -> String { resolution_class(width, height).into() }
+
+/// `resolution_label` as the names the Play order uses ("4K", "1440p", "1080p", "720p", "SD", "").
+pub fn resolution_class(width: i64, height: i64) -> &'static str {
     match () { _ if height >= 2000 || width >= 3600 => "4K", _ if height >= 1400 || width >= 2400 => "1440p",
-        _ if height >= 1000 || width >= 1800 => "1080p", _ if height >= 700 || width >= 1200 => "720p", _ if height > 0 => "SD", _ => "" }.into()
+        _ if height >= 1000 || width >= 1800 => "1080p", _ if height >= 700 || width >= 1200 => "720p", _ if height > 0 => "SD", _ => "" }
 }
 
 #[derive(Clone, Debug, PartialEq)]

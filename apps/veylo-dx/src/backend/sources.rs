@@ -30,6 +30,9 @@ pub struct Source {
     /// No line of the release names the title being played (an add-on's loose match: "Call Me by
     /// Your Name" for "Your Name"): such sources go after every one that does.
     pub off_title: bool,
+    /// The picture the file's own header declares, once Play's check has read it: its size and
+    /// HDR then outrank what the label claims.
+    pub picture: Option<crate::tracks::Picture>,
 }
 
 pub(super) fn find_quality(text: &str) -> Option<&'static str> {
@@ -134,6 +137,7 @@ pub(super) fn source_of(addon: &str, v: &Value) -> Source {
         url: if kind == SourceKind::Direct { url } else { String::new() },
         label,
         off_title: false,
+        picture: None,
     }
 }
 
@@ -294,12 +298,26 @@ pub(super) fn playable(s: &Source) -> bool {
 
 pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u8, u64, i16, u8, u8)>);
 
+/// The HDR scale Play ranks a file by: its header's where Play's check read one that says,
+/// else its label's. HDR10+ lives in the frames, so a label's HDR10+ stands over a header's HDR.
+pub(super) fn verified_hdr_tier(s: &Source) -> u8 {
+    let label = hdr_tier(&s.label);
+    match s.picture.and_then(|p| p.hdr_tier()) { Some(2) if label == 3 => 3, Some(t) => t, None => label }
+}
+
 /// The resolution Play ranks a file by: its label's, or 1080p's when the file is too small to
 /// carry it (a 2 GB "4K" film is a heavy re-encode: among the 1080p files its size decides). An
 /// episode (S01E02, or a season pack's share) needs less than a film. Unknown sizes keep their
 /// label's class.
 pub(super) fn picture_class(s: &Source, size: u64) -> u8 {
     let class = 5 - quality_rank(s.quality);
+    // With the file's real length the bitrate decides (about what the size floors mean for a
+    // two-hour film or a 45-minute episode).
+    if let Some(seconds) = s.picture.and_then(|p| p.seconds).filter(|_| size > 0) {
+        let mbps = size as f64 * 8.0 / seconds / 1e6;
+        let floor = match s.quality { Some("4K") => 3.0, Some("1440p") => 2.0, _ => 0.0 };
+        return if mbps < floor { class.min(5 - quality_rank(Some("1080p"))) } else { class };
+    }
     let episode = s.pack || episode_mark().is_match(&s.label);
     let floor: u64 = match (s.quality, episode) {
         (Some("4K"), false) => 3_000_000_000, (Some("4K"), true) => 1_000_000_000,
@@ -318,7 +336,7 @@ pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Lang
         Some(l) => u8::from(l.key != "english"),
     };
     let provider = if !crate::addons::is_free_addon(&s.addon) { 0 } else if s.label.to_uppercase().contains("FREE TRIAL") { 2 } else { 1 };
-    let hdr = hdr_tier(&s.label);
+    let hdr = verified_hdr_tier(s);
     // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
     let hdr_rank = match hdr { 1 => 0, 0 => 1, t => t };
     // An upscale or regrade goes after every native file: its 4K and HDR are made up, its size padding.
@@ -498,8 +516,9 @@ pub async fn pick_source(candidates: Vec<Source>, pack_episodes: Option<usize>) 
     if working.is_empty() { return Pick { best: None, rest: Vec::new(), debrid, audio_known: false }; }
     let mut paired: Vec<(Source, AudioVerdict)> = working.into_iter().zip(verdicts).collect();
     paired.sort_by_cached_key(|(s, _)| order_key(s, size(s), lang));
-    dev_log(&format!("checked {} working files in {} ms, audio: {}", paired.len(), started.elapsed().as_millis(),
-        paired.iter().map(|(_, v)| match v { Some((true, true)) => "main", Some((true, false)) => "yes", Some((false, _)) => "no", None => "?" }).collect::<Vec<_>>().join(" ")));
+    dev_log(&format!("checked {} working files in {} ms, audio: {}; pictures: {}", paired.len(), started.elapsed().as_millis(),
+        paired.iter().map(|(_, v)| match v { Some((true, true)) => "main", Some((true, false)) => "yes", Some((false, _)) => "no", None => "?" }).collect::<Vec<_>>().join(" "),
+        paired.iter().map(|(s, _)| picture_summary(s)).collect::<Vec<_>>().join(" | ")));
     // The files' own audio tracks: one in your language first, then those that can't tell, then
     // the rest, each in the Play order.
     let (working, verdicts): (Vec<Source>, Vec<AudioVerdict>) = paired.into_iter().unzip();
@@ -556,7 +575,8 @@ pub(super) const AUDIO_TIMEOUT: Duration = Duration::from_millis(1500);
 /// What checking one link found: it works (and its real size, debrid status clip, audio tracks
 /// and the link its redirects end at).
 #[derive(Clone, Debug)]
-pub(super) struct ProbeOutcome { ok: bool, status: u64, bytes: Option<u64>, debrid: Option<String>, tracks: Option<Vec<crate::tracks::AudioTrack>>, resolved: Option<String> }
+pub(super) struct ProbeOutcome { ok: bool, status: u64, bytes: Option<u64>, debrid: Option<String>, tracks: Option<Vec<crate::tracks::AudioTrack>>,
+    picture: Option<crate::tracks::Picture>, resolved: Option<String> }
 
 /// Checks by link, for a while: a check under way is joined, not repeated (Play's early round
 /// on the first add-on's sources, the final one, "Another source"). Only links that work are
@@ -594,8 +614,9 @@ pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
             probe = check().await.map_err(|_| None)?.map_err(|_| None)?;
         }
         let ok = probe["ok"] == true;
-        let (tracks, resolved) = if ok { tokio::time::timeout(AUDIO_TIMEOUT, file_audio(src)).await.unwrap_or_default() } else { (None, None) };
-        let outcome = ProbeOutcome { ok, status: probe["status"].as_u64().unwrap_or(0), bytes: probe["bytes"].as_u64(), debrid: probe["debrid_status"].as_str().map(str::to_owned), tracks, resolved };
+        let (tracks, picture, resolved) = if ok { tokio::time::timeout(AUDIO_TIMEOUT, file_header(src)).await.unwrap_or_default() } else { (None, None, None) };
+        let outcome = ProbeOutcome { ok, status: probe["status"].as_u64().unwrap_or(0), bytes: probe["bytes"].as_u64(), debrid: probe["debrid_status"].as_str().map(str::to_owned),
+            tracks, picture, resolved };
         if ok { Ok(outcome) } else { Err(Some(outcome)) }
     }).await {
         Ok(found) => Some(found.clone()),
@@ -603,21 +624,41 @@ pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
     }
 }
 
-/// The audio tracks a file's header declares, read from its first bytes (stopping as soon as
-/// they are known), and the https link the source's redirects end at.
-pub(super) async fn file_audio(src: Source) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<String>) {
+/// The audio tracks and the picture a file's header declares, read from its first bytes
+/// (stopping as soon as the tracks are known: the picture is in the same part of the header),
+/// and the https link the source's redirects end at.
+pub(super) async fn file_header(src: Source) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
     let mut req = backend_http().get(&src.url).header("range", format!("bytes=0-{}", crate::tracks::HEAD_BYTES - 1));
     for (k, v) in &src.headers { req = req.header(k.as_str(), v.as_str()); }
-    let Ok(mut response) = req.send().await else { return (None, None) };
-    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None); }
+    let Ok(mut response) = req.send().await else { return (None, None, None) };
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None, None); }
     let resolved = Some(response.url().to_string()).filter(|u| u.starts_with("https://") && *u != src.url);
     let mut head = Vec::new();
     while head.len() < crate::tracks::HEAD_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else { break };
         head.extend_from_slice(&chunk);
-        if let Some(tracks) = crate::tracks::audio_tracks(&head) { return (Some(tracks), resolved); }
+        if let Some(tracks) = crate::tracks::audio_tracks(&head) { return (Some(tracks), crate::tracks::picture(&head), resolved); }
     }
-    (crate::tracks::audio_tracks(&head), resolved)
+    (crate::tracks::audio_tracks(&head), crate::tracks::picture(&head), resolved)
+}
+
+/// A working file as its header declares it: its resolution and HDR replace the label's (the
+/// label stays where the header can't tell).
+pub(super) fn with_picture(mut src: Source, picture: crate::tracks::Picture) -> Source {
+    let class = crate::player::resolution_class(picture.width as i64, picture.height as i64);
+    if !class.is_empty() { src.quality = Some(class); }
+    src.picture = Some(picture);
+    src.hdr = match verified_hdr_tier(&src) { 3 => Some("HDR10+"), 2 => Some("HDR"), 1 => Some("DV"), _ => None };
+    src
+}
+
+/// "3840x1608 PQ DV8 24 Mb/s": what the log says about a file's own picture.
+pub(super) fn picture_summary(s: &Source) -> String {
+    let Some(p) = s.picture else { return "?".into() };
+    let transfer = match p.transfer { crate::tracks::Transfer::Pq => " PQ", crate::tracks::Transfer::Hlg => " HLG", crate::tracks::Transfer::Sdr => " SDR", _ => "" };
+    let dv = p.dolby_vision.map(|d| format!(" DV{d}")).unwrap_or_default();
+    let rate = p.seconds.zip(s.size_bytes).map(|(sec, b)| format!(" {:.0} Mb/s", b as f64 * 8.0 / sec / 1e6)).unwrap_or_default();
+    format!("{}x{}{transfer}{dv}{rate}", p.width, p.height)
 }
 
 /// The batch's working sources, each with the size its server reports, and a debrid status seen.
@@ -660,6 +701,7 @@ pub(super) async fn probe_batch(batch: Vec<Source>, lang: Option<&'static crate:
                 continue;
             }
             let mut src = batch[i].clone();
+            if let Some(picture) = result.picture { src = with_picture(src, picture); }
             // The player opens the link the add-on's resolve led to: no second resolve on Play.
             if let Some(url) = result.resolved { src.url = url; }
             if let Some(bytes) = result.bytes.filter(|b| *b > 0) {
