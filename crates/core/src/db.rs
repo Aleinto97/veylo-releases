@@ -320,6 +320,90 @@ pub(crate) fn upsert_meta(
     )?;
     Ok(key)
 }
+/// Sync between devices: titles changed after `since` (seconds) and the per-video records changed
+/// after it. A title with no history left (unsaved, unrated, its progress gone) is listed too,
+/// flagged, without its metadata: the caller sends it only where the other side knows it.
+pub(crate) fn sync_changes(db: &Connection, since: i64) -> Result<Value> {
+    let mut stmt = db.prepare_cached(
+        "SELECT key,type,raw_id,addon_url,meta,saved,watched,position_ms,duration_ms,watched_ms,liked,video_id,updated,
+           (saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0)
+         FROM media WHERE updated>?1 ORDER BY updated,key LIMIT 5000",
+    )?;
+    let media = stmt
+        .query_map([since], |r| {
+            let history: bool = r.get(13)?;
+            let meta = if history { serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(json!({})) } else { json!({}) };
+            Ok(json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
+                "meta":meta,"saved":r.get::<_,bool>(5)?,"watched":r.get::<_,bool>(6)?,"position_ms":r.get::<_,i64>(7)?,
+                "duration_ms":r.get::<_,i64>(8)?,"watched_ms":r.get::<_,i64>(9)?,"liked":r.get::<_,i64>(10)?,
+                "video_id":r.get::<_,Option<String>>(11)?,"updated":r.get::<_,i64>(12)?,"history":history}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stmt = db.prepare_cached(
+        "SELECT p.media_key,m.type,m.raw_id,m.addon_url,p.video_id,p.position_ms,p.duration_ms,p.watched_ms,p.watched,p.updated
+         FROM playback p JOIN media m ON m.key=p.media_key WHERE p.updated>?1 ORDER BY p.updated LIMIT 20000",
+    )?;
+    let playback = stmt
+        .query_map([since], |r| {
+            Ok(json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
+                "video_id":r.get::<_,String>(4)?,"position_ms":r.get::<_,i64>(5)?,"duration_ms":r.get::<_,i64>(6)?,
+                "watched_ms":r.get::<_,i64>(7)?,"watched":r.get::<_,bool>(8)?,"updated":r.get::<_,i64>(9)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(json!({"media":media,"playback":playback,"now":now()}))
+}
+
+/// Another device's changes (as `sync_changes` lists them, `deleted` for a title it forgot): each
+/// title and per-video record replaces this one's only when it is newer, and keeps its own time
+/// so it isn't listed again as a change of this device's. A title known here only as catalogue
+/// metadata (no history) always takes the other device's history.
+pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> {
+    let tx = db.transaction()?;
+    let mut applied = 0;
+    let field = |v: &Value, k: &str| v[k].as_str().filter(|s| !s.is_empty() && s.len() <= 2048).map(str::to_owned);
+    for m in request["media"].as_array().into_iter().flatten() {
+        let (Some(kind), Some(id), Some(addon)) = (field(m, "type"), field(m, "id"), m["addon_url"].as_str().map(str::to_owned)) else { continue };
+        let Some(updated) = m["updated"].as_i64() else { continue };
+        let key = identity(&kind, &id, &addon);
+        let local: Option<(i64, bool)> = tx
+            .query_row(
+                "SELECT updated,(saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0) FROM media WHERE key=?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if local.is_some_and(|(at, history)| history && at >= updated) { continue; }
+        if m["deleted"] == true {
+            tx.execute("DELETE FROM playback WHERE media_key=?1", [&key])?;
+            tx.execute("DELETE FROM media WHERE key=?1", [&key])?;
+            applied += 1;
+            continue;
+        }
+        let meta = if m["meta"].is_object() { m["meta"].clone() } else { json!({}) };
+        upsert_meta(&tx, &kind, &id, &addon, &meta)?;
+        tx.execute(
+            "UPDATE media SET saved=?2,watched=?3,position_ms=?4,duration_ms=?5,watched_ms=?6,liked=?7,video_id=?8,updated=?9 WHERE key=?1",
+            params![key, m["saved"] == true, m["watched"] == true, m["position_ms"].as_i64().unwrap_or(0).max(0),
+                m["duration_ms"].as_i64().unwrap_or(0).max(0), m["watched_ms"].as_i64().unwrap_or(0).max(0),
+                m["liked"].as_i64().unwrap_or(0).clamp(-1, 1), m["video_id"].as_str(), updated],
+        )?;
+        applied += 1;
+    }
+    for p in request["playback"].as_array().into_iter().flatten() {
+        let (Some(kind), Some(id), Some(addon), Some(video)) = (field(p, "type"), field(p, "id"), p["addon_url"].as_str().map(str::to_owned), field(p, "video_id")) else { continue };
+        let Some(updated) = p["updated"].as_i64() else { continue };
+        let key = upsert_meta(&tx, &kind, &id, &addon, &json!({}))?;
+        applied += tx.execute(
+            "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,watched,updated) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(media_key,video_id) DO UPDATE SET position_ms=excluded.position_ms,duration_ms=excluded.duration_ms,
+               watched_ms=excluded.watched_ms,watched=excluded.watched,updated=excluded.updated WHERE playback.updated<excluded.updated",
+            params![key, video, p["position_ms"].as_i64().unwrap_or(0).max(0), p["duration_ms"].as_i64().unwrap_or(0).max(0),
+                p["watched_ms"].as_i64().unwrap_or(0).max(0), p["watched"] == true, updated],
+        )?;
+    }
+    tx.commit()?;
+    Ok(json!({"applied":applied}))
+}
 pub(crate) fn cache_metas(
     db: &mut Connection,
     body: &Value,

@@ -347,6 +347,12 @@ impl Core {
             "set_library" | "progress" | "mark_watched" | "mark_videos" | "feedback" | "forget" => {
                 self.mutate(&request)
             }
+            // Sync between a person's devices (the app's account): what changed here, and another's changes.
+            "sync_changes" => {
+                let since = request["since"].as_i64().unwrap_or(0);
+                self.with_db(|db| db::sync_changes(db, since))
+            }
+            "sync_apply" => self.with_db(|db| db::sync_apply(db, &request)),
             "recommendations" => Ok(recommendations::recommend(
                 &self.with_db(|db| db::personal_media(db))?,
                 None,

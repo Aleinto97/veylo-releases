@@ -28,11 +28,13 @@ macro_rules! static_re { ($name:ident, $pat:expr) => {
     pub(super) fn $name() -> &'static regex::Regex { static R: OnceLock<regex::Regex> = OnceLock::new(); R.get_or_init(|| re($pat)) }
 }; }
 
+mod account;
 mod metadata;
 mod open;
 mod sources;
 mod store;
 mod subtitles;
+pub use account::*;
 pub use metadata::*;
 pub use open::*;
 pub use sources::*;
@@ -116,6 +118,8 @@ pub fn init() -> Result<()> {
     BACKEND
         .set(Backend { core, proxy, data_dir: dir, http, accents: Mutex::new(HashMap::new()) })
         .map_err(|_| anyhow!("Backend already started"))?;
+    // Signed in: your devices' changes come in, and this one's go out, from launch on.
+    start_sync();
     Ok(())
 }
 
@@ -472,12 +476,14 @@ pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64,
 pub async fn set_episodes_watched(media: &Media, video_ids: Vec<String>, watched: bool) -> Result<()> {
     if video_ids.is_empty() { return Ok(()); }
     exec(json!({"op":"mark_videos","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":watched,"video_ids":video_ids,"meta":media.raw})).await?;
+    sync_soon();
     Ok(())
 }
 
 /// Stop tracking a title: its history, progress, marks and rating are deleted from the store.
 pub async fn forget(media: &Media) -> Result<()> {
     exec(json!({"op":"forget","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await?;
+    sync_forgotten(media);
     Ok(())
 }
 
@@ -647,12 +653,14 @@ pub async fn stored(media: &Media) -> Option<Media> {
 /// Save a title to the Library, or take it out (its history stays).
 pub async fn set_saved(media: &Media, saved: bool) -> Result<()> {
     exec(json!({"op":"set_library","type":media.kind,"id":media.id,"addon_url":media.addon_url,"saved":saved,"meta":media.raw})).await?;
+    sync_soon();
     Ok(())
 }
 
 /// Mark a film watched or not: the core's own mutation.
 pub async fn set_watched(media: &Media, watched: bool) -> Result<()> {
     exec(json!({"op":"mark_watched","type":media.kind,"id":media.id,"addon_url":media.addon_url,"watched":watched,"meta":media.raw})).await?;
+    sync_soon();
     Ok(())
 }
 
@@ -674,6 +682,7 @@ pub async fn picks() -> Result<Picks> {
 pub async fn feedback(media: &Media, value: i64) -> Result<()> {
     exec(json!({"op":"feedback","type":media.kind,"id":media.id,"addon_url":media.addon_url,
         "value":value,"meta":media.raw})).await?;
+    sync_soon();
     Ok(())
 }
 

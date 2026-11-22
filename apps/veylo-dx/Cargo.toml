@@ -26,12 +26,15 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net", "io-util"] }
 unicode-normalization = "0.1"
 # CPU inference on Linux, Windows and Android; runtime shipped beside the app.
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.10"
+# Accounts: the link a phone hands a computer is sealed (AES-256-GCM); the computer shows it as a QR code.
+ring = "0.17"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 url = "2"
 # The player on every platform: libmpv driven from Rust (src/engine.rs). Android links the
 # mpv-android build in android/mpv (android/fetch-mpv.sh); desktop the system libmpv.
