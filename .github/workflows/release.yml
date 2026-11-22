@@ -25,9 +25,9 @@ jobs:
   plan:
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ needs.plan.outputs.version }}
+      version: ${{ steps.plan.outputs.version }}
       build: ${{ steps.plan.outputs.build }}
-      publish: ${{ needs.plan.outputs.publish }}
+      publish: ${{ steps.plan.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
       - name: Is this version new?
