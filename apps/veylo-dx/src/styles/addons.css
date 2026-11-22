@@ -1,0 +1,39 @@
+/* Settings' add-on marketplace. */
+
+/* ---------------------------------------------------------------- add-on marketplace */
+.tab-dot { position: absolute; top: 8px; right: 8px; width: 9px; height: 9px; border-radius: 50%; background: var(--lamp); box-shadow: 0 0 0 2px rgba(0,0,0,.5); }
+.dock-tab { position: relative; }
+.link-btn { display: inline-flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 8px; color: var(--bone); font-size: 14px; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+.link-btn .icon { width: 16px; height: 16px; }
+.link-btn:focus-visible { outline: 2px solid var(--bone); border-radius: 12px; }
+.select-field { height: 48px; padding: 0 18px; border-radius: 24px; border: 0; outline: none; background: rgba(255,255,255,.08); color: var(--bone); font: inherit; font-weight: 600; }
+.select-field option { background: #1a1a1d; color: var(--bone); }
+.select-field:focus { box-shadow: inset 0 0 0 2px var(--bone); }
+.addon-problem { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,120,100,.12); color: #ffd2c8; font-size: 14.5px; }
+.addon-problem .icon { width: 18px; height: 18px; flex: none; }
+.settings-block .group-head .pill.small { min-height: 40px; padding: 0 14px; font-size: 14px; }
+.pill.small { min-height: 40px; padding: 0 14px; font-size: 14px; }
+.market { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 14px; }
+.market-card { display: flex; flex-direction: column; gap: 6px; padding: 20px 22px; border-radius: 22px; --glass: rgba(255,255,255,.05); }
+.market-card.on { box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px rgba(242,239,234,.24), 0 12px 32px rgba(0,0,0,.28); }
+.market-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.market-name { font-size: 26px; font-weight: 700; }
+.market-version { font-size: 13.5px; }
+.market-about { margin: 0; color: #c9c7c3; font-size: 14.5px; line-height: 1.5; }
+.market-about.dim { color: var(--dust); font-size: 13.5px; }
+.market-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: auto; padding-top: 16px; }
+/* Installed is a state, not a button. */
+.market-status { display: inline-flex; align-items: center; gap: 8px; margin-right: auto; font-size: 15px; font-weight: 650; color: var(--bone); }
+.market-status .icon { width: 22px; height: 22px; padding: 4px; border-radius: 50%; background: var(--bone); color: #000; box-sizing: border-box; }
+.addon-row { align-items: center; }
+/* Add-ons Veylo doesn't set up: one quiet list, like the settings panels. */
+.addon-list { gap: 0; }
+.addon-row.glass { border-radius: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,.09); }
+.addon-row.glass:first-child { border-radius: 16px 16px 0 0; box-shadow: inset 0 1px 0 var(--sheen); }
+.addon-row.glass:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+@media (max-width: 640px) {
+  .setting-row { flex-wrap: wrap; }
+  .key-field, .select-field { width: 100%; }
+}
+.check-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,255,255,.06); color: var(--bone); font-size: 14.5px; }
+.check-note .icon { width: 18px; height: 18px; flex: none; }

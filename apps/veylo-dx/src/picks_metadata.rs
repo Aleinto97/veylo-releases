@@ -1,4 +1,5 @@
-//! Public title metadata for local classification. Fixed provider endpoints only; cache contains
+//! Public title metadata for local classification (TMDB keywords with a key, Wikidata's
+//! without). Fixed provider endpoints only; cache contains
 //! hashed identities and cleaned keywords/summaries, never provider URLs or credentials.
 use crate::backend::{self, Media};
 use serde_json::{json, Value};
@@ -44,7 +45,8 @@ fn title_lock(key: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
     Some(lock)
 }
 impl Entry {
-    fn needs_keywords(&self, now: i64, key_present: bool) -> bool { key_present && now >= self.keywords_due }
+    /// TMDB answers with a key, Wikidata without one, so there is always a source to ask.
+    fn needs_keywords(&self, now: i64) -> bool { now >= self.keywords_due }
     fn update(&mut self, keywords: Option<Vec<String>>, now: i64) {
         match keywords {
             Some(fetched) => { self.keywords_due = now + if fetched.is_empty() { 86400 } else { WEEK }; self.extra.keywords = fetched; }
@@ -66,21 +68,32 @@ pub async fn enrich(media: &Media) {
         let Some(store) = STORE.get() else { return };
         let mut entry = store.read().ok().and_then(|s| s.get(&id).cloned()).unwrap_or_default();
         let now = backend::now_secs();
-        if !entry.needs_keywords(now, backend::tmdb_ready()) { return; }
+        if !entry.needs_keywords(now) { return; }
         let Ok(_permit) = GATE.acquire().await else { return };
         entry.update(backend::picks_keywords(&media).await, now);
-        // Serialize writes on the blocking pool, so concurrent refreshes cannot overwrite a
-        // newer snapshot or leave a partially interleaved JSON document.
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut store) = store.write() {
-                if !store.contains_key(&id) && store.len() >= LIMIT {
-                    if let Some(oldest) = store.iter().min_by_key(|(_, e)| e.touched).map(|(k, _)| k.clone()) { store.remove(&oldest); }
-                }
-                store.insert(id, entry);
-                let _ = std::fs::write(backend::backend_data_dir().join("picks-metadata-v1.json"), encode_store(&store).to_string());
+        // Only the entry is changed under the lock (Picks reads the store all the time); the file
+        // follows a few seconds later, one write for every title enriched meanwhile.
+        if let Ok(mut store) = store.write() {
+            if !store.contains_key(&id) && store.len() >= LIMIT {
+                if let Some(oldest) = store.iter().min_by_key(|(_, e)| e.touched).map(|(k, _)| k.clone()) { store.remove(&oldest); }
             }
-        }).await;
+            store.insert(id, entry);
+        }
+        save_soon();
     }).await;
+}
+
+/// Write the store once a burst of enrichment is over, encoding it under a read lock on a thread
+/// of its own (one save at a time: the next waits for the next burst).
+fn save_soon() {
+    static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        PENDING.store(false, std::sync::atomic::Ordering::Release);
+        let Some(text) = STORE.get().and_then(|s| s.read().ok().map(|s| encode_store(&s).to_string())) else { return };
+        let _ = std::fs::write(backend::backend_data_dir().join("picks-metadata-v1.json"), text);
+    });
 }
 
 fn encode_store(store: &Store) -> Value {
@@ -140,17 +153,16 @@ mod tests {
         assert_eq!(clean("<p>Bob&#39;s <b>family</b>&nbsp;&amp; &#x66;riends.</p>",100),"Bob's family & friends.");
     }
     #[test]
-    fn expiry_key_enabling_and_offline_refresh_preserve_data() {
+    fn expiry_and_offline_refresh_preserve_data() {
         let mut e = Entry::default();
-        assert!(!e.needs_keywords(100,false));
-        assert!(e.needs_keywords(100,true));
+        assert!(e.needs_keywords(100));
         e.update(Some(vec!["dark".into()]),100);
-        assert!(!e.needs_keywords(101,true));
-        assert!(e.needs_keywords(100+WEEK,true));
+        assert!(!e.needs_keywords(101));
+        assert!(e.needs_keywords(100+WEEK));
         e.update(None,100+WEEK);
         assert_eq!(e.extra.keywords,["dark"]);
-        assert!(!e.needs_keywords(101+WEEK,true));
-        assert!(e.needs_keywords(100+WEEK+RETRY,true));
+        assert!(!e.needs_keywords(101+WEEK));
+        assert!(e.needs_keywords(100+WEEK+RETRY));
     }
     #[test]
     fn cache_roundtrip_uses_an_isolated_file_and_rejects_other_versions() {

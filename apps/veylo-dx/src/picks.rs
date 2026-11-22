@@ -19,6 +19,14 @@ enum Slot { Filters, Mood }
 fn year_span(from: &str, to: &str) -> Option<String> { (!from.is_empty() || !to.is_empty()).then(|| format!("{from}–{to}")) }
 fn new_night_id() -> u64 { backend::rand_u64() | 1 }
 fn has(list: &[Media], m: &Media) -> bool { list.iter().any(|x| x.key() == m.key()) }
+/// A title you finished, under any of its ids (`backend::watched_ids`).
+fn finished(seen: &HashSet<String>, m: &Media) -> bool {
+    seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|i| seen.contains(i))
+}
+/// Candidate checks (poster, trailer, embedding) running at once.
+const CHECKS_AT_ONCE: usize = 12;
+/// How long a duel card stays on screen before its sources are asked for (a card skipped at once costs nothing).
+const PREFETCH_AFTER_MS: u64 = 2500;
 
 #[component]
 pub fn Picks() -> Element {
@@ -86,7 +94,7 @@ pub fn Picks() -> Element {
     });
 
     // Candidates: your ranked recommendations first, then the wider catalogue in the background:
-    // random pages of popular, well-rated TMDB titles and a TVmaze sample, so every visit brings
+    // random pages of popular, well-rated titles (TMDB, else Cinemeta) and a TVmaze sample, so every visit brings
     // new titles. Titles you keep pull in more like them as you go (expand, below).
     use_future(move || async move {
         let mut items = backend::picks().await.map(|p| p.items).unwrap_or_default();
@@ -99,7 +107,7 @@ pub fn Picks() -> Element {
         pool.set(first);
         loading.set(false);
         let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 25) as u32).collect();
-        let mut more = backend::tmdb_candidates(None, None, Style::Both, None, None, pages).await;
+        let mut more = backend::discover_candidates(None, None, Style::Both, None, None, pages).await;
         more.extend(backend::tvmaze_candidates(None, Style::Both, None, None).await);
         pool.with_mut(|p| rules::merge(p, more));
         pool_complete.set(true);
@@ -145,8 +153,7 @@ pub fn Picks() -> Element {
         let gone = rejected.read();
         let not_for_me = disliked.read();
         let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
-        let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|i| seen.contains(i));
-        out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(m) && !not_for_me.contains(&brain::id(m))).collect::<Vec<_>>()
+        out.into_iter().filter(|m| !gone.contains(&m.key()) && !finished(&seen, m) && !not_for_me.contains(&brain::id(m))).collect::<Vec<_>>()
     });
     let resolved_pair = use_memo(move || {
         let list = pool.read();
@@ -196,12 +203,16 @@ pub fn Picks() -> Element {
         let ready: Vec<Media> = list.iter().filter(|m| ok.contains(&m.key())).cloned().collect();
         if ready.iter().filter(|m| !brain::excluded(m, &skip)).count() >= 2 { ready } else { list.to_vec() }
     };
-    // Check the candidates ahead of the duel, a dozen at a time.
+    // Check the candidates ahead of the duel, at most a dozen at a time: a finished check frees a
+    // place (the effect follows `checking`), it doesn't add a dozen more.
     use_effect(move || {
+        let in_flight = checking.read().len();
+        let room = CHECKS_AT_ONCE.saturating_sub(in_flight);
+        if room == 0 { return; }
         let list = filtered.read().clone();
         let todo: Vec<Media> = {
             let (ok, busy) = (verified.peek(), checking.peek());
-            list.into_iter().filter(|m| !ok.contains(&m.key()) && !busy.contains(&m.key())).take(12).collect()
+            list.into_iter().filter(|m| !ok.contains(&m.key()) && !busy.contains(&m.key())).take(room).collect()
         };
         for m in todo {
             checking.write().insert(m.key());
@@ -221,7 +232,7 @@ pub fn Picks() -> Element {
     let catalog_genres = use_resource(|| async { backend::catalog_genres().await });
     let mut enriching = use_signal(|| false);
     // Few candidates for these filters: ask the catalogs that declare the genre, then TMDB
-    // Discover (any genre, type and years), each once per filter combination.
+    // Discover (any genre, type and years; Cinemeta's lists without a key), each once per filter combination.
     use_effect(move || {
         let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
         if g.is_none() && k.is_none() && st == Style::Both && f.is_none() && t.is_none() { return; }
@@ -231,7 +242,7 @@ pub fn Picks() -> Element {
         enriching.set(true);
         spawn(async move {
             let mut more = match &g { Some(g) => backend::genre_candidates(g).await, None => Vec::new() };
-            more.extend(backend::tmdb_candidates(g.clone(), k.clone(), st, f, t, vec![1, 2]).await);
+            more.extend(backend::discover_candidates(g.clone(), k.clone(), st, f, t, vec![1, 2]).await);
             if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(g, st, f, t).await); }
             pool.with_mut(|p| rules::merge(p, more));
             enriching.set(false);
@@ -250,7 +261,7 @@ pub fn Picks() -> Element {
         let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
         spawn(async move {
             let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 30) as u32).collect();
-            let mut more = backend::tmdb_candidates(g.clone(), k.clone(), st, f, t, pages).await;
+            let mut more = backend::discover_candidates(g.clone(), k.clone(), st, f, t, pages).await;
             if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(g, st, f, t).await); }
             pool.with_mut(|p| rules::merge(p, more));
             enriching.set(false);
@@ -262,13 +273,14 @@ pub fn Picks() -> Element {
         toast.set(Some((id, text)));
         spawn(async move { backend::sleep(2800).await; if toast.peek().as_ref().map(|t| t.0) == Some(id) { toast.set(None); } });
     };
-    // Titles TMDB recommends for one you kept, liked or played: the pool grows toward your taste.
+    // Titles like one you kept, liked or played (TMDB's recommendations, else Cinemeta's lists for
+    // its genres): the pool grows toward your taste.
     let mut expanded = use_signal(HashSet::<String>::new);
     let mut expand = move |m: Media| {
         let id = brain::id(&m);
-        if !backend::tmdb_ready() || expanded.peek().contains(&id) { return; }
+        if expanded.peek().contains(&id) { return; }
         expanded.write().insert(id);
-        spawn(async move { let more = backend::tmdb_related(&m).await; if !more.is_empty() { pool.with_mut(|p| rules::merge(p, more)); } });
+        spawn(async move { let more = backend::related(&m).await; if !more.is_empty() { pool.with_mut(|p| rules::merge(p, more)); } });
     };
     // Never offered again in this run as a new card: what was shown, kept or starred, under any
     // of its names (another source can list the same title under another key). Only a reshuffle,
@@ -317,9 +329,8 @@ pub fn Picks() -> Element {
     use_effect(move || {
         if !hide_watched() || loading() || !brain_ready() { return; }
         let Some(seen) = watched.read().clone() else { return };
-        let finished = |m: &Media| seen.contains(&m.id) || seen.contains(&rules::title_key(m)) || m.raw["imdb_id"].as_str().is_some_and(|id| seen.contains(id));
         let (left, right) = pair.peek().clone();
-        if left.iter().chain(right.iter()).any(finished) { start_duel(); }
+        if left.iter().chain(right.iter()).any(|m| finished(&seen, m)) { start_duel(); }
     });
     // Remember tonight as it goes.
     use_effect(move || {
@@ -380,7 +391,7 @@ pub fn Picks() -> Element {
         pair.set(if left { (Some(won), challenger) } else { (challenger, Some(won)) });
     };
     // Keeping is seen before it happens: the kept card steps forward, the other steps back
-    // (style.css, .keep-left/.keep-right), then the duel moves on. Presses meanwhile are ignored.
+    // (styles/screens.css, .keep-left/.keep-right), then the duel moves on. Presses meanwhile are ignored.
     let mut leaving = use_signal(|| None::<bool>);
     let mut choose = move |left: bool| {
         if leaving.peek().is_some() { return; }
@@ -579,40 +590,50 @@ pub fn Picks() -> Element {
         genre(), years.clone(),
     ].into_iter().flatten().collect();
     let customised = kind().is_some() || style() != Style::Live || genre().is_some() || years.is_some();
+    // Back to the defaults (Live action is the default style); the filters panel and the empty state alike.
+    let mut clear_filters = move || { kind.set(None); style.set(Style::Live); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); };
     let pair_ready = { let (l, r) = pair(); l.as_ref().zip(r.as_ref()).is_some_and(|(l, r)| verified.read().contains(&l.key()) && verified.read().contains(&r.key())) };
     let ai_failed = !verified.read().is_empty() && crate::picks_ai::failed();
 
+    // What the brain says (each title's features cost a hash and a projection) is worked out
+    // only when the brain, the candidates, the cards or tonight's picks change: not on every
+    // toast, press or finished background check.
     let reference = use_memo(move || brain.read().reference(&filtered.read()));
-    let b = brain.read();
-    let votes = b.votes_tonight();
-    let leaning: Vec<String> = b.leaning().into_iter().map(|(l, _)| l).collect();
-    let moods = b.moods();
-    let learning = if votes == 0 && moods.is_empty() { 0.0 } else { b.learning(&filtered.read(), &reference.read()) };
-    let lamps = ((learning * 5.0).ceil() as usize).min(5);
-    let kept_now = kept.read().clone();
-    let champion = kept_now.first().map(Media::key).filter(|_| streak() > 0);
-    let card = |m: &Media| -> CardInfo {
-        CardInfo {
-            matching: (votes > 0 || !moods.is_empty()).then(|| (b.match_of(m, &reference.read()) * 100.0).round().clamp(1.0, 99.0) as u8),
+    let learning = use_memo(move || {
+        let b = brain.read();
+        if b.votes_tonight() == 0 && b.moods().is_empty() { 0.0 } else { b.learning(&filtered.read(), &reference.read()) }
+    });
+    let infos = use_memo(move || {
+        let b = brain.read();
+        let speaks = b.votes_tonight() > 0 || !b.moods().is_empty();
+        let kept_now = kept.read();
+        let champion = kept_now.first().map(Media::key).filter(|_| streak() > 0);
+        let card = |m: &Media| CardInfo {
+            matching: speaks.then(|| (b.match_of(m, &reference.read()) * 100.0).round().clamp(1.0, 99.0) as u8),
             why: b.why(m, &kept_now).map(|w| w.text()),
             feels: b.feels(m),
             wins: if champion.as_deref() == Some(&m.key()) { streak() } else { 0 },
             liked: liked_ids.read().contains(&brain::id(m)),
-        }
-    };
-    let (rl, rr) = resolved_pair();
-    let infos = (rl.as_ref().map(card), rr.as_ref().map(card));
-    let shortlist: Vec<(Media, bool, u8)> = {
+        };
+        let (l, r) = resolved_pair();
+        (l.as_ref().map(card), r.as_ref().map(card))
+    });
+    let shortlist = use_memo(move || {
+        let b = brain.read();
         let stars = starred.read();
         let mut all: Vec<Media> = stars.clone();
-        for m in kept_now.iter() { if !has(&all, m) { all.push(m.clone()); } }
+        for m in kept.read().iter() { if !has(&all, m) { all.push(m.clone()); } }
         b.ranked(&all).into_iter().take(8).map(|m| {
             let pct = (b.match_of(&m, &reference.read()) * 100.0).round().clamp(1.0, 99.0) as u8;
             let star = has(&stars, &m);
             (m, star, pct)
-        }).collect()
-    };
-    drop(b);
+        }).collect::<Vec<(Media, bool, u8)>>()
+    });
+    let (votes, leaning, moods) = { let b = brain.read(); (b.votes_tonight(), b.leaning().into_iter().map(|(l, _)| l).collect::<Vec<String>>(), b.moods()) };
+    let lamps = ((learning() * 5.0).ceil() as usize).min(5);
+    let (rl, rr) = resolved_pair();
+    let infos = infos();
+    let shortlist = shortlist();
     let waiting = loading() || !brain_ready() || (hide_watched() && watched.read().is_none());
     let growing = !pool_complete() || enriching();
 
@@ -705,7 +726,7 @@ pub fn Picks() -> Element {
                                 title: if hide_watched() { "Hiding completed titles; unfinished series stay available" } else { "Showing completed titles too" },
                                 onclick: move |_| {
                                     let on = !hide_watched();
-                                    backend::save_settings(&backend::Settings { picks_hide_watched: on, ..backend::load_settings() });
+                                    backend::update_settings(|s| s.picks_hide_watched = on);
                                     hide_watched.set(on);
                                 },
                                 icons::EyeOff {} span { "Hide watched" } }
@@ -729,7 +750,7 @@ pub fn Picks() -> Element {
                         }
                         div { class: "pop-row end",
                             if customised {
-                                button { class: "pill glass", onclick: move |_| { kind.set(None); style.set(Style::Live); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); },
+                                button { class: "pill glass", onclick: move |_| clear_filters(),
                                     icons::Undo {} span { "Clear filters" } }
                             }
                             button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
@@ -747,15 +768,15 @@ pub fn Picks() -> Element {
                 div { class: "duel-cards", div { class: "duel-card skeleton-card" } span { class: "versus display", aria_hidden: "true", "vs" } div { class: "duel-card skeleton-card" } }
             } else if rl.is_none() && rr.is_none() {
                 div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Search {} } p { "Nothing matches these filters" }
-                    button { class: "pill glass", onclick: move |_| { kind.set(None); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); }, icons::Undo {} span { "Clear filters" } } } }
+                    button { class: "pill glass", onclick: move |_| clear_filters(), icons::Undo {} span { "Clear filters" } } } }
             } else {
                 div { class: match leaving() { Some(true) => "duel-cards keep-left", Some(false) => "duel-cards keep-right", None => "duel-cards" },
                     // A key only renews a component inside a list: a new title must get a new card.
                     // A card shows once its poster and trailer are confirmed.
-                    {side(rl.clone(), infos.0.clone(), "left", verified.read().clone(), style(), growing,
+                    {side(rl.clone(), infos.0.clone(), "left", &verified.read(), style(), growing,
                         EventHandler::new(move |_| choose(true)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
                     span { class: "versus display", aria_hidden: "true", "vs" }
-                    {side(rr.clone(), infos.1.clone(), "right", verified.read().clone(), style(), growing,
+                    {side(rr.clone(), infos.1.clone(), "right", &verified.read(), style(), growing,
                         EventHandler::new(move |_| choose(false)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
                 }
             }
@@ -792,7 +813,7 @@ struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>,
 /// One side of the duel: the card once checked, else a placeholder (or a note when nothing else
 /// matches these filters).
 #[allow(clippy::too_many_arguments)]
-fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: HashSet<String>, style: Style, growing: bool,
+fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: &HashSet<String>, style: Style, growing: bool,
     on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
     match m {
         Some(m) if verified.contains(&m.key()) && rules::style_matches(&m, style) => rsx! {
@@ -813,7 +834,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     let m = media.clone();
     use_hook(move || { spawn(async move { if let Ok(t) = backend::title_meta(&m).await { meta.set(Some(t)); } }); });
     let facts = meta();
-    let art = crate::home::use_artwork(&media);
+    let art = crate::components::use_artwork(&media);
     let logo = art().and_then(|a| a.logo).or_else(|| facts.as_ref().map(|f| f.logo.clone()).filter(|l| !l.is_empty()));
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
     let mut logo_failed = use_signal(|| false);
@@ -826,7 +847,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     let trailer = Some(backend::official_first(&art().map(|a| a.trailers).unwrap_or_default(), &facts.as_ref().map(|f| f.trailers.clone()).unwrap_or_default()))
         .filter(|t| !t.is_empty());
     let videos = art().map(|a| a.videos).unwrap_or_default();
-    let about = crate::About::of(&media, facts.as_ref(), art().as_ref());
+    let about = crate::theatre::About::of(&media, facts.as_ref(), art().as_ref());
     let director = facts.as_ref().and_then(|f| f.directors.first().cloned());
     let arrow = if side == "left" { "←" } else { "→" };
     let (open, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone());
@@ -859,7 +880,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
                     None => rsx! { h2 { class: "display duel-title", "{media.name}" } },
                 }
                 div { class: "facts",
-                    if let Some(r) = facts.as_ref().map(|f| f.rating.clone()).filter(|r| !r.is_empty()) { span { class: "fact", span { class: "lamp", icons::Star {} } span { class: "tnum", "{r}" } } }
+                    crate::components::Scores { media: media.clone(), imdb: facts.as_ref().map(|f| f.rating.clone()).unwrap_or_default() }
                     if let Some(r) = facts.as_ref().map(|f| f.runtime.clone()).filter(|r| !r.is_empty()) { span { class: "fact", icons::Clock {} span { "{r}" } } }
                     if !media.year.is_empty() { span { class: "fact", icons::Calendar {} span { class: "tnum", "{media.year}" } } }
                     if !media.genres.is_empty() { span { class: "fact", icons::Tag {} span { {media.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ")} } } }
@@ -870,7 +891,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
                     button { class: "pill accent", title: "Keep this ({arrow})", onclick: move |e| { e.stop_propagation(); on_keep.call(()) }, icons::Check {} span { "Keep" } kbd { class: "keycap small-cap", "{arrow}" } }
                     CardPlayButton { media: media.clone(), episodes: facts.as_ref().map(|f| f.episodes.clone()).unwrap_or_default(), on_play: move |_| on_play.call(play.clone()) }
                     if let Some(t) = trailer { icons::IconButton { label: "Trailer and videos", class: "glass",
-                        onclick: move |_| crate::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None), icons::Clapper {} } }
+                        onclick: move |_| crate::theatre::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None), icons::Clapper {} } }
                     icons::IconButton { label: "Details", class: "glass", onclick: move |_| { let mut s = shell; s.opened.set(Some(open.clone())) }, icons::Info {} }
                 }
             }
@@ -882,7 +903,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
 #[component]
 fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on_remove: EventHandler<Media>) -> Element {
     let mut shell = use_context::<Shell>();
-    let art = crate::home::use_artwork(&media);
+    let art = crate::components::use_artwork(&media);
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
     let (open, remove, play) = (media.clone(), media.clone(), media.clone());
     rsx! {
@@ -918,15 +939,15 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
     // The shortlist has no episode list at hand; the title page resolves the episode instead.
     let target = progress.read().as_ref().and_then(|(m, seen)| rules::card_playback(m, &episodes, seen, backend::now_secs()))
         .or_else(|| (compact && media.kind != "movie").then(|| rules::CardPlayback { video: String::new(), label: "Play".into() }));
-    // What this button would play, asked of the add-ons while the card is shown.
-    let ahead_episodes = episodes.clone();
-    use_effect(move || {
-        if let Some((m, seen)) = progress.read().as_ref() {
-            if let Some(t) = rules::card_playback(m, &ahead_episodes, seen, backend::now_secs()).filter(|t| !t.video.is_empty()) {
-                backend::prefetch_sources(&m.kind, &t.video);
-            }
-        }
-    });
+    // What a duel card's button would play, asked of the add-ons once the card has stayed on screen
+    // a moment (the shortlist doesn't: its titles were asked for while they were duel cards). The
+    // episodes arrive after the card does, so they are followed.
+    use_effect(use_reactive!(|episodes, compact| {
+        if compact { return; }
+        let Some(t) = progress.read().as_ref().and_then(|(m, seen)| rules::card_playback(m, &episodes, seen, backend::now_secs()).map(|t| (m.kind.clone(), t.video))) else { return };
+        if t.1.is_empty() { return; }
+        spawn(async move { backend::sleep(PREFETCH_AFTER_MS).await; backend::prefetch_sources(&t.0, &t.1); });
+    }));
     let label = target.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| "Play".into());
     let media = progress.read().as_ref().map(|(m, _)| m.clone()).unwrap_or(media);
     let go = move |e: MouseEvent| {
@@ -941,50 +962,6 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
             icons::IconButton { label: "{label}", class: "glass small", onclick: go, icons::Play {} }
         } else {
             button { class: "pill glass", title: "Play or resume this title", onclick: go, icons::Play {} span { "{label}" } }
-        }
-    }
-}
-
-/// "Start over" forgets everything Picks learned and can't be undone, so the first press only
-/// asks. `labelled` is the Settings row's worded button; elsewhere an icon.
-#[component]
-pub fn StartOver(on_reset: EventHandler<()>, #[props(default)] labelled: bool) -> Element {
-    let mut armed = use_signal(|| false);
-    rsx! {
-        if armed() {
-            span { class: "confirm", role: "group", aria_label: "Forget what Picks learned?",
-                button { class: "pill forget-confirm", onclick: move |_| { armed.set(false); on_reset.call(()) }, icons::Trash {} span { "Forget taste" } }
-                icons::IconButton { label: "Keep it", class: "glass small", onclick: move |_| armed.set(false), icons::Close {} }
-            }
-        } else if labelled {
-            button { class: "pill glass", onclick: move |_| armed.set(true), icons::Undo {} span { "Start over" } }
-        } else {
-            icons::IconButton { label: "Start over: forget what Picks learned", class: "glass small", onclick: move |_| armed.set(true), icons::Trash {} }
-        }
-    }
-}
-
-/// A poster with the name under it; used by Search.
-#[component]
-pub fn PosterButton(media: Media, on_press: EventHandler<Media>, #[props(default)] badge: Option<String>, #[props(default)] pressed: Option<bool>) -> Element {
-    let m = media.clone();
-    let artwork = backend::posters(&media);
-    let mut index = use_signal(|| 0usize);
-    let art = artwork.get(index()).cloned();
-    rsx! {
-        button {
-            class: if pressed == Some(true) { "poster on" } else { "poster" },
-            aria_label: "{media.name}",
-            aria_pressed: pressed.map(|p| p.to_string()),
-            onclick: move |_| on_press.call(m.clone()),
-            div { class: "frame",
-                match art {
-                    Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", onerror: move |_| index += 1 } },
-                    None => rsx! { span { class: "frame-name", "{media.name}" } },
-                }
-                if badge.is_some() { span { class: "badge", aria_hidden: "true", icons::Heart {} } }
-            }
-            span { class: "poster-meta", "{media.meta_line(false)}" }
         }
     }
 }

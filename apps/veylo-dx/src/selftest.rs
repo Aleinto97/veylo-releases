@@ -79,10 +79,12 @@ fn store() -> Result<String> {
         backend::library().await
     })?;
     ensure!(saved.iter().any(|m| m.id == media.id && m.saved), "a saved title didn't come back from the library");
-    let mut settings = backend::load_settings();
-    settings.picks_rounds = 7;
-    backend::save_settings(&settings);
-    ensure!(backend::load_settings().picks_rounds == 7, "settings didn't read back");
+    let before = backend::load_settings();
+    let flipped = !before.picks_hide_watched;
+    backend::update_settings(|s| s.picks_hide_watched = flipped);
+    let read_back = backend::load_settings().picks_hide_watched;
+    backend::save_settings(&before);
+    ensure!(read_back == flipped, "settings didn't read back");
     Ok("library saved and read back; settings round-trip".into())
 }
 

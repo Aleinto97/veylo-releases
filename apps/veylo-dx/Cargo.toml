@@ -1,4 +1,4 @@
-# Dioxus prototype of the Veylo shell (Search and Picks), all Rust + CSS.
+# Veylo, the all-Rust Dioxus app (Android, Linux, Windows, macOS): Rust + CSS on the shared core.
 # Deliberately its own workspace: it must not touch the Android workspace's
 # manifest or Cargo.lock, which the APK packaging guard watches.
 # Its two crates live in crates/ beside the shared ones but belong to this workspace.
@@ -7,7 +7,7 @@ members = [".", "../../crates/video-surface", "../../crates/picture-check"]
 
 [package]
 name = "veylo-dx"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

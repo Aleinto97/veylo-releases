@@ -31,7 +31,8 @@ pub const TMDB_KEY_PAGE: &str = "https://www.themoviedb.org/settings/api";
 // ---------------------------------------------------------------- languages
 
 /// A stream language: Torrentio's option key, the AIOStreams name, the flag both add-ons
-/// print and the release tags that name it in a file name.
+/// print, the release tags that name it in a file name and the codes a file's tracks use for it
+/// (mpv's `alang` order: ISO 639-1, then -2/B and -2/T).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Language {
     pub key: &'static str,
@@ -39,6 +40,7 @@ pub struct Language {
     aio: &'static str,
     flag: &'static str,
     tags: &'static [&'static str],
+    pub codes: &'static [&'static str],
 }
 
 impl Language {
@@ -55,37 +57,37 @@ impl Language {
     }
 }
 
-macro_rules! lang { ($key:expr, $label:expr, $flag:expr, [$($tag:expr),*]) => {
-    Language { key: $key, label: $label, aio: $label, flag: $flag, tags: &[$($tag),*] }
+macro_rules! lang { ($key:expr, $label:expr, $flag:expr, [$($tag:expr),*], [$($code:expr),*]) => {
+    Language { key: $key, label: $label, aio: $label, flag: $flag, tags: &[$($tag),*], codes: &[$($code),*] }
 }; }
 
 pub const LANGUAGES: &[Language] = &[
-    lang!("english", "English", "🇬🇧", ["ENG", "ENGLISH"]),
-    lang!("italian", "Italian", "🇮🇹", ["ITA", "ITALIAN", "ITALIANO"]),
-    lang!("spanish", "Spanish", "🇪🇸", ["SPA", "ESP", "SPANISH", "CASTELLANO", "ESPANOL"]),
-    lang!("latino", "Latino", "🇲🇽", ["LATINO", "LAT"]),
-    lang!("french", "French", "🇫🇷", ["FRE", "FRA", "FRENCH", "VFF", "VF", "TRUEFRENCH"]),
-    lang!("german", "German", "🇩🇪", ["GER", "DEU", "GERMAN"]),
-    lang!("portuguese", "Portuguese", "🇵🇹", ["POR", "PORTUGUESE", "DUBLADO"]),
-    lang!("dutch", "Dutch", "🇳🇱", ["DUT", "NLD", "DUTCH"]),
-    lang!("polish", "Polish", "🇵🇱", ["POL", "POLISH", "PL"]),
-    lang!("russian", "Russian", "🇷🇺", ["RUS", "RUSSIAN"]),
-    lang!("ukrainian", "Ukrainian", "🇺🇦", ["UKR", "UKRAINIAN"]),
-    lang!("turkish", "Turkish", "🇹🇷", ["TUR", "TURKISH"]),
-    lang!("greek", "Greek", "🇬🇷", ["GRE", "GREEK"]),
-    lang!("swedish", "Swedish", "🇸🇪", ["SWE", "SWEDISH"]),
-    lang!("danish", "Danish", "🇩🇰", ["DAN", "DANISH"]),
-    lang!("norwegian", "Norwegian", "🇳🇴", ["NOR", "NORWEGIAN"]),
-    lang!("finnish", "Finnish", "🇫🇮", ["FIN", "FINNISH"]),
-    lang!("czech", "Czech", "🇨🇿", ["CZE", "CES", "CZECH"]),
-    lang!("hungarian", "Hungarian", "🇭🇺", ["HUN", "HUNGARIAN"]),
-    lang!("romanian", "Romanian", "🇷🇴", ["ROM", "RON", "ROMANIAN"]),
-    lang!("arabic", "Arabic", "🇸🇦", ["ARA", "ARABIC"]),
-    lang!("hebrew", "Hebrew", "🇮🇱", ["HEB", "HEBREW"]),
-    lang!("hindi", "Hindi", "🇮🇳", ["HIN", "HINDI"]),
-    lang!("japanese", "Japanese", "🇯🇵", ["JAP", "JPN", "JAPANESE"]),
-    lang!("korean", "Korean", "🇰🇷", ["KOR", "KOREAN"]),
-    lang!("chinese", "Chinese", "🇨🇳", ["CHI", "CHN", "CHINESE", "MANDARIN"]),
+    lang!("english", "English", "🇬🇧", ["ENG", "ENGLISH"], ["en", "eng"]),
+    lang!("italian", "Italian", "🇮🇹", ["ITA", "ITALIAN", "ITALIANO"], ["it", "ita"]),
+    lang!("spanish", "Spanish", "🇪🇸", ["SPA", "ESP", "SPANISH", "CASTELLANO", "ESPANOL"], ["es", "spa"]),
+    lang!("latino", "Latino", "🇲🇽", ["LATINO", "LAT"], ["es-419", "es-mx", "es", "spa"]),
+    lang!("french", "French", "🇫🇷", ["FRE", "FRA", "FRENCH", "VFF", "VF", "TRUEFRENCH"], ["fr", "fre", "fra"]),
+    lang!("german", "German", "🇩🇪", ["GER", "DEU", "GERMAN"], ["de", "ger", "deu"]),
+    lang!("portuguese", "Portuguese", "🇵🇹", ["POR", "PORTUGUESE", "DUBLADO"], ["pt", "por", "pt-br", "pob"]),
+    lang!("dutch", "Dutch", "🇳🇱", ["DUT", "NLD", "DUTCH"], ["nl", "dut", "nld"]),
+    lang!("polish", "Polish", "🇵🇱", ["POL", "POLISH", "PL"], ["pl", "pol"]),
+    lang!("russian", "Russian", "🇷🇺", ["RUS", "RUSSIAN"], ["ru", "rus"]),
+    lang!("ukrainian", "Ukrainian", "🇺🇦", ["UKR", "UKRAINIAN"], ["uk", "ukr"]),
+    lang!("turkish", "Turkish", "🇹🇷", ["TUR", "TURKISH"], ["tr", "tur"]),
+    lang!("greek", "Greek", "🇬🇷", ["GRE", "GREEK"], ["el", "gre", "ell"]),
+    lang!("swedish", "Swedish", "🇸🇪", ["SWE", "SWEDISH"], ["sv", "swe"]),
+    lang!("danish", "Danish", "🇩🇰", ["DAN", "DANISH"], ["da", "dan"]),
+    lang!("norwegian", "Norwegian", "🇳🇴", ["NOR", "NORWEGIAN"], ["no", "nor", "nob", "nb"]),
+    lang!("finnish", "Finnish", "🇫🇮", ["FIN", "FINNISH"], ["fi", "fin"]),
+    lang!("czech", "Czech", "🇨🇿", ["CZE", "CES", "CZECH"], ["cs", "cze", "ces"]),
+    lang!("hungarian", "Hungarian", "🇭🇺", ["HUN", "HUNGARIAN"], ["hu", "hun"]),
+    lang!("romanian", "Romanian", "🇷🇴", ["ROM", "RON", "ROMANIAN"], ["ro", "rum", "ron"]),
+    lang!("arabic", "Arabic", "🇸🇦", ["ARA", "ARABIC"], ["ar", "ara"]),
+    lang!("hebrew", "Hebrew", "🇮🇱", ["HEB", "HEBREW"], ["he", "heb"]),
+    lang!("hindi", "Hindi", "🇮🇳", ["HIN", "HINDI"], ["hi", "hin"]),
+    lang!("japanese", "Japanese", "🇯🇵", ["JAP", "JPN", "JAPANESE"], ["ja", "jpn"]),
+    lang!("korean", "Korean", "🇰🇷", ["KOR", "KOREAN"], ["ko", "kor"]),
+    lang!("chinese", "Chinese", "🇨🇳", ["CHI", "CHN", "CHINESE", "MANDARIN"], ["zh", "chi", "zho"]),
 ];
 
 pub fn language(key: &str) -> Option<&'static Language> { LANGUAGES.iter().find(|l| l.key == key) }
@@ -190,8 +192,7 @@ pub struct Overview {
     pub updates: usize,
 }
 
-fn version_parts(v: &str) -> Vec<u64> { v.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect() }
-fn newer(candidate: &str, than: &str) -> bool { version_parts(candidate) > version_parts(than) }
+use crate::updater::newer;
 
 fn seen_key(addon: &Value) -> String { format!("{}@{}", s(addon, "id"), host_of(&s(addon, "manifest_url"))) }
 
@@ -365,9 +366,19 @@ async fn aiostreams_link(key: &str, language: Option<&Language>, previous: Optio
     Ok((url.clone(), json!({"url": url, "uuid": uuid, "password": password})))
 }
 
+/// One add-on change at a time: each reads addons.json, waits on the network and writes it back,
+/// so two at once (start-up's set-up and a tap in Settings) would lose one's record. Taken by the
+/// public entry points only; the `_unlocked` helpers run inside one.
+static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Install (or set up again) a curated add-on with the current key and language. Any other
 /// copy of it (one installed from its website) is replaced.
 pub async fn install(c: Curated) -> Result<()> {
+    let _one = CHANGING.lock().await;
+    install_unlocked(c).await
+}
+
+async fn install_unlocked(c: Curated) -> Result<()> {
     if let Some(url) = c.free_url() { return install_free(c, url).await; }
     let key = rd_key()?;
     let settings = backend::load_settings();
@@ -405,6 +416,7 @@ pub async fn install(c: Curated) -> Result<()> {
     store.managed.remove(&pending);
     mark_seen(&mut store, &addon);
     save(&store);
+    backend::forget_sources();
     Ok(())
 }
 
@@ -421,12 +433,15 @@ async fn install_free(c: Curated, url: &str) -> Result<()> {
     store.managed.remove(&removed_key(c));
     mark_seen(&mut store, &addon);
     save(&store);
+    backend::forget_sources();
     Ok(())
 }
 
 pub async fn remove(row: &Row) -> Result<()> {
+    let _one = CHANGING.lock().await;
     // The AIOStreams login stays in addons.json so a later install updates the same configuration.
     exec(json!({"op":"remove_addon","url":row.url})).await?;
+    backend::forget_sources();
     // A free add-on you removed is not installed again by default.
     if let Some(c) = row.curated.filter(|c| !c.needs_key()) {
         let mut store = load();
@@ -439,20 +454,23 @@ pub async fn remove(row: &Row) -> Result<()> {
 /// Apply a newer version: curated add-ons are set up again (so new defaults apply), others
 /// fetch their manifest again.
 pub async fn update(row: &Row) -> Result<()> {
-    if let Some(c) = row.curated { return install(c).await; }
+    let _one = CHANGING.lock().await;
+    if let Some(c) = row.curated { return install_unlocked(c).await; }
     let addon = exec(json!({"op":"install_addon","url":row.url})).await?;
     let mut store = load();
     mark_seen(&mut store, &addon);
     save(&store);
+    backend::forget_sources();
     Ok(())
 }
 
 /// After the key or language changes: set up every curated add-on that is installed again.
 pub async fn reconfigure() -> Result<()> {
+    let _one = CHANGING.lock().await;
     let ov = overview().await;
     let mut first_error = None;
     for (c, row) in ov.curated {
-        if row.is_some() && c.needs_key() { if let Err(e) = install(c).await { first_error.get_or_insert(e); } }
+        if row.is_some() && c.needs_key() { if let Err(e) = install_unlocked(c).await { first_error.get_or_insert(e); } }
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -460,6 +478,7 @@ pub async fn reconfigure() -> Result<()> {
 /// "Remove key": forget the Real-Debrid key, and take out the add-ons Veylo set up with it
 /// (their links carry the key). Add-ons you installed yourself stay.
 pub async fn remove_rd_key() -> Result<()> {
+    let _one = CHANGING.lock().await;
     // The add-ons go first: if one can't be removed, the key stays so Remove key can be tried again.
     for row in overview().await.curated.into_iter().filter(|(c, _)| c.needs_key()).filter_map(|(_, row)| row) {
         exec(json!({"op":"remove_addon","url":row.url})).await
@@ -486,8 +505,7 @@ pub async fn remove_rd_key() -> Result<()> {
     }
     save(&store);
     ensure!(!unreachable, "AIOStreams didn't answer, so its copy of your key is still there. Try Remove key again later.");
-    let settings = backend::Settings { rd_key: None, rd_key_removed: true, ..backend::load_settings() };
-    backend::save_settings(&settings);
+    backend::update_settings(|s| { s.rd_key = None; s.rd_key_removed = true; });
     Ok(())
 }
 
@@ -515,6 +533,15 @@ fn needs_config_update(c: Curated, record: Option<&Value>) -> bool {
 /// At start: adopt the Real-Debrid key from a Torrentio link installed from its website,
 /// replace website installs of curated add-ons with Veylo's own, then look for new versions.
 pub async fn startup() -> usize {
+    {
+        let _one = CHANGING.lock().await;
+        set_up().await;
+    }
+    check_updates().await
+}
+
+/// `startup` before the update check: key adoption, the free add-ons, replacing website installs.
+async fn set_up() {
     let mut settings = backend::load_settings();
     let addons = installed().await;
     // A key you removed in Settings is not taken back from an add-on's link.
@@ -532,7 +559,7 @@ pub async fn startup() -> usize {
         let store = load();
         for c in Curated::ALL.into_iter().filter(|c| !c.needs_key()) {
             let present = addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
-            if !present && !store.managed.contains_key(&removed_key(c)) { let _ = install(c).await; }
+            if !present && !store.managed.contains_key(&removed_key(c)) { let _ = install_unlocked(c).await; }
         }
     }
     if settings.rd_key.is_some() {
@@ -542,10 +569,9 @@ pub async fn startup() -> usize {
             let foreign = addons.iter().any(|a| { let u = s(a, "manifest_url"); host_of(&u) == c.host() && Some(&u) != managed.as_ref() });
             let outdated = needs_config_update(c, store.managed.get(c.id()))
                 && addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
-            if foreign || outdated { let _ = install(c).await; }
+            if foreign || outdated { let _ = install_unlocked(c).await; }
         }
     }
-    check_updates().await
 }
 
 #[cfg(test)]

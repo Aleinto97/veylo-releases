@@ -4,7 +4,7 @@ Veylo is an all-Rust Dioxus app (`apps/veylo-dx`) for Android and Linux desktop 
 
 ## Where to work
 
-- `apps/veylo-dx/src/`: screens (`home.rs`, `picks.rs`, `title.rs`, `library.rs`, ...), `backend.rs` for core/TMDB access, `picks_rules.rs` for Picks filtering, `style.css`.
+- `apps/veylo-dx/src/`: screens (`home.rs`, `picks.rs`, `title.rs`, `library.rs`, ...), `backend/` for core access (`sources.rs` Play's choice, `metadata.rs` TMDB/BetterPosters/TVmaze, `store.rs` settings and saved state, `subtitles.rs`), `components.rs` for shared UI pieces, `picks_rules.rs` for Picks filtering, `styles/*.css`.
 - `apps/veylo-dx/android/`: Kotlin player, Media3 FFmpeg glue, `jniLibs`, launcher `res`; `build.rs` copies them into the project dx generates.
 - `crates/core/`: addon protocol, SQLite/history, recommendations, subtitles. `crates/media-proxy/`: loopback relay.
 - `crates/video-surface/`: the desktop picture paths (Wayland, GL area, Windows, macOS). `crates/picture-check/`: CI's colour-bar picture test. Both belong to the `apps/veylo-dx` workspace, not the root one.

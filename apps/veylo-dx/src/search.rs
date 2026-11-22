@@ -1,6 +1,6 @@
 //! Search: a full-window finder. The query is the one bold line; results are
 //! posters grouped by type, with the closest title promoted above them.
-use crate::{backend::{self, Media, SearchOutcome}, icons, picks::PosterButton, Shell};
+use crate::{backend::{self, Media, SearchOutcome}, icons, components::PosterButton, Shell};
 use dioxus::prelude::*;
 
 const DEBOUNCE_MS: u64 = 280;
@@ -8,7 +8,8 @@ const DEBOUNCE_MS: u64 = 280;
 #[component]
 pub fn SearchOverlay() -> Element {
     let mut shell = use_context::<Shell>();
-    let mut query = use_signal(String::new);
+    // Kept in the shell, so Esc and Back (which close Search from the app root) remember it too.
+    let mut query = shell.search_draft;
     let mut outcome = use_signal(|| None::<SearchOutcome>);
     let mut searching = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
@@ -37,12 +38,11 @@ pub fn SearchOverlay() -> Element {
         let q = query();
         if q.trim().chars().count() >= 2 { backend::remember_query(&mut shell.history.write(), &q); }
     };
-    let mut close = move || { remember(); shell.search_open.set(false); };
+    let close = move || crate::close_search(shell);
     let open = move |m: Media| {
-        remember();
         backend::remember_item(&mut shell.history.write(), &m);
         shell.opened.set(Some(m));
-        shell.search_open.set(false);
+        crate::close_search(shell);
     };
     let mut set_query = move |q: String, delay: u64| { query.set(q.clone()); run(q, delay); };
 
@@ -68,6 +68,7 @@ pub fn SearchOverlay() -> Element {
         }
     }
     groups.sort_by_key(|(k, _)| match k.as_str() { "movie" => 0, "series" => 1, "anime" => 2, _ => 3 });
+    let side_by_side = groups.iter().any(|(k, _)| k == "movie") && groups.iter().any(|(k, _)| k == "series");
     let failed = outcome.read().as_ref().map(|o| o.failed.clone()).unwrap_or_default();
     let catalogs = outcome.read().as_ref().map_or(1, |o| o.catalogs);
     let history = shell.history.read().clone();
@@ -101,7 +102,7 @@ pub fn SearchOverlay() -> Element {
                         icons::IconButton { label: "Clear", class: "small", onclick: move |_| set_query(String::new(), 0), icons::Backspace {} }
                     }
                 }
-                crate::ShortcutButton {}
+                crate::shortcuts::ShortcutButton {}
                 icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| close(), icons::Close {} }
             }
             p { class: "visually-hidden", aria_live: "polite", "{status}" }
@@ -133,24 +134,31 @@ pub fn SearchOverlay() -> Element {
                     }
                 } else {
                     if let Some((addon, media)) = top {
-                        TopMatch { media: media.clone(), source: several_addons.then_some(addon), on_open: open }
+                        // Keyed: another best match starts from its own first poster.
+                        TopMatch { key: "{media.key()}", media: media.clone(), source: several_addons.then_some(addon), on_open: open }
                     }
-                    for (kind, list) in groups {
-                        div { class: "group-head", title: "{backend::group_label(&kind)}",
-                            span { class: "group-icon",
-                                match kind.as_str() {
-                                    "movie" => rsx! { icons::Film {} },
-                                    "series" => rsx! { icons::Tv {} },
-                                    "anime" => rsx! { icons::Blossom {} },
-                                    _ => rsx! { icons::Grid {} },
+                    // Films on the left and series on the right, side by side; anime and the rest
+                    // (or films or series alone) across the whole width below.
+                    div { class: "search-columns",
+                        for (kind, list) in groups {
+                            section { key: "{kind}", class: if side_by_side && matches!(kind.as_str(), "movie" | "series") { "search-group" } else { "search-group wide" },
+                                div { class: "group-head", title: "{backend::group_label(&kind)}",
+                                    span { class: "group-icon",
+                                        match kind.as_str() {
+                                            "movie" => rsx! { icons::Film {} },
+                                            "series" => rsx! { icons::Tv {} },
+                                            "anime" => rsx! { icons::Blossom {} },
+                                            _ => rsx! { icons::Grid {} },
+                                        }
+                                    }
+                                    span { class: "group-name", "{backend::group_label(&kind)}" }
+                                    span { class: "tnum dim", "{list.len()}" }
                                 }
-                            }
-                            span { class: "group-name", "{backend::group_label(&kind)}" }
-                            span { class: "tnum dim", "{list.len()}" }
-                        }
-                        div { class: "grid",
-                            for m in list {
-                                PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
+                                div { class: "grid",
+                                    for m in list {
+                                        PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
+                                    }
+                                }
                             }
                         }
                     }
@@ -178,16 +186,11 @@ pub fn SearchOverlay() -> Element {
 #[component]
 fn TopMatch(media: Media, source: Option<String>, on_open: EventHandler<Media>) -> Element {
     let m = media.clone();
-    let artwork = backend::posters(&media);
-    let mut index = use_signal(|| 0usize);
-    let art = artwork.get(index()).cloned();
     let meta = [media.meta_line(true), source.unwrap_or_default()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
     rsx! {
         button { class: "top-match glass", aria_label: "Open {media.name}", onclick: move |_| on_open.call(m.clone()),
             if !media.background.is_empty() { div { class: "top-art", img { src: "{media.background}", alt: "" } } }
-            div { class: "frame top-poster",
-                if let Some(src) = art { img { src: "{src}", alt: "", onerror: move |_| index += 1 } }
-            }
+            div { class: "frame top-poster", crate::components::FallbackImg { sources: backend::posters(&media) } }
             div { class: "top-copy",
                 span { class: "lamp best", title: "Best match", aria_label: "Best match", icons::Star {} }
                 span { class: "display top-title", "{media.name}" }

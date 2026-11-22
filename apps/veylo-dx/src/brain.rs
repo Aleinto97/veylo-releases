@@ -90,7 +90,8 @@ pub struct Item {
     pub genres: Vec<String>,
     pub animated: bool,
     pub rating: Option<f64>,
-    pub emb: Option<Vec<f32>>,
+    /// Shared: the brain is copied for saving (`persist`) without copying every embedding.
+    pub emb: Option<std::sync::Arc<[f32]>>,
     pub mood: bool,
 }
 
@@ -104,11 +105,11 @@ impl Item {
             animated: rules::is_animated(m),
             rating: m.raw["imdbRating"].as_str().and_then(|r| r.trim().parse::<f64>().ok()).or_else(|| m.raw["imdbRating"].as_f64())
                 .filter(|r| r.is_finite() && *r > 0.0 && *r <= 10.0),
-            emb: picks_ai::embedding(m),
+            emb: picks_ai::embedding(m).map(Into::into),
             mood: false,
         }
     }
-    fn mood(text: &str, emb: Vec<f32>) -> Self { Item { name: text.to_owned(), kind: "mood".into(), emb: Some(emb), mood: true, ..Default::default() } }
+    fn mood(text: &str, emb: Vec<f32>) -> Self { Item { name: text.to_owned(), kind: "mood".into(), emb: Some(emb.into()), mood: true, ..Default::default() } }
     fn encode(&self) -> Value {
         json!({"n": self.name, "k": self.kind, "y": self.year, "g": self.genres, "a": self.animated, "r": self.rating,
             "e": self.emb.as_deref().map(picks_ai::pack), "m": self.mood})
@@ -121,7 +122,7 @@ impl Item {
             genres: v["g"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|g| GENRES.contains(g)).map(str::to_owned).collect(),
             animated: v["a"].as_bool().unwrap_or(false),
             rating: v["r"].as_f64(),
-            emb: v["e"].as_str().and_then(picks_ai::unpack),
+            emb: v["e"].as_str().and_then(picks_ai::unpack).map(Into::into),
             mood: v["m"].as_bool().unwrap_or(false),
         })
     }
@@ -401,8 +402,9 @@ impl Brain {
     fn x(&self, item: &Item) -> Vec<f64> {
         let mut x = vec![0.0; D];
         if let (Some(space), Some(e)) = (&self.space, &item.emb) {
-            let center = if item.mood { self.query_center().unwrap_or_else(|| space.mean.clone()) } else { space.mean.clone() };
-            let mut z = space.project(e, &center);
+            // Titles centre on the catalogue's mean (borrowed, not copied: this runs for every title scored).
+            let query_center = if item.mood { self.query_center() } else { None };
+            let mut z = space.project(e, query_center.as_deref().unwrap_or(&space.mean));
             if item.mood { let n = norm(&z); if n > 1e-9 { for v in &mut z { *v *= MOOD_NORM / n; } } }
             x[..z.len()].copy_from_slice(&z);
         }
@@ -524,7 +526,7 @@ impl Brain {
         for m in pool {
             let key = id(m);
             if self.items.get(&key).is_some_and(|i| i.emb.is_none()) {
-                if let Some(e) = picks_ai::embedding(m) { if let Some(i) = self.items.get_mut(&key) { i.emb = Some(e); changed = true; } }
+                if let Some(e) = picks_ai::embedding(m) { if let Some(i) = self.items.get_mut(&key) { i.emb = Some(e.into()); changed = true; } }
             }
         }
         if changed { self.dirty = true; self.rebuild(); }
@@ -739,22 +741,53 @@ pub fn load_from(dir: &Path, session: u64) -> Brain {
 
 fn dir() -> PathBuf { crate::backend::backend_data_dir() }
 
-pub fn load(session: u64) -> Brain { load_from(&dir(), session) }
+/// The brain last read from disk, and its files' sizes and times then: Home and Picks load it on
+/// every visit, and reading thousands of titles again is only needed once the files changed.
+type FilesPrint = Vec<Option<(u64, std::time::SystemTime)>>;
+static LOADED: Mutex<Option<(FilesPrint, Brain)>> = Mutex::new(None);
 
-static PENDING_ITEMS: Mutex<Option<Value>> = Mutex::new(None);
+fn files_print(dir: &Path) -> FilesPrint {
+    [ITEMS_FILE, EVENTS_FILE, SPACE_FILE, OLD_TASTE_FILE].iter()
+        .map(|f| std::fs::metadata(dir.join(f)).ok().and_then(|m| Some((m.len(), m.modified().ok()?)))).collect()
+}
 
-/// Log an event at once; the title store is written a few seconds later, one write for a burst.
+pub fn load(session: u64) -> Brain {
+    let dir = dir();
+    let print = files_print(&dir);
+    let cached = LOADED.lock().ok().and_then(|l| l.as_ref().filter(|(p, _)| *p == print).map(|(_, b)| b.clone()));
+    let Some(mut b) = cached else {
+        let b = load_from(&dir, session);
+        if let Ok(mut l) = LOADED.lock() { *l = Some((print, b.clone())); }
+        return b;
+    };
+    // The mood words may have been embedded since, and the night may differ: one replay for both.
+    let anchors: Vec<(String, Vec<f32>)> = MOODS.iter().filter_map(|(label, phrase)| picks_ai::query_embedding(phrase).map(|e| ((*label).to_owned(), e))).collect();
+    if anchors != b.anchors || session != b.session { b.anchors = anchors; b.session = session; b.rebuild(); }
+    b
+}
+
+/// The title store waiting to be written: the titles (their embeddings shared, not copied) and,
+/// past the cap, the log and library facts that decide which titles are kept.
+type PendingItems = (HashMap<String, Item>, Vec<Event>, Vec<Fact>);
+static PENDING_ITEMS: Mutex<Option<PendingItems>> = Mutex::new(None);
+
+/// Log an event at once; the title store is written a few seconds later, one write for a burst,
+/// and encoded there too (thousands of embeddings): a vote never waits for it.
 pub fn persist(brain: &mut Brain, event: Option<&Event>) {
     let dir = dir();
     if let Some(e) = event { append_event(&dir, e); }
     if !brain.dirty { return; }
     brain.dirty = false;
-    let value = items_value(&brain.items, &brain.events, &brain.facts);
-    let first = PENDING_ITEMS.lock().map(|mut p| p.replace(value).is_none()).unwrap_or(false);
+    // Only past the cap does the encoding need the log and the library (what to keep).
+    let over = brain.items.len() > MAX_ITEMS;
+    let snapshot = (brain.items.clone(), if over { brain.events.clone() } else { Vec::new() }, if over { brain.facts.clone() } else { Vec::new() });
+    let first = PENDING_ITEMS.lock().map(|mut p| p.replace(snapshot).is_none()).unwrap_or(false);
     if first {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(4));
-            if let Some(v) = PENDING_ITEMS.lock().ok().and_then(|mut p| p.take()) { let _ = std::fs::write(dir.join(ITEMS_FILE), v.to_string()); }
+            if let Some((items, events, facts)) = PENDING_ITEMS.lock().ok().and_then(|mut p| p.take()) {
+                let _ = std::fs::write(dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string());
+            }
         });
     }
 }
@@ -779,7 +812,7 @@ pub async fn refresh_space(current: Option<Space>, items: Vec<Vec<f32>>) -> Opti
 
 impl Brain {
     /// Embeddings the brain keeps for titles, for fitting the projection.
-    pub fn item_embeddings(&self) -> Vec<Vec<f32>> { self.items.values().filter(|i| !i.mood).filter_map(|i| i.emb.clone()).collect() }
+    pub fn item_embeddings(&self) -> Vec<Vec<f32>> { self.items.values().filter(|i| !i.mood).filter_map(|i| i.emb.as_deref().map(<[f32]>::to_vec)).collect() }
 }
 
 /// Mood words embedded by the local model (once; cached with the titles' embeddings).

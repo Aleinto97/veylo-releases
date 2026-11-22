@@ -18,13 +18,19 @@ pub const ASSET: Option<&str> = if cfg!(target_os = "android") { Some("veylo-and
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release { pub version: String, url: String }
 
-fn parse(version: &str) -> Option<Vec<u64>> {
-    version.trim().trim_start_matches('v').split('.').map(|p| p.parse().ok()).collect()
+/// A version's numbers: "v1.2.3-beta" is [1, 2, 3] (a "v" before and a suffix after are left out);
+/// a version without a number at its start is [].
+fn parse(version: &str) -> Vec<u64> {
+    let v = version.trim().trim_start_matches('v');
+    let end = v.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(v.len());
+    v[..end].split('.').map_while(|p| p.parse().ok()).collect()
 }
 
-/// Whether `latest` is a higher version than `current` ("0.2.0" > "0.1.9"; a "v" prefix is fine).
+/// Whether `latest` is a higher version than `current`, number by number ("0.10.0" > "0.9.3").
+/// Also the add-ons' update check (addons.rs).
 pub fn newer(latest: &str, current: &str) -> bool {
-    matches!((parse(latest), parse(current)), (Some(a), Some(b)) if a > b)
+    let (a, b) = (parse(latest), parse(current));
+    !a.is_empty() && a > b
 }
 
 fn client() -> reqwest::Client {
@@ -210,5 +216,8 @@ mod tests {
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
         assert!(!newer("latest", "0.1.0"));
+        assert!(newer("2.40.0-beta.1", "2.38.1"));
+        assert!(!newer("1.9", "1.10"));
+        assert!(!newer("0.8.0-rc1", "0.8.0"));
     }
 }
