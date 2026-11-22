@@ -18,7 +18,7 @@
 </style>
 <main>
   <h1>Sign in to Veylo</h1>
-  <p id="say">Choose your Google account. You'll go straight back to Veylo.</p>
+  <p id="say">Choose your Google account in the box Google shows here. You'll go straight back to Veylo.</p>
   <div id="button"></div>
 </main>
 <script>
@@ -30,12 +30,18 @@
     google.accounts.id.initialize({
       client_id: '__WEB_CLIENT_ID__',
       auto_select: false,
+      // The account list in this page (the browser's own sign-in prompt), not a second window.
+      use_fedcm_for_prompt: true,
+      itp_support: true,
+      cancel_on_tap_outside: false,
       callback: answer => {
         say('Signed in. Going back to Veylo…');
         location.replace('http://127.0.0.1:' + port + '/?state=' + encodeURIComponent(state) + '&id_token=' + encodeURIComponent(answer.credential));
       },
     });
+    // The button stays for a browser that doesn't show the prompt (it opens Google in a popup).
     google.accounts.id.renderButton(document.getElementById('button'), { theme: 'filled_black', size: 'large', text: 'continue_with', shape: 'pill' });
+    google.accounts.id.prompt();
   }
 </script>
 <script src="https://accounts.google.com/gsi/client" async onload="start()"></script>
