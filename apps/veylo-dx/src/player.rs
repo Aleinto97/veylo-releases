@@ -35,6 +35,9 @@ pub struct PlayRequest {
     pub accent: String,
     /// Library title whose progress is recorded (and the episode's video id); None for previews and tests.
     pub record: Option<(Media, Option<String>)>,
+    /// An automatic choice with others left: when its audio tracks are tagged and none is in the
+    /// Audio-language setting's language, the next source is tried instead of subtitles.
+    pub language_check: bool,
 }
 
 /// What is actually playing: resolution, picture (from the stream where it can tell) and size.
@@ -52,8 +55,9 @@ pub enum PlayerEvent {
     Attached(crate::engine::LiveRef),
     /// Video is on screen. `decoder` is the hardware API in use, or None for software.
     Started { decoder: Option<String>, codec: String, facts: Facts },
-    /// `next`: the viewer asked for the next episode; `another`: this source failed, try the next one.
-    Finished { position_ms: i64, duration_ms: i64, next: bool, another: bool },
+    /// `next`: the viewer asked for the next episode; `another`: this source failed, try the next one
+    /// (`language`: because its audio is not in your language).
+    Finished { position_ms: i64, duration_ms: i64, next: bool, another: bool, language: bool },
     Failed(String),
 }
 

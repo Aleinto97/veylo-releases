@@ -198,9 +198,17 @@ pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(mut env: JNIEn
 }
 
 /// One line in logcat under "veylo" (stderr is not shown on Android). Never URLs or keys.
+/// Some builds (Honor, Huawei) hide app logs, so the line also goes, timed, into the app's own
+/// files/dev-log.txt (`adb shell run-as dev.veylo.dx cat files/dev-log.txt`), kept under 64 KiB.
 pub fn log(message: &str) {
     extern "C" { fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32; }
     if let Ok(text) = std::ffi::CString::new(message) { unsafe { __android_log_write(4, c"veylo".as_ptr(), text.as_ptr()); } }
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = FILE.get_or_init(|| files_dir().ok().map(|d| d.join("dev-log.txt"))) else { return };
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 64 * 1024) { let _ = std::fs::rename(path, path.with_extension("old.txt")); }
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) { let _ = writeln!(f, "{ms} {message}"); }
 }
 
 /// Developer option: files/dev-play.json ({"url", "title", "hdr"}), pushed with `adb shell run-as`,
@@ -210,6 +218,15 @@ pub fn take_dev_play() -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     serde_json::from_str(&text).ok()
+}
+
+/// Developer option: files/dev-autoplay.txt (lines "kind/id/title/year"), pushed with `adb shell
+/// run-as`, is read once at launch and deleted; `backend::dev_autoplay` times Play's choice for each.
+pub fn take_dev_autoplay() -> Option<String> {
+    let path = files_dir().ok()?.join("dev-autoplay.txt");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(text)
 }
 
 /// Shipped embedding model assets, extracted by one background inference worker.

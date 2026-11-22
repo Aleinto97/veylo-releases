@@ -918,6 +918,15 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
     // The shortlist has no episode list at hand; the title page resolves the episode instead.
     let target = progress.read().as_ref().and_then(|(m, seen)| rules::card_playback(m, &episodes, seen, backend::now_secs()))
         .or_else(|| (compact && media.kind != "movie").then(|| rules::CardPlayback { video: String::new(), label: "Play".into() }));
+    // What this button would play, asked of the add-ons while the card is shown.
+    let ahead_episodes = episodes.clone();
+    use_effect(move || {
+        if let Some((m, seen)) = progress.read().as_ref() {
+            if let Some(t) = rules::card_playback(m, &ahead_episodes, seen, backend::now_secs()).filter(|t| !t.video.is_empty()) {
+                backend::prefetch_sources(&m.kind, &t.video);
+            }
+        }
+    });
     let label = target.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| "Play".into());
     let media = progress.read().as_ref().map(|(m, _)| m.clone()).unwrap_or(media);
     let go = move |e: MouseEvent| {

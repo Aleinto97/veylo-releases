@@ -52,7 +52,8 @@ pub fn SettingsPage() -> Element {
         });
     };
     let mut choose_language = move |key: String| {
-        let next = backend::Settings { stream_language: Some(key).filter(|k| addons::language(k).is_some()), ..backend::load_settings() };
+        let key = if addons::language(&key).is_some() { key } else { backend::DEFAULT_LANGUAGE.to_owned() };
+        let next = backend::Settings { stream_language: Some(key), ..backend::load_settings() };
         backend::save_settings(&next);
         settings.set(next);
         run("language".into(), Box::pin(async { addons::reconfigure().await }));
@@ -140,7 +141,6 @@ pub fn SettingsPage() -> Element {
                     select { class: "select-field", aria_label: "Audio language", disabled: busy().is_some(),
                         onkeydown: move |e| { e.stop_propagation(); },
                         onchange: move |e| choose_language(e.value()),
-                        option { value: "", selected: settings().stream_language.is_none(), "Any language" }
                         for l in addons::LANGUAGES {
                             option { value: "{l.key}", selected: settings().stream_language.as_deref() == Some(l.key), "{l.label}" }
                         }

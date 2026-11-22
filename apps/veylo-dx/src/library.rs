@@ -88,6 +88,9 @@ fn WeekCard(seen: Seen, now: i64) -> Element {
     let done = if m.kind == "movie" { backend::film_watched(&m) } else { m.watched };
     let state = if done { "Watched".to_string() } else if backend::in_progress(&m) { context } else { "Started".into() };
     let (open, resume) = (m.clone(), m.clone());
+    // Its Resume button starts at once: the sources are asked for while the card is shown.
+    let ahead = m.clone();
+    use_hook(move || if !done { crate::title::prefetch_resume(&ahead) });
     rsx! {
         div { class: "week-card",
             button { class: "week-open", aria_label: "Open {m.name}", onclick: move |_| shell.opened.set(Some(open.clone())),

@@ -154,7 +154,15 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         let key = backend::stream_language();
         let name = key.as_deref().map(backend::subtitle_language_of).unwrap_or_default();
         let mut say = say;
-        match fallback(&s.tracks, key.as_deref()) {
+        let found = fallback(&s.tracks, key.as_deref());
+        let langs: Vec<&str> = s.tracks.iter().filter(|t| t.audio).map(|t| if t.lang.is_empty() { "?" } else { t.lang.as_str() }).collect();
+        backend::dev_log(&format!("audio tracks [{}]{}", langs.join(" "), if matches!(found, Fallback::Embedded(_) | Fallback::Download) { ": none in your language" } else { "" }));
+        if matches!(found, Fallback::Embedded(_) | Fallback::Download) && fb_live.0.request.language_check && s.position < 120.0 {
+            say(format!("No {name} audio in this file: trying another source"));
+            fb_live.0.finish(Finish::OtherLanguage);
+            return;
+        }
+        match found {
             Fallback::Off(audio) => {
                 // mpv's alang normally picked this already; make it explicit when it did not.
                 if let Some(id) = audio {

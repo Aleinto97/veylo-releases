@@ -20,6 +20,7 @@ mod player_ui;
 mod search;
 mod settings;
 mod title;
+mod tracks;
 mod video;
 mod updater;
 mod display;
@@ -181,7 +182,8 @@ fn print_sources(kind: &str, id: &str, pack: Option<usize>) {
             println!("{:>2}. [{} {}] {} | {} | {}", i + 1, s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"),
                 if s.filename.is_empty() { s.description.lines().next().unwrap_or("") } else { &s.filename }, s.size.as_deref().unwrap_or("size?"), s.addon);
         }
-        let (best, debrid) = backend::first_working(order).await;
+        let pick = backend::pick_source(order).await;
+        let (best, debrid) = (pick.best, pick.debrid);
         println!("Play would start: {}", best.map(|s| if s.filename.is_empty() { s.description.lines().next().unwrap_or("").to_owned() } else { s.filename }).unwrap_or_else(|| format!("nothing ({debrid:?})")));
     });
 }
@@ -292,6 +294,10 @@ fn Shell_() -> Element {
     use_hook(video::install);
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
+        #[cfg(target_os = "android")]
+        if let Some(list) = android::take_dev_autoplay() { spawn(backend::dev_autoplay(list)); }
+        // Desktop: VEYLO_DX_DEV_AUTOPLAY names the same kind of list.
+        if let Some(list) = std::env::var_os("VEYLO_DX_DEV_AUTOPLAY").and_then(|p| std::fs::read_to_string(p).ok()) { spawn(backend::dev_autoplay(list)); }
         #[cfg(target_os = "android")]
         if let Some(v) = android::take_dev_play() {
             let text = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
@@ -594,12 +600,16 @@ fn StatusChip(status: PlayerStatus) -> Element {
 }
 
 /// Play through the platform player and narrate what it is doing.
-/// `on_next` plays the next episode; `on_another` tries the next source when this one failed.
+/// `on_next` plays the next episode; `on_another` tries the next source when this one failed
+/// (told whether it was for the audio language).
+/// Tries the next source from where the failed one stopped, told whether it was for the audio language.
+pub type TryAnother = Box<dyn Fn(Shell, i64, bool)>;
+
 pub fn start_playback(shell: Shell, request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>) {
     start_playback_with(shell, request, on_next, None)
 }
 
-pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<Box<dyn Fn(Shell, i64)>>) {
+pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<TryAnother>) {
     if request.accent.is_empty() { request.accent = try_consume_context::<Accent>().map(|a| a.0.peek().clone()).unwrap_or_default(); }
     let title = request.title.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -609,7 +619,7 @@ pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, o
 }
 
 fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<player::PlayerEvent>,
-    on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<Box<dyn Fn(Shell, i64)>>) {
+    on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<TryAnother>) {
     // Playback belongs to the app, even when its source chooser closes immediately.
     dioxus::core::spawn_forever(async move {
         // This playback's in-app session: only it may take the player off screen.
@@ -621,13 +631,13 @@ fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::
                     shell.player_status.set(Some(PlayerStatus::Playing { title: title.clone(), codec, hardware: decoder, facts })),
                 player::PlayerEvent::Attached(live) => { mine = Some(live.clone()); shell.player.set(Some(live)); }
                 player::PlayerEvent::Failed(error) => { clear(&mine); shell.player_status.set(Some(PlayerStatus::Failed(error))); break; }
-                player::PlayerEvent::Finished { next, another, position_ms, .. } => {
+                player::PlayerEvent::Finished { next, another, language, position_ms, .. } => {
                     clear(&mine);
                     shell.player_status.set(None);
                     backend::flush_progress().await;
                     *shell.picks_dirty.write() += 1;
                     if next { if let Some(play_next) = &on_next { play_next(shell); } }
-                    if another { if let Some(try_another) = &on_another { try_another(shell, position_ms); } }
+                    if another { if let Some(try_another) = &on_another { try_another(shell, position_ms, language); } }
                     break;
                 }
             }
@@ -675,6 +685,8 @@ fn LastPlayedButton(media: Media) -> Element {
         else { "Carry on".into() };
     let label = format!("{line}: {}", media.name);
     let m = media.clone();
+    let ahead = media.clone();
+    use_hook(move || title::prefetch_resume(&ahead));
     rsx! {
         button { class: "last-played glass", title: "{label}", aria_label: "{label}",
             onclick: move |_| title::resume_now(shell, m.clone()),

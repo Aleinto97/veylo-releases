@@ -132,6 +132,9 @@ fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHa
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
     let logo = art().and_then(|a| a.logo).or_else(|| media.raw["logo"].as_str().map(str::to_owned)).filter(|l| !l.is_empty());
     let mut logo_failed = use_signal(|| false);
+    // Play here starts at once: its sources are asked for while the pick is on screen.
+    let ahead = media.clone();
+    use_hook(move || crate::title::prefetch_resume(&ahead));
     // The film's own line when it has one, else the start of its synopsis.
     let blurb = art().and_then(|a| a.tagline).filter(|t| !t.is_empty()).unwrap_or_else(|| media.description.clone());
     let runtime = backend::s(&media.raw, "runtime");

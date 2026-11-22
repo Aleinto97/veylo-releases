@@ -11,8 +11,8 @@
 //! Two free add-ons need no key and are installed by default (a removal is remembered):
 //! NoTorrent (web streams in the original audio, Spanish, Portuguese and Turkish) and Absolute
 //! Cinema (web streams in the original audio and Italian), set to web streams only with none of
-//! its catalogues. The Play order puts Real-Debrid sources before them, so with a key they are
-//! the fallback and without one they are what plays. Install links, passwords and keys live only in the app's
+//! its catalogues. With a Real-Debrid key they are not asked for sources at all (Play and the
+//! source list use Real-Debrid only); without one they are what plays. Install links, passwords and keys live only in the app's
 //! own folder (addons.json, settings.json) and are never logged, shown or put in errors.
 use crate::backend::{self, exec, on_runtime, s};
 use anyhow::{bail, ensure, Context, Result};
@@ -113,7 +113,7 @@ impl Curated {
     }
     /// The second line on its card.
     pub fn detail(self) -> &'static str {
-        if self.needs_key() { "Cached Real-Debrid results only, no filters" } else { "No key needed. Real-Debrid sources play first when you have one" }
+        if self.needs_key() { "Cached Real-Debrid results only, no filters" } else { "No key needed. Used only while you have no Real-Debrid key" }
     }
     fn host(self) -> &'static str {
         match self {
@@ -269,11 +269,19 @@ fn torrentio_url(key: &str, language: Option<&Language>) -> String {
     format!("{TORRENTIO}/{}/manifest.json", opts.join("|"))
 }
 
+/// How long AIOStreams waits for each scraper. Measured over 18 titles: 3 s instead of 5 s took
+/// the slowest answer from 6.1 s to 3.8 s and changed no choice of Play's for the worse.
+const SCRAPER_TIMEOUT_MS: u64 = 3000;
+
+/// The AIOStreams configuration Veylo writes now; a lower one (or none) is written again at start.
+/// 1: 3D excluded. 2: the 3 s scraper timeout.
+const AIOSTREAMS_REVISION: u64 = 2;
+
 /// AIOStreams configuration: three debrid scrapers on Real-Debrid, cached only, streams only
 /// (no extra catalogues), the Torrentio-style labels the Play order reads, 3D excluded.
 fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
     let preset = |kind: &str, name: &str| json!({"type": kind, "instanceId": kind, "enabled": true,
-        "options": {"name": name, "timeout": 5000, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false}});
+        "options": {"name": name, "timeout": SCRAPER_TIMEOUT_MS, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false}});
     let mut sort = vec![json!({"key": "cached", "direction": "desc"})];
     if language.is_some() { sort.push(json!({"key": "language", "direction": "desc"})); }
     sort.extend([json!({"key": "resolution", "direction": "desc"}), json!({"key": "size", "direction": "desc"})]);
@@ -287,6 +295,31 @@ fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
     });
     if let Some(l) = language { config["preferredLanguages"] = json!([l.aio]); }
     config
+}
+
+/// A throwaway AIOStreams configuration (the usual one plus `extra` presets, as (type, name)) for
+/// the add-on experiment in `backend::autoplay_bench`: its stream base link and its login.
+#[cfg(test)]
+pub(crate) async fn trial_config(extra: &[(&str, &str)], timeout_ms: Option<u64>) -> Result<(String, (String, String))> {
+    let key = rd_key()?;
+    let mut config = aiostreams_config(&key, language("english"));
+    let presets = config["presets"].as_array_mut().context("presets")?;
+    if let Some(ms) = timeout_ms { for p in presets.iter_mut() { p["options"]["timeout"] = json!(ms); } }
+    for (kind, name) in extra {
+        presets.push(json!({"type": kind, "instanceId": kind, "enabled": true,
+            "options": {"name": name, "timeout": SCRAPER_TIMEOUT_MS, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false, "useMultipleInstances": false, "showTorrentLinks": false}}));
+    }
+    let password = random_password()?;
+    let data = aiostreams_call(reqwest::Method::POST, json!({"config": config, "password": password}), None).await?;
+    let (uuid, encrypted) = (s(&data, "uuid"), s(&data, "encryptedPassword"));
+    ensure!(!uuid.is_empty() && !encrypted.is_empty(), "no configuration");
+    Ok((format!("{AIOSTREAMS}/stremio/{uuid}/{encrypted}"), (uuid, password)))
+}
+
+/// Delete a throwaway configuration made by `trial_config`.
+#[cfg(test)]
+pub(crate) async fn trial_delete(login: (String, String)) -> Result<()> {
+    aiostreams_call(reqwest::Method::DELETE, json!({}), Some(login)).await.map(|_| ())
 }
 
 fn random_password() -> Result<String> {
@@ -367,7 +400,7 @@ pub async fn install(c: Curated) -> Result<()> {
     }
     let mut record = record;
     record["url"] = json!(new_url);
-    if c == Curated::AioStreams { record["exclude_3d"] = json!(true); }
+    if c == Curated::AioStreams { record["revision"] = json!(AIOSTREAMS_REVISION); }
     store.managed.insert(c.id().into(), record);
     store.managed.remove(&pending);
     mark_seen(&mut store, &addon);
@@ -474,9 +507,9 @@ pub async fn check_rd_key(key: String) -> Result<String> {
     }).await?
 }
 
-// Only Veylo-managed, installed AIOStreams configurations need this one-time upgrade.
-fn needs_3d_filter(c: Curated, record: Option<&Value>) -> bool {
-    c == Curated::AioStreams && record.is_some_and(|r| r["exclude_3d"] != true)
+// Only Veylo-managed, installed AIOStreams configurations written by an older Veylo are written again.
+fn needs_config_update(c: Curated, record: Option<&Value>) -> bool {
+    c == Curated::AioStreams && record.is_some_and(|r| r["revision"].as_u64().unwrap_or(u64::from(r["exclude_3d"] == true)) < AIOSTREAMS_REVISION)
 }
 
 /// At start: adopt the Real-Debrid key from a Torrentio link installed from its website,
@@ -507,7 +540,7 @@ pub async fn startup() -> usize {
         for c in Curated::ALL.into_iter().filter(|c| c.needs_key()) {
             let managed = store.managed.get(c.id()).map(|m| s(m, "url"));
             let foreign = addons.iter().any(|a| { let u = s(a, "manifest_url"); host_of(&u) == c.host() && Some(&u) != managed.as_ref() });
-            let outdated = needs_3d_filter(c, store.managed.get(c.id()))
+            let outdated = needs_config_update(c, store.managed.get(c.id()))
                 && addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
             if foreign || outdated { let _ = install(c).await; }
         }
@@ -540,11 +573,13 @@ mod tests {
     }
 
     #[test]
-    fn existing_managed_aiostreams_gets_the_3d_filter_once() {
-        assert!(needs_3d_filter(Curated::AioStreams, Some(&json!({}))));
-        assert!(!needs_3d_filter(Curated::AioStreams, Some(&json!({"exclude_3d":true}))));
-        assert!(!needs_3d_filter(Curated::AioStreams, None));
-        assert!(!needs_3d_filter(Curated::Torrentio, Some(&json!({}))));
+    fn existing_managed_aiostreams_is_written_again_once_per_revision() {
+        assert!(needs_config_update(Curated::AioStreams, Some(&json!({}))));
+        assert!(needs_config_update(Curated::AioStreams, Some(&json!({"exclude_3d":true}))));
+        assert!(!needs_config_update(Curated::AioStreams, Some(&json!({"exclude_3d":true, "revision": AIOSTREAMS_REVISION}))));
+        assert!(!needs_config_update(Curated::AioStreams, None));
+        assert!(!needs_config_update(Curated::Torrentio, Some(&json!({}))));
+        assert_eq!(aiostreams_config("KEY", None)["presets"][0]["options"]["timeout"], 3000);
     }
 
     #[test]

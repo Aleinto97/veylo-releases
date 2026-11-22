@@ -68,6 +68,13 @@ pub fn TitlePage(media: Media) -> Element {
     let episodes = move || match meta() { Load::Ready(m) => m.episodes, _ => Vec::new() };
     let label_of = move |e: &Episode| format!("S{} E{}", e.season, e.number);
 
+    // What the Play button would start, asked of the add-ons now: Play then only checks sources.
+    let for_ahead = media.clone();
+    use_effect(move || {
+        let id = if !episodic(&for_ahead) { Some(for_ahead.id.clone()) } else { up_next(&episodes(), &for_ahead, &seen()) };
+        if let Some(id) = id { backend::prefetch_sources(&for_ahead.kind, &id); }
+    });
+
     // Play: the Android app's order, then the one-byte check on at most four candidates.
     let play_media = media.clone();
     let autoplay = use_callback(move |(video, label): (String, Option<String>)| {
@@ -84,18 +91,13 @@ pub fn TitlePage(media: Media) -> Element {
         });
         let next = next_episode(&episodes(), &video);
         spawn(async move {
-            let result = backend::sources(&media.kind, &video).await;
-            let order = match &result { Ok((list, _)) => backend::play_order(list, pack), Err(_) => Vec::new() };
-            let (best, debrid) = backend::first_working(order.clone()).await;
+            let pick = backend::autoplay(&media.kind, &video, pack, &media.name, (media.kind == "movie").then(|| media.first_year()).flatten()).await;
             busy.set(None);
             if !crate::still_wanted(shell, ticket) { return; }
-            match best {
-                Some(src) => {
-                    let rest: Vec<Source> = order.iter().skip_while(|s| s.url != src.url).skip(1).cloned().collect();
-                    start_with(shell, &media, &video, &title, src, next.map(|e| (e.id.clone(), Some(label_of(&e)))), rest, None)
-                }
+            match pick.best {
+                Some(src) => start_with(shell, &media, &video, &title, src, next.map(|e| (e.id.clone(), Some(label_of(&e)))), pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }),
                 None => {
-                    shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(debrid.as_deref()).into())));
+                    shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(pick.debrid.as_deref()).into())));
                     chooser.set(Some(Chooser { video, label }));
                 }
             }
@@ -309,46 +311,63 @@ fn next_episode(list: &[Episode], video: &str) -> Option<Episode> {
 /// Start the platform player for a checked source and record progress for this video.
 /// `rest`: the Play-order candidates after this one, for "Another source".
 fn start(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>) {
-    start_with(shell, media, video, title, src, next, Vec::new(), None)
+    start_with(shell, media, video, title, src, next, Vec::new(), None, 0)
 }
 
+/// How many times an automatic choice may move on because its audio is not in your language.
+const LANGUAGE_RETRIES: u8 = 2;
+
 /// `at`: where the previous, failed source stopped, so the next one carries on from there.
+/// `checks`: while above 0 (automatic choices), a file whose tagged audio lacks the Audio-language
+/// setting's language makes way for the next source instead of turning subtitles on.
 #[allow(clippy::too_many_arguments)]
-fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>, rest: Vec<Source>, at: Option<i64>) {
+fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>, mut rest: Vec<Source>, at: Option<i64>, checks: u8) {
+    // The same file from another scraper would fail the same way.
+    if !src.filename.is_empty() { rest.retain(|s| s.filename != src.filename); }
+    let language_check = checks > 0 && rest.iter().any(backend::claims_language);
     let resume = at.filter(|p| *p > 0).unwrap_or_else(|| if backend::in_progress(media) && (media.last_video_id.as_deref() == Some(video) || media.kind == "movie") { media.position_ms } else { 0 });
     let full_title = title.to_owned();
     let subtitle = if video != media.id { media.name.clone() } else { media.meta_line(true) };
     let title = title.strip_prefix(&format!("{} ", media.name)).filter(|_| video != media.id).unwrap_or(title).to_owned();
     let another = {
         let (media, video, full_title, next) = (media.clone(), video.to_owned(), full_title.clone(), next.clone());
-        Box::new(move |mut shell: Shell, position: i64| {
+        Box::new(move |mut shell: Shell, position: i64, language: bool| {
             let (media, video, full_title, next, rest) = (media.clone(), video.clone(), full_title.clone(), next.clone(), rest.clone());
             let ticket = crate::finding(shell, full_title.clone());
             spawn(async move {
-                let (best, debrid) = backend::first_working(rest.clone()).await;
+                // Not in your language: the sources whose label names it, then the rest.
+                let (claimed, others): (Vec<Source>, Vec<Source>) = rest.into_iter().partition(|s| language && backend::claims_language(s));
+                let mut pick = backend::pick_source(claimed).await;
+                if pick.best.is_none() { pick = backend::pick_source(others).await; } else { pick.rest.extend(others); }
+                backend::dev_log(&format!("another source{}: {}", if language { " (language)" } else { "" },
+                    pick.best.as_ref().map(backend::source_summary).unwrap_or_else(|| "nothing".into())));
                 if !crate::still_wanted(shell, ticket) { return; }
-                match best {
-                    Some(found) => {
-                        let after: Vec<Source> = rest.iter().skip_while(|s| s.url != found.url).skip(1).cloned().collect();
-                        start_with(shell, &media, &video, &full_title, found, next, after, Some(position));
-                    }
+                match pick.best {
+                    Some(found) => start_with(shell, &media, &video, &full_title, found, next, pick.rest, Some(position), if pick.audio_known { 0 } else { checks.saturating_sub(1) }),
                     None => {
-                        shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(debrid.as_deref()).into())));
+                        shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(pick.debrid.as_deref()).into())));
                         if shell.opened.peek().is_none() { shell.opened.set(Some(media.clone())); }
                     }
                 }
             });
-        }) as Box<dyn Fn(Shell, i64)>
+        }) as crate::TryAnother
     };
     crate::start_playback_with(shell, PlayRequest {
         title, subtitle, url: src.url, start_ms: resume, headers: src.headers,
         size: src.size.clone(), hdr: src.hdr.map(str::to_owned), quality: src.quality.map(str::to_owned),
-        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))), has_next: next.is_some(),
+        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))), has_next: next.is_some(), language_check,
         ..Default::default()
     }, next.map(|(id, label)| {
         let media = media.clone();
         Box::new(move |shell: Shell| play_next(shell, media.clone(), id.clone(), label.clone())) as Box<dyn Fn(Shell)>
     }), Some(another));
+}
+
+/// Ask for the sources `resume_now` would play while its button is on screen: the film, or the
+/// series' unfinished episode.
+pub fn prefetch_resume(media: &Media) {
+    let id = if media.kind == "movie" { Some(media.id.clone()) } else { media.last_video_id.clone().filter(|_| !media.video_watched) };
+    if let Some(id) = id { backend::prefetch_sources(&media.kind, &id); }
 }
 
 /// Resume from Home or Continue watching: the film, or the series' last episode, starts at once
@@ -391,17 +410,13 @@ fn play_next(mut shell: Shell, media: Media, video: String, label: Option<String
         let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
         let after = next_episode(&list, &video).map(|e| (e.id.clone(), Some(format!("S{} E{}", e.season, e.number))));
         let pack = list.iter().find(|e| e.id == video).map(|e| list.iter().filter(|x| x.season == e.season).count());
-        let order = match backend::sources(&media.kind, &video).await { Ok((sources, _)) => backend::play_order(&sources, pack), Err(_) => Vec::new() };
-        let (best, debrid) = backend::first_working(order.clone()).await;
+        let pick = backend::autoplay(&media.kind, &video, pack, &media.name, (media.kind == "movie").then(|| media.first_year()).flatten()).await;
         if !crate::still_wanted(shell, ticket) { return; }
-        match best {
-            Some(src) => {
-                let rest: Vec<Source> = order.iter().skip_while(|s| s.url != src.url).skip(1).cloned().collect();
-                start_with(shell, &media, &video, &title, src, after, rest, None)
-            }
+        match pick.best {
+            Some(src) => start_with(shell, &media, &video, &title, src, after, pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }),
             None => {
                 // Nothing played: say why and open the title page, where every source can be chosen.
-                shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(debrid.as_deref()).into())));
+                shell.player_status.set(Some(PlayerStatus::Failed(backend::no_source_message(pick.debrid.as_deref()).into())));
                 if shell.opened.peek().is_none() { shell.opened.set(Some(media.clone())); }
             }
         }

@@ -107,7 +107,7 @@ impl State {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Finish { Close, Next, Another }
+pub enum Finish { Close, Next, Another, OtherLanguage }
 
 /// A playing session, shared by the engine thread, the video surface and the controls.
 pub struct Live {
@@ -433,6 +433,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
             Ok(Event::PropertyChange { name, change, .. }) => match (name, change) {
                 ("time-pos", PropertyData::Double(v)) => {
                     if let Some(prev) = last_tick { measured += played_between(prev, v, speed); }
+                    #[cfg(target_os = "android")]
+                    if last_tick.is_none() { crate::android::log(&format!("playing from {v:.1}s")); }
                     last_tick = Some(v);
                     position = v;
                     if v > 1.0 { played = true; }
@@ -442,7 +444,11 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 ("chapter-list", PropertyData::Str(j)) => { chapters = j.to_owned(); mark(&chapters, duration); }
                 ("demuxer-cache-time", PropertyData::Double(v)) => cache_end = v,
                 ("pause", PropertyData::Flag(v)) => live.update(|s| { s.paused = v; true }),
-                ("paused-for-cache", PropertyData::Flag(v)) => live.update(|s| { s.buffering = v; true }),
+                ("paused-for-cache", PropertyData::Flag(v)) => {
+                    #[cfg(target_os = "android")]
+                    crate::android::log(&format!("{} at {position:.1}s", if v { "buffering" } else { "buffered" }));
+                    live.update(|s| { s.buffering = v; true })
+                }
                 ("seeking", PropertyData::Flag(v)) => live.update(|s| { let c = s.buffering != v; s.buffering = v; c }),
                 ("eof-reached", PropertyData::Flag(true)) if played => {
                     live.update(|s| { s.ended = true; true });
@@ -475,7 +481,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
     let _ = events.send(PlayerEvent::Finished {
         position_ms: (position * 1000.0) as i64, duration_ms: (duration * 1000.0) as i64,
-        next: how == Finish::Next, another: how == Finish::Another,
+        next: how == Finish::Next, another: matches!(how, Finish::Another | Finish::OtherLanguage),
+        language: how == Finish::OtherLanguage,
     });
 }
 
