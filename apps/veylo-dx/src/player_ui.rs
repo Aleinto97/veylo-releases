@@ -336,8 +336,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                     }
                     span { class: "player-time tnum dim", if duration > 0.0 { "-{clock(duration - position)}" } }
                     div { class: "player-actions",
-                        button { class: "bare", aria_label: "Audio (A)", title: "Audio (A)", aria_pressed: "{sheet() == Some(Sheet::Audio)}", onclick: move |_| sheet.set(Some(Sheet::Audio)), icons::Audio {} }
-                        button { class: "bare", aria_label: "Subtitles (C)", title: "Subtitles (C)", disabled: !has_subs, aria_pressed: "{sheet() == Some(Sheet::Subtitles)}", onclick: move |_| sheet.set(Some(Sheet::Subtitles)), icons::Subtitles {} }
+                        button { class: "bare", aria_label: "Audio tracks (A cycles them)", title: "Audio tracks (A cycles them)", aria_pressed: "{sheet() == Some(Sheet::Audio)}", onclick: move |_| sheet.set(Some(Sheet::Audio)), icons::Audio {} }
+                        button { class: "bare", aria_label: "Subtitles (S)", title: "Subtitles (S)", disabled: !has_subs, aria_pressed: "{sheet() == Some(Sheet::Subtitles)}", onclick: move |_| sheet.set(Some(Sheet::Subtitles)), icons::Subtitles {} }
                         button { class: "bare", aria_label: "Speed ([ ])", title: "Speed ([ ])", aria_pressed: "{sheet() == Some(Sheet::Speed)}", onclick: move |_| sheet.set(Some(Sheet::Speed)), icons::Gauge {} }
                         button { class: "bare", aria_label: "Picture (Z)", title: "Picture (Z)", aria_pressed: "{sheet() == Some(Sheet::Picture)}", onclick: move |_| sheet.set(Some(Sheet::Picture)), icons::Resize {} }
                         if !ANDROID {

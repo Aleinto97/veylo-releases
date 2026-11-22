@@ -107,12 +107,14 @@ fn text(v: &[u8]) -> String { String::from_utf8_lossy(v).trim_end_matches('\0').
 
 // ---------------------------------------------------------------- MP4
 
-/// The boxes in `b`: (type, payload start, payload end).
-fn boxes(b: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+/// The boxes in `b`: (type, payload start, payload end, whole). A box is whole when all of it is
+/// in `b`; one sized "to the end of the file" (size 0) can't be known whole from a file's head.
+fn boxes(b: &[u8]) -> Vec<([u8; 4], usize, usize, bool)> {
     let mut out = Vec::new();
     let mut at = 0;
     while at + 8 <= b.len() {
         let size = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as u64;
+        let size_field = size;
         let kind: [u8; 4] = b[at + 4..at + 8].try_into().unwrap();
         let (header, size) = match size {
             1 if at + 16 <= b.len() => (16, u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap())),
@@ -121,7 +123,7 @@ fn boxes(b: &[u8]) -> Vec<([u8; 4], usize, usize)> {
         };
         if size < header as u64 { break; }
         let end = at.saturating_add(size as usize);
-        out.push((kind, at + header, end.min(b.len())));
+        out.push((kind, at + header, end.min(b.len()), size_field != 0 && end <= b.len()));
         if end > b.len() { break; }
         at = end;
     }
@@ -130,22 +132,21 @@ fn boxes(b: &[u8]) -> Vec<([u8; 4], usize, usize)> {
 
 fn mp4(head: &[u8]) -> Option<Vec<AudioTrack>> {
     let top = boxes(head);
-    let (_, ms, me) = *top.iter().find(|b| &b.0 == b"moov")?;
-    // The index must be whole.
-    let declared = u32::from_be_bytes(head[ms - 8..ms - 4].try_into().ok()?) as usize;
-    if declared > 1 && ms - 8 + declared > head.len() { return None; }
+    let (_, ms, me, whole) = *top.iter().find(|b| &b.0 == b"moov")?;
+    // The index must be whole (whatever form its size is written in).
+    if !whole { return None; }
     let moov = &head[ms..me];
-    Some(boxes(moov).into_iter().filter(|b| &b.0 == b"trak").filter_map(|(_, ts, te)| {
+    Some(boxes(moov).into_iter().filter(|b| &b.0 == b"trak").filter_map(|(_, ts, te, _)| {
         let trak = &moov[ts..te];
-        let (_, ds, de) = boxes(trak).into_iter().find(|b| &b.0 == b"mdia")?;
+        let (_, ds, de, _) = boxes(trak).into_iter().find(|b| &b.0 == b"mdia")?;
         let mdia = &trak[ds..de];
         let parts = boxes(mdia);
-        let (_, hs, he) = *parts.iter().find(|b| &b.0 == b"hdlr")?;
+        let (_, hs, he, _) = *parts.iter().find(|b| &b.0 == b"hdlr")?;
         let hdlr = &mdia[hs..he];
         if hdlr.get(8..12) != Some(b"soun") { return None; }
         let name = hdlr.get(24..).map(text).unwrap_or_default();
-        let elng = parts.iter().find(|b| &b.0 == b"elng").and_then(|(_, s, e)| mdia.get(s + 4..*e)).map(text);
-        let packed = parts.iter().find(|b| &b.0 == b"mdhd").and_then(|(_, s, _)| {
+        let elng = parts.iter().find(|b| &b.0 == b"elng").and_then(|(_, s, e, _)| mdia.get(s + 4..*e)).map(text);
+        let packed = parts.iter().find(|b| &b.0 == b"mdhd").and_then(|(_, s, _, _)| {
             let at = s + if mdia.get(*s) == Some(&1) { 32 } else { 20 };
             Some(u16::from_be_bytes(mdia.get(at..at + 2)?.try_into().ok()?))
         });
@@ -246,5 +247,15 @@ mod tests {
         let mut late = bx(b"ftyp", b"isomiso2");
         late.extend(bx(b"mdat", &[0; 32]));
         assert_eq!(audio_tracks(&late), None);
+        // A 64-bit sized index: read when whole, unknown when the head cuts it off.
+        let mut large = 1u32.to_be_bytes().to_vec();
+        large.extend(b"moov");
+        large.extend(((moov.len() + 16) as u64).to_be_bytes());
+        large.extend(&moov);
+        let mut wide = bx(b"ftyp", b"isomiso2");
+        wide.extend(&large);
+        assert_eq!(audio_tracks(&wide).map(|t| t.len()), Some(2));
+        let cut = &wide[..wide.len() - 10];
+        assert_eq!(audio_tracks(cut), None);
     }
 }

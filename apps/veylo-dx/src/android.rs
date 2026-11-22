@@ -9,8 +9,9 @@ fn with_activity<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| anyhow!("JNI: {e}"))?;
     let mut env = vm.attach_current_thread().map_err(|e| anyhow!("JNI attach: {e}"))?;
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    // The activity is a global reference the activity glue owns: a JObject never deletes its
+    // reference when dropped, so this one simply goes out of scope.
     let result = f(&mut env, &activity);
-    std::mem::forget(activity); // borrowed global reference owned by the activity glue
     if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
     result.map_err(|e| anyhow!("JNI: {e}"))
 }
@@ -50,12 +51,29 @@ pub fn install_update(apk: &std::path::Path) -> Result<String> {
     })
 }
 
-/// Status bar and navigation bar heights in dp (= CSS px in the WebView).
+/// Status bar and navigation bar heights in dp (= CSS px in the WebView): the window's own insets
+/// (they follow gesture navigation, rotation and split screen), ignoring whether the bars are
+/// hidden at the moment (the player hides them). Before the window has insets, the system's
+/// nominal bar heights.
 pub fn system_bar_insets() -> Result<(f32, f32)> {
     with_activity(|env, activity| {
         let res = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
         let metrics = env.call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?.l()?;
         let density = env.get_field(&metrics, "density", "F")?.f()?.max(0.5);
+        let window = env.call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
+        let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
+        let insets = env.call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?.l()?;
+        if !insets.is_null() {
+            let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()?;
+            let (top, bottom) = if sdk >= 30 {
+                let bars = env.call_static_method("android/view/WindowInsets$Type", "systemBars", "()I", &[])?.i()?;
+                let i = env.call_method(&insets, "getInsetsIgnoringVisibility", "(I)Landroid/graphics/Insets;", &[JValue::Int(bars)])?.l()?;
+                (env.get_field(&i, "top", "I")?.i()?, env.get_field(&i, "bottom", "I")?.i()?)
+            } else {
+                (env.call_method(&insets, "getStableInsetTop", "()I", &[])?.i()?, env.call_method(&insets, "getStableInsetBottom", "()I", &[])?.i()?)
+            };
+            return Ok((top as f32 / density, bottom as f32 / density));
+        }
         let mut dp = |name: &str| -> jni::errors::Result<f32> {
             let (n, kind, pkg) = (env.new_string(name)?, env.new_string("dimen")?, env.new_string("android")?);
             let id = env.call_method(&res, "getIdentifier", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
@@ -171,7 +189,7 @@ fn give_surface(live: &crate::engine::Live, wid: i64, w: i32, h: i32) {
 /// VeyloVideo.nativeSurface: the SurfaceView's surface was created, resized, or is going away.
 /// Runs on the UI thread; mpv must let go of a dying surface before this returns.
 #[no_mangle]
-pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(mut env: JNIEnv, _class: JClass, surface: JObject, width: jint, height: jint) {
+pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(env: JNIEnv, _class: JClass, surface: JObject, width: jint, height: jint) {
     let Ok(mut slot) = SURFACE.lock() else { return };
     let live = crate::engine::active();
     if surface.is_null() {
@@ -203,8 +221,12 @@ pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(mut env: JNIEn
 pub fn log(message: &str) {
     extern "C" { fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32; }
     if let Ok(text) = std::ffi::CString::new(message) { unsafe { __android_log_write(4, c"veylo".as_ptr(), text.as_ptr()); } }
-    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    let Some(path) = FILE.get_or_init(|| files_dir().ok().map(|d| d.join("dev-log.txt"))) else { return };
+    // Only a found folder is kept: a line logged before the activity exists must not turn the file off.
+    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let path = match FILE.get() {
+        Some(path) => path,
+        None => match files_dir() { Ok(dir) => FILE.get_or_init(|| dir.join("dev-log.txt")), Err(_) => return },
+    };
     if std::fs::metadata(path).is_ok_and(|m| m.len() > 64 * 1024) { let _ = std::fs::rename(path, path.with_extension("old.txt")); }
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     use std::io::Write;

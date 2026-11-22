@@ -174,7 +174,7 @@ pub fn card_playback(media: &Media, list: &[crate::backend::Episode], seen: &Has
     }
     let episodes = regular_episodes(list,now);
     if let Some(video) = media.last_video_id.as_ref().filter(|v| crate::backend::in_progress(media) && !seen.contains(*v)) {
-        let label = episodes.iter().find(|e| &e.id == video).map(|e| format!("S{} E{}",e.season,e.number))
+        let label = episodes.iter().find(|e| &e.id == video).map(|e| e.label())
             .or_else(|| crate::backend::episode_label(video));
         return Some(CardPlayback { video: video.clone(), label: label.map(|l| format!("Resume {l}")).unwrap_or_else(|| "Resume".into()) });
     }
@@ -182,7 +182,7 @@ pub fn card_playback(media: &Media, list: &[crate::backend::Episode], seen: &Has
     let furthest = episodes.iter().rposition(|e| seen.contains(&e.id));
     let next = furthest.and_then(|i| episodes.iter().skip(i+1).find(|e| !seen.contains(&e.id))).copied()
         .or_else(|| episodes.iter().find(|e| !seen.contains(&e.id)).copied()).or_else(|| episodes.first().copied())?;
-    Some(CardPlayback { video: next.id.clone(), label: format!("{} S{} E{}",if furthest.is_some() && !seen.contains(&next.id) { "Resume" } else { "Play" },next.season,next.number) })
+    Some(CardPlayback { video: next.id.clone(), label: format!("{} {}", if furthest.is_some() && !seen.contains(&next.id) { "Resume" } else { "Play" }, next.label()) })
 }
 
 #[cfg(test)]

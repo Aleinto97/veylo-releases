@@ -1,6 +1,6 @@
 //! Home: each catalog as a quiet poster shelf. What you are watching lives in the Library, and
 //! the last thing you played waits top right (main.rs, LastPlayed).
-use crate::{backend::{self, CatalogRow, Media}, icons, player::PlayRequest, Shell};
+use crate::{backend::{self, CatalogRow, Media}, components::{use_artwork, PosterCard}, icons, player::PlayRequest, Shell};
 use dioxus::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,7 +93,8 @@ pub fn Home() -> Element {
                         div { class: "row-error", span { class: "warn-icon", icons::Alert {} } span { "{error}" } }
                     }
                 }
-                for (row, state) in rows() {
+                // Read in place: the shelves (every title's metadata) aren't copied for each render.
+                for (row, state) in rows.read().iter() {
                     section { class: "shelf", key: "{row.key}",
                         SectionHeader { title: row.title.clone(), meta: row.subtitle.clone() }
                         match state {
@@ -205,33 +206,6 @@ fn SectionHeader(title: String, #[props(default)] meta: Option<String>) -> Eleme
     }
 }
 
-
-/// Upright poster with the name under it (PosterCard on touch screens). A broken
-/// image falls back to the other artwork, then to the initial: never an empty card.
-#[component]
-pub fn PosterCard(media: Media) -> Element {
-    let mut shell = use_context::<Shell>();
-    let artwork = backend::posters(&media);
-    let mut index = use_signal(|| 0usize);
-    let art = artwork.get(index()).cloned();
-    let fraction = backend::progress_fraction(&media);
-    let done = if media.kind == "movie" { backend::film_watched(&media) } else { media.watched };
-    let m = media.clone();
-    rsx! {
-        button { class: "card", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(m.clone())),
-            div { class: "card-art tall",
-                match art {
-                    Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", onerror: move |_| index += 1 } },
-                    // The poster carries the title; only when no image works is the name written.
-                    None => rsx! { span { class: "initial display", "{media.name}" } },
-                }
-                if done { span { class: "watched", aria_label: "Watched", icons::Check {} } }
-                if fraction > 0.0 && !done { div { class: "card-progress", div { style: "width: {fraction * 100.0}%" } } }
-            }
-        }
-    }
-}
-
 #[component]
 fn SkeletonStrip() -> Element {
     rsx! {
@@ -261,26 +235,3 @@ fn DemoNote() -> Element {
     }
 }
 
-/// A poster on its own (BetterPosters first, then the add-on's), for pages that also show
-/// wide artwork: the title page, Picks. Nothing is drawn when no image works.
-#[component]
-pub fn PosterArt(media: Media, class: String) -> Element {
-    let art = use_artwork(&media);
-    let mut artwork: Vec<String> = backend::posters(&media).into_iter().filter(|u| *u != media.background).collect();
-    // TMDB's poster is the last resort for titles no other source has.
-    if let Some(p) = art().and_then(|a| a.poster) { artwork.push(p); }
-    let mut index = use_signal(|| 0usize);
-    match artwork.get(index()).cloned() {
-        Some(src) => rsx! { div { class: "poster-art {class}", img { src: "{src}", alt: "{media.name} poster", onerror: move |_| index += 1 } } },
-        None => rsx! {},
-    }
-}
-
-/// TMDB artwork for a title (text-free backdrop, logo), loaded once; None until it arrives
-/// or when there is no key, in which case the add-on's images stay.
-pub fn use_artwork(media: &Media) -> Signal<Option<backend::Artwork>> {
-    let mut art = use_signal(|| None::<backend::Artwork>);
-    let m = media.clone();
-    use_hook(move || { spawn(async move { if let Some(a) = backend::artwork(&m).await { art.set(Some(a)); } }); });
-    art
-}

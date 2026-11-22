@@ -20,6 +20,8 @@ pub fn SettingsPage() -> Element {
     let mut rd_account = use_signal(|| None::<String>);
     // The answer of the last "Check for updates".
     let mut check_note = use_signal(|| None::<String>);
+    let mut tmdb_checking = use_signal(|| false);
+    let mut tmdb_problem = use_signal(|| None::<String>);
     // Run one add-on job, then reload the list; errors carry no links or keys.
     let mut run = move |label: String, job: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>>| {
         if busy.peek().is_some() { return; }
@@ -39,9 +41,7 @@ pub fn SettingsPage() -> Element {
         spawn(async move {
             match addons::check_rd_key(key.clone()).await {
                 Ok(account) => {
-                    let next = backend::Settings { rd_key: Some(key), rd_key_removed: false, ..backend::load_settings() };
-                    backend::save_settings(&next);
-                    settings.set(next);
+                    settings.set(backend::update_settings(|s| { s.rd_key = Some(key); s.rd_key_removed = false; }));
                     rd_account.set(Some(account));
                     if let Err(e) = addons::reconfigure().await { problem.set(Some(format!("{e:#}"))); }
                 }
@@ -53,9 +53,7 @@ pub fn SettingsPage() -> Element {
     };
     let mut choose_language = move |key: String| {
         let key = if addons::language(&key).is_some() { key } else { backend::DEFAULT_LANGUAGE.to_owned() };
-        let next = backend::Settings { stream_language: Some(key), ..backend::load_settings() };
-        backend::save_settings(&next);
-        settings.set(next);
+        settings.set(backend::update_settings(|s| s.stream_language = Some(key)));
         run("language".into(), Box::pin(async { addons::reconfigure().await }));
     };
     rsx! {
@@ -73,7 +71,7 @@ pub fn SettingsPage() -> Element {
                         i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "BetterPosters"), (false, "Add-on")] {
                             button { class: if settings().better_posters == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().better_posters == on}",
-                                onclick: move |_| { let next = backend::Settings { better_posters: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
+                                onclick: move |_| settings.set(backend::update_settings(|s| s.better_posters = on)), "{name}" }
                         }
                     }
                 }
@@ -85,29 +83,55 @@ pub fn SettingsPage() -> Element {
                 div { class: "group-head", span { class: "group-icon", icons::Globe {} } span { class: "group-name", "Artwork" } }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "TMDB" }
-                        span { class: "dim setting-about", if settings().tmdb_key.is_some() { "Connected: artwork, episode stills and Picks keywords" } else { "Add a free TMDB key for artwork and richer Picks metadata" } } }
+                        span { class: "dim setting-about",
+                            if tmdb_checking() { "Checking your key…" }
+                            else if settings().tmdb_key.is_some() { "Connected: artwork, episode stills and Picks keywords" }
+                            else { "Optional. Adds TMDB's extra stills, videos, taglines and recommendations; without it, BetterPosters, TVmaze and Wikidata fill in" } } }
                     if settings().tmdb_key.is_some() {
-                        button { class: "pill glass", onclick: move |_| { let next = backend::Settings { tmdb_key: None, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, icons::Trash {} span { "Remove key" } }
+                        button { class: "pill glass", onclick: move |_| settings.set(backend::update_settings(|s| s.tmdb_key = None)), icons::Trash {} span { "Remove key" } }
                     } else {
-                        GetKey { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
-                        // Masked while typing; saved on Enter.
+                        LinkButton { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
+                        // Masked while typing; checked with TMDB, then saved, on Enter.
                         input { class: "key-field", r#type: "password", placeholder: "TMDB API key", aria_label: "TMDB API key", autocomplete: "off",
+                            disabled: tmdb_checking(),
                             onkeydown: move |e| { e.stop_propagation(); },
-                            onchange: move |e| { let v = e.value().trim().to_owned(); if !v.is_empty() { let next = backend::Settings { tmdb_key: Some(v), ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); } } }
+                            onchange: move |e| {
+                                let key = e.value().trim().to_owned();
+                                if key.is_empty() || tmdb_checking() { return; }
+                                tmdb_checking.set(true);
+                                tmdb_problem.set(None);
+                                spawn(async move {
+                                    match backend::check_tmdb_key(key.clone()).await {
+                                        Ok(()) => settings.set(backend::update_settings(|s| s.tmdb_key = Some(key))),
+                                        Err(e) => tmdb_problem.set(Some(format!("{e:#}"))),
+                                    }
+                                    tmdb_checking.set(false);
+                                });
+                            } }
                     }
                 }
+                if let Some(p) = tmdb_problem() { p { class: "addon-problem", role: "alert", icons::Alert {} span { "{p}" } } }
             }
 
             section { class: "settings-block",
                 div { class: "group-head", span { class: "group-icon", icons::Sparkles {} } span { class: "group-name", "Picks" } }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Local AI" }
-                        span { class: "dim setting-about", "The bge-small model runs on this device and compares synopses. TMDB keywords enrich its input." } }
-                    GetKey { url: "https://www.tvmaze.com/", label: "Episode metadata: TVmaze (CC BY-SA)" }
+                        span { class: "dim setting-about", "The bge-small model runs on this device and compares synopses. Keywords from TMDB, or Wikidata without a key, enrich its input." } }
+                }
+                div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "Series data" }
+                        span { class: "dim setting-about", "Series casts, schedules and some Picks series come from TVmaze, under CC BY-SA." } }
+                    LinkButton { url: "https://www.tvmaze.com/", label: "TVmaze" }
+                }
+                div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "Open data" }
+                        span { class: "dim setting-about", "Credits, critics' scores and keywords come from Wikidata (CC0); cast photos and studio logos from Wikimedia Commons, under their authors' licences." } }
+                    LinkButton { url: "https://www.wikidata.org/", label: "Wikidata" }
                 }
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Learned taste" } span { class: "dim setting-about", "What Picks learned from your duels, plays, likes and moods" } }
-                    crate::picks::StartOver { labelled: true, on_reset: move |_| crate::brain::reset() }
+                    crate::components::StartOver { labelled: true, on_reset: move |_| crate::brain::reset() }
                 }
             }
 
@@ -126,7 +150,7 @@ pub fn SettingsPage() -> Element {
                                 let done = addons::remove_rd_key().await; settings.set(backend::load_settings()); done })); },
                             icons::Trash {} span { "Remove key" } }
                     } else {
-                        GetKey { url: addons::RD_KEY_PAGE, label: "Get your Real-Debrid key" }
+                        LinkButton { url: addons::RD_KEY_PAGE, label: "Get your Real-Debrid key" }
                         input { class: "key-field", r#type: "password", placeholder: "Real-Debrid API token", aria_label: "Real-Debrid API token", autocomplete: "off",
                             disabled: busy().is_some(),
                             onkeydown: move |e| { e.stop_propagation(); },
@@ -206,9 +230,10 @@ pub fn SettingsPage() -> Element {
     }
 }
 
-/// "Get your key": opens the provider's key page in the browser, to copy and paste back here.
+/// A link that opens in the browser: a provider's key page (to copy the key and paste it back
+/// here) or a source's own site.
 #[component]
-fn GetKey(url: &'static str, label: &'static str) -> Element {
+fn LinkButton(url: &'static str, label: &'static str) -> Element {
     rsx! {
         button { class: "link-btn", title: "{url}", onclick: move |_| crate::open_external(url),
             icons::Link {} span { "{label}" } }
@@ -237,7 +262,7 @@ fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
                         i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "Automatic"), (false, "Always SDR")] {
                             button { class: if settings().hdr_output == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().hdr_output == on}",
-                                onclick: move |_| { let next = backend::Settings { hdr_output: on, ..backend::load_settings() }; backend::save_settings(&next); settings.set(next); }, "{name}" }
+                                onclick: move |_| settings.set(backend::update_settings(|s| s.hdr_output = on)), "{name}" }
                         }
                     }
                 }

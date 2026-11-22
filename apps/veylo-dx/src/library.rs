@@ -1,5 +1,5 @@
 //! Library as a viewing history: the last week as big cards, then every month as a grid.
-use crate::{backend::{self, Media, Seen}, home::PosterCard, icons, Shell};
+use crate::{backend::{self, Media, Seen}, components::PosterCard, icons, Shell};
 use dioxus::prelude::*;
 
 #[component]
@@ -51,7 +51,8 @@ pub fn Library() -> Element {
                                 div { class: "group-head", span { class: "group-icon", icons::Clock {} } span { class: "group-name", "This week" }
                                     span { class: "tnum dim", "{week.len()}" } }
                                 div { class: "week-strip",
-                                    for s in week { WeekCard { key: "{s.media.key()}", seen: s.clone(), now } }
+                                    // Only the first few ask for their sources ahead: the ones Resume is likeliest on.
+                                    for (i, s) in week.into_iter().enumerate() { WeekCard { key: "{s.media.key()}", seen: s.clone(), now, ahead: i < 2 } }
                                 }
                             }
                         }
@@ -76,21 +77,21 @@ pub fn Library() -> Element {
 
 /// A wide card for this week: artwork, title, where you are, when you watched.
 #[component]
-fn WeekCard(seen: Seen, now: i64) -> Element {
+fn WeekCard(seen: Seen, now: i64, ahead: bool) -> Element {
     let mut shell = use_context::<Shell>();
     let m = seen.media.clone();
-    let art = crate::home::use_artwork(&m);
+    let art = crate::components::use_artwork(&m);
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| m.backdrop().to_owned());
     let fraction = backend::progress_fraction(&m);
     // With the episode shown as a tag, the text only says what is left.
     let context = backend::resume_context(&m);
     let context = match &seen.episode { Some(ep) => context.strip_prefix(ep.as_str()).map(|r| r.trim_start_matches(", ").to_owned()).unwrap_or(context), None => context };
-    let done = if m.kind == "movie" { backend::film_watched(&m) } else { m.watched };
+    let done = m.watched;
     let state = if done { "Watched".to_string() } else if backend::in_progress(&m) { context } else { "Started".into() };
     let (open, resume) = (m.clone(), m.clone());
     // Its Resume button starts at once: the sources are asked for while the card is shown.
-    let ahead = m.clone();
-    use_hook(move || if !done { crate::title::prefetch_resume(&ahead) });
+    let for_ahead = m.clone();
+    use_hook(move || if ahead && !done { crate::title::prefetch_resume(&for_ahead) });
     rsx! {
         div { class: "week-card",
             button { class: "week-open", aria_label: "Open {m.name}", onclick: move |_| shell.opened.set(Some(open.clone())),

@@ -111,11 +111,27 @@ fn parts(m: &Media) -> Option<Parts> { Parts::new(m, &picks_metadata::cached(m))
 /// vector from the unenriched text keeps serving.
 pub fn embedding(m: &Media) -> Option<Vec<f32>> {
     ensure_cache();
+    let (full, base) = text_keys(m)?;
     let cache = cache().read().ok()?;
-    let full = parts(m)?;
-    cache.get(&full.key()).cloned().or_else(|| {
-        Parts::new(m, &picks_metadata::Extra::default()).and_then(|base| cache.get(&base.key()).cloned())
-    })
+    cache.get(&full).cloned().or_else(|| base.and_then(|base| cache.get(&base).cloned()))
+}
+
+/// A title's cache keys (its text with and without enrichment), found by a fast hash of exactly
+/// what goes into them: Picks looks titles up all the time, and cleaning and hashing a synopsis
+/// with SHA-256 each time cost more than the lookup itself. None when there is too little text.
+fn text_keys(m: &Media) -> Option<(String, Option<String>)> {
+    use std::hash::{Hash, Hasher};
+    type Keys = Option<(String, Option<String>)>;
+    static KNOWN: OnceLock<Mutex<std::collections::HashMap<u64, Keys>>> = OnceLock::new();
+    let extra = picks_metadata::cached(m);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&m.name, &m.year, &m.description, &extra.keywords).hash(&mut h);
+    let print = h.finish();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(keys) = known.lock().ok().and_then(|k| k.get(&print).cloned()) { return keys; }
+    let keys = Parts::new(m, &extra).map(|full| (full.key(), Parts::new(m, &picks_metadata::Extra::default()).map(|b| b.key())));
+    if let Ok(mut k) = known.lock() { if k.len() > 20_000 { k.clear(); } k.insert(print, keys.clone()); }
+    keys
 }
 /// Both vectors are unit length, so the dot product is the cosine.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {

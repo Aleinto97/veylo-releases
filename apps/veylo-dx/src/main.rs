@@ -1,4 +1,4 @@
-//! Veylo shell prototype in Dioxus: Picks and Search on the Rust core.
+//! Veylo in Dioxus: the shell (top bar, keys, player status), its screens and the in-app player, on the Rust core.
 // Windows release builds are a GUI app: no console window behind Veylo.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod addons;
@@ -6,6 +6,7 @@ mod addons;
 mod android;
 mod backend;
 mod brain;
+mod components;
 mod engine;
 mod home;
 mod library;
@@ -21,6 +22,8 @@ mod search;
 #[cfg(not(target_os = "android"))]
 mod selftest;
 mod settings;
+mod shortcuts;
+mod theatre;
 mod title;
 mod tracks;
 mod video;
@@ -28,10 +31,13 @@ mod updater;
 mod display;
 
 use backend::Media;
+use theatre::Theatre;
 use base64::Engine;
 use dioxus::prelude::*;
 
-const STYLE: &str = include_str!("style.css");
+/// The app's styles, in cascade order (src/styles).
+const STYLE: &str = concat!(include_str!("styles/base.css"), include_str!("styles/screens.css"), include_str!("styles/sizes.css"),
+    include_str!("styles/addons.css"), include_str!("styles/player.css"), include_str!("styles/pages.css"), include_str!("styles/motion.css"));
 const ARCHIVO: &[u8] = include_bytes!("../assets/fonts/archivo.ttf");
 
 /// Destinations, in the Android app's order.
@@ -63,51 +69,6 @@ pub struct Accent(pub Signal<String>);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PickCommand { Left, Right, Skip, Neither }
 
-/// One video in the theatre: a YouTube id, its name and kind ("Trailer", "Teaser", ...).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Clip { pub youtube: String, pub name: String, pub kind: String, pub official: bool }
-
-/// The in-app video player: whose videos they are, the videos and the one playing.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Theatre { pub about: About, pub clips: Vec<Clip>, pub at: usize }
-
-/// The title the videos belong to, from what its page or card already loaded: its logo and
-/// backdrop, year, runtime, certificate and genres, rating, tagline, director and leading cast.
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct About {
-    pub title: String, pub backdrop: String, pub logo: Option<String>,
-    pub facts: Vec<String>, pub rating: Option<String>, pub tagline: Option<String>,
-    pub director: Option<(String, Vec<String>)>, pub cast: Vec<String>,
-}
-
-impl About {
-    pub fn of(media: &Media, meta: Option<&backend::TitleMeta>, art: Option<&backend::Artwork>) -> Self {
-        let filled = |s: &str| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
-        let genres: Vec<String> = media.genres.iter().take(2).cloned().collect();
-        let facts = [filled(&media.year), meta.and_then(|m| filled(&m.runtime)), art.and_then(|a| a.certificate.clone()),
-            Some(genres.join(", ")).filter(|g| !g.is_empty())].into_iter().flatten().collect();
-        // Key crew from TMDB (directed or created by), else the add-on's directors.
-        let director = art.and_then(|a| a.crew.iter().find(|(role, _)| role.starts_with("Directed") || role.starts_with("Created")).cloned())
-            .or_else(|| meta.filter(|m| !m.directors.is_empty()).map(|m| ("Directed by".to_owned(), m.directors.iter().take(2).cloned().collect())));
-        let cast: Vec<String> = art.map(|a| a.cast.iter().take(4).map(|p| p.name.clone()).collect::<Vec<_>>()).filter(|c| !c.is_empty())
-            .or_else(|| meta.map(|m| m.cast.iter().take(4).cloned().collect())).unwrap_or_default();
-        About {
-            title: media.name.clone(),
-            backdrop: art.and_then(|a| a.backdrop.clone()).unwrap_or_else(|| media.backdrop().to_owned()),
-            logo: art.and_then(|a| a.logo.clone()).or_else(|| meta.and_then(|m| filled(&m.logo))),
-            facts, rating: meta.and_then(|m| filled(&m.rating)), tagline: art.and_then(|a| a.tagline.clone()), director, cast,
-        }
-    }
-}
-
-impl Clip {
-    /// What the clip is, in words: "Official trailer", "Teaser", "Behind the scenes".
-    pub fn label(&self) -> String {
-        let kind = if self.kind == "Behind the Scenes" { "Behind the scenes".to_owned() } else if self.kind.is_empty() { "Video".to_owned() } else { self.kind.clone() };
-        if self.official && matches!(self.kind.as_str(), "Trailer" | "Teaser") { format!("Official {}", kind.to_lowercase()) } else { kind }
-    }
-}
-
 /// Shared shell state, provided once at the root.
 #[derive(Clone, Copy)]
 pub struct Shell {
@@ -115,6 +76,9 @@ pub struct Shell {
     /// What the player is doing, shown as a status line; None when idle.
     pub player_status: Signal<Option<PlayerStatus>>,
     pub search_open: Signal<bool>,
+    /// What is typed in Search, kept so every way of closing it (Esc, Back, Close, a result)
+    /// remembers the query.
+    pub search_draft: Signal<String>,
     /// A title's videos playing in the in-app theatre (trailers, teasers, featurettes).
     pub trailer: Signal<Option<Theatre>>,
     /// The app's shortcuts sheet.
@@ -157,6 +121,17 @@ pub fn finding(mut shell: Shell, title: String) -> u64 {
 
 pub fn still_wanted(shell: Shell, ticket: u64) -> bool { *shell.play_ticket.peek() == ticket }
 
+/// Close Search, remembering what was typed (two characters or more).
+pub fn close_search(mut shell: Shell) {
+    let draft = shell.search_draft.peek().clone();
+    if draft.trim().chars().count() >= 2 { backend::remember_query(&mut shell.history.write(), &draft); }
+    if !draft.is_empty() { shell.search_draft.set(String::new()); }
+    if *shell.search_open.peek() { shell.search_open.set(false); }
+}
+
+/// How long a playback failure stays on screen.
+const FAILURE_SHOWN_MS: u64 = 8000;
+
 /// Back out of the player before anything plays: the search in progress is dropped.
 pub fn cancel_finding(mut shell: Shell) {
     *shell.play_ticket.write() += 1;
@@ -184,7 +159,7 @@ fn print_sources(kind: &str, id: &str, pack: Option<usize>) {
             println!("{:>2}. [{} {}] {} | {} | {}", i + 1, s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"),
                 if s.filename.is_empty() { s.description.lines().next().unwrap_or("") } else { &s.filename }, s.size.as_deref().unwrap_or("size?"), s.addon);
         }
-        let pick = backend::pick_source(order).await;
+        let pick = backend::pick_source(order, pack).await;
         let (best, debrid) = (pick.best, pick.debrid);
         println!("Play would start: {}", best.map(|s| if s.filename.is_empty() { s.description.lines().next().unwrap_or("").to_owned() } else { s.filename }).unwrap_or_else(|| format!("nothing ({debrid:?})")));
     });
@@ -283,6 +258,14 @@ fn start_tab() -> Tab {
     }
 }
 
+/// The system bars' heights in CSS px (top, bottom); nothing to reserve on the desktop.
+fn system_bar_insets() -> (f32, f32) {
+    #[cfg(target_os = "android")]
+    { android::system_bar_insets().unwrap_or((24.0, 24.0)) }
+    #[cfg(not(target_os = "android"))]
+    { (0.0, 0.0) }
+}
+
 /// The backend starts once the window exists: on Android the JNI context
 /// (files folder, player) is only available from then on.
 #[component]
@@ -302,6 +285,7 @@ fn Shell_() -> Element {
         tab: Signal::new(start_tab()),
         player_status: Signal::new(None),
         search_open: Signal::new(std::env::var_os("VEYLO_DX_SEARCH").is_some()),
+        search_draft: Signal::new(String::new()),
         search_query: Signal::new(None),
         shortcuts_open: Signal::new(false),
         trailer: Signal::new(None),
@@ -355,18 +339,23 @@ fn Shell_() -> Element {
     let Shell { tab, mut search_open, mut opened, lamp_source, mut pick_command, player_status, mut shortcuts_open, mut title_command, .. } = shell;
     let lamp = use_resource(move || async move { backend::accent(lamp_source()).await });
     let lamp_css = lamp().flatten().unwrap_or_else(|| "#f2efea".into());
-    // Android draws the WebView under its bars: reserve their real heights everywhere.
-    let insets = use_hook(|| {
-        #[cfg(target_os = "android")]
-        { android::system_bar_insets().unwrap_or((24.0, 24.0)) }
-        #[cfg(not(target_os = "android"))]
-        { (0.0f32, 0.0f32) }
-    });
+    // Android draws the WebView under its bars: reserve their real heights everywhere, read again
+    // whenever the window changes size (rotation, split screen, a new navigation mode).
+    let mut insets = use_signal(system_bar_insets);
 
-    // Android Back closes a page or Search, like Esc; on a top-level screen it leaves the app.
+    // Android Back closes a page, Search or the videos, like Esc; on a top-level screen it leaves the app.
     #[cfg(target_os = "android")]
     use_effect(move || { let _ = android::set_back_enabled(shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
-        || matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))); });
+        || (shell.trailer)().is_some() || matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))); });
+    // A failure says why once; it doesn't stay over the app (a new playback replaces it sooner).
+    let mut status = shell.player_status;
+    use_effect(move || {
+        let Some(PlayerStatus::Failed(error)) = player_status() else { return };
+        spawn(async move {
+            backend::sleep(FAILURE_SHOWN_MS).await;
+            if matches!(&*status.peek(), Some(PlayerStatus::Failed(e)) if *e == error) { status.set(None); }
+        });
+    });
     // Written in an effect, never during render (a write there would re-render forever).
     let mut accent = use_context_provider(|| Accent(Signal::new(String::new()))).0;
     let current = lamp_css.clone();
@@ -399,14 +388,13 @@ fn Shell_() -> Element {
             return;
         }
         let ctrl = e.modifiers().ctrl() || e.modifiers().meta();
-        let go = |mut tab: Signal<Tab>, mut opened: Signal<Option<Media>>, mut search_open: Signal<bool>, to: Tab| { opened.set(None); search_open.set(false); tab.set(to); };
+        let go = |mut tab: Signal<Tab>, mut opened: Signal<Option<Media>>, to: Tab| { close_search(shell); opened.set(None); tab.set(to); };
         match e.key() {
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("k") => { e.prevent_default(); search_open.set(true); }
             Key::Character(c) if ctrl && ["1", "2", "3", "4"].contains(&c.as_str()) => {
                 e.prevent_default();
-                go(tab, opened, search_open, Tab::ALL[c.parse::<usize>().unwrap_or(1) - 1]);
+                go(tab, opened, Tab::ALL[c.parse::<usize>().unwrap_or(1) - 1]);
             }
-            Key::Escape if shortcuts_open() && shell.trailer.read().is_some() => shortcuts_open.set(false),
             Key::Escape if shell.trailer.read().is_some() => { let mut t = shell.trailer; t.set(None); }
             // In the theatre, ← and → step through the title's videos.
             Key::ArrowLeft | Key::ArrowRight if shell.trailer.read().is_some() => {
@@ -422,11 +410,11 @@ fn Shell_() -> Element {
                 let key = c.to_lowercase();
                 let mut t = shell.trailer;
                 match key.as_str() {
-                    " " | "k" => { e.prevent_default(); theatre_command("toggle"); }
-                    "j" => theatre_command("back"),
-                    "l" => theatre_command("forward"),
-                    "m" => theatre_command("mute"),
-                    "f" => theatre_command("full"),
+                    " " | "k" => { e.prevent_default(); theatre::command("toggle"); }
+                    "j" => theatre::command("back"),
+                    "l" => theatre::command("forward"),
+                    "m" => theatre::command("mute"),
+                    "f" => theatre::command("full"),
                     "y" => if let Some(id) = t.peek().as_ref().and_then(|t| t.clips.get(t.at)).map(|c| c.youtube.clone()) { open_external(&format!("https://www.youtube.com/watch?v={id}")); },
                     "?" => shortcuts_open.set(!shortcuts_open()),
                     d if d.len() == 1 && ("1"..="9").contains(&d) => {
@@ -436,11 +424,9 @@ fn Shell_() -> Element {
                     _ => {}
                 }
             }
-            Key::Escape if shortcuts_open() => shortcuts_open.set(false),
-            Key::Escape if search_open() => search_open.set(false),
+            Key::Escape if search_open() => close_search(shell),
             Key::Escape if opened.read().is_some() => opened.set(None),
-            _ if search_open() || shortcuts_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
-            Key::Backspace if shortcuts_open() => shortcuts_open.set(false),
+            _ if search_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
             Key::Backspace if opened.read().is_some() => opened.set(None),
             Key::Character(c) if c == "?" => shortcuts_open.set(!shortcuts_open()),
             Key::Character(c) if c == "/" => { e.prevent_default(); search_open.set(true); }
@@ -458,7 +444,7 @@ fn Shell_() -> Element {
     use_hook(|| { document::eval(r#"window.addEventListener('keydown', e => {
         if (e.target === document.body) { const a = document.querySelector('.app'); if (a) { a.focus(); a.dispatchEvent(new KeyboardEvent('keydown', e)); } }
     });"#); });
-    // The top bar gathers smoke once the page scrolls under it (style.css, .scrolled). Checked on
+    // The top bar gathers smoke once the page scrolls under it (styles/base.css, .scrolled). Checked on
     // scroll and, at most once a frame, when the page changes (a new tab or title starts at the top).
     use_hook(|| { document::eval(r#"(() => {
         const sync = () => { const p = document.querySelector('.page'); document.documentElement.classList.toggle('scrolled', !!p && p.scrollTop > 4); };
@@ -468,7 +454,7 @@ fn Shell_() -> Element {
         new MutationObserver(later).observe(document.body, { childList: true, subtree: true });
         // Opening a title: its backdrop opens out of the card you tapped (a clip that widens from
         // the card's place to the whole hero). Nothing is stretched or swapped; the words lift in
-        // after (style.css). Remembered on tap, played when the page mounts.
+        // after (styles/pages.css). Remembered on tap, played when the page mounts.
         let from = null;
         document.addEventListener('click', e => {
             const card = e.target.closest && e.target.closest('.card, .week-open');
@@ -496,7 +482,7 @@ fn Shell_() -> Element {
         };
         // Selection pills slide: the dock's glass pill and each segmented control's thumb move to the
         // selected item and take its width. Groups whose slider is placed get data-sliding, so the
-        // item's own fill steps aside (style.css); without this script the items keep their fill.
+        // item's own fill steps aside (styles/motion.css); without this script the items keep their fill.
         const slide = () => document.querySelectorAll('.dock, .segmented').forEach(g => {
             const s = g.querySelector('.slider'), on = g.querySelector('.dock-tab.on, .seg.on');
             if (!s) return;
@@ -524,7 +510,10 @@ fn Shell_() -> Element {
             art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%'); };
         document.addEventListener('pointermove', glare, { passive: true });
         document.addEventListener('pointerdown', glare, { passive: true });
-        new MutationObserver(() => requestAnimationFrame(() => { grow(); slide(); })).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        // At most once a frame however many changes arrive (slide reads layout).
+        let framed = false;
+        new MutationObserver(() => { if (framed) return; framed = true; requestAnimationFrame(() => { framed = false; grow(); slide(); }); })
+            .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
     })();"#); });
 
     rsx! {
@@ -532,7 +521,8 @@ fn Shell_() -> Element {
         style { {STYLE} }
         div {
             class: format!("app{}{}", if cfg!(target_os = "android") { " android" } else { "" }, if (shell.player)().is_some() { " playing" } else { "" }),
-            style: "--lamp: {lamp_css}; --top-inset: {insets.0}px; --bottom-inset: {insets.1}px",
+            style: "--lamp: {lamp_css}; --top-inset: {insets().0}px; --bottom-inset: {insets().1}px",
+            onresize: move |_| if cfg!(target_os = "android") { let now = system_bar_insets(); if *insets.peek() != now { insets.set(now); } },
             tabindex: "-1",
             onkeydown: on_key,
             onmounted: move |e| async move { let _ = e.set_focus(true).await; },
@@ -562,10 +552,10 @@ fn Shell_() -> Element {
             } }
             if let Some(live) = (shell.player)() { player_ui::PlayerScreen { live } }
             if search_open() { search::SearchOverlay {} }
-            if shortcuts_open() { AppShortcuts {} }
+            if shortcuts_open() { shortcuts::AppShortcuts {} }
             // Windows, macOS and Android install releases; Linux builds from source.
             if updater::ASSET.is_some() { updater::UpdateNotice {} }
-            if let Some(theatre) = (shell.trailer)() { TheatreSheet { theatre } }
+            if let Some(theatre) = (shell.trailer)() { theatre::TheatreSheet { theatre } }
         }
     }
 }
@@ -606,7 +596,7 @@ fn TopBar() -> Element {
             }
             span { class: "topbar-spacer" }
             LastPlayed {}
-            ShortcutButton {}
+            shortcuts::ShortcutButton {}
             icons::IconButton { label: "Search (Ctrl+K)", class: "glass", onclick: move |_| shell.search_open.set(true), icons::Search {} }
         }
     }
@@ -614,6 +604,7 @@ fn TopBar() -> Element {
 
 #[component]
 fn StatusChip(status: PlayerStatus) -> Element {
+    let mut current = use_context::<Shell>().player_status;
     rsx! {
         div { class: "toast glass", role: "status",
             match status {
@@ -634,22 +625,25 @@ fn StatusChip(status: PlayerStatus) -> Element {
                         title: if lit { "Hardware decoding" } else { "Software decoding" },
                         icons::Cpu {} span { "{decoder}" } }
                 }},
-                PlayerStatus::Failed(error) => rsx! { span { class: "warn-icon", icons::Alert {} } span { "{error}" } },
+                PlayerStatus::Failed(error) => rsx! {
+                    span { class: "warn-icon", icons::Alert {} } span { "{error}" }
+                    icons::IconButton { label: "Dismiss", class: "small", onclick: move |_| current.set(None), icons::Close {} }
+                },
             }
         }
     }
 }
 
-/// Play through the platform player and narrate what it is doing.
-/// `on_next` plays the next episode; `on_another` tries the next source when this one failed
-/// (told whether it was for the audio language).
 /// Tries the next source from where the failed one stopped, told whether it was for the audio language.
 pub type TryAnother = Box<dyn Fn(Shell, i64, bool)>;
 
+/// Play through the platform player and narrate what it is doing. `on_next` plays the next episode.
 pub fn start_playback(shell: Shell, request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>) {
     start_playback_with(shell, request, on_next, None)
 }
 
+/// `start_playback`, with `on_another` trying the next source when this one failed (told whether
+/// it was for the audio language).
 pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<TryAnother>) {
     if request.accent.is_empty() { request.accent = try_consume_context::<Accent>().map(|a| a.0.peek().clone()).unwrap_or_default(); }
     let title = request.title.clone();
@@ -704,7 +698,7 @@ pub fn open_external(url: &str) {
 #[component]
 fn LastPlayed() -> Element {
     let shell = use_context::<Shell>();
-    let last = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::viewing_history().await.ok().and_then(|l| l.into_iter().next()) } });
+    let last = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::recent_viewing(4).await.ok().and_then(|l| l.into_iter().next()) } });
     match last() {
         Some(Some(seen)) => rsx! { for m in [seen.media] { LastPlayedButton { key: "{m.key()}", media: m.clone() } } },
         _ => rsx! {},
@@ -746,219 +740,6 @@ fn LastPlayedButton(media: Media) -> Element {
     }
 }
 
-/// The same discoverable control in the top bar and Search; player uses its own sheet.
-#[component]
-fn ShortcutButton() -> Element {
-    let mut shell = use_context::<Shell>();
-    rsx! { icons::IconButton { label: "Page shortcuts (?)", class: "glass", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} } }
-}
-
-/// Only commands that apply here, followed by shared app navigation.
-#[component]
-fn AppShortcuts() -> Element {
-    let mut shell = use_context::<Shell>();
-    let mut rows: Vec<(&[&str], &str)> = Vec::new();
-    let context = if shell.pending().is_some() {
-        rows.push((&["Esc"], "Cancel opening")); "Opening"
-    } else if let Some(t) = (shell.trailer)() {
-        rows.extend([(&["Space", "K"][..], "Play or pause"), (&["J", "L"][..], "10 seconds back or on"), (&["M"][..], "Mute or unmute"), (&["F"][..], "Full screen")]);
-        if t.clips.len() > 1 { rows.extend([(&["←", "→"][..], "Previous or next video"), (&["1–9"][..], "Jump to a video")]); }
-        rows.extend([(&["Y"][..], "Open on YouTube"), (&["Esc"][..], "Close the videos")]); "Videos"
-    } else if (shell.search_open)() {
-        rows.extend([(&["Enter"][..], "Search"), (&["Esc"][..], "Close search")]); "Search"
-    } else if let Some(media) = shell.opened.read().as_ref() {
-        rows.extend([(&["P"][..], "Play or resume"), (&["L"][..], "Like"), (&["D"][..], "Not for me"), (&["S"][..], "Save"), (&["T"][..], "Trailer")]);
-        if media.kind == "movie" { rows.extend([(&["W"][..], "Watched"), (&["O"][..], "Choose source")]); }
-        rows.push((&["Esc"], "Back")); "Title"
-    } else {
-        if (shell.tab)() == Tab::Picks {
-            rows.extend([(&["←", "→"][..], "Keep the left or right card"), (&["S"][..], "Skip: two other titles, nothing learned"),
-                (&["N"][..], "Neither: steer away from both")]);
-        }
-        (shell.tab)().title()
-    };
-    if shell.pending().is_none() {
-        rows.extend([(&["Ctrl", "K"][..], "Search"), (&["Ctrl", "1–4"][..], "Home / Picks / Library / Settings")]);
-        if !(shell.search_open)() { rows.push((&["/"], "Search")); }
-    }
-    rows.extend([(&["Tab"][..], "Next control; Shift+Tab goes back"), (&["Enter", "Space"][..], "Activate a focused button"), (&["?"][..], "Show or hide shortcuts")]);
-    rsx! {
-        div { class: "scrim shortcuts-scrim", onclick: move |_| shell.shortcuts_open.set(false),
-            section { class: "shortcuts glass", role: "dialog", aria_modal: "true", aria_label: "{context} shortcuts", tabindex: "-1", onmounted: move |e| async move { let _ = e.set_focus(true).await; }, onclick: move |e| e.stop_propagation(),
-                div { class: "sheet-head",
-                    span { class: "group-icon", icons::Keyboard {} }
-                    span { class: "group-name", "{context} shortcuts" }
-                    icons::IconButton { label: "Close (Esc)", class: "glass", onclick: move |_| shell.shortcuts_open.set(false), icons::Close {} }
-                }
-                div { class: "shortcut-list",
-                    for (keys, what) in rows {
-                        div { class: "shortcut",
-                            span { class: "caps", for k in keys.iter() { kbd { class: "keycap", "{k}" } } }
-                            span { "{what}" }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// A title's videos in the in-app theatre, starting at `start` (a YouTube id) or the best one.
-/// TMDB's videos lead (official trailers first); the add-on's YouTube trailers follow as
-/// alternatives. With no YouTube video at all, an add-on's direct trailer file plays in the player.
-pub fn watch_videos(mut shell: Shell, about: About, videos: Vec<backend::Video>, trailers: Vec<backend::Trailer>, start: Option<String>) {
-    let mut clips: Vec<Clip> = videos.into_iter().map(|v| Clip { youtube: v.youtube, name: v.name, kind: v.kind, official: v.official }).collect();
-    for id in trailers.iter().filter_map(|t| t.youtube.clone()) {
-        if !clips.iter().any(|c| c.youtube == id) {
-            let n = clips.iter().filter(|c| c.kind == "Trailer").count();
-            clips.push(Clip { youtube: id, name: if n == 0 { "Trailer".into() } else { format!("Trailer {}", n + 1) }, kind: "Trailer".into(), official: false });
-        }
-    }
-    if clips.is_empty() {
-        if let Some(url) = trailers.iter().find_map(|t| t.url.clone()) {
-            start_playback(shell, player::PlayRequest { title: format!("{}: trailer", about.title), url, ..Default::default() }, None);
-        }
-        return;
-    }
-    let at = start.and_then(|s| clips.iter().position(|c| c.youtube == s)).unwrap_or(0);
-    shell.trailer.set(Some(Theatre { about, clips, at }));
-}
-
-/// Drive the theatre's YouTube embed through its player API (postMessage). The embed reports its
-/// state, time and mute back (`theatre_listen`), so toggles and seeks start from what it is doing.
-fn theatre_command(command: &'static str) {
-    document::eval(&format!(r#"(() => {{
-        const f = document.querySelector('.theatre iframe'); if (!f || !f.contentWindow) return;
-        const s = window.__veyloYt || (window.__veyloYt = {{}});
-        const post = (func, args) => f.contentWindow.postMessage(JSON.stringify({{ event: 'command', func, args: args || [] }}), '*');
-        switch ('{command}') {{
-            case 'toggle': post(s.state === 1 ? 'pauseVideo' : 'playVideo'); s.state = s.state === 1 ? 2 : 1; break;
-            case 'back': post('seekTo', [Math.max(0, (s.time || 0) - 10), true]); s.time = Math.max(0, (s.time || 0) - 10); break;
-            case 'forward': post('seekTo', [(s.time || 0) + 10, true]); s.time = (s.time || 0) + 10; break;
-            case 'mute': post(s.muted ? 'unMute' : 'mute'); s.muted = !s.muted; break;
-            case 'full': {{ const go = f.requestFullscreen || f.webkitRequestFullscreen; if (go) go.call(f); break; }}
-        }}
-    }})()"#));
-}
-
-/// Listen to the embed's reports once per app, and keep asking the current embed to report
-/// (a new video is a new embed).
-fn theatre_listen() {
-    document::eval(r#"(() => {
-        if (window.__veyloYtListening) return;
-        window.__veyloYtListening = true;
-        window.__veyloYt = {};
-        window.addEventListener('message', e => {
-            if (!/youtube/.test(e.origin || '')) return;
-            let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (_) { return; }
-            const s = window.__veyloYt;
-            if (d && d.event === 'onStateChange') s.state = d.info;
-            if (d && d.event === 'infoDelivery' && d.info) {
-                if ('playerState' in d.info) s.state = d.info.playerState;
-                if ('currentTime' in d.info) s.time = d.info.currentTime;
-                if ('muted' in d.info) s.muted = d.info.muted;
-            }
-        });
-        setInterval(() => {
-            const f = document.querySelector('.theatre iframe');
-            if (f && f.contentWindow) f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'veylo' }), '*');
-        }, 1000);
-    })()"#);
-}
-
-/// The theatre: the official YouTube embed large, what is playing and its kind, and every video of
-/// the title as a strip of thumbnails to switch between. Nothing autoplays until it is opened, and
-/// closing it stops it.
-#[component]
-fn TheatreSheet(theatre: Theatre) -> Element {
-    let mut shell = use_context::<Shell>();
-    let n = theatre.clips.len();
-    let at = theatre.at.min(n.saturating_sub(1));
-    let clip = theatre.clips[at].clone();
-    let mut go = move |to: usize| shell.trailer.with_mut(|t| if let Some(t) = t { t.at = to; });
-    let link = format!("https://www.youtube.com/watch?v={}", clip.youtube);
-    let about = theatre.about.clone();
-    let mut logo_failed = use_signal(|| false);
-    use_hook(theatre_listen);
-    rsx! {
-        div { class: "scrim theatre-scrim", onclick: move |_| shell.trailer.set(None),
-            if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{about.backdrop}", alt: "" } }
-            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}", onclick: move |e| e.stop_propagation(),
-                // The video is the main actor: it takes all the room the side column leaves.
-                div { class: "theatre-stage",
-                    div { class: "trailer-frame",
-                        // A new video gets a new frame (a key only renews an element inside a list).
-                        for id in [clip.youtube.clone()] {
-                            iframe { key: "{id}", src: "https://www.youtube-nocookie.com/embed/{id}?autoplay=1&playsinline=1&rel=0&modestbranding=1&enablejsapi=1", title: "{clip.name}",
-                                allow: "autoplay; encrypted-media; picture-in-picture; fullscreen", allowfullscreen: "true", referrerpolicy: "strict-origin-when-cross-origin" }
-                        }
-                    }
-                }
-                aside { class: "theatre-side",
-                    div { class: "theatre-tools",
-                        if n > 1 {
-                            icons::IconButton { label: "Previous video (←)", class: "glass small", onclick: move |_| go((at + n - 1) % n), icons::ArrowLeft {} }
-                            span { class: "theatre-count tnum", "{at + 1} / {n}" }
-                            icons::IconButton { label: "Next video (→)", class: "glass small", onclick: move |_| go((at + 1) % n), icons::ArrowRight {} }
-                        }
-                        span { class: "theatre-spacer" }
-                        icons::IconButton { label: "Open on YouTube", class: "glass small", onclick: move |_| open_external(&link), icons::Link {} }
-                        icons::IconButton { label: "Close (Esc)", class: "glass small", onclick: move |_| shell.trailer.set(None), icons::Close {} }
-                    }
-                    div { class: "theatre-titles",
-                        match about.logo.clone().filter(|_| !logo_failed()) {
-                            Some(src) => rsx! { img { class: "theatre-logo", src: "{src}", alt: "{about.title}", onerror: move |_| logo_failed.set(true) } },
-                            None => rsx! { h2 { class: "display theatre-title", "{about.title}" } },
-                        }
-                        div { class: "theatre-facts",
-                            if let Some(r) = about.rating.clone() { span { class: "theatre-rating", icons::Star {} span { class: "tnum", "{r}" } } }
-                            for f in about.facts.iter() { span { "{f}" } }
-                        }
-                    }
-                    div { class: "theatre-now",
-                        span { class: if clip.official { "theatre-kind official" } else { "theatre-kind" },
-                            if clip.official { icons::Check {} } else { icons::Clapper {} } span { {clip.label()} } }
-                        if !clip.name.is_empty() && clip.name != clip.label() { span { class: "theatre-name", "{clip.name}" } }
-                    }
-                    if let Some(t) = about.tagline.clone() { p { class: "theatre-tagline", "“{t}”" } }
-                    if about.director.is_some() || !about.cast.is_empty() {
-                        div { class: "theatre-credits",
-                            if let Some((role, names)) = about.director.clone() { p { span { class: "dim", "{role} " } {names.join(", ")} } }
-                            if !about.cast.is_empty() { p { span { class: "dim", "With " } {about.cast.join(", ")} } }
-                        }
-                    }
-                    if n > 1 {
-                        div { class: "theatre-list", role: "list", aria_label: "All videos",
-                            for (i, c) in theatre.clips.iter().cloned().enumerate() {
-                                button { key: "{c.youtube}", class: if i == at { "theatre-clip on" } else { "theatre-clip" }, role: "listitem",
-                                    aria_current: if i == at { "true" } else { "false" }, aria_label: "{c.label()}: {c.name}", onclick: move |_| go(i),
-                                    span { class: "theatre-thumb",
-                                        img { src: "https://i.ytimg.com/vi/{c.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }
-                                        if i == at { span { class: "now-playing", icons::Play {} } }
-                                        if i < 9 { kbd { class: "keycap clip-key", aria_hidden: "true", "{i + 1}" } }
-                                    }
-                                    span { class: "theatre-clip-text",
-                                        span { class: "theatre-clip-name", "{c.name}" }
-                                        span { class: if c.official { "theatre-clip-kind official" } else { "theatre-clip-kind" }, {c.label()} }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // The keys, at a glance (? lists them all).
-                    div { class: "theatre-keys", aria_hidden: "true",
-                        span { kbd { class: "keycap", "Space" } "Play" }
-                        span { kbd { class: "keycap", "J" } kbd { class: "keycap", "L" } "10 s" }
-                        span { kbd { class: "keycap", "M" } "Mute" }
-                        span { kbd { class: "keycap", "F" } "Full" }
-                        if n > 1 { span { kbd { class: "keycap", "←" } kbd { class: "keycap", "→" } "Videos" } }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod playback_lifetime_tests {
     use super::*;
@@ -980,7 +761,7 @@ mod playback_lifetime_tests {
             probe.status.set(Some(status));
             Shell {
                 tab: Signal::new(Tab::Home), player_status: status,
-                search_open: Signal::new(false), trailer: Signal::new(None), shortcuts_open: Signal::new(false),
+                search_open: Signal::new(false), search_draft: Signal::new(String::new()), trailer: Signal::new(None), shortcuts_open: Signal::new(false),
                 title_command: Signal::new(None), search_query: Signal::new(None), opened: Signal::new(None),
                 lamp_source: Signal::new(String::new()), pick_command: Signal::new(None),
                 history: Signal::new(backend::History::default()), picks_dirty: Signal::new(0), addon_updates: Signal::new(0),
