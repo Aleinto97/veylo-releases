@@ -44,9 +44,11 @@ pub struct PlayRequest {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Facts { pub resolution: String, pub picture: String, pub size: String }
 
+/// The resolution class, by width as much as height: a widescreen film is stored cropped, so a
+/// 1080p scope film is 1920x800 and a 4K one 3840x1600, short of the class's usual height.
 pub fn resolution_label(width: i64, height: i64) -> String {
-    match () { _ if height >= 2000 || width >= 3800 => "4K", _ if height >= 1400 => "1440p", _ if height >= 1000 => "1080p",
-        _ if height >= 700 => "720p", _ if height > 0 => "SD", _ => "" }.into()
+    match () { _ if height >= 2000 || width >= 3600 => "4K", _ if height >= 1400 || width >= 2400 => "1440p",
+        _ if height >= 1000 || width >= 1800 => "1080p", _ if height >= 700 || width >= 1200 => "720p", _ if height > 0 => "SD", _ => "" }.into()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +83,12 @@ mod label_tests {
     fn resolution_names_the_class_not_the_exact_size() {
         assert_eq!(resolution_label(3840, 1600), "4K");
         assert_eq!(resolution_label(1920, 1080), "1080p");
+        assert_eq!(resolution_label(1920, 788), "1080p", "a 2.39:1 film cropped to its picture");
+        assert_eq!(resolution_label(1920, 800), "1080p");
+        assert_eq!(resolution_label(1280, 536), "720p");
+        assert_eq!(resolution_label(3840, 1608), "4K");
+        assert_eq!(resolution_label(1280, 720), "720p");
+        assert_eq!(resolution_label(720, 404), "SD");
         assert_eq!(resolution_label(0, 0), "");
     }
 }
