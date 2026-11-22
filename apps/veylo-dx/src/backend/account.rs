@@ -640,4 +640,43 @@ mod tests {
             assert!(rt.block_on(answer_link(bad)).is_err(), "{bad}");
         }
     }
+
+    /// Against the real project (built with its values, firebase/README.md): a passing account
+    /// signs up, syncs a saved film, links a "computer" through the QR handshake, and is deleted.
+    /// `VEYLO_DX_DATA=<empty folder> cargo test live_account -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_account_sync_and_link() {
+        assert!(accounts_available(), "built without the Firebase values");
+        assert!(std::env::var_os("VEYLO_DX_DATA").is_some(), "point VEYLO_DX_DATA at an empty folder");
+        init().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let email = format!("veylo-test-{}@example.com", random_text(6).to_lowercase().replace(['-', '_'], "x"));
+            let me = sign_up(email.clone(), random_text(12)).await.unwrap();
+            println!("signed up {} ({})", me.email, me.uid.len());
+            let film = Media::from_json(&json!({"id":"tt1375666","type":"movie","name":"Inception"}), CINEMETA).unwrap();
+            set_saved(&film, true).await.unwrap();
+            let (took, sent) = sync_now().await.unwrap();
+            println!("first sync: took {took}, sent {sent}");
+            assert!(sent >= 1);
+            let (token, uid) = id_token().await.unwrap();
+            let docs = list_items(&token, &uid, None, 50).await.unwrap();
+            println!("on the server: {} document(s)", docs.len());
+            assert!(docs.iter().any(|(_, f)| f["data"]["stringValue"].as_str().is_some_and(|d| d.contains("tt1375666"))));
+            // The QR handshake: a computer asks, the phone (this session) answers, the computer takes it.
+            let offer = offer_link().await.unwrap();
+            assert!(take_link(&offer).await.unwrap().is_none(), "unanswered yet");
+            answer_link(&offer.code).await.unwrap();
+            let linked = take_link(&offer).await.unwrap().expect("answered");
+            assert_eq!(linked.uid, me.uid);
+            println!("linked as the same account");
+            // Someone else's data stays out of reach.
+            let other = list_items(&offer.token, &uid, None, 5).await;
+            assert!(other.is_err(), "an anonymous session must not read an account's items");
+            delete_account().await.unwrap();
+            assert!(account().is_none());
+            println!("deleted");
+        });
+    }
 }
