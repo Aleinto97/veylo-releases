@@ -360,10 +360,22 @@ pub(crate) fn sync_changes(db: &Connection, since: i64) -> Result<Value> {
 pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> {
     let tx = db.transaction()?;
     let mut applied = 0;
-    let field = |v: &Value, k: &str| v[k].as_str().filter(|s| !s.is_empty() && s.len() <= 2048).map(str::to_owned);
+    let field = |v: &Value, k: &str| {
+        v[k].as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 2048)
+            .map(str::to_owned)
+    };
     for m in request["media"].as_array().into_iter().flatten() {
-        let (Some(kind), Some(id), Some(addon)) = (field(m, "type"), field(m, "id"), m["addon_url"].as_str().map(str::to_owned)) else { continue };
-        let Some(updated) = m["updated"].as_i64() else { continue };
+        let (Some(kind), Some(id), Some(addon)) = (
+            field(m, "type"),
+            field(m, "id"),
+            m["addon_url"].as_str().map(str::to_owned),
+        ) else {
+            continue;
+        };
+        let Some(updated) = m["updated"].as_i64() else {
+            continue;
+        };
         let key = identity(&kind, &id, &addon);
         let local: Option<(i64, bool)> = tx
             .query_row(
@@ -372,14 +384,20 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if local.is_some_and(|(at, history)| history && at >= updated) { continue; }
+        if local.is_some_and(|(at, history)| history && at >= updated) {
+            continue;
+        }
         if m["deleted"] == true {
             tx.execute("DELETE FROM playback WHERE media_key=?1", [&key])?;
             tx.execute("DELETE FROM media WHERE key=?1", [&key])?;
             applied += 1;
             continue;
         }
-        let meta = if m["meta"].is_object() { m["meta"].clone() } else { json!({}) };
+        let meta = if m["meta"].is_object() {
+            m["meta"].clone()
+        } else {
+            json!({})
+        };
         upsert_meta(&tx, &kind, &id, &addon, &meta)?;
         tx.execute(
             "UPDATE media SET saved=?2,watched=?3,position_ms=?4,duration_ms=?5,watched_ms=?6,liked=?7,video_id=?8,updated=?9 WHERE key=?1",
@@ -390,8 +408,17 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
         applied += 1;
     }
     for p in request["playback"].as_array().into_iter().flatten() {
-        let (Some(kind), Some(id), Some(addon), Some(video)) = (field(p, "type"), field(p, "id"), p["addon_url"].as_str().map(str::to_owned), field(p, "video_id")) else { continue };
-        let Some(updated) = p["updated"].as_i64() else { continue };
+        let (Some(kind), Some(id), Some(addon), Some(video)) = (
+            field(p, "type"),
+            field(p, "id"),
+            p["addon_url"].as_str().map(str::to_owned),
+            field(p, "video_id"),
+        ) else {
+            continue;
+        };
+        let Some(updated) = p["updated"].as_i64() else {
+            continue;
+        };
         let key = upsert_meta(&tx, &kind, &id, &addon, &json!({}))?;
         applied += tx.execute(
             "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,watched,updated) VALUES(?1,?2,?3,?4,?5,?6,?7)
