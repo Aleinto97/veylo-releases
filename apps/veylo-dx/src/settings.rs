@@ -60,6 +60,8 @@ pub fn SettingsPage() -> Element {
         div { class: "settings",
             h1 { class: "display title", "Settings" }
 
+            crate::account_ui::AccountBlock {}
+
             section { class: "settings-block",
                 div { class: "group-head", span { class: "group-icon", icons::Grid {} } span { class: "group-name", "Charts and posters" } }
                 div { class: "setting-row glass",

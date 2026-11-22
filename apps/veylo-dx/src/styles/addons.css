@@ -37,3 +37,15 @@
 }
 .check-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,255,255,.06); color: var(--bone); font-size: 14.5px; }
 .check-note .icon { width: 18px; height: 18px; flex: none; }
+
+/* Settings → Account: the ways to sign in, the email form and the computer's QR code. */
+.account-choices { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.google-g { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 11px; background: #fff; color: #4285f4; font: 800 14px/1 system-ui, sans-serif; }
+.account-form { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; padding: 16px; border-radius: 20px; --glass: rgba(255,255,255,.045); }
+.account-form .key-field { width: 100%; max-width: 420px; }
+.account-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.account-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(120,220,150,.12); font-size: 14.5px; }
+.account-note .icon { width: 18px; height: 18px; flex: none; }
+.link-panel { flex-direction: row; align-items: center; gap: 22px; }
+.link-qr { width: 200px; height: 200px; flex: none; border-radius: 12px; background: #fff; }
+@media (max-width: 699px) { .link-panel { flex-direction: column; align-items: flex-start; } }

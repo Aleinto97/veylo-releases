@@ -6,6 +6,7 @@ mod addons;
 mod android;
 mod backend;
 mod brain;
+mod account_ui;
 mod components;
 mod engine;
 mod home;

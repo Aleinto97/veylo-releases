@@ -1,5 +1,5 @@
 //! JNI glue for Android: the app's private files folder, the Rust player's video surface
-//! (VeyloVideo.kt), Back (VeyloBack.kt) and updates (VeyloUpdate.kt).
+//! (VeyloVideo.kt), Back (VeyloBack.kt), updates (VeyloUpdate.kt) and account sign-in (VeyloAccount.kt).
 use anyhow::{anyhow, Result};
 use jni::{objects::{JObject, JString, JValue}, JavaVM, JNIEnv};
 use std::path::PathBuf;
@@ -90,6 +90,38 @@ fn load_class<'a>(env: &mut JNIEnv<'a>, activity: &JObject, name: &str) -> jni::
     let name = env.new_string(name)?;
     let class = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?.l()?;
     Ok(jni::objects::JClass::from(class))
+}
+
+/// Google sign-in through Android's account sheet (VeyloAccount.kt); the answer comes later
+/// through `account_result`.
+pub fn google_id_token(web_client: &str) -> Result<()> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloAccount")?;
+        let client = env.new_string(web_client)?;
+        env.call_static_method(&class, "signInWithGoogle", "(Landroid/app/Activity;Ljava/lang/String;)V", &[JValue::Object(activity), JValue::Object(&client)])?;
+        Ok(())
+    })
+}
+
+/// Google's QR scanner (VeyloAccount.kt), for a computer's sign-in code; the answer comes later
+/// through `account_result`.
+pub fn scan_code() -> Result<()> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloAccount")?;
+        env.call_static_method(&class, "scanCode", "(Landroid/app/Activity;)V", &[JValue::Object(activity)])?;
+        Ok(())
+    })
+}
+
+/// The account sheet's or the scanner's answer, once it has one: "token:…", "code:…", "cancel:"
+/// or "error:…".
+pub fn account_result() -> Option<String> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloAccount")?;
+        let value = env.call_static_method(&class, "take", "()Ljava/lang/String;", &[])?.l()?;
+        if value.is_null() { return Ok(None); }
+        Ok(Some(env.get_string(&JString::from(value))?.into()))
+    }).ok().flatten()
 }
 
 /// While a page or Search is open, Back closes it (VeyloBack.kt) instead of leaving the app.

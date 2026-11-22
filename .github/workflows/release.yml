@@ -1,7 +1,9 @@
 # Builds Windows, macOS and Android and publishes them as a release of this repo whenever a push to main
 # raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch and offer Update.
 # Run it by hand from the Actions tab with "publish" off to only build (the files become an artifact).
-# Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD.
+# Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD; for
+# accounts, the Firebase project and Google clients (apps/veylo-dx/firebase/README.md). A build
+# without those has no Account section.
 name: release
 on:
   push:
@@ -58,6 +60,12 @@ jobs:
         with:
           workspaces: apps/veylo-dx -> target
       - run: tools/build-macos.sh
+        env:
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
+          VEYLO_GOOGLE_DESKTOP_CLIENT: ${{ secrets.VEYLO_GOOGLE_DESKTOP_CLIENT }}
+          VEYLO_GOOGLE_DESKTOP_SECRET: ${{ secrets.VEYLO_GOOGLE_DESKTOP_SECRET }}
       - name: Self-test the app before it ships
         run: |
           ditto -x -k dist/veylo-macos-arm64.zip "$RUNNER_TEMP/app"
@@ -114,6 +122,11 @@ jobs:
           VEYLO_PUBLISH: ${{ needs.plan.outputs.publish == 'true' && '1' || '0' }}
           VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           VEYLO_EXTRA_ASSETS: ${{ runner.temp }}/extra
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
+          VEYLO_GOOGLE_DESKTOP_CLIENT: ${{ secrets.VEYLO_GOOGLE_DESKTOP_CLIENT }}
+          VEYLO_GOOGLE_DESKTOP_SECRET: ${{ secrets.VEYLO_GOOGLE_DESKTOP_SECRET }}
         run: tools/release.sh "$(git log -1 --format=%B)"
       - if: needs.plan.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
