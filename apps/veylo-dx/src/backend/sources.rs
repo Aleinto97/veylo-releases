@@ -235,7 +235,8 @@ pub(super) fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option
 }
 
 /// Play order: 2D direct sources of 1080p or more only (unlabelled ones after every labelled one);
-/// HDR before SDR, then biggest file (per episode for season packs), then 4K > 1440p > 1080p,
+/// HDR before SDR, then 4K > 1440p > 1080p (a file too small for its resolution counts as a
+/// 1080p, see `picture_class`), then biggest file (per episode for season packs),
 /// remux > WEB-DL > WEBRip > other, HDR10+ > HDR > SDR, then AV1 > H.265 > H.264.
 /// Dolby-Vision-only files (usually profile 5, wrong colours without a DV decoder) come last;
 /// AI upscales and SDR regraded to HDR after every native file.
@@ -291,7 +292,22 @@ pub(super) fn playable(s: &Source) -> bool {
     s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !cinema_copy().is_match(&s.label)
 }
 
-pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u64, u8, i16, u8, u8)>);
+pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u8, u64, i16, u8, u8)>);
+
+/// The resolution Play ranks a file by: its label's, or 1080p's when the file is too small to
+/// carry it (a 2 GB "4K" film is a heavy re-encode: among the 1080p files its size decides). An
+/// episode (S01E02, or a season pack's share) needs less than a film. Unknown sizes keep their
+/// label's class.
+pub(super) fn picture_class(s: &Source, size: u64) -> u8 {
+    let class = 5 - quality_rank(s.quality);
+    let episode = s.pack || episode_mark().is_match(&s.label);
+    let floor: u64 = match (s.quality, episode) {
+        (Some("4K"), false) => 3_000_000_000, (Some("4K"), true) => 1_000_000_000,
+        (Some("1440p"), false) => 2_000_000_000, (Some("1440p"), true) => 700_000_000,
+        _ => 0,
+    };
+    if size > 0 && size < floor { class.min(5 - quality_rank(Some("1080p"))) } else { class }
+}
 
 /// The Play-order sort key of one source whose file is `size` bytes: smaller plays first.
 pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Language>) -> OrderKey {
@@ -306,8 +322,8 @@ pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Lang
     // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
     let hdr_rank = match hdr { 1 => 0, 0 => 1, t => t };
     // An upscale or regrade goes after every native file: its 4K and HDR are made up, its size padding.
-    (s.off_title, tier, provider, hdr == 1, upscaled().is_match(&s.label), s.quality.is_none(), std::cmp::Reverse((hdr >= 2, size,
-        5 - quality_rank(s.quality), source_tier(&s.label).map_or(-1, i16::from), hdr_rank, codec_tier(&s.label))))
+    (s.off_title, tier, provider, hdr == 1, upscaled().is_match(&s.label), s.quality.is_none(), std::cmp::Reverse((hdr >= 2,
+        picture_class(s, size), size, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, codec_tier(&s.label))))
 }
 
 /// The source's label names the Audio-language setting's language (flag, name or release tag).
@@ -679,5 +695,33 @@ pub fn no_source_message(debrid: Option<&str>) -> &'static str {
         Some("busy") => "Your sources are refusing requests for a moment (too many at once). Try again in a minute.",
         Some(BELOW_1080P) => "No source is 1080p or better, so Play didn't choose one. Pick one from the list.",
         _ => "No source responded. Try again or choose another source.",
+    }
+}
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+
+    /// Developer audit, nothing played or resolved: Play's order on saved source lists
+    /// (VEYLO_AUDIT: {"movie/tt…": {"name", "year", "kind", "streams": [add-on streams]}}),
+    /// printing each title's first three. `cargo test ranking_audit -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ranking_audit() {
+        let path = std::env::var("VEYLO_AUDIT").expect("VEYLO_AUDIT: a saved list of titles and their streams");
+        let all: serde_json::Map<String, Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for (key, t) in &all {
+            let (name, year, series) = (s(t, "name"), t["year"].as_i64().map(|y| y as i32), t["kind"] == "series");
+            let mut list: Vec<Source> = t["streams"].as_array().into_iter().flatten().map(|v| source_of("Torrentio", v)).collect();
+            for src in &mut list { src.off_title = !names_title(src, &name, if series { None } else { year }); }
+            let order = play_order_for(&list, series.then_some(10), Some("english"));
+            println!("== {name} ({key}): {} sources, {} playable", list.len(), order.len());
+            for src in order.iter().take(3) {
+                let release = src.description.lines().next().unwrap_or(&src.filename).chars().take(78).collect::<String>();
+                let ranked = episode_size(src, series.then_some(10)).unwrap_or(0);
+                println!("   {:5} {:6} {:>10} (ranked as {:.2} GB, class {}) {}{}", src.quality.unwrap_or("?"), src.hdr.unwrap_or("SDR"), src.size.as_deref().unwrap_or("?"),
+                    ranked as f64 / 1e9, picture_class(src, ranked), if src.off_title { "[off-title] " } else { "" }, release);
+            }
+        }
     }
 }

@@ -1416,6 +1416,23 @@ mod tests {
         assert_eq!(date_label("2014-11-05T00:00:00.000Z"), "5 Nov 2014");
     }
 
+    /// Resolution before size, but a file too small for its resolution competes as a 1080p.
+    #[test]
+    fn resolution_then_size_unless_the_file_is_too_small_for_it() {
+        let src = |title: &str| source_of("A", &json!({"title": title, "url": format!("https://x.invalid/{}", title.len())}));
+        let order = |list: &[Source]| play_order_for(list, None, None).into_iter().map(|s| s.label.trim().to_owned()).collect::<Vec<_>>();
+        // A film: a 4.45 GB 4K WEBRip over a bigger 1080p; a 2 GB "4K" is ranked among the 1080p files by size.
+        assert_eq!(order(&[src("Film 2025 1080p WEB-DL 6.28 GB"), src("Film 2025 2160p WEBRip 4.45 GB")]),
+            ["Film 2025 2160p WEBRip 4.45 GB", "Film 2025 1080p WEB-DL 6.28 GB"]);
+        assert_eq!(order(&[src("Film 2025 2160p WEBRip 2 GB"), src("Film 2025 1080p WEB-DL 6 GB"), src("Film 2025 1080p WEBRip 1.5 GB")]),
+            ["Film 2025 1080p WEB-DL 6 GB", "Film 2025 2160p WEBRip 2 GB", "Film 2025 1080p WEBRip 1.5 GB"]);
+        // An episode needs less: 1.5 GB is a real 4K episode, 0.6 GB isn't.
+        assert_eq!(order(&[src("Show S01E01 1080p WEB-DL 3 GB"), src("Show S01E01 2160p WEB-DL 1.5 GB")]),
+            ["Show S01E01 2160p WEB-DL 1.5 GB", "Show S01E01 1080p WEB-DL 3 GB"]);
+        assert_eq!(order(&[src("Show S01E01 2160p WEBRip 0.6 GB"), src("Show S01E01 1080p WEB-DL 1 GB")]),
+            ["Show S01E01 1080p WEB-DL 1 GB", "Show S01E01 2160p WEBRip 0.6 GB"]);
+    }
+
     #[test]
     fn hdr_then_size_then_hdr_format() {
         let src = |title: &str| source_of("A", &json!({"title": title, "url": "https://x.invalid/a"}));
