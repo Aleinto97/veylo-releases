@@ -63,7 +63,11 @@ static_re!(remux, r"(?i)REMUX\b");
 static_re!(bluray, r"(?i)\b(?:BLU[ ._-]?RAY|BDRIP|BRRIP|BDREMUX|BD(?:25|50|66|100))\b");
 static_re!(web_dl, r"(?i)\bWEB(?:[ ._-]?DL)?\b");
 static_re!(web_rip, r"(?i)\bWEB[ ._-]?RIP\b");
-static_re!(low_source, r"(?i)\b(?:HDTV|PDTV|DVDRIP|DVDSCR|HDCAM|CAM|TS|TELESYNC|TC|SCREENER)\b");
+static_re!(low_source, r"(?i)\b(?:HDTV|PDTV|DVDRIP|DVDSCR|HDCAM|CAM|TS|HDTS|TELESYNC|TC|SCREENER)\b");
+// Filmed or copied in a cinema, or a pre-release screener: never Play's choice, whatever
+// resolution the name claims ("1080p HDTS" is a camera copy at 1080p). A bare "TS" isn't here:
+// it is also MPEG-TS, a container real releases use.
+static_re!(cinema_copy, r"(?i)\b(?:HD[ ._-]?CAM|CAM[ ._-]?RIP|CAM|HD[ ._-]?TS|TELESYNC|HD[ ._-]?TC|TELECINE|DVD[ ._-]?SCR|SCREENER)\b");
 static_re!(av1, r"(?i)\bAV1\b");
 // Resolution or HDR made up after the fact: AI upscales and SDR regraded to HDR.
 static_re!(upscaled, r"(?i)(?:\b|_)(?:AI[ ._-]?)?UPSCALE(?:D|S)?(?:\b|_)|\bUPSCL\b|\bAI[ ._-]?(?:ENHANCED|REMASTER(?:ED)?)\b|\bREGRADED?\b|\bSDR[ ._-]?TO[ ._-]?HDR\b|\bFAKE[ ._-]?HDR\b");
@@ -280,10 +284,11 @@ pub fn play_order_for(sources: &[Source], pack_episodes: Option<usize>, language
     out
 }
 
-/// What Play may choose: a direct 2D link, not labelled under 1080p (nor an unlabelled DVD rip, TV capture or cam).
+/// What Play may choose: a direct 2D link, not labelled under 1080p (nor an unlabelled DVD rip
+/// or TV capture), and never a copy filmed in a cinema or a screener, whatever its resolution.
 pub(super) fn playable(s: &Source) -> bool {
     let low = match s.quality { Some(q) => quality_rank(Some(q)) > 2, None => low_source().is_match(&s.label) };
-    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low
+    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !cinema_copy().is_match(&s.label)
 }
 
 pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u64, u8, i16, u8, u8)>);
