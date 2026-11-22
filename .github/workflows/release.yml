@@ -64,8 +64,6 @@ jobs:
           VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
           VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
           VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
-          VEYLO_GOOGLE_DESKTOP_CLIENT: ${{ secrets.VEYLO_GOOGLE_DESKTOP_CLIENT }}
-          VEYLO_GOOGLE_DESKTOP_SECRET: ${{ secrets.VEYLO_GOOGLE_DESKTOP_SECRET }}
       - name: Self-test the app before it ships
         run: |
           ditto -x -k dist/veylo-macos-arm64.zip "$RUNNER_TEMP/app"
@@ -125,8 +123,6 @@ jobs:
           VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
           VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
           VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
-          VEYLO_GOOGLE_DESKTOP_CLIENT: ${{ secrets.VEYLO_GOOGLE_DESKTOP_CLIENT }}
-          VEYLO_GOOGLE_DESKTOP_SECRET: ${{ secrets.VEYLO_GOOGLE_DESKTOP_SECRET }}
         run: tools/release.sh "$(git log -1 --format=%B)"
       - if: needs.plan.outputs.publish != 'true'
         uses: actions/upload-artifact@v4

@@ -1,7 +1,8 @@
 //! Your Veylo account and the sync between your devices, through Firebase (Authentication and
 //! Firestore, called over REST). Every sign-in happens in the app:
 //! - email and password;
-//! - Google: Android's own account sheet (VeyloAccount.kt) on Android, the browser on a computer;
+//! - Google: Android's own account sheet (VeyloAccount.kt) on Android; on a computer, the project's
+//!   sign-in page in the browser (firebase/hosting/sign-in.html), which hands the token back;
 //! - a computer linked from a signed-in phone or tablet: the computer shows a QR code, the phone
 //!   scans it and hands the computer its session, sealed with the key in that code.
 //!
@@ -23,10 +24,9 @@ use std::collections::BTreeMap;
 pub struct Config {
     pub api_key: &'static str,
     pub project: &'static str,
-    /// Google's "web" client: Android's account sheet asks for a token for it.
+    /// Google's "web" client: Android's account sheet and the computer's sign-in page ask for a
+    /// token for it.
     pub web_client: Option<&'static str>,
-    /// Google's "desktop" client: the browser sign-in on a computer.
-    pub desktop_client: Option<(&'static str, &'static str)>,
 }
 
 pub fn config() -> Option<Config> {
@@ -35,7 +35,6 @@ pub fn config() -> Option<Config> {
         api_key: set(option_env!("VEYLO_FIREBASE_API_KEY"))?,
         project: set(option_env!("VEYLO_FIREBASE_PROJECT"))?,
         web_client: set(option_env!("VEYLO_GOOGLE_WEB_CLIENT")),
-        desktop_client: set(option_env!("VEYLO_GOOGLE_DESKTOP_CLIENT")).zip(set(option_env!("VEYLO_GOOGLE_DESKTOP_SECRET"))),
     })
 }
 
@@ -43,9 +42,7 @@ pub fn config() -> Option<Config> {
 pub fn accounts_available() -> bool { config().is_some() }
 
 /// Google sign-in this device offers: Android's account sheet, or the browser on a computer.
-pub fn google_available() -> bool {
-    config().is_some_and(|c| if cfg!(target_os = "android") { c.web_client.is_some() } else { c.desktop_client.is_some() })
-}
+pub fn google_available() -> bool { config().is_some_and(|c| c.web_client.is_some()) }
 
 // ---------------------------------------------------------------- session
 
@@ -188,43 +185,37 @@ async fn google_id_token() -> Result<String> {
     }
 }
 
-/// The installed-app flow: Google's page in the browser, its answer to a one-off local address
-/// (127.0.0.1), the code exchanged with a PKCE verifier.
+/// On a computer: the project's sign-in page (Firebase Hosting, firebase/hosting/sign-in.html) in
+/// the browser, where Google's button gives an ID token for the web client; the page hands it to
+/// a one-off local address (127.0.0.1) with the check value Veylo gave it.
 #[cfg(not(target_os = "android"))]
 async fn google_id_token() -> Result<String> {
-    let (client, secret) = config().and_then(|c| c.desktop_client).context("Google sign-in isn't set up in this build")?;
+    let c = config().context("Google sign-in isn't set up in this build")?;
+    c.web_client.context("Google sign-in isn't set up in this build")?;
+    let project = c.project;
     on_runtime(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let redirect = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
-        let verifier = random_text(48);
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let state = random_text(16);
-        let url = url::Url::parse_with_params("https://accounts.google.com/o/oauth2/v2/auth", &[("client_id", client), ("redirect_uri", &redirect),
-            ("response_type", "code"), ("scope", "openid email profile"), ("code_challenge", &challenge), ("code_challenge_method", "S256"),
-            ("state", &state), ("prompt", "select_account")])?;
-        crate::open_external(url.as_str());
-        let code = tokio::time::timeout(Duration::from_secs(300), async {
+        let port = listener.local_addr()?.port();
+        let state = random_text(24);
+        crate::open_external(&format!("https://{project}.firebaseapp.com/sign-in.html?port={port}&state={state}"));
+        tokio::time::timeout(Duration::from_secs(300), async {
             loop {
                 let (mut stream, _) = listener.accept().await?;
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 16384];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
                 let Ok(answer) = url::Url::parse(&format!("http://127.0.0.1{path}")) else { continue };
                 let q: HashMap<String, String> = answer.query_pairs().into_owned().collect();
                 if q.get("state") != Some(&state) { continue; }
-                let page = if q.contains_key("code") { "You're signed in. You can close this tab and go back to Veylo." } else { "Sign-in was cancelled. You can close this tab." };
-                let body = format!("<!doctype html><meta charset=utf-8><title>Veylo</title><body style=\"font:18px system-ui;background:#111;color:#eee;display:grid;place-items:center;height:90vh\">{page}</body>");
+                let token = q.get("id_token").cloned().filter(|t| !t.is_empty());
+                let page = if token.is_some() { "You're signed in. You can close this tab and go back to Veylo." } else { "Sign-in was cancelled. You can close this tab." };
+                let body = format!("<!doctype html><meta charset=utf-8><title>Veylo</title><body style=\"font:18px system-ui;background:#0e0e10;color:#f2efea;display:grid;place-items:center;height:90vh\">{page}</body>");
                 let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
-                return q.get("code").cloned().context("Sign-in cancelled.");
+                return token.context("Sign-in cancelled.");
             }
-        }).await.map_err(|_| anyhow!("Sign-in took too long. Try again."))??;
-        let v: Value = backend().http.post("https://oauth2.googleapis.com/token")
-            .form(&[("code", code.as_str()), ("client_id", client), ("client_secret", secret), ("redirect_uri", &redirect),
-                ("grant_type", "authorization_code"), ("code_verifier", &verifier)])
-            .send().await?.json().await?;
-        Ok::<_, anyhow::Error>(s(&v, "id_token")).and_then(|t| if t.is_empty() { Err(anyhow!("Google didn't sign you in. Try again.")) } else { Ok(t) })
+        }).await.map_err(|_| anyhow!("Sign-in took too long. Try again."))?
     }).await?
 }
 
@@ -677,6 +668,27 @@ mod tests {
             delete_account().await.unwrap();
             assert!(account().is_none());
             println!("deleted");
+        });
+    }
+
+    /// A computer's Google sign-in through the browser page, with your own account: it signs in,
+    /// takes what your other devices synced, and signs out again (the account stays).
+    /// `VEYLO_DX_DATA=<empty folder> cargo test live_google_desktop -- --ignored --nocapture`
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    #[ignore]
+    fn live_google_desktop() {
+        assert!(google_available(), "built without the Firebase values");
+        assert!(std::env::var_os("VEYLO_DX_DATA").is_some(), "point VEYLO_DX_DATA at an empty folder");
+        init().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let me = sign_in_google().await.unwrap();
+            println!("signed in with Google ({} provider)", me.provider);
+            let (took, _) = sync_now().await.unwrap();
+            let library = library().await.unwrap();
+            println!("took {took} synced rows; this computer's library now has {} title(s)", library.len());
+            sign_out();
         });
     }
 }
