@@ -1416,6 +1416,30 @@ mod tests {
         assert_eq!(date_label("2014-11-05T00:00:00.000Z"), "5 Nov 2014");
     }
 
+    /// What a file's header says outranks its label: a "4K HDR" that is a 1080p in SDR, a "HDR"
+    /// that is Dolby Vision alone (profile 5), and a 4K whose real bitrate is a re-encode's.
+    #[test]
+    fn a_file_s_own_picture_outranks_its_label() {
+        use crate::tracks::{Picture, Transfer};
+        let src = |title: &str| source_of("A", &json!({"title": title, "url": format!("https://x.invalid/{}", title.len())}));
+        let pic = |w, h, transfer, dv, seconds| Picture { width: w, height: h, transfer, dolby_vision: dv, seconds };
+        let fake = with_picture(src("Film 2025 2160p HDR WEB-DL 30 GB"), pic(1920, 800, Transfer::Sdr, None, Some(7200.0)));
+        assert_eq!((fake.quality, fake.hdr), (Some("1080p"), None));
+        let real = with_picture(src("Film 2025 2160p WEB-DL 20 GB"), pic(3840, 1600, Transfer::Pq, None, Some(7200.0)));
+        assert_eq!((real.quality, real.hdr), (Some("4K"), Some("HDR")), "HDR the label didn't say");
+        let dv5 = with_picture(src("Film 2025 2160p HDR WEB-DL 25 GB"), pic(3840, 2160, Transfer::Pq, Some(5), Some(7200.0)));
+        assert_eq!(dv5.hdr, Some("DV"));
+        let plus = with_picture(src("Film 2025 2160p HDR10+ WEB-DL 22 GB"), pic(3840, 2160, Transfer::Pq, None, Some(7200.0)));
+        assert_eq!(plus.hdr, Some("HDR10+"), "HDR10+ is in the frames: the label's stands over the header's HDR");
+        let order: Vec<_> = play_order_for(&[fake.clone(), dv5.clone(), real.clone(), plus.clone()], None, None).into_iter().map(|s| s.url).collect();
+        assert_eq!(order, [plus.url, real.url, fake.url, dv5.url]);
+        // 2.5 GB over two hours is under 3 Mb/s: a 4K that competes as a 1080p, against a bigger 1080p.
+        let thin = with_picture(src("Film 2025 2160p WEB-DL 2.5 GB"), pic(3840, 2160, Transfer::Sdr, None, Some(7200.0)));
+        let full = src("Film 2025 1080p BluRay REMUX 30 GB");
+        assert_eq!(play_order_for(&[thin.clone(), full.clone()], None, None)[0].url, full.url);
+        assert_eq!(picture_summary(&thin), "3840x2160 SDR 3 Mb/s");
+    }
+
     /// Resolution before size, but a file too small for its resolution competes as a 1080p.
     #[test]
     fn resolution_then_size_unless_the_file_is_too_small_for_it() {
