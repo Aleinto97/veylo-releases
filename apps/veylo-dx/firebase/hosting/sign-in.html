@@ -1,0 +1,42 @@
+<!doctype html>
+<!-- Veylo on a computer: Google sign-in in the browser (src/backend/account.rs). Veylo opens this
+     page with the port of a one-off local address and a check value; Google's button gives an ID
+     token for the project's web client, and the page hands it to that local address. Published
+     with Firebase Hosting; __WEB_CLIENT_ID__ is filled in at publish time (firebase/README.md). -->
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Sign in to Veylo</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0e0e10; color: #f2efea;
+         font: 17px/1.5 system-ui, sans-serif; text-align: center; }
+  main { padding: 24px; max-width: 420px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  p { color: #b9b4ac; margin: 0 0 24px; }
+  #button { display: inline-block; min-height: 44px; }
+</style>
+<main>
+  <h1>Sign in to Veylo</h1>
+  <p id="say">Choose your Google account. You'll go straight back to Veylo.</p>
+  <div id="button"></div>
+</main>
+<script>
+  const query = new URLSearchParams(location.search);
+  const port = query.get('port'), state = query.get('state');
+  const say = text => { document.getElementById('say').textContent = text; };
+  function start() {
+    if (!/^\d{2,5}$/.test(port || '') || !/^[\w-]{8,64}$/.test(state || '')) { say('Open this page from Veylo: Settings → Account → Continue with Google.'); return; }
+    google.accounts.id.initialize({
+      client_id: '__WEB_CLIENT_ID__',
+      auto_select: false,
+      callback: answer => {
+        say('Signed in. Going back to Veylo…');
+        location.replace('http://127.0.0.1:' + port + '/?state=' + encodeURIComponent(state) + '&id_token=' + encodeURIComponent(answer.credential));
+      },
+    });
+    google.accounts.id.renderButton(document.getElementById('button'), { theme: 'filled_black', size: 'large', text: 'continue_with', shape: 'pill' });
+  }
+</script>
+<script src="https://accounts.google.com/gsi/client" async onload="start()"></script>
+</html>
