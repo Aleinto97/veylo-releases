@@ -9,6 +9,8 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -43,9 +45,22 @@ def download(url, digest):
     cache.parent.mkdir(parents=True, exist_ok=True)
     if not cache.exists() or hashlib.sha256(cache.read_bytes()).hexdigest() != digest:
         print('Fetching', url, flush=True)
-        # Direct writes avoid this host's broken atomic-new-file links.
-        with urllib.request.urlopen(url, timeout=120) as response, open(cache, 'wb') as out:
-            shutil.copyfileobj(response, out)
+        # Direct writes avoid this host's broken atomic-new-file links; retry transient 5xx/network errors.
+        last_err = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(url, timeout=120) as response, open(cache, 'wb') as out:
+                    shutil.copyfileobj(response, out)
+                last_err = None
+                break
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_err = exc
+                if attempt < 3:
+                    wait = 2 ** (attempt + 1)
+                    print(f'Fetch attempt {attempt + 1} failed ({exc}); retrying in {wait}s...', flush=True)
+                    time.sleep(wait)
+        if last_err is not None:
+            raise last_err
     if hashlib.sha256(cache.read_bytes()).hexdigest() != digest:
         raise RuntimeError('Checksum mismatch: ' + url)
     return cache

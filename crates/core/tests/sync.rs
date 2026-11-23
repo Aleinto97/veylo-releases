@@ -122,7 +122,10 @@ async fn three_devices_converge_with_independent_episodes_and_deletions() {
             .await
             .unwrap();
         assert_eq!(watched["video_ids"], json!(["tt0903747:1:1"]));
-        assert_eq!(item(dev, "movie", "tt1375666").await["library"], json!(true));
+        assert_eq!(
+            item(dev, "movie", "tt1375666").await["library"],
+            json!(true)
+        );
     }
 }
 
@@ -131,7 +134,9 @@ async fn sqlite_indexes_cover_hot_sync_and_recommendation_queries() {
     let data = Data::new();
     let _core = data.core();
     let conn = rusqlite::Connection::open(data.0.join("core.sqlite3")).unwrap();
-    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
     let plan = |sql: &str| -> String {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -142,7 +147,14 @@ async fn sqlite_indexes_cover_hot_sync_and_recommendation_queries() {
             .join(" | ")
     };
     let media_plan = plan("SELECT key FROM media WHERE updated>0 ORDER BY updated,key LIMIT 5000");
-    assert!(media_plan.contains("media_updated"), "expected media_updated index, got: {media_plan}");
-    let playback_plan = plan("SELECT media_key FROM playback WHERE updated>0 ORDER BY updated LIMIT 20000");
-    assert!(playback_plan.contains("playback_updated"), "expected playback_updated index, got: {playback_plan}");
+    assert!(
+        media_plan.contains("media_updated"),
+        "expected media_updated index, got: {media_plan}"
+    );
+    let playback_plan =
+        plan("SELECT media_key FROM playback WHERE updated>0 ORDER BY updated LIMIT 20000");
+    assert!(
+        playback_plan.contains("playback_updated"),
+        "expected playback_updated index, got: {playback_plan}"
+    );
 }
