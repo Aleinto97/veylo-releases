@@ -2,7 +2,7 @@
 //! rather watch tonight. Every vote, Neither, play, like and mood teaches one local model, and the
 //! next card is the favourite of one plausible version of your taste. A card that keeps winning
 //! joins tonight's shortlist. There is no final answer: play anything, any time.
-use crate::{backend::{self, Media, TitleMeta}, brain::{self, Brain}, icons, picks_rules::{self as rules, Style}, PickCommand, Shell};
+use crate::{backend::{self, Media}, brain::{self, Brain}, icons, picks_rules::{self as rules, Style}, PickCommand, Shell};
 use dioxus::prelude::*;
 use std::collections::HashSet;
 
@@ -87,9 +87,18 @@ pub fn Picks() -> Element {
         let (l, r) = pair();
         let on_screen = champion.filter(|c| [l, r].iter().flatten().any(|m| m.key() == c.key()));
         let Some(c) = on_screen else { if !lamp.peek().is_empty() { lamp.set(String::new()); } return };
+        let key = c.key();
+        if let Some(src) = backend::cached_artwork(&c).and_then(|a| a.backdrop) {
+            if *lamp.peek() != src { lamp.set(src); }
+            return;
+        }
         spawn(async move {
             let src = backend::artwork(&c).await.and_then(|a| a.backdrop).unwrap_or_else(|| c.backdrop().to_owned());
-            if *lamp.peek() != src { lamp.set(src); }
+            let still_on = {
+                let (l, r) = pair.peek().clone();
+                [l, r].iter().flatten().any(|m| m.key() == key)
+            };
+            if still_on && *lamp.peek() != src { lamp.set(src); }
         });
     });
 
@@ -403,7 +412,7 @@ pub fn Picks() -> Element {
             l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())) };
         if !ready { return; }
         leaving.set(Some(left));
-        spawn(async move { backend::sleep(300).await; keep(left); leaving.set(None); });
+        spawn(async move { backend::sleep(190).await; keep(left); leaving.set(None); });
     };
 
     // A kept card waiting for an opponent gets one as soon as the catalogue offers it; if every
@@ -834,16 +843,22 @@ fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: 
 #[component]
 fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
     let shell = use_context::<Shell>();
-    let mut meta = use_signal(|| None::<TitleMeta>);
+    let init_meta = backend::cached_title_meta(&media);
+    let need_meta = init_meta.is_none();
+    let mut meta = use_signal(move || init_meta);
     let m = media.clone();
-    use_hook(move || { spawn(async move { if let Ok(t) = backend::title_meta(&m).await { meta.set(Some(t)); } }); });
+    use_hook(move || { if need_meta { spawn(async move { if let Ok(t) = backend::title_meta(&m).await { meta.set(Some(t)); } }); } });
     let facts = meta();
     let art = crate::components::use_artwork(&media);
     let logo = art().and_then(|a| a.logo).or_else(|| facts.as_ref().map(|f| f.logo.clone()).filter(|l| !l.is_empty()));
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
+    let mut bg_sources = Vec::new();
+    if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
+    let fb = media.backdrop().to_owned();
+    if !fb.is_empty() && !bg_sources.contains(&fb) { bg_sources.push(fb); }
+    if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
     let mut logo_failed = use_signal(|| false);
     // Each card lends its own accent: its Keep button takes the colour of its artwork.
-    let accent_src = backdrop.clone();
+    let accent_src = bg_sources.first().cloned().unwrap_or_default();
     let accent = use_resource(use_reactive!(|accent_src| async move { backend::accent(accent_src).await }));
     let card_style = accent().flatten().map(|c| format!("--lamp: {c}")).unwrap_or_default();
     // TMDB's official trailers first; the add-on's only where TMDB has none. The theatre also
@@ -858,7 +873,7 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     let liked = info.liked;
     rsx! {
         article { class: "duel-card {side}", style: "{card_style}", aria_label: "{media.name}",
-            if !backdrop.is_empty() { img { class: "duel-art", src: "{backdrop}", alt: "" } }
+            div { class: "duel-art", crate::components::FallbackImg { sources: bg_sources } }
             button { class: "duel-hit", aria_label: "Keep {media.name} ({arrow})", onclick: move |_| on_keep.call(()) }
             div { class: "card-top",
                 div { class: "card-badges",
@@ -908,12 +923,16 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
 fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on_remove: EventHandler<Media>) -> Element {
     let mut shell = use_context::<Shell>();
     let art = crate::components::use_artwork(&media);
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
+    let mut bg_sources = Vec::new();
+    if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
+    let fb = media.backdrop().to_owned();
+    if !fb.is_empty() && !bg_sources.contains(&fb) { bg_sources.push(fb); }
+    if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
     let (open, remove, play) = (media.clone(), media.clone(), media.clone());
     rsx! {
         div { class: "short-item glass", role: "listitem",
             button { class: "short-open", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
-                if !backdrop.is_empty() { img { src: "{backdrop}", alt: "", loading: "lazy" } }
+                crate::components::FallbackImg { sources: bg_sources, lazy: true }
                 span { class: "short-name", if star { span { class: "lamp", icons::Star {} } } span { "{media.name}" } }
                 span { class: "short-bar", style: "--fill: {pct}%", aria_label: "{pct}% match" }
             }

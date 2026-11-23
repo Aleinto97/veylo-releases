@@ -505,41 +505,43 @@ fn Shell_() -> Element {
             }
         }
     });
-    // The top bar gathers smoke once the page scrolls under it (styles/base.css, .scrolled). Checked on
-    // scroll and, at most once a frame, when the page changes (a new tab or title starts at the top).
+    // Scroll shadow, per-tab scroll restoration, title scroll-to-top, pill slider, and mouse glare:
+    // combined into one rAF-throttled MutationObserver instead of multiple observers.
     use_hook(|| { document::eval(r#"(() => {
-        const sync = () => { const p = document.querySelector('.page'); document.documentElement.classList.toggle('scrolled', !!p && p.scrollTop > 4); };
-        let queued = false;
-        const later = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; sync(); }); } };
+        const savedScroll = Object.create(null);
+        const screenOf = p => {
+            if (!p) return null;
+            for (const c of ['home', 'library', 'settings', 'duel']) {
+                if (p.querySelector('.' + c)) return c;
+            }
+            return null;
+        };
+        const sync = () => {
+            const p = document.querySelector('.page');
+            const y = p ? p.scrollTop : 0;
+            document.documentElement.classList.toggle('scrolled', y > 4);
+            // Smooth GPU hero parallax on TitlePage: drives a single clamped CSS var with zero reflow.
+            const tp = p && p.querySelector('.title-page');
+            if (tp) tp.style.setProperty('--hero-y', Math.min(320, Math.max(0, y)) + 'px');
+            const s = screenOf(p);
+            if (s && p) savedScroll[s] = y;
+        };
         document.addEventListener('scroll', e => { if (e.target.classList && e.target.classList.contains('page')) sync(); }, true);
-        new MutationObserver(later).observe(document.body, { childList: true, subtree: true });
-        // Opening a title: its backdrop opens out of the card you tapped (a clip that widens from
-        // the card's place to the whole hero). Nothing is stretched or swapped; the words lift in
-        // after (styles/pages.css). Remembered on tap, played when the page mounts.
-        let from = null;
-        document.addEventListener('click', e => {
-            const card = e.target.closest && e.target.closest('.card, .week-open');
-            const art = card && (card.querySelector('.card-art') || card);
-            from = art ? { r: art.getBoundingClientRect(), at: performance.now() } : null;
-        }, true);
-        const grow = () => {
-            const page = document.querySelector('.title-page');
-            if (!page || page.dataset.grown) return;
-            page.dataset.grown = '1';
-            // A title opens at its top, whatever the page behind it was scrolled to.
-            const scroller = document.querySelector('.page'); if (scroller) scroller.scrollTop = 0;
-            if (!from) return;
-            const f = from; from = null;
-            const hero = page.querySelector('.title-hero');
-            if (!hero || performance.now() - f.at > 1500 || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-            const h = hero.getBoundingClientRect(), clamp = (v, max) => Math.max(0, Math.min(v, max));
-            const top = clamp(f.r.top - h.top, h.height - 40), left = clamp(f.r.left - h.left, h.width - 40);
-            const bottom = clamp(h.bottom - f.r.bottom, h.height - top - 40), right = clamp(h.right - f.r.right, h.width - left - 40);
-            hero.style.clipPath = `inset(${top}px ${right}px ${bottom}px ${left}px round 8px)`;
-            hero.getBoundingClientRect();
-            hero.style.transition = 'clip-path .6s cubic-bezier(.16,1,.3,1)';
-            hero.style.clipPath = 'inset(0 0 0 0 round 0px)';
-            setTimeout(() => { hero.style.transition = ''; hero.style.clipPath = ''; }, 650);
+        const restoreScroll = () => {
+            const p = document.querySelector('.page');
+            if (!p) return;
+            const title = p.querySelector('.title-page');
+            if (title) {
+                if (!title.dataset.topDone) { title.dataset.topDone = '1'; p.scrollTop = 0; sync(); }
+                return;
+            }
+            const s = screenOf(p);
+            const el = s && p.querySelector('.' + s);
+            if (el && !el.dataset.restored) {
+                el.dataset.restored = '1';
+                if (savedScroll[s]) p.scrollTop = savedScroll[s];
+                sync();
+            }
         };
         // Selection pills slide: the dock's glass pill and each segmented control's thumb move to the
         // selected item and take its width. Groups whose slider is placed get data-sliding, so the
@@ -552,7 +554,12 @@ fn Shell_() -> Element {
             if (s.dataset.at === at.join()) return;
             const first = !s.dataset.at; s.dataset.at = at.join();
             if (first) s.style.transition = 'none';
-            Object.assign(s.style, { left: at[0] + 'px', top: at[1] + 'px', width: at[2] + 'px', height: at[3] + 'px', opacity: '1' });
+            Object.assign(s.style, {
+                transform: `translate3d(${at[0]}px, ${at[1]}px, 0)`,
+                width: at[2] + 'px',
+                height: at[3] + 'px',
+                opacity: '1',
+            });
             g.dataset.sliding = '';
             if (first) requestAnimationFrame(() => requestAnimationFrame(() => { s.style.transition = ''; }));
         });
@@ -564,18 +571,48 @@ fn Shell_() -> Element {
             const tabs = [...document.querySelectorAll('.dock-tab')], from = tabs.findIndex(x => x.classList.contains('on'));
             document.documentElement.style.setProperty('--dir', tabs.indexOf(t) < from ? '-1' : '1');
         }, true);
-        // Light on glass: a soft highlight follows the finger or pointer over a poster.
-        const glare = e => { const art = e.target.closest && e.target.closest('.card-art');
-            if (!art) return; const r = art.getBoundingClientRect();
+        // Light on glass: mouse-only glare so touch scrolling never triggers getBoundingClientRect().
+        const glare = e => {
+            if (e.pointerType !== 'mouse') return;
+            const art = e.target.closest && e.target.closest('.card-art');
+            if (!art) return;
+            const r = art.getBoundingClientRect();
             art.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100).toFixed(1) + '%');
-            art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%'); };
+            art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%');
+        };
         document.addEventListener('pointermove', glare, { passive: true });
-        document.addEventListener('pointerdown', glare, { passive: true });
-        // At most once a frame however many changes arrive (slide reads layout).
+        // Single rAF-throttled observer for scroll shadow, title scroll-reset, and pill sliders.
         let framed = false;
-        new MutationObserver(() => { if (framed) return; framed = true; requestAnimationFrame(() => { framed = false; grow(); slide(); }); })
-            .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        new MutationObserver(() => {
+            if (framed) return;
+            framed = true;
+            requestAnimationFrame(() => { framed = false; restoreScroll(); sync(); slide(); });
+        }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
     })();"#); });
+
+    // The ambient light keeps the previous picture under the new one while it fades in, then
+    // prunes back to one layer after 1.1s so scrolling never blurs two full-screen images at once.
+    let mut lamp_layers = use_signal(Vec::<String>::new);
+    use_effect(move || {
+        let raw = lamp_source();
+        if raw.is_empty() { return; }
+        let now = backend::ambient_url(&raw);
+        let mut layers = lamp_layers.peek().clone();
+        if layers.last() == Some(&now) { return; }
+        layers.retain(|s| s != &now);
+        layers.push(now.clone());
+        if layers.len() > 2 { layers.remove(0); }
+        let need_prune = layers.len() > 1;
+        lamp_layers.set(layers);
+        if need_prune {
+            spawn(async move {
+                backend::sleep(1100).await;
+                if lamp_layers.peek().last() == Some(&now) {
+                    lamp_layers.set(vec![now]);
+                }
+            });
+        }
+    });
 
     rsx! {
         style { {fonts} }
@@ -589,7 +626,7 @@ fn Shell_() -> Element {
             onmounted: move |e| async move { let _ = e.set_focus(true).await; },
             // The light the glass refracts: the title in front, blurred into the room.
             div { class: "ambient", aria_hidden: "true",
-                if !lamp_source().is_empty() { img { key: "{lamp_source}", src: "{lamp_source}", alt: "" } }
+                for src in lamp_layers() { img { key: "{src}", src: "{src}", alt: "" } }
             }
             // Android's status bar sits on solid black on every screen, above every overlay.
             div { class: "status-guard", aria_hidden: "true" }

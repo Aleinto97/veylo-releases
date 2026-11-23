@@ -75,9 +75,11 @@ pub fn SearchOverlay() -> Element {
 
     rsx! {
         div { class: "search", inert: (shell.shortcuts_open)().then_some("true"), role: "dialog", aria_modal: "true", aria_label: "Search",
-            // Frosted without backdrop-filter (unsupported in some webviews): its own blurred artwork.
+            // Frosted without backdrop-filter (unsupported in some webviews): tiny w300 blurred artwork.
             div { class: "search-ambient", aria_hidden: "true",
-                if !(shell.lamp_source)().is_empty() { img { src: "{(shell.lamp_source)()}", alt: "" } }
+                if !(shell.lamp_source)().is_empty() {
+                    img { src: "{backend::ambient_url(&(shell.lamp_source)())}", alt: "", decoding: "async" }
+                }
             }
             div { class: "search-head",
                 div { class: if searching() { "search-field glass busy" } else { "search-field glass" },
@@ -107,7 +109,7 @@ pub fn SearchOverlay() -> Element {
                     if !history.queries.is_empty() {
                         div { class: "tokens",
                             for past in history.queries.iter().take(8).cloned() {
-                                button { class: "token glass", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }
+                                button { key: "{past}", class: "token glass", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }
                             }
                             icons::IconButton { label: "Clear history", class: "small", onclick: move |_| backend::clear_history(&mut shell.history.write()), icons::Trash {} }
                         }
@@ -182,10 +184,15 @@ pub fn SearchOverlay() -> Element {
 #[component]
 fn TopMatch(media: Media, source: Option<String>, on_open: EventHandler<Media>) -> Element {
     let m = media.clone();
+    let pre = media.clone();
     let meta = [media.meta_line(true), source.unwrap_or_default()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ");
     rsx! {
-        button { class: "top-match glass", aria_label: "Open {media.name}", onclick: move |_| on_open.call(m.clone()),
-            if !media.background.is_empty() { div { class: "top-art", img { src: "{media.background}", alt: "" } } }
+        button { class: "top-match glass", aria_label: "Open {media.name}",
+            onpointerdown: move |_| backend::prefetch_title(&pre),
+            onclick: move |_| on_open.call(m.clone()),
+            if !media.background.is_empty() {
+                div { class: "top-art", crate::components::FallbackImg { sources: vec![media.background.clone()] } }
+            }
             div { class: "frame top-poster", crate::components::FallbackImg { sources: backend::posters(&media) } }
             div { class: "top-copy",
                 span { class: "lamp best", title: "Best match", aria_label: "Best match", icons::Star {} }

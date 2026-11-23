@@ -17,8 +17,17 @@ struct Chooser { video: String, label: Option<String> }
 #[component]
 pub fn TitlePage(media: Media) -> Element {
     let mut shell = use_context::<Shell>();
-    let mut meta = use_signal(|| Load::<TitleMeta>::Loading);
-    let mut season = use_signal(|| None::<i64>);
+    let cached_meta = backend::cached_title_meta(&media);
+    let init_season = cached_meta.as_ref().and_then(|m| {
+        media.last_video_id.as_ref().and_then(|v| m.episodes.iter().find(|e| &e.id == v))
+            .or_else(|| m.episodes.iter().find(|e| e.season > 0)).or(m.episodes.first()).map(|e| e.season)
+    });
+    let need_meta = cached_meta.is_none();
+    let mut meta = use_signal(move || match cached_meta {
+        Some(m) => Load::Ready(m),
+        None => Load::Loading,
+    });
+    let mut season = use_signal(move || init_season);
     let mut liked = use_signal(|| media.liked);
     let mut saved = use_signal(|| media.saved);
     // Films: one "Already watched" switch (marked, or played through). Series: per episode.
@@ -43,17 +52,43 @@ pub fn TitlePage(media: Media) -> Element {
     }); });
     let mut chooser = use_signal(|| None::<Chooser>);
     let mut logo_failed = use_signal(|| false);
+    let mut failed_frames = use_signal(std::collections::HashSet::<String>::new);
+    // Two-slot hero crossfade state:
+    // - `shown`:    currently displayed (fully decoded) backdrop URL on top.
+    // - `under`:    previous backdrop held solid underneath during a 1.4s crossfade.
+    // - `seq`:      monotonically increases on every real image change so the incoming `top` slot
+    //               always gets a fresh DOM key and replays its smooth animation cleanly.
+    // - `top_ready`: true once the current `top` image has fired `onload` (never fades a half-decoded image).
+    let mut seq = use_signal(|| 0usize);
+    let mut top_url = use_signal(String::new);
+    let mut under_url = use_signal(String::new);
+    let mut top_ready = use_signal(|| false);
+    // Grace window on cold start: let the clean widescreen backdrop + logo arrive (~150-450ms)
+    // so the hero fades in ONCE with the real art instead of flashing a promotional backdrop or
+    // plain text and swapping it half a second later.
+    let mut allow_fallback = use_signal(|| false);
+    use_hook(move || {
+        spawn(async move {
+            backend::sleep(600).await;
+            allow_fallback.set(true);
+        });
+    });
     let mut busy = use_signal(|| None::<String>);
     // Its place in today's chart (BetterPosters), shown as a fact.
     let mut rank = use_signal(|| None::<u64>);
     let for_rank = media.clone();
     use_hook(move || { spawn(async move { rank.set(backend::today_rank(&for_rank).await); }); });
-    // The backdrop dissolves through the production's own frames, slowly.
+    // The backdrop dissolves through the production's own textless frames every 9 seconds.
     let mut frame = use_signal(|| 0usize);
-    use_future(move || async move { loop { backend::sleep(9000).await; *frame.write() += 1; } });
+    use_future(move || async move {
+        let mut waited = 0;
+        while !*top_ready.peek() && waited < 10_000 { backend::sleep(100).await; waited += 100; }
+        loop { backend::sleep(9000).await; *frame.write() += 1; }
+    });
 
     let for_meta = media.clone();
     use_hook(move || {
+        if !need_meta { return; }
         spawn(async move {
             match backend::title_meta(&for_meta).await {
                 Ok(m) => {
@@ -164,44 +199,147 @@ pub fn TitlePage(media: Media) -> Element {
         .or_else(|| facts.as_ref().map(|m| m.logo.clone()).filter(|l| !l.is_empty()))
         .or_else(|| media.raw["logo"].as_str().map(str::to_owned).filter(|l| !l.is_empty()));
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
-    // The accent follows the backdrop on screen.
-    let mut lamp = shell.lamp_source;
-    let lamp_src = backdrop.clone();
-    use_effect(use_reactive!(|lamp_src| if *lamp.peek() != lamp_src { lamp.set(lamp_src); }));
     let production = art().unwrap_or_default();
-    let trailer = facts.as_ref().map(|m| m.trailers.clone()).filter(|t| !t.is_empty() || !production.videos.is_empty());
-    // The backdrop the page opened with stays the first frame; a better one arriving later (TMDB's
-    // text-free art) dissolves in over it instead of replacing it.
-    let first = use_hook(|| backdrop.clone());
-    let mut frames: Vec<String> = vec![first.clone(), backdrop.clone()];
-    for s in &production.stills { frames.push(s.clone()); }
+    // Combine add-on trailers with free/TMDB artwork trailers without blocking `title_meta`.
+    let trailer = {
+        let mut all = facts.as_ref().map(|m| m.trailers.clone()).unwrap_or_default();
+        for key in &production.trailers {
+            let t = backend::Trailer { youtube: Some(key.clone()), url: None };
+            if !all.contains(&t) { all.push(t); }
+        }
+        (!all.is_empty() || !production.videos.is_empty()).then_some(all)
+    };
+    // Build the clean backdrop rotation list. Only use a true widescreen `media.background` as
+    // fallback (never stretch a vertical `media.poster` across the 16:9 hero!). The poster still
+    // seeds the blurred `.ambient` room glow immediately on cold start so the screen feels alive.
+    let fallback_bg = use_hook(|| media.background.clone());
+    let ambient_fallback = use_hook(|| media.backdrop().to_owned());
+    let has_art_backdrop = production.backdrop.is_some();
+    let mut frames: Vec<String> = if has_art_backdrop {
+        let mut list = vec![backdrop.clone()];
+        for s in &production.stills { list.push(s.clone()); }
+        list
+    } else if allow_fallback() && !fallback_bg.is_empty() {
+        vec![fallback_bg.clone()]
+    } else {
+        Vec::new()
+    };
     let mut unique = std::collections::HashSet::new();
     frames.retain(|f| unique.insert(f.clone()));
-    frames.retain(|f| !f.is_empty());
-    let arrived = backdrop != first && !first.is_empty();
-    use_effect(use_reactive!(|arrived| if arrived && *frame.peek() == 0 { frame.set(1); }));
-    let on_frame = if frames.is_empty() { 0 } else { frame() % frames.len() };
+    {
+        let broken = failed_frames.read();
+        frames.retain(|f| !f.is_empty() && !broken.contains(f));
+    }
+    let active_idx = if frames.is_empty() { 0 } else { frame() % frames.len() };
+    let desired = frames.get(active_idx).cloned().unwrap_or_default();
+    let preload_next = if frames.len() > 1 {
+        frames.get((active_idx + 1) % frames.len()).cloned().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Promote `desired` into the two-slot crossfade whenever the target URL changes.
+    use_effect(use_reactive!(|desired| {
+        if desired.is_empty() { return; }
+        let prev = top_url.peek().clone();
+        if prev == desired { return; }
+        if !prev.is_empty() && *top_ready.peek() {
+            under_url.set(prev);
+        }
+        top_ready.set(false);
+        top_url.set(desired);
+        *seq.write() += 1;
+    }));
+    // The ambient glow follows the hero's backdrop (resized to w300 in main.rs for 120fps blur),
+    // and can immediately warm the room with the poster's colors while the widescreen hero loads.
+    let mut lamp = shell.lamp_source;
+    let lamp_src = if has_art_backdrop { backdrop.clone() } else { ambient_fallback.clone() };
+    use_effect(use_reactive!(|lamp_src| if !lamp_src.is_empty() && *lamp.peek() != lamp_src { lamp.set(lamp_src); }));
     // Only logos that read as white idents (see backend::idents).
     let mut idents = use_signal(Vec::<backend::Studio>::new);
     let studios = production.studios.clone();
     use_effect(use_reactive!(|studios| { spawn(async move { idents.set(backend::idents(studios).await); }); }));
+    // Use card metadata immediately on Frame 0 so facts don't pop in after `title_meta`.
+    let imdb_rating = facts.as_ref().map(|m| m.rating.clone()).filter(|r| !r.is_empty())
+        .unwrap_or_else(|| backend::s(&media.raw, "imdbRating"));
+    let runtime = facts.as_ref().map(|m| m.runtime.clone()).filter(|r| !r.is_empty())
+        .or_else(|| Some(backend::s(&media.raw, "runtime")).filter(|r| !r.is_empty()));
+    let cur_top = top_url();
+    let cur_under = under_url();
+    let cur_seq = seq();
+    let cur_ready = top_ready();
+    let is_initial = cur_under.is_empty();
+    let logo_pending = art().is_none() && facts.is_none() && !allow_fallback();
 
     rsx! {
         article { class: "title-page", aria_label: "{media.name}",
             section { class: "title-hero",
-                for (i, src) in frames.iter().enumerate() {
-                    img { key: "{src}", class: if i == on_frame { "title-art on" } else { "title-art" }, src: "{src}", alt: "" }
+                div { class: "title-art-stack",
+                    if !cur_under.is_empty() {
+                        for k in [format!("u-{cur_under}")] {
+                            img {
+                                key: "{k}",
+                                class: "title-art under",
+                                src: "{cur_under}",
+                                alt: "",
+                                decoding: "async",
+                            }
+                        }
+                    }
+                    if !cur_top.is_empty() {
+                        for k in [format!("t-{cur_seq}")] {
+                            img {
+                                key: "{k}",
+                                class: format!(
+                                    "title-art top{}{}",
+                                    if is_initial { " initial" } else { "" },
+                                    if cur_ready { " ready" } else { "" }
+                                ),
+                                src: "{cur_top}",
+                                alt: "",
+                                decoding: "async",
+                                onload: move |_| {
+                                    let my_seq = cur_seq;
+                                    top_ready.set(true);
+                                    // Retire the old `under` layer after the 0.95s crossfade completes.
+                                    if !under_url.peek().is_empty() {
+                                        spawn(async move {
+                                            backend::sleep(1050).await;
+                                            if *seq.peek() == my_seq {
+                                                under_url.set(String::new());
+                                            }
+                                        });
+                                    }
+                                },
+                                onerror: {
+                                    let failed_src = cur_top.clone();
+                                    move |_| { failed_frames.write().insert(failed_src.clone()); }
+                                },
+                            }
+                        }
+                    }
+                    if !preload_next.is_empty() && preload_next != cur_top && preload_next != cur_under {
+                        for k in [format!("p-{preload_next}")] {
+                            img {
+                                key: "{k}",
+                                class: "title-art preload",
+                                src: "{preload_next}",
+                                alt: "",
+                                aria_hidden: "true",
+                            }
+                        }
+                    }
                 }
                 div { class: "title-copy",
                     match logo.filter(|_| !logo_failed()) {
                         Some(src) => rsx! { img { class: "title-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
+                        None if logo_pending => rsx! { div { class: "title-logo", style: "height: 76px" } },
                         None => rsx! { h1 { class: "display title-name", "{media.name}" } },
                     }
                     if let Some(t) = production.tagline.clone() { p { class: "tagline", "{t}" } }
                     div { class: "facts",
                         if let Some(r) = rank() { span { class: "fact today", title: "Most watched today on TMDB (BetterPosters)", icons::Trophy {} span { class: "tnum", "#{r} today" } } }
-                        crate::components::Scores { media: media.clone(), imdb: facts.as_ref().map(|m| m.rating.clone()).unwrap_or_default() }
-                        if let Some(r) = facts.as_ref().map(|m| m.runtime.clone()).filter(|r| !r.is_empty()) {
+                        crate::components::Scores { media: media.clone(), imdb: imdb_rating }
+                        if let Some(r) = runtime {
                             span { class: "fact", title: "Runtime", icons::Clock {} span { "{r}" } }
                         }
                         if !year.is_empty() { span { class: "fact", title: "Released", icons::Calendar {} span { class: "tnum", "{year}" } } }
@@ -274,7 +412,9 @@ pub fn TitlePage(media: Media) -> Element {
                 }
 
                 match meta() {
-                    Load::Loading => rsx! { div { class: "rows", for i in 0..3 { div { key: "{i}", class: "row skeleton-row" } } } },
+                    Load::Loading => rsx! {
+                        if !film { div { class: "rows", for i in 0..3 { div { key: "{i}", class: "row skeleton-row" } } } }
+                    },
                     Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
                     Load::Ready(m) => rsx! {
                         if !film { Episodes { list: m.episodes.clone(), media: media.clone(), season: season, last: media.last_video_id.clone(), busy: busy(), seen: seen,
@@ -470,15 +610,20 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
             #[props(default)] posters: std::collections::HashMap<i64, String>) -> Element {
     let mut shell = use_context::<Shell>();
     let mut season = season;
-    // TMDB stills for the shown season, used where the add-on gives no thumbnail.
-    let mut stills = use_signal(std::collections::HashMap::<i64, String>::new);
+    // Free-first episode stills (TVmaze / ani.zip, then TMDB fallback) keyed by the active season.
+    let mut stills = use_signal(|| (None::<i64>, std::collections::HashMap::<i64, String>::new()));
     // The range of a long season you chose, for that season; otherwise the one with your next episode.
     let mut range = use_signal(|| None::<(Option<i64>, usize)>);
     let for_stills = media.clone();
     use_effect(move || {
         let Some(n) = season() else { return };
         let m = for_stills.clone();
-        spawn(async move { stills.set(backend::season_stills(&m, n).await); });
+        spawn(async move {
+            let got = backend::season_stills(&m, n).await;
+            if *season.peek() == Some(n) {
+                stills.set((Some(n), got));
+            }
+        });
     });
     let mut seasons: Vec<i64> = list.iter().map(|e| e.season).collect();
     seasons.sort_by_key(|s| if *s == 0 { i64::MAX } else { *s });
@@ -529,7 +674,13 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                         button { key: "{n}", class: if season() == Some(n) { "season-card on" } else { "season-card" },
                             role: "radio", aria_checked: "{season() == Some(n)}", onclick: move |_| season.set(Some(n)),
                             div { class: "sp",
-                                if let Some(src) = posters.get(&n) { img { src: "{src}", alt: "", loading: "lazy" } }
+                                if let Some(src) = posters.get(&n) {
+                                    crate::components::FallbackImg {
+                                        sources: vec![src.clone()],
+                                        lazy: true,
+                                        span { class: "display", if n == 0 { "Extras" } else { "{n}" } }
+                                    }
+                                }
                                 else { span { class: "display", if n == 0 { "Extras" } else { "{n}" } } }
                             }
                             span { if n == 0 { "Extras" } else { "Season {n}" } }
@@ -583,13 +734,27 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                     let ids: Vec<String> = shown.iter().filter(|x| if done { x.number >= e.number } else { x.number <= e.number }).map(|x| x.id.clone()).collect();
                     rsx! {
                     div { key: "{e.id}", style: "--i: {i.min(8)}",
-                        class: format!("ep-tile glass{}{}{}", if is_next { " next" } else { "" }, if done { " seen" } else { "" }, if is_last { " last" } else { "" }),
+                        class: format!("ep-tile{}{}{}", if is_next { " next" } else { "" }, if done { " seen" } else { "" }, if is_last { " last" } else { "" }),
                         button { class: "ep-main", disabled: busy.is_some(),
                             aria_label: "Play episode {e.number}: {e.title}",
                             onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_play.call((id.clone(), l.clone())) },
                             div { class: "ep-still",
-                                if let Some(src) = Some(e.thumbnail.clone()).filter(|t| !t.is_empty()).or_else(|| stills.read().get(&e.number).cloned()) {
-                                    img { src: "{src}", alt: "", loading: "lazy" }
+                                {
+                                    let mut candidates = Vec::new();
+                                    {
+                                        let st = stills.read();
+                                        if st.0 == Some(e.season) {
+                                            if let Some(s) = st.1.get(&e.number) {
+                                                if !s.is_empty() { candidates.push(s.clone()); }
+                                            }
+                                        }
+                                    }
+                                    if !e.thumbnail.is_empty() && !candidates.contains(&e.thumbnail) {
+                                        candidates.push(e.thumbnail.clone());
+                                    }
+                                    rsx! {
+                                        crate::components::FallbackImg { sources: candidates, lazy: true }
+                                    }
                                 }
                                 if is_next { span { class: "ep-next", "Up next" } }
                                 span { class: "ep-play", if busy.as_deref() == Some(e.id.as_str()) { span { class: "spinner" } } else { icons::Play {} } }
@@ -675,7 +840,13 @@ fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> E
                         button { key: "{p.role}|{p.name}", class: "person", title: "Search {p.name}",
                             onclick: { let n = p.name.clone(); move |_| { shell.search_query.set(Some(n.clone())); shell.search_open.set(true); } },
                             span { class: "face",
-                                if let Some(src) = p.photo.clone() { img { src: "{src}", alt: "", loading: "lazy" } }
+                                if let Some(src) = p.photo.clone() {
+                                    crate::components::FallbackImg {
+                                        sources: vec![src],
+                                        lazy: true,
+                                        span { class: "display", "{p.name.chars().next().unwrap_or(' ')}" }
+                                    }
+                                }
                                 else { span { class: "display", "{p.name.chars().next().unwrap_or(' ')}" } }
                             }
                             span { class: "person-name", "{p.name}" }
@@ -728,7 +899,13 @@ fn Videos(videos: Vec<backend::Video>, about: crate::theatre::About, trailers: V
                             onclick: { let (k, all, a, tr) = (v.youtube.clone(), videos.clone(), about.clone(), trailers.clone());
                                 move |_| crate::theatre::watch_videos(shell, a.clone(), all.clone(), tr.clone(), Some(k.clone())) },
                             span { class: "video-thumb",
-                                img { src: "https://i.ytimg.com/vi/{v.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }
+                                crate::components::FallbackImg {
+                                    sources: vec![
+                                        format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", v.youtube),
+                                        format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", v.youtube),
+                                    ],
+                                    lazy: true,
+                                }
                                 span { class: "ep-play", icons::Play {} }
                             }
                             span { class: "video-name", "{v.name}" }

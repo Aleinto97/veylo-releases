@@ -123,7 +123,7 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
     let mut shell = use_context::<Shell>();
     let n = theatre.clips.len();
     let at = theatre.at.min(n.saturating_sub(1));
-    let clip = theatre.clips[at].clone();
+    let Some(clip) = theatre.clips.get(at).cloned() else { return rsx! {}; };
     let mut go = move |to: usize| shell.trailer.with_mut(|t| if let Some(t) = t { t.at = to; });
     let link = format!("https://www.youtube.com/watch?v={}", clip.youtube);
     let about = theatre.about.clone();
@@ -131,7 +131,7 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
     use_hook(theatre_listen);
     rsx! {
         div { class: "scrim theatre-scrim", onclick: move |_| shell.trailer.set(None),
-            if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{about.backdrop}", alt: "" } }
+            if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{backend::ambient_url(&about.backdrop)}", alt: "", decoding: "async" } }
             section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}", onclick: move |e| e.stop_propagation(),
                 // The video is the main actor: it takes all the room the side column leaves.
                 div { class: "theatre-stage",

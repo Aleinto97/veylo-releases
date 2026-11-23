@@ -47,6 +47,7 @@ pub fn SettingsPage() -> Element {
         check_note.set(None);
         spawn(async move {
             if let Err(e) = job.await { problem.set(Some(format!("{e:#}"))); }
+            else { crate::home::invalidate_cache(); }
             busy.set(None);
             overview.restart();
         });
@@ -90,7 +91,11 @@ pub fn SettingsPage() -> Element {
                         i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "BetterPosters"), (false, "Add-on")] {
                             button { class: if settings().better_posters == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().better_posters == on}",
-                                onclick: move |_| settings.set(backend::update_settings(|s| s.better_posters = on)), "{name}" }
+                                onclick: move |_| {
+                                    settings.set(backend::update_settings(|s| s.better_posters = on));
+                                    backend::clear_artwork_caches();
+                                    crate::home::invalidate_cache();
+                                }, "{name}" }
                         }
                     }
                 }
@@ -104,10 +109,13 @@ pub fn SettingsPage() -> Element {
                     div { class: "setting-copy", span { class: "setting-name", "TMDB" }
                         span { class: "dim setting-about",
                             if tmdb_checking() { "Checking your key…" }
-                            else if settings().tmdb_key.is_some() { "Connected: artwork, episode stills and Picks keywords" }
-                            else { "Optional. Adds TMDB's extra stills, videos, taglines and recommendations; without it, BetterPosters, TVmaze and Wikidata fill in" } } }
+                            else if settings().tmdb_key.is_some() { "Connected: free sources run first; TMDB adds textless backdrops, actor/producer photos, videos and gap-fill stills" }
+                            else { "Optional. Free sources (BetterPosters, TVmaze, AniList, Wikidata) always run first; TMDB adds textless backdrops, actor/producer photos, taglines and videos" } } }
                     if settings().tmdb_key.is_some() {
-                        button { class: "pill glass", onclick: move |_| settings.set(backend::update_settings(|s| s.tmdb_key = None)), icons::Trash {} span { "Remove key" } }
+                        button { class: "pill glass", onclick: move |_| {
+                            settings.set(backend::update_settings(|s| s.tmdb_key = None));
+                            backend::clear_artwork_caches();
+                        }, icons::Trash {} span { "Remove key" } }
                     } else {
                         LinkButton { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
                         // Masked while typing; checked with TMDB, then saved, on Enter.
@@ -121,7 +129,10 @@ pub fn SettingsPage() -> Element {
                                 tmdb_problem.set(None);
                                 spawn(async move {
                                     match backend::check_tmdb_key(key.clone()).await {
-                                        Ok(()) => settings.set(backend::update_settings(|s| s.tmdb_key = Some(key))),
+                                        Ok(()) => {
+                                            settings.set(backend::update_settings(|s| s.tmdb_key = Some(key)));
+                                            backend::clear_artwork_caches();
+                                        }
                                         Err(e) => tmdb_problem.set(Some(format!("{e:#}"))),
                                     }
                                     tmdb_checking.set(false);

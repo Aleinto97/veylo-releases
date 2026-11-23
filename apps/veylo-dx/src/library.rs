@@ -35,15 +35,42 @@ impl LibFilter {
     }
 }
 
+#[derive(Clone, Default)]
+struct LibSnapshot {
+    history: Option<Vec<Seen>>,
+    saved: Option<Vec<Media>>,
+}
+
+static LIB_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<LibSnapshot>> = std::sync::OnceLock::new();
+
 #[component]
 pub fn Library() -> Element {
     // No title in front here: the accent goes back to neutral.
     let shell = use_context::<Shell>();
     let mut lamp = shell.lamp_source;
     use_hook(move || lamp.set(String::new()));
-    let history = use_resource(|| async { backend::viewing_history().await });
-    // Saved to watch (S or the bookmark on a title page), newest first as the store keeps them.
-    let saved = use_resource(|| async { backend::library().await.map(|l| l.into_iter().filter(|m| m.saved).collect::<Vec<_>>()).unwrap_or_default() });
+    let snap = LIB_SNAPSHOT.get().and_then(|m| m.lock().ok()).map(|s| s.clone()).unwrap_or_default();
+    let mut history = use_signal(move || snap.history.map(Ok::<Vec<Seen>, String>));
+    let mut saved = use_signal(move || snap.saved);
+    // Refresh from SQLite silently in the background so returning to Library paints on Frame 0
+    // with zero skeleton flash while still reflecting newly saved or watched titles.
+    use_hook(move || {
+        spawn(async move {
+            let (hist_res, lib_res) = tokio::join!(backend::viewing_history(), backend::library());
+            match hist_res {
+                Ok(list) => {
+                    if let Ok(mut s) = LIB_SNAPSHOT.get_or_init(Default::default).lock() { s.history = Some(list.clone()); }
+                    history.set(Some(Ok(list)));
+                }
+                Err(e) => if history.peek().is_none() { history.set(Some(Err(format!("{e:#}")))); },
+            }
+            if let Ok(all) = lib_res {
+                let s_list: Vec<Media> = all.into_iter().filter(|m| m.saved).collect();
+                if let Ok(mut s) = LIB_SNAPSHOT.get_or_init(Default::default).lock() { s.saved = Some(s_list.clone()); }
+                saved.set(Some(s_list));
+            }
+        });
+    });
     // Titles removed this visit vanish at once; the store already forgot them.
     let gone = use_signal(std::collections::HashSet::<String>::new);
     use_context_provider(|| Gone(gone));
@@ -221,21 +248,27 @@ fn WeekCard(seen: Seen, now: i64, ahead: bool) -> Element {
     let mut shell = use_context::<Shell>();
     let m = seen.media.clone();
     let art = crate::components::use_artwork(&m);
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| m.backdrop().to_owned());
+    let mut bg_sources = Vec::new();
+    if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
+    let fb = m.backdrop().to_owned();
+    if !fb.is_empty() && !bg_sources.contains(&fb) { bg_sources.push(fb); }
+    if !m.poster.is_empty() && !bg_sources.contains(&m.poster) { bg_sources.push(m.poster.clone()); }
     let fraction = backend::progress_fraction(&m);
     // With the episode shown as a tag, the text only says what is left.
     let context = backend::resume_context(&m);
     let context = match &seen.episode { Some(ep) => context.strip_prefix(ep.as_str()).map(|r| r.trim_start_matches(", ").to_owned()).unwrap_or(context), None => context };
     let done = m.watched;
     let state = if done { "Watched".to_string() } else if backend::in_progress(&m) { context } else { "Started".into() };
-    let (open, resume) = (m.clone(), m.clone());
+    let (open, resume, pre) = (m.clone(), m.clone(), m.clone());
     // Its Resume button starts at once: the sources are asked for while the card is shown.
     let for_ahead = m.clone();
     use_hook(move || if ahead && !done { crate::title::prefetch_resume(&for_ahead) });
     rsx! {
         div { class: "week-card",
-            button { class: "week-open", aria_label: "Open {m.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
-                if !backdrop.is_empty() { img { src: "{backdrop}", alt: "", loading: "lazy" } }
+            button { class: "week-open", aria_label: "Open {m.name}",
+                onpointerdown: move |_| backend::prefetch_title(&pre),
+                onclick: move |_| shell.opened.set(Some(open.clone())),
+                crate::components::FallbackImg { sources: bg_sources, lazy: true }
                 div { class: "week-copy",
                     span { class: "week-when", "{backend::when_label(seen.at, now)}" }
                     span { class: "display week-title", "{m.name}" }

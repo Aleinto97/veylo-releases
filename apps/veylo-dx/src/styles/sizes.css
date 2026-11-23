@@ -34,13 +34,13 @@
 /* Press: the control sinks and brightens, then springs back on release. Large surfaces only
    give a little; keyboard focus keeps its visible ring. */
 .orb, .pill, .seg, .chip-btn, .dock-tab, .option, .name-chip, .ep-seen {
-  transition: transform .32s cubic-bezier(.34, 1.56, .64, 1), filter .2s ease, background-color .15s, color .15s;
+  transition: transform .18s cubic-bezier(.22, 1, .36, 1), filter .14s ease, background-color .12s, color .12s;
 }
 .orb:active:not(:disabled), .pill:active:not(:disabled), .seg:active, .chip-btn:active, .dock-tab:active, .option:active, .name-chip:active {
-  transform: scale(.9); filter: brightness(1.35); transition-duration: .08s;
+  transform: scale(.92); filter: brightness(1.25); transition-duration: .06s;
 }
-.card, .ep-main, .week-open, .duel-hit, .source-main, .demo-row { transition: transform .32s cubic-bezier(.34, 1.56, .64, 1); }
-.card:active, .ep-main:active:not(:disabled), .week-open:active, .source-main:active, .demo-row:active { transform: scale(.975); transition-duration: .08s; }
+.card, .ep-main, .week-open, .duel-hit, .source-main, .demo-row { transition: transform .18s cubic-bezier(.22, 1, .36, 1); }
+.card:active, .ep-main:active:not(:disabled), .week-open:active, .source-main:active, .demo-row:active { transform: scale(.975); transition-duration: .06s; }
 
 /* Library: remove a title (and its history). Quiet until wanted. */
 .lib-item { position: relative; min-width: 0; }

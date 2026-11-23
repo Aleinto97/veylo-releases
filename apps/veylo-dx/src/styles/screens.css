@@ -28,7 +28,7 @@
 .count { display: inline-flex; align-items: center; height: 36px; padding: 0 14px; border-radius: 18px; margin-left: 6px; color: var(--dust); font-variant-numeric: tabular-nums; font-size: 14px; font-weight: 650; }
 
 .queue { padding: 6px var(--gutter) 0; }
-.strip { display: flex; gap: 16px; overflow-x: auto; padding: 14px 6px 12px; margin: 0 -6px; scrollbar-width: none; }
+.strip { display: flex; gap: 16px; overflow-x: auto; padding: 14px 6px 12px; margin: 0 -6px; scrollbar-width: none; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
 .strip .poster { width: 132px; flex: none; }
 
 .poster { display: flex; flex-direction: column; gap: 3px; text-align: left; min-width: 0; }
@@ -84,20 +84,37 @@
 /* ---------------------------------------------------------------- title sheet */
 .scrim { position: fixed; inset: 0; z-index: 30; display: grid; grid-template-columns: minmax(0, 1fr); place-items: start center; overflow-y: auto; padding: calc(32px + var(--top-inset)) 24px calc(32px + var(--bottom-inset)); background: rgba(0,0,0,.62);
   -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); animation: arrive .16s ease-out; }
-@keyframes rise-sheet { from { opacity: 0; transform: translateY(10px) scale(.99); } to { opacity: 1; transform: none; } }
+@keyframes rise-sheet { from { opacity: 0; transform: translate3d(0, 24px, 0) scale(.985); } to { opacity: 1; transform: none; } }
 
 /* ---------------------------------------------------------------- title page
    A full page: hero artwork melting into the ambient light, then facts and episodes. */
 .topbar-spacer { flex: 1; }
 .title-page { position: relative; min-height: 100%; padding-bottom: 64px; }
 .title-hero { position: relative; min-height: clamp(420px, 70vh, 700px); display: flex; align-items: flex-end; isolation: isolate; padding: 0 var(--gutter) 8px; }
-.title-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; z-index: -2; opacity: 0; transition: opacity 1.8s ease;
+/* Single masked container for all hero backdrop layers: prevents overlapping crossfade images
+   from double-compositing the bottom gradient fade or leaking ghosts of the previous frame. */
+.title-art-stack { position: absolute; inset: 0; z-index: -2; overflow: hidden;
+  transform: translate3d(0, calc(var(--hero-y, 0px) * .28), 0); will-change: transform;
   -webkit-mask-image: linear-gradient(180deg, #000 50%, transparent 100%); mask-image: linear-gradient(180deg, #000 50%, transparent 100%); }
+/* Bulletproof two-slot crossfade (only `under` + `top` ever exist in DOM):
+   - `under`: solid base layer holding the outgoing picture at opacity 1 (zero dip to black).
+   - `top`:   freshly keyed incoming layer that stays hidden until decoded (`onload`), then runs
+              a smooth 1.4s opacity dissolve + continuous 10.5s Ken Burns drift (`scale 1.0 -> 1.05`).
+   - `top.initial`: fast 0.45s reveal on first open (no sluggish 1.8s fade-from-black). */
+.title-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; }
+.title-art.under { z-index: 1; opacity: 1; }
+.title-art.top { z-index: 2; opacity: 0; will-change: opacity, transform; }
+.title-art.top.ready { opacity: 1; animation: hero-fade .95s cubic-bezier(.4, 0, .2, 1) both, hero-drift 9s cubic-bezier(.16, 1, .3, 1) both; }
+.title-art.top.initial.ready { animation: hero-fade .3s cubic-bezier(.22, 1, .36, 1) both, hero-drift 9s cubic-bezier(.16, 1, .3, 1) both; }
+.title-art.preload { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; z-index: -10; }
+@keyframes hero-fade { from { opacity: 0; } to { opacity: 1; } }
+/* Settles from a subtle zoom to exact 1.0 by the 9s mark, so moving to `under` has a 0px jump. */
+@keyframes hero-drift { from { transform: scale(1.045); } to { transform: none; } }
 .title-hero::before { content: ''; position: absolute; inset: 0; z-index: -1;
   background: linear-gradient(90deg, rgba(0,0,0,.8) 0%, rgba(0,0,0,.35) 50%, rgba(0,0,0,0) 80%), linear-gradient(180deg, rgba(0,0,0,.5) 0%, rgba(0,0,0,0) 25%);
   -webkit-mask-image: linear-gradient(180deg, #000 50%, transparent 100%); mask-image: linear-gradient(180deg, #000 50%, transparent 100%); }
 .title-copy { max-width: 760px; width: 100%; }
-.title-logo { max-height: 150px; max-width: min(460px, 80%); object-fit: contain; object-position: left bottom; }
+.title-logo { max-height: 150px; max-width: min(460px, 80%); object-fit: contain; object-position: left bottom; animation: hero-fade .3s ease-out both; }
 .title-name { margin: 0; font-size: clamp(44px, 6.4vw, 78px); line-height: .94; font-weight: 800; letter-spacing: -0.02em; text-wrap: balance; }
 .facts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
 .fact { display: inline-flex; align-items: center; gap: 7px; height: 36px; padding: 0 14px 0 11px; border-radius: 18px; background: rgba(255,255,255,.1);
@@ -120,7 +137,7 @@
 .ep-still { position: relative; width: 208px; aspect-ratio: 16 / 9; flex: none; border-radius: 14px; overflow: hidden; background: rgba(255,255,255,.06); }
 .ep-still img { width: 100%; height: 100%; object-fit: cover; }
 .ep-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%;
-  background: rgba(0,0,0,.45); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); transition: transform .15s, background-color .15s; }
+  background: rgba(0,0,0,.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); transition: transform .15s, background-color .15s; }
 .ep-play .icon { width: 20px; height: 20px; fill: currentColor; }
 .ep-main:hover .ep-play, .ep-main:focus-visible .ep-play { background: var(--lamp); color: #000; transform: translate(-50%, -50%) scale(1.08); }
 .ep-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -141,10 +158,10 @@
 
 .scrim.bottom { display: flex; justify-content: center; align-items: flex-end; padding: var(--top-inset) 0 0; overflow: hidden; }
 .bottom-sheet { width: min(900px, 100%); max-width: 100%; min-width: 0; max-height: 82vh; display: flex; flex-direction: column; overflow: hidden; border-radius: 28px 28px 0 0; --glass: var(--glass-strong);
-  padding-bottom: var(--bottom-inset); animation: rise-sheet .22s ease-out; }
+  padding-bottom: var(--bottom-inset); animation: rise-sheet .26s cubic-bezier(.22, 1.08, .36, 1) both; }
 .sheet-head { display: flex; align-items: center; gap: 12px; padding: 16px 16px 10px 20px; }
 .sheet-head .group-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sheet-scroll { overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 0 16px 20px; }
+.sheet-scroll { overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 0 16px 20px; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 
 /* ---------------------------------------------------------------- episodes and sources */
 
@@ -201,7 +218,7 @@
 .card:focus-visible .card-art { box-shadow: 0 0 0 2px var(--bone); }
 .card-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(0,0,0,.55); }
 .card-progress > div { height: 100%; background: var(--bone); }
-.watched { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border-radius: 12px; display: grid; place-items: center; background: rgba(0,0,0,.6); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.watched { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; border-radius: 12px; display: grid; place-items: center; background: rgba(0,0,0,.72); box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); }
 .watched .icon { width: 14px; height: 14px; }
 .skeleton-card { background: rgba(255,255,255,.06); }
 .row-error { display: flex; align-items: center; gap: 10px; color: var(--amber); font-size: 15px; }
@@ -327,17 +344,18 @@
 /* The medallion between the cards. */
 .versus { align-self: center; display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; font-size: 18px; font-weight: 800; text-transform: uppercase;
   color: var(--bone); background: var(--glass-strong); box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 12px 30px rgba(0,0,0,.4); }
-.duel-cards.keep-left .versus, .duel-cards.keep-right .versus { animation: versus-spin .3s var(--out); }
+.duel-cards.keep-left .versus, .duel-cards.keep-right .versus { animation: versus-spin .18s var(--out); }
 @keyframes versus-spin { to { transform: rotate(180deg) scale(.8); opacity: .4; } }
 .duel-card { position: relative; min-height: 0; border-radius: 28px; overflow: hidden; isolation: isolate; display: flex; align-items: flex-end;
-  box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 24px 60px rgba(0,0,0,.45); transition: transform .18s ease-out, box-shadow .18s; animation: lift .45s cubic-bezier(.16, 1, .3, 1); }
+  box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 24px 60px rgba(0,0,0,.45); transition: transform .16s ease-out, box-shadow .16s; animation: lift .24s cubic-bezier(.22, 1, .36, 1); }
 /* Keeping: the kept card steps forward, the other steps back and fades; the challenger lifts in. */
-.duel-cards.keep-left .duel-card.left, .duel-cards.keep-right .duel-card.right { transform: scale(1.012); transition: transform .3s cubic-bezier(.16, 1, .3, 1);
+.duel-cards.keep-left .duel-card.left, .duel-cards.keep-right .duel-card.right { transform: scale(1.014); transition: transform .18s cubic-bezier(.22, 1, .36, 1);
   box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px rgba(242,239,234,.55), 0 30px 70px rgba(0,0,0,.5); }
-.duel-cards.keep-left .duel-card.right, .duel-cards.keep-right .duel-card.left { opacity: 0; transform: translateY(14px) scale(.97); pointer-events: none;
-  transition: opacity .25s ease-in, transform .3s cubic-bezier(.16, 1, .3, 1); }
+.duel-cards.keep-left .duel-card.right, .duel-cards.keep-right .duel-card.left { opacity: 0; transform: translateY(10px) scale(.975); pointer-events: none;
+  transition: opacity .16s ease-in, transform .18s cubic-bezier(.22, 1, .36, 1); }
 .duel-card:hover { transform: translateY(-3px); box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px rgba(242,239,234,.55), 0 30px 70px rgba(0,0,0,.5); }
-.duel-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -2; }
+.duel-art { position: absolute; inset: 0; width: 100%; height: 100%; z-index: -2; overflow: hidden; }
+.duel-art img { width: 100%; height: 100%; object-fit: cover; }
 .duel-card::after { content: ''; position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, rgba(0,0,0,.05) 0%, rgba(0,0,0,.35) 40%, rgba(0,0,0,.9) 100%); }
 .duel-hit { position: absolute; inset: 0; z-index: 0; border-radius: 28px; }
 .duel-hit:focus-visible { outline: 2px solid var(--bone); outline-offset: -3px; }

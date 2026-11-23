@@ -624,10 +624,45 @@ fn episodes_from_meta(meta: &Value) -> Vec<Episode> {
     episodes
 }
 
+static TITLE_META_CACHE: OnceLock<Mutex<HashMap<String, TitleMeta>>> = OnceLock::new();
+static TITLE_PREFETCHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Start warming `title_artwork_fast` and `title_meta` the instant a finger touches a card
+/// (`onpointerdown`), gaining a 100-160ms head start before `onclick` even mounts `TitlePage`.
+pub fn prefetch_title(media: &Media) {
+    if cached_title_meta(media).is_some() && cached_title_artwork(media).is_some() {
+        return;
+    }
+    let key = media.key();
+    {
+        let Ok(mut set) = TITLE_PREFETCHING.get_or_init(Default::default).lock() else { return };
+        if set.len() > 64 { set.clear(); }
+        if !set.insert(key.clone()) { return; }
+    }
+    let m = media.clone();
+    let Some(rt) = RUNTIME.get() else { return };
+    rt.spawn(async move {
+        let _ = tokio::join!(title_artwork_fast(&m), title_meta(&m));
+        if let Ok(mut set) = TITLE_PREFETCHING.get_or_init(Default::default).lock() {
+            set.remove(&key);
+        }
+    });
+}
+
+/// Synchronously read cached `TitleMeta` from this session so re-opening a title renders
+/// immediately on Frame 0 with zero loading flash.
+pub fn cached_title_meta(media: &Media) -> Option<TitleMeta> {
+    TITLE_META_CACHE.get()?.lock().ok()?.get(&media.key()).cloned()
+}
+
 pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
+    if let Some(hit) = cached_title_meta(media) {
+        return Ok(hit);
+    }
     let request = exec(json!({"op":"meta","type":media.kind,"id":media.id,"addon_url":media.addon_url}));
-    // Fetch add-on meta, BetterPosters overlay and TMDB artwork concurrently instead of serially.
-    let (addon, bp, art) = tokio::join!(request, bp_meta(media), artwork(media));
+    // Fetch add-on meta and BetterPosters overlay concurrently — do not block title details on
+    // slower artwork/TVmaze/TMDB calls (which `use_title_artwork` loads independently).
+    let (addon, bp) = tokio::join!(request, bp_meta(media));
     let meta = match (addon, bp) {
         (Ok(v), bp) => merge_meta(v.get("meta").cloned().unwrap_or(v), bp.as_ref()),
         // A title Cinemeta doesn't know yet: BetterPosters alone.
@@ -648,14 +683,8 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
     trailers.retain(|t| t.youtube.is_some() || t.url.is_some());
     let mut seen_trailers = HashSet::new();
     trailers.retain(|t| seen_trailers.insert(t.clone()));
-    // TMDB's trailers follow the add-on's, as alternatives where one is blocked or missing.
-    let mut genres: Vec<String> = meta["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect();
-    for genre in art.as_ref().map(|a| a.genres.as_slice()).unwrap_or_default() { if !genres.contains(genre) { genres.push(genre.clone()); } }
-    for key in art.map(|a| a.trailers).unwrap_or_default() {
-        let t = Trailer { youtube: Some(key), url: None };
-        if !trailers.contains(&t) { trailers.push(t); }
-    }
-    Ok(TitleMeta {
+    let genres: Vec<String> = meta["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect();
+    let out = TitleMeta {
         genres,
         logo: s(meta, "logo"),
         runtime: s(meta, "runtime"),
@@ -671,7 +700,11 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
         trailers,
         episodes,
         description: s(meta, "description"),
-    })
+    };
+    if let Ok(mut c) = TITLE_META_CACHE.get_or_init(Default::default).lock() {
+        cache_insert(&mut c, 200, media.key(), out.clone());
+    }
+    Ok(out)
 }
 
 /// What the store knows about a title opened from anywhere (a catalog shelf, Search, Picks):
@@ -1188,12 +1221,13 @@ mod tests {
             "content_ratings": {"results": [{"iso_3166_1": "DE", "rating": "16"}]}, "seasons": [{"season_number": 1, "poster_path": "/s1.jpg"}, {"season_number": 2, "poster_path": null}]});
         let b = production(&show, "tv", None);
         assert_eq!(b.crew[0].0, "Created by");
-        assert_eq!(b.crew[0].1[0].photo.as_deref(), Some("https://image.tmdb.org/t/p/w185/g.jpg"), "a creator's photo, for their card");
+        assert_eq!(b.crew[0].1[0].photo.as_deref(), Some("https://image.tmdb.org/t/p/h632/g.jpg"), "a creator's photo, for their card");
         assert_eq!(b.cast[0].role, "Lucy MacLean");
         assert_eq!(b.cast[0].photo, None);
         assert_eq!(b.certificate.as_deref(), Some("16"), "any country when the US has none");
-        assert_eq!(b.season_posters.len(), 1);
+        assert_eq!(b.season_posters.get(&1).map(String::as_str), Some("https://image.tmdb.org/t/p/w500/s1.jpg"));
         assert_eq!(b.studios[0].name, "Prime Video");
+        assert_eq!(b.studios[0].logo, "https://image.tmdb.org/t/p/w300/p.png");
     }
 
     #[test]
@@ -1554,8 +1588,12 @@ mod tests {
     #[test]
     fn better_posters_first_then_the_addon_poster() {
         let m = Media::from_json(&json!({"id":"tt6262770","name":"Tenzing","type":"movie","poster":"https://images.example/p.jpg"}), "a").unwrap();
-        assert_eq!(posters(&m), ["https://btttr.cc/poster/imdb/poster-default/tt6262770.jpg", "https://images.example/p.jpg",
-            "https://images.metahub.space/poster/medium/tt6262770/img"]);
+        assert_eq!(posters(&m), [
+            "https://btttr.cc/poster/imdb/poster-default/tt6262770.jpg",
+            "https://images.example/p.jpg",
+            "https://images.metahub.space/poster/large/tt6262770/img",
+            "https://images.metahub.space/poster/medium/tt6262770/img",
+        ]);
         let k = Media::from_json(&json!({"id":"kitsu:1","name":"Anime","type":"anime","poster":"https://images.example/k.jpg"}), "a").unwrap();
         assert_eq!(posters(&k), ["https://images.example/k.jpg"]);
     }

@@ -5,13 +5,26 @@ use crate::{backend::{self, Media}, icons, Shell};
 use dioxus::prelude::*;
 
 /// The first of `sources` that loads, each broken image giving way to the next; `children` when
-/// none does. Key it (or its parent) by the title where the title can change, so a new title
-/// starts again from its first image.
+/// none does. Remembers failed URLs so asynchronously arriving higher-priority sources load
+/// immediately without re-trying a broken URL or flashing a broken image icon.
 #[component]
 pub fn FallbackImg(sources: Vec<String>, #[props(default)] lazy: bool, children: Element) -> Element {
-    let mut index = use_signal(|| 0usize);
-    match sources.get(index()) {
-        Some(src) => rsx! { img { src: "{src}", alt: "", loading: if lazy { "lazy" } else { "eager" }, onerror: move |_| index += 1 } },
+    let mut failed = use_signal(std::collections::HashSet::<String>::new);
+    let current = {
+        let f = failed.read();
+        sources.iter().find(|u| !u.is_empty() && !f.contains(*u)).cloned()
+    };
+    match current {
+        Some(src) => rsx! {
+            img {
+                key: "{src}",
+                src: "{src}",
+                alt: "",
+                loading: if lazy { "lazy" } else { "eager" },
+                decoding: "async",
+                onerror: move |_| { failed.write().insert(src.clone()); },
+            }
+        },
         None => children,
     }
 }
@@ -24,8 +37,11 @@ pub fn PosterCard(media: Media) -> Element {
     let fraction = backend::progress_fraction(&media);
     let done = media.watched;
     let m = media.clone();
+    let pre = media.clone();
     rsx! {
-        button { class: "card", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(m.clone())),
+        button { class: "card", aria_label: "Open {media.name}",
+            onpointerdown: move |_| backend::prefetch_title(&pre),
+            onclick: move |_| shell.opened.set(Some(m.clone())),
             div { class: "card-art tall",
                 // The poster carries the title; only when no image works is the name written.
                 FallbackImg { sources: backend::posters(&media), lazy: true, span { class: "initial display", "{media.name}" } }
@@ -36,26 +52,77 @@ pub fn PosterCard(media: Media) -> Element {
     }
 }
 
-/// TMDB artwork for a title (text-free backdrop, logo), loaded once; None until it arrives
-/// or when there is no key, in which case the add-on's images stay.
+/// Artwork for a card (Tonight's pick, Library week cards, Picks duel): initializes synchronously
+/// from session cache so revisiting a screen paints on Frame 0, otherwise loads once.
 pub fn use_artwork(media: &Media) -> Signal<Option<backend::Artwork>> {
-    let mut art = use_signal(|| None::<backend::Artwork>);
+    let init = backend::cached_artwork(media);
+    let need = init.is_none();
+    let mut art = use_signal(move || init);
     let m = media.clone();
-    use_hook(move || { spawn(async move { if let Some(a) = backend::artwork(&m).await { art.set(Some(a)); } }); });
+    use_hook(move || {
+        if need {
+            spawn(async move { if let Some(a) = backend::artwork(&m).await { art.set(Some(a)); } });
+        }
+    });
     art
 }
 
-/// The title page's artwork: use_artwork's, and without a TMDB key the keyless credits, studios
-/// and season posters (backend::open_production) laid over it as they arrive. Each half shows
-/// as soon as it comes; neither waits for the other.
+/// The title page's artwork:
+/// 1. Fast hero art (`title_artwork_fast`: BetterPosters + optional TMDB clean textless backdrop/logo)
+///    arrives in ~150-250ms without waiting on series/Wikidata calls.
+/// 2. Free series/anime art (`open_series_free`: TVmaze untouched season posters & billing-order
+///    cast, ARM + AniList extraLarge season posters) merges with FREE-FIRST priority for season
+///    posters, cast and crew while keeping the clean textless hero backdrop untouched.
+/// 3. Slower Wikidata enrichment (`open_wikidata`) fills remaining studios, certificate and film
+///    credits silently without touching the hero.
+///
+/// All three initialize synchronously from session caches so revisited titles paint on Frame 0.
 pub fn use_title_artwork(media: &Media) -> Memo<Option<backend::Artwork>> {
-    let art = use_artwork(media);
-    let mut extra = use_signal(|| None::<backend::Artwork>);
-    let m = media.clone();
-    use_hook(move || { spawn(async move { if let Some(x) = backend::open_production(&m).await { extra.set(Some(x)); } }); });
-    use_memo(move || match (art(), extra()) {
-        (base, Some(x)) => Some(backend::with_extras(base.unwrap_or_default(), x)),
-        (base, None) => base,
+    let init_hero = backend::cached_title_artwork(media);
+    let init_series = backend::cached_series_free(media);
+    let init_wiki = backend::cached_wikidata(media);
+    let need_hero = init_hero.is_none();
+    let need_series = init_series.is_none() && media.kind != "movie";
+    let need_wiki = init_wiki.is_none();
+    let mut hero = use_signal(move || init_hero);
+    let mut series = use_signal(move || init_series);
+    let mut wiki = use_signal(move || init_wiki);
+    let (m1, m2, m3) = (media.clone(), media.clone(), media.clone());
+    use_hook(move || {
+        if need_hero {
+            spawn(async move { if let Some(x) = backend::title_artwork_fast(&m1).await { hero.set(Some(x)); } });
+        }
+        if need_series {
+            spawn(async move { if let Some(x) = backend::open_series_free(&m2).await { series.set(Some(x)); } });
+        }
+        if need_wiki {
+            spawn(async move { if let Some(x) = backend::open_wikidata(&m3).await { wiki.set(Some(x)); } });
+        }
+    });
+    use_memo(move || {
+        // Free-first merge: TVmaze/AniList season posters & billing-order cast win over TMDB,
+        // while verified clean textless hero backdrop & logo from `hero` always win over TVmaze.
+        let combined = match (series(), hero()) {
+            (Some(s), Some(h)) => {
+                // Keep hero's backdrop/logo/tagline/videos/stills primary, free series' season_posters/cast/crew primary.
+                let mut free_first = backend::with_extras(s, h.clone());
+                if h.backdrop.is_some() {
+                    free_first.backdrop = h.backdrop;
+                    free_first.backdrop_clean = h.backdrop_clean;
+                }
+                if h.logo.is_some() { free_first.logo = h.logo; }
+                Some(free_first)
+            }
+            (Some(s), None) => Some(s),
+            (None, Some(h)) => Some(h),
+            (None, None) => None,
+        };
+        match (combined, wiki()) {
+            (Some(c), Some(w)) => Some(backend::with_extras(c, w)),
+            (Some(c), None) => Some(c),
+            (None, Some(w)) => Some(w),
+            (None, None) => None,
+        }
     })
 }
 
@@ -118,8 +185,11 @@ pub fn StartOver(on_reset: EventHandler<()>, #[props(default)] labelled: bool) -
 #[component]
 pub fn PosterButton(media: Media, on_press: EventHandler<Media>) -> Element {
     let m = media.clone();
+    let pre = media.clone();
     rsx! {
-        button { class: "poster", aria_label: "{media.name}", onclick: move |_| on_press.call(m.clone()),
+        button { class: "poster", aria_label: "{media.name}",
+            onpointerdown: move |_| backend::prefetch_title(&pre),
+            onclick: move |_| on_press.call(m.clone()),
             div { class: "frame",
                 FallbackImg { sources: backend::posters(&media), lazy: true, span { class: "frame-name", "{media.name}" } }
             }

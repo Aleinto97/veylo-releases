@@ -6,27 +6,79 @@ use dioxus::prelude::*;
 #[derive(Clone, Debug, PartialEq)]
 enum Shelf { Loading, Ready(Vec<Media>), Failed(String) }
 
+#[derive(Clone, Default)]
+struct HomeSnapshot {
+    rows: Vec<(CatalogRow, Shelf)>,
+    library: Vec<Media>,
+    tonight: Vec<Media>,
+    at: i64,
+}
+
+static HOME_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<HomeSnapshot>> = std::sync::OnceLock::new();
+const HOME_TTL_SECS: i64 = 300;
+
+/// Drop cached Home shelves (called when the user switches BetterPosters/add-on settings).
+pub fn invalidate_cache() {
+    if let Some(m) = HOME_SNAPSHOT.get() {
+        if let Ok(mut s) = m.lock() { *s = HomeSnapshot::default(); }
+    }
+}
+
+fn read_home_snapshot() -> Option<HomeSnapshot> {
+    let snap = HOME_SNAPSHOT.get()?.lock().ok()?.clone();
+    (!snap.rows.is_empty()).then_some(snap)
+}
+
+fn write_home_snapshot(update: impl FnOnce(&mut HomeSnapshot)) {
+    if let Ok(mut s) = HOME_SNAPSHOT.get_or_init(Default::default).lock() {
+        update(&mut s);
+    }
+}
+
 #[component]
 pub fn Home() -> Element {
     let shell = use_context::<Shell>();
-    let mut rows = use_signal(Vec::<(CatalogRow, Shelf)>::new);
+    let snap = read_home_snapshot();
+    let fresh_rows = snap.as_ref().is_some_and(|s| backend::now_secs() - s.at < HOME_TTL_SECS
+        && s.rows.iter().all(|(_, st)| matches!(st, Shelf::Ready(_))));
+    let init_rows = snap.as_ref().map(|s| s.rows.clone()).unwrap_or_default();
+    let init_lib = snap.as_ref().map(|s| s.library.clone()).unwrap_or_default();
+    let init_tonight = snap.as_ref().map(|s| s.tonight.clone()).unwrap_or_default();
+    let mut rows = use_signal(move || init_rows);
     let mut rows_error = use_signal(|| None::<String>);
-    let mut library = use_signal(Vec::<Media>::new);
-    let mut loading = use_signal(|| true);
+    let mut library = use_signal(move || init_lib);
+    let mut loading = use_signal(move || snap.is_none());
     // Tonight's pick and the next few behind it; "Not tonight" steps through them.
-    let mut tonight = use_signal(Vec::<Media>::new);
+    let mut tonight = use_signal(move || init_tonight);
     let mut skipped = use_signal(|| 0usize);
 
     let load_row = move |row: CatalogRow| {
         spawn(async move {
             let result = backend::catalog(row.clone()).await;
+            let next_state = match result { Ok(items) => Shelf::Ready(items), Err(e) => Shelf::Failed(format!("{e:#}")) };
             rows.with_mut(|all| if let Some(slot) = all.iter_mut().find(|(r, _)| r.key == row.key) {
-                slot.1 = match result { Ok(items) => Shelf::Ready(items), Err(e) => Shelf::Failed(format!("{e:#}")) };
+                slot.1 = next_state.clone();
+            });
+            write_home_snapshot(|s| {
+                if let Some(slot) = s.rows.iter_mut().find(|(r, _)| r.key == row.key) {
+                    slot.1 = next_state;
+                }
+                s.at = backend::now_secs();
             });
         });
     };
     let mut opened = shell.opened;
     use_future(move || async move {
+        // Always refresh library state silently (Continue Watching / New for your shows);
+        // skip refetching catalog shelves & Tonight's pick when our session snapshot is fresh.
+        if fresh_rows {
+            if let Ok(items) = backend::library().await {
+                library.set(items.clone());
+                write_home_snapshot(|s| s.library = items);
+            }
+            loading.set(false);
+            return;
+        }
         // Fetch library, catalog shelf definitions, and Picks recommendations concurrently.
         let (lib_res, rows_res, picks_res) = tokio::join!(backend::library(), backend::home_rows(), backend::picks());
         if let Ok(items) = lib_res {
@@ -35,14 +87,22 @@ pub fn Home() -> Element {
                 let want = want.to_lowercase();
                 if let Some(m) = items.iter().find(|m| m.name.to_lowercase().contains(&want)) { opened.set(Some(m.clone())); }
             }
-            library.set(items);
+            library.set(items.clone());
+            write_home_snapshot(|s| s.library = items);
         }
         match rows_res {
             Ok(list) => {
-                rows.set(list.iter().cloned().map(|r| (r, Shelf::Loading)).collect());
+                // Keep any already-loaded shelf items visible while refreshing so nothing blinks.
+                let prev: std::collections::HashMap<String, Shelf> = rows.peek().iter().cloned().map(|(r, st)| (r.key, st)).collect();
+                let next: Vec<(CatalogRow, Shelf)> = list.iter().cloned().map(|r| {
+                    let st = prev.get(&r.key).cloned().unwrap_or(Shelf::Loading);
+                    (r, st)
+                }).collect();
+                rows.set(next.clone());
+                write_home_snapshot(|s| { s.rows = next; s.at = backend::now_secs(); });
                 for row in list { load_row(row); }
             }
-            Err(e) => rows_error.set(Some(format!("{e:#}"))),
+            Err(e) => if rows.peek().is_empty() { rows_error.set(Some(format!("{e:#}"))); },
         }
         // Tonight's pick: recommendations you have neither watched nor started, in the order of
         // the taste Picks learned (brain.rs), with its reason when it has one.
@@ -63,7 +123,9 @@ pub fn Home() -> Element {
                     scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
                 }).await.ok()
             }).await.ok().flatten();
-            tonight.set(ranked.unwrap_or(order).into_iter().take(6).collect());
+            let chosen: Vec<Media> = ranked.unwrap_or(order).into_iter().take(6).collect();
+            tonight.set(chosen.clone());
+            write_home_snapshot(|s| s.tonight = chosen);
         }
         loading.set(false);
     });
@@ -150,10 +212,10 @@ pub fn Home() -> Element {
     }
 }
 
-/// How many posters a shelf shows. A catalog can hold a couple of hundred titles; a TV (often 1–2 GB
-/// of memory) keeps the first few dozen of each row, and Search finds the rest.
+/// How many posters a shelf shows. Bounding each shelf keeps the Home DOM lean (~300 cards max
+/// instead of 1,500+), cutting memory and scroll layout cost; Search finds anything deeper.
 fn shelf_len() -> usize {
-    if crate::is_tv() { 36 } else { usize::MAX }
+    if crate::is_tv() { 36 } else { 40 }
 }
 
 /// One title Picks chose for you: its backdrop and logo, and why. The card opens it; the button
@@ -162,7 +224,11 @@ fn shelf_len() -> usize {
 fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHandler<()>) -> Element {
     let mut shell = use_context::<Shell>();
     let art = use_artwork(&media);
-    let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
+    let mut bg_sources = Vec::new();
+    if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
+    let fallback_bg = media.backdrop().to_owned();
+    if !fallback_bg.is_empty() && !bg_sources.contains(&fallback_bg) { bg_sources.push(fallback_bg); }
+    if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
     let logo = art().and_then(|a| a.logo).or_else(|| media.raw["logo"].as_str().map(str::to_owned)).filter(|l| !l.is_empty());
     let mut logo_failed = use_signal(|| false);
     // Play here starts at once: its sources are asked for while the pick is on screen.
@@ -174,15 +240,19 @@ fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHa
     let rating = backend::s(&media.raw, "imdbRating");
     let facts: Vec<String> = [media.year.clone(), media.genres.first().cloned().unwrap_or_default(), runtime]
         .into_iter().filter(|s| !s.is_empty()).collect();
-    let (open, open_art, play) = (media.clone(), media.clone(), media.clone());
+    let (open, open_art, play, pre1, pre2) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
     rsx! {
         div { class: "tonight glass",
-            button { class: "tonight-art card-art wide", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open_art.clone())),
-                if !backdrop.is_empty() { img { src: "{backdrop}", alt: "" } }
+            button { class: "tonight-art card-art wide", aria_label: "Open {media.name}",
+                onpointerdown: move |_| backend::prefetch_title(&pre1),
+                onclick: move |_| shell.opened.set(Some(open_art.clone())),
+                crate::components::FallbackImg { sources: bg_sources }
             }
             div { class: "tonight-copy",
                 if !media.reason.is_empty() { span { class: "tonight-why", icons::Sparkles {} span { "{media.reason}" } } }
-                button { class: "bare tonight-title", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
+                button { class: "bare tonight-title", aria_label: "Open {media.name}",
+                    onpointerdown: move |_| backend::prefetch_title(&pre2),
+                    onclick: move |_| shell.opened.set(Some(open.clone())),
                     match logo.filter(|_| !logo_failed()) {
                         Some(src) => rsx! { img { class: "tonight-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
                         None => rsx! { span { class: "display tonight-name", "{media.name}" } },
@@ -219,11 +289,13 @@ fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHa
 #[component]
 fn AlsoTonight(media: Media) -> Element {
     let mut shell = use_context::<Shell>();
-    let src = backend::posters(&media).into_iter().next().unwrap_or_default();
     let m = media.clone();
+    let pre = media.clone();
     rsx! {
-        button { class: "card-art tonight-alt", aria_label: "Open {media.name}", title: "{media.name}", onclick: move |_| shell.opened.set(Some(m.clone())),
-            if !src.is_empty() { img { src: "{src}", alt: "" } } else { span { class: "initial", "{media.name}" } }
+        button { class: "card-art tonight-alt", aria_label: "Open {media.name}", title: "{media.name}",
+            onpointerdown: move |_| backend::prefetch_title(&pre),
+            onclick: move |_| shell.opened.set(Some(m.clone())),
+            crate::components::FallbackImg { sources: backend::posters(&media), lazy: true, span { class: "initial", "{media.name}" } }
         }
     }
 }
