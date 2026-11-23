@@ -5,9 +5,16 @@
 [workspace]
 members = [".", "../../crates/video-surface", "../../crates/picture-check"]
 
+# 32-bit Android (many TVs run a 32-bit system), in vendored copies changed only for that:
+# manganis 0.7.10 refuses it at compile time, though its one pointer join is exact there;
+# libmpv2-sys 4.0.1 ships 64-bit bindings only, so it gets 32-bit ARM ones made from its own headers.
+[patch.crates-io]
+manganis = { path = "patches/manganis-0.7.10" }
+libmpv2-sys = { path = "patches/libmpv2-sys-4.0.1" }
+
 [package]
 name = "veylo-dx"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

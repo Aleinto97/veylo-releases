@@ -18,7 +18,7 @@ use objc2_app_kit::{NSAutoresizingMaskOptions, NSScreen, NSView, NSWindow, NSWin
 use objc2_core_graphics::{CGColor, CGColorSpace};
 use objc2_core_video::CVTimeStamp;
 use objc2_open_gl::{CGLChoosePixelFormat, CGLContextObj, CGLCreateContext, CGLLockContext, CGLPixelFormatAttribute as A,
-    CGLPixelFormatObj, CGLRetainContext, CGLRetainPixelFormat, CGLSetCurrentContext, CGLGetCurrentContext, CGLUnlockContext};
+    CGLPixelFormatObj, CGLReleasePixelFormat, CGLRetainContext, CGLRetainPixelFormat, CGLSetCurrentContext, CGLGetCurrentContext, CGLUnlockContext};
 use objc2_quartz_core::{CALayer, CAOpenGLLayer, CATransaction};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
@@ -108,9 +108,16 @@ define_class!(
 
         #[unsafe(method(drawInCGLContext:pixelFormat:forLayerTime:displayTime:))]
         fn draw(&self, ctx: CGLContextObj, pf: CGLPixelFormatObj, t: f64, ts: *const CVTimeStamp) {
-            unsafe { draw_frame(); }
+            let rendered = unsafe { draw_frame() };
             // The superclass flushes the frame to the layer.
             unsafe { let _: () = msg_send![super(self), drawInCGLContext: ctx, pixelFormat: pf, forLayerTime: t, displayTime: ts]; }
+            if rendered {
+                if let Ok(session) = RENDER.lock() {
+                    if let Some(s) = session.as_ref() {
+                        unsafe { sys::mpv_render_context_report_swap(s.render); }
+                    }
+                }
+            }
         }
     }
 );
@@ -136,7 +143,11 @@ fn gl() -> Option<(CGLPixelFormatObj, CGLContextObj, bool)> {
             if format.is_null() { tried.push(format!("{label}: pixel format error {}", err.0)); continue; }
             let mut context: CGLContextObj = null_mut();
             let err = unsafe { CGLCreateContext(format, null_mut(), NonNull::from(&mut context)) };
-            if context.is_null() { tried.push(format!("{label}: context error {}", err.0)); continue; }
+            if context.is_null() {
+                unsafe { CGLReleasePixelFormat(format); }
+                tried.push(format!("{label}: context error {}", err.0));
+                continue;
+            }
             *gl = Some(Gl { format, context, float: is_float, label });
             break;
         }
@@ -178,7 +189,7 @@ fn wants_frame() -> bool {
     dirty || frame
 }
 
-unsafe fn draw_frame() {
+unsafe fn draw_frame() -> bool {
     let (mut fbo, mut viewport) = (0i32, [0i32; 4]);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &mut fbo);
     glGetIntegerv(GL_VIEWPORT, viewport.as_mut_ptr());
@@ -195,8 +206,9 @@ unsafe fn draw_frame() {
                 sys::mpv_render_param { type_: 0, data: null_mut() },
             ];
             sys::mpv_render_context_render(s.render, params.as_mut_ptr());
+            true
         }
-        None => { glClearColor(0.0, 0.0, 0.0, 1.0); glClear(GL_COLOR_BUFFER_BIT); }
+        None => { glClearColor(0.0, 0.0, 0.0, 1.0); glClear(GL_COLOR_BUFFER_BIT); false }
     }
 }
 
@@ -287,7 +299,12 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
     let render = unsafe { create_render(player.mpv()) }.map_err(|e| format!("video layer: {e}"))?;
     if let Ok(mut s) = RENDER.lock() { *s = Some(Session { _player: player.clone(), render }); }
     HDR_MODE.store(0, Ordering::Release);
-    if let Ok(layer) = LAYER.lock() { if let Some(l) = layer.as_ref() { set_edr(&l.0, None); } }
+    if let Ok(layer) = LAYER.lock() {
+        if let Some(l) = layer.as_ref() {
+            if let Some(w) = window() { l.0.setContentsScale(w.backingScaleFactor()); }
+            set_edr(&l.0, None);
+        }
+    }
     DIRTY.store(true, Ordering::Release);
     view.setHidden(false);
     Ok(())
@@ -296,8 +313,15 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
 /// Free mpv's renderer (before mpv itself, which our Session keeps alive until then).
 fn free_render() {
     let Some(session) = RENDER.lock().ok().and_then(|mut s| s.take()) else { return };
-    unsafe { with_context(|| sys::mpv_render_context_free(session.render)); }
-    drop(session);
+    unsafe {
+        with_context(|| {
+            sys::mpv_render_context_set_update_callback(session.render, None, null_mut());
+            sys::mpv_render_context_free(session.render);
+        });
+    }
+    // Dropping mpv's core waits for its threads: never block the AppKit main thread.
+    let player = session._player;
+    std::thread::spawn(move || drop(player));
 }
 
 pub fn close(_path: Path) {

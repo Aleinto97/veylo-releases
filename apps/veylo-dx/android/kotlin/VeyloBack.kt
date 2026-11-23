@@ -10,7 +10,8 @@ import androidx.activity.OnBackPressedCallback
 /**
  * Android Back closes what the Rust shell has open (a title page, Search, the videos,
  * the player) exactly like Esc does on desktop: it sends Esc to the page. Rust enables
- * it only while something is open, so Back on a top-level screen still leaves the app.
+ * it only while something is open, so Back on a top-level screen still leaves the app;
+ * on a TV it is always on, so Back only goes back and the remote's Home key leaves.
  */
 object VeyloBack {
     private var callback: OnBackPressedCallback? = null

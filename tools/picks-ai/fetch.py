@@ -29,6 +29,7 @@ RUNTIMES = {
     'windows-x64': 'runtimes/win-x64/native/onnxruntime.dll',
     'macos-arm64': 'runtimes/osx-arm64/native/libonnxruntime.dylib',
     'android-arm64': 'jni/arm64-v8a/libonnxruntime.so',
+    'android-armv7': 'jni/armeabi-v7a/libonnxruntime.so',
 }
 ASSETS = {
     'model.onnx': ('onnx/model_quantized.onnx', '6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4'),
@@ -62,7 +63,7 @@ def prepare(target):
     dest.mkdir(parents=True, exist_ok=True)
     native_path = RUNTIMES[target]
     desktop_archive = download(*ORT_DESKTOP)
-    runtime_archive = download(*ORT_ANDROID) if target == 'android-arm64' else desktop_archive
+    runtime_archive = download(*ORT_ANDROID) if target.startswith('android-') else desktop_archive
     with zipfile.ZipFile(runtime_archive) as z:
         with z.open(native_path) as src, open(dest / Path(native_path).name, 'wb') as out:
             shutil.copyfileobj(src, out)

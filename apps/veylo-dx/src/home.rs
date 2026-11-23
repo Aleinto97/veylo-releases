@@ -27,7 +27,9 @@ pub fn Home() -> Element {
     };
     let mut opened = shell.opened;
     use_future(move || async move {
-        if let Ok(items) = backend::library().await {
+        // Fetch library, catalog shelf definitions, and Picks recommendations concurrently.
+        let (lib_res, rows_res, picks_res) = tokio::join!(backend::library(), backend::home_rows(), backend::picks());
+        if let Ok(items) = lib_res {
             // Developer option: VEYLO_DX_OPEN=<title> opens the first library title containing it.
             if let Ok(want) = std::env::var("VEYLO_DX_OPEN") {
                 let want = want.to_lowercase();
@@ -35,7 +37,7 @@ pub fn Home() -> Element {
             }
             library.set(items);
         }
-        match backend::home_rows().await {
+        match rows_res {
             Ok(list) => {
                 rows.set(list.iter().cloned().map(|r| (r, Shelf::Loading)).collect());
                 for row in list { load_row(row); }
@@ -44,7 +46,7 @@ pub fn Home() -> Element {
         }
         // Tonight's pick: recommendations you have neither watched nor started, in the order of
         // the taste Picks learned (brain.rs), with its reason when it has one.
-        if let Ok(p) = backend::picks().await {
+        if let Ok(p) = picks_res {
             let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(24).collect();
             let known = library.peek().clone();
             let order = fresh.clone();
@@ -67,6 +69,21 @@ pub fn Home() -> Element {
     });
 
     let continuing: Vec<Media> = library.read().iter().filter(|m| backend::in_progress(m)).cloned().collect();
+    // Tracked shows from the user's library that have a newly aired episode in TVmaze's schedule.
+    let mut new_for_you = use_signal(Vec::<Media>::new);
+    use_effect(move || {
+        let lib = library.read();
+        let tracked: std::collections::HashSet<String> = lib.iter()
+            .filter(|m| m.kind == "series" && (m.saved || backend::in_progress(m) || m.position_ms > 0))
+            .map(|m| m.id.clone()).collect();
+        if tracked.is_empty() { return; }
+        let matched: Vec<Media> = rows.read().iter()
+            .find(|(r, _)| r.id == "new-episodes")
+            .and_then(|(_, st)| match st { Shelf::Ready(items) => Some(items), _ => None })
+            .map(|items| items.iter().filter(|m| tracked.contains(&m.id)).cloned().collect())
+            .unwrap_or_default();
+        if *new_for_you.peek() != matched { new_for_you.set(matched); }
+    });
     // The room takes its light from what you are watching.
     let mut lamp = shell.lamp_source;
     let queue: Vec<Media> = { let all = tonight.read(); if all.is_empty() { Vec::new() } else { (0..all.len()).map(|i| all[(skipped() + i) % all.len()].clone()).collect() } };
@@ -83,6 +100,15 @@ pub fn Home() -> Element {
                         for m in [m] {
                             TonightsPick { key: "{m.key()}", media: m.clone(), also: queue.iter().skip(1).take(3).cloned().collect::<Vec<_>>(),
                                 can_skip: queue.len() > 1, on_skip: move |_| skipped += 1 }
+                        }
+                    }
+                }
+
+                if !new_for_you.read().is_empty() {
+                    section { class: "shelf",
+                        SectionHeader { title: "New for your shows", meta: Some("Tracked series with newly aired episodes".into()) }
+                        div { class: "strip poster-strip",
+                            for m in new_for_you.read().iter() { PosterCard { key: "nfy-{m.key()}", media: m.clone() } }
                         }
                     }
                 }
@@ -112,7 +138,7 @@ pub fn Home() -> Element {
                             Shelf::Ready(items) if items.is_empty() => rsx! { p { class: "meta dim", "Empty" } },
                             Shelf::Ready(items) => rsx! {
                                 div { class: "strip poster-strip",
-                                    for m in items { PosterCard { key: "{m.key()}", media: m.clone() } }
+                                    for m in items.iter().take(shelf_len()) { PosterCard { key: "{m.key()}", media: m.clone() } }
                                 }
                             },
                         }
@@ -122,6 +148,12 @@ pub fn Home() -> Element {
             }
         }
     }
+}
+
+/// How many posters a shelf shows. A catalog can hold a couple of hundred titles; a TV (often 1–2 GB
+/// of memory) keeps the first few dozen of each row, and Search finds the rest.
+fn shelf_len() -> usize {
+    if crate::is_tv() { 36 } else { usize::MAX }
 }
 
 /// One title Picks chose for you: its backdrop and logo, and why. The card opens it; the button

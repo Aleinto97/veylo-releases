@@ -8,7 +8,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") { return macos(); }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") { return; }
     // The Rust player links mpv-android's libmpv (android/fetch-mpv.sh), packaged below.
-    let abi_dir = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() { Ok("aarch64") => "arm64-v8a", _ => "" };
+    // arm64 phones and tablets; 32-bit ARM for the many Android TVs that run a 32-bit system.
+    let abi_dir = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() { Ok("aarch64") => "arm64-v8a", Ok("arm") => "armeabi-v7a", _ => "" };
     let mpv_libs = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("android/mpv").join(abi_dir);
     assert!(mpv_libs.join("libmpv.so").is_file(), "libmpv for Android is missing: run android/fetch-mpv.sh");
     println!("cargo:rustc-link-search=native={}", mpv_libs.display());
@@ -17,8 +18,8 @@ fn main() {
     std::fs::create_dir_all(out).expect("kotlin output dir");
     for entry in std::fs::read_dir("android/kotlin").expect("android/kotlin") {
         let path = entry.expect("kotlin entry").path();
-        if path.extension().is_some_and(|e| e == "kt") {
-            std::fs::copy(&path, out.join(path.file_name().unwrap())).expect("copy kotlin source");
+        if path.extension().is_some_and(|e| e == "kt" || e == "pro") {
+            std::fs::copy(&path, out.join(path.file_name().unwrap())).expect("copy kotlin/proguard file");
             println!("cargo:rerun-if-changed={}", out.join(path.file_name().unwrap()).display());
         }
     }
@@ -39,13 +40,14 @@ fn main() {
             }
         }
         overlay(std::path::Path::new("android/res"), &main.join("res"));
+        tv_launcher(&main.join("AndroidManifest.xml"));
     }
 
     // The player's libmpv + FFmpeg (android/fetch-mpv.sh), linked by the Rust engine (src/engine.rs).
     // libplayer.so is mpv-android's own JNI glue, which Veylo doesn't use.
     let mpv = std::path::Path::new("android/mpv");
     println!("cargo:rerun-if-changed=android/mpv");
-    if abi == "arm64-v8a" {
+    {
         let main = out.ancestors().nth(4).expect("android project layout");
         let libs = main.join("jniLibs").join(abi);
         std::fs::create_dir_all(&libs).expect("jniLibs dir");
@@ -61,6 +63,26 @@ fn main() {
         std::fs::copy(mpv.join("cacert.pem"), assets.join("cacert.pem")).expect("copy cacert.pem");
         println!("cargo:rerun-if-changed={}", assets.join("cacert.pem").display());
     }
+}
+
+/// Android TV: the TV home screen lists only apps whose activity is in LEANBACK_LAUNCHER, shown by
+/// their banner (android/res/drawable-xhdpi/tv_banner.png, from branding/veylo-tv-banner.svg).
+/// dx 0.7 can't add either to its activity or application, so patch the manifest it generates.
+fn tv_launcher(manifest: &std::path::Path) {
+    let Ok(xml) = std::fs::read_to_string(manifest) else { return };
+    let mut patched = xml.clone();
+    if !patched.contains("android:banner=") {
+        patched = patched.replacen("<application ", "<application android:banner=\"@drawable/tv_banner\" ", 1);
+    }
+    if !patched.contains("LEANBACK_LAUNCHER") {
+        patched = patched.replacen("<category android:name=\"android.intent.category.LAUNCHER\" />",
+            "<category android:name=\"android.intent.category.LAUNCHER\" />\n                <category android:name=\"android.intent.category.LEANBACK_LAUNCHER\" />", 1);
+    }
+    if !patched.contains("supportsPictureInPicture") {
+        patched = patched.replacen("<activity ", "<activity android:supportsPictureInPicture=\"true\" ", 1);
+    }
+    if patched != xml { std::fs::write(manifest, patched).expect("patch AndroidManifest.xml"); }
+    println!("cargo:rerun-if-changed={}", manifest.display());
 }
 
 /// Windows: link the libmpv fetched by windows/fetch-mpv.ps1 (or VEYLO_MPV_DIR) and put
@@ -117,6 +139,7 @@ fn stage_picks_ai() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target = match (os.as_str(), arch.as_str()) {
         ("android", "aarch64") => "android-arm64",
+        ("android", "arm") => "android-armv7",
         ("linux", "aarch64") => "linux-aarch64",
         ("linux", "x86_64") => "linux-x64",
         ("windows", "x86_64") => "windows-x64",
@@ -147,7 +170,8 @@ fn stage_picks_ai() {
             copy_dir(&root.join("model"), &main.join("assets/picks-ai"));
             // Notices are assets too; only native code belongs in jniLibs.
             copy_dir(&native, &main.join("assets/picks-ai/runtime"));
-            let libs = main.join("jniLibs/arm64-v8a");
+            let abi = if arch == "arm" { "armeabi-v7a" } else { "arm64-v8a" };
+            let libs = main.join("jniLibs").join(abi);
             std::fs::create_dir_all(&libs).expect("Picks JNI directory");
             std::fs::copy(native.join(library), libs.join(library)).expect("Copy ONNX Runtime");
             // The native library is already in jniLibs, avoid an extra copy in APK assets.

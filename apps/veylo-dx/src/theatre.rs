@@ -76,7 +76,7 @@ pub fn command(command: &'static str) {
     document::eval(&format!(r#"(() => {{
         const f = document.querySelector('.theatre iframe'); if (!f || !f.contentWindow) return;
         const s = window.__veyloYt || (window.__veyloYt = {{}});
-        const post = (func, args) => f.contentWindow.postMessage(JSON.stringify({{ event: 'command', func, args: args || [] }}), '*');
+        const post = (func, args) => f.contentWindow.postMessage(JSON.stringify({{ event: 'command', func, args: args || [] }}), 'https://www.youtube-nocookie.com');
         switch ('{command}') {{
             case 'toggle': post(s.state === 1 ? 'pauseVideo' : 'playVideo'); s.state = s.state === 1 ? 2 : 1; break;
             case 'back': post('seekTo', [Math.max(0, (s.time || 0) - 10), true]); s.time = Math.max(0, (s.time || 0) - 10); break;
@@ -87,27 +87,30 @@ pub fn command(command: &'static str) {
     }})()"#));
 }
 
-/// Listen to the embed's reports once per app, and keep asking the current embed to report
-/// (a new video is a new embed).
+/// Listen to the embed's reports once per app, and handshake with the embed while the theatre is open
+/// (stopping its interval as soon as the theatre closes so nothing polls in the background).
 fn theatre_listen() {
     document::eval(r#"(() => {
-        if (window.__veyloYtListening) return;
-        window.__veyloYtListening = true;
-        window.__veyloYt = {};
-        window.addEventListener('message', e => {
-            if (!/youtube/.test(e.origin || '')) return;
-            let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (_) { return; }
-            const s = window.__veyloYt;
-            if (d && d.event === 'onStateChange') s.state = d.info;
-            if (d && d.event === 'infoDelivery' && d.info) {
-                if ('playerState' in d.info) s.state = d.info.playerState;
-                if ('currentTime' in d.info) s.time = d.info.currentTime;
-                if ('muted' in d.info) s.muted = d.info.muted;
-            }
-        });
-        setInterval(() => {
+        if (!window.__veyloYtListening) {
+            window.__veyloYtListening = true;
+            window.__veyloYt = {};
+            window.addEventListener('message', e => {
+                if (e.origin !== 'https://www.youtube-nocookie.com' && e.origin !== 'https://www.youtube.com') return;
+                let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (_) { return; }
+                const s = window.__veyloYt;
+                if (d && d.event === 'onStateChange') s.state = d.info;
+                if (d && d.event === 'infoDelivery' && d.info) {
+                    if ('playerState' in d.info) s.state = d.info.playerState;
+                    if ('currentTime' in d.info) s.time = d.info.currentTime;
+                    if ('muted' in d.info) s.muted = d.info.muted;
+                }
+            });
+        }
+        if (window.__veyloYtTimer) clearInterval(window.__veyloYtTimer);
+        window.__veyloYtTimer = setInterval(() => {
             const f = document.querySelector('.theatre iframe');
-            if (f && f.contentWindow) f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'veylo' }), '*');
+            if (!f || !f.contentWindow) { clearInterval(window.__veyloYtTimer); window.__veyloYtTimer = null; return; }
+            f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'veylo' }), 'https://www.youtube-nocookie.com');
         }, 1000);
     })()"#);
 }

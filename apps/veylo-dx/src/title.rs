@@ -96,7 +96,7 @@ pub fn TitlePage(media: Media) -> Element {
             busy.set(None);
             if !crate::still_wanted(shell, ticket) { return; }
             // Nothing played: every source can be chosen by hand.
-            if !play_pick(shell, &media, &video, &title, pick, next.map(|e| (e.id.clone(), Some(e.label())))) { chooser.set(Some(Chooser { video, label })); }
+            if !play_pick(shell, &media, &video, &title, pick, pack, next.map(|e| (e.id.clone(), Some(e.label())))) { chooser.set(Some(Chooser { video, label })); }
         });
     });
 
@@ -312,7 +312,7 @@ fn next_episode(list: &[Episode], video: &str) -> Option<Episode> {
 /// Start the platform player for a checked source and record progress for this video.
 /// `rest`: the Play-order candidates after this one, for "Another source".
 fn start(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>) {
-    start_with(shell, media, video, title, src, next, Vec::new(), None, 0)
+    start_with(shell, media, video, title, src, None, next, Vec::new(), None, 0)
 }
 
 /// How many times an automatic choice may move on because its audio is not in your language.
@@ -322,7 +322,7 @@ const LANGUAGE_RETRIES: u8 = 2;
 /// `checks`: while above 0 (automatic choices), a file whose tagged audio lacks the Audio-language
 /// setting's language makes way for the next source instead of turning subtitles on.
 #[allow(clippy::too_many_arguments)]
-fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>, mut rest: Vec<Source>, at: Option<i64>, checks: u8) {
+fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, pack: Option<usize>, next: Option<(String, Option<String>)>, mut rest: Vec<Source>, at: Option<i64>, checks: u8) {
     // The same file from another scraper would fail the same way.
     if !src.filename.is_empty() { rest.retain(|s| s.filename != src.filename); }
     let language_check = checks > 0 && rest.iter().any(backend::claims_language);
@@ -330,6 +330,8 @@ fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source
     let full_title = title.to_owned();
     let subtitle = if video != media.id { media.name.clone() } else { media.meta_line(true) };
     let title = title.strip_prefix(&format!("{} ", media.name)).filter(|_| video != media.id).unwrap_or(title).to_owned();
+    let next_video = next.as_ref().map(|(id, _)| (media.kind.clone(), id.clone()));
+    let next_label = next.as_ref().and_then(|(_, label)| label.clone());
     let another = {
         let (media, video, full_title, next) = (media.clone(), video.to_owned(), full_title.clone(), next.clone());
         Box::new(move |shell: Shell, position: i64, language: bool| {
@@ -338,13 +340,13 @@ fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source
             spawn(async move {
                 // Not in your language: the sources whose label names it, then the rest.
                 let (claimed, others): (Vec<Source>, Vec<Source>) = rest.into_iter().partition(|s| language && backend::claims_language(s));
-                let mut pick = backend::pick_source(claimed, None).await;
-                if pick.best.is_none() { pick = backend::pick_source(others, None).await; } else { pick.rest.extend(others); }
+                let mut pick = backend::pick_source(claimed, pack).await;
+                if pick.best.is_none() { pick = backend::pick_source(others, pack).await; } else { pick.rest.extend(others); }
                 backend::dev_log(&format!("another source{}: {}", if language { " (language)" } else { "" },
                     pick.best.as_ref().map(backend::source_summary).unwrap_or_else(|| "nothing".into())));
                 if !crate::still_wanted(shell, ticket) { return; }
                 match pick.best {
-                    Some(found) => start_with(shell, &media, &video, &full_title, found, next, pick.rest, Some(position), if pick.audio_known { 0 } else { checks.saturating_sub(1) }),
+                    Some(found) => start_with(shell, &media, &video, &full_title, found, pack, next, pick.rest, Some(position), if pick.audio_known { 0 } else { checks.saturating_sub(1) }),
                     None => { no_source(shell, pick.debrid.as_deref()); open_page(shell, &media); }
                 }
             });
@@ -353,7 +355,7 @@ fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source
     crate::start_playback_with(shell, PlayRequest {
         title, subtitle, url: src.url, start_ms: resume, headers: src.headers,
         size: src.size.clone(), hdr: src.hdr.map(str::to_owned), quality: src.quality.map(str::to_owned),
-        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))), has_next: next.is_some(), language_check,
+        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))), has_next: next.is_some(), next_label, next_video, language_check,
         ..Default::default()
     }, next.map(|(id, label)| {
         let media = media.clone();
@@ -398,8 +400,32 @@ pub(crate) fn play_from_card(shell: Shell, media: Media, video: String) {
     play_next(shell, media, video, label);
 }
 
+/// Play an offline downloaded file immediately with zero network access.
+pub fn play_offline(shell: Shell, entry: backend::DownloadEntry) {
+    let resume = if backend::in_progress(&entry.media)
+        && (entry.media.last_video_id.as_deref() == Some(entry.video_id.as_str()) || entry.media.kind == "movie")
+    {
+        entry.media.position_ms
+    } else {
+        0
+    };
+    crate::start_playback(shell, PlayRequest {
+        title: entry.title,
+        subtitle: format!("Offline · {}", entry.subtitle),
+        url: entry.path.to_string_lossy().into_owned(),
+        start_ms: resume,
+        size: Some(backend::file_size_label(entry.bytes)),
+        record: Some((entry.media.clone(), (entry.video_id != entry.media.id).then_some(entry.video_id))),
+        ..Default::default()
+    }, None);
+}
+
 /// Play one video now with the automatic choice, without the page (Resume, Next episode).
 fn play_next(shell: Shell, media: Media, video: String, label: Option<String>) {
+    if let Some(offline) = backend::find_download(&media.key(), &video) {
+        play_offline(shell, offline);
+        return;
+    }
     let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
     let ticket = crate::finding(shell, title.clone());
     spawn(async move {
@@ -411,14 +437,14 @@ fn play_next(shell: Shell, media: Media, video: String, label: Option<String>) {
         let pick = backend::autoplay(&media.kind, &video, pack, &media.name, (media.kind == "movie").then(|| media.first_year()).flatten()).await;
         if !crate::still_wanted(shell, ticket) { return; }
         // Nothing played: the title page, where every source can be chosen.
-        if !play_pick(shell, &media, &video, &title, pick, after) { open_page(shell, &media); }
+        if !play_pick(shell, &media, &video, &title, pick, pack, after) { open_page(shell, &media); }
     });
 }
 
 /// Play Play's automatic choice; false (having said why) when there is none.
-fn play_pick(shell: Shell, media: &Media, video: &str, title: &str, pick: backend::Pick, next: Option<(String, Option<String>)>) -> bool {
+fn play_pick(shell: Shell, media: &Media, video: &str, title: &str, pick: backend::Pick, pack: Option<usize>, next: Option<(String, Option<String>)>) -> bool {
     match pick.best {
-        Some(src) => { start_with(shell, media, video, title, src, next, pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }); true }
+        Some(src) => { start_with(shell, media, video, title, src, pack, next, pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }); true }
         None => { no_source(shell, pick.debrid.as_deref()); false }
     }
 }
@@ -730,6 +756,15 @@ fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<Stri
     let title = chooser.label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
     let (m, t, v) = (media.clone(), title.clone(), chooser.video.clone());
     let play = use_callback(move |src: Source| { start(shell, &m, &v, &t, src, next.clone()); on_close.call(()); });
+    let mut dl_note = use_signal(|| None::<String>);
+    let (dm, dt, dv) = (media.clone(), title.clone(), chooser.video.clone());
+    let save_offline = use_callback(move |src: Source| {
+        let sub = [src.quality.map(str::to_owned), src.hdr.map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        match backend::start_download(dm.clone(), dv.clone(), dt.clone(), if sub.is_empty() { src.addon.clone() } else { sub }, src.url, src.headers) {
+            Ok(()) => dl_note.set(Some("Saving for offline playback — see Library → Downloads.".into())),
+            Err(e) => dl_note.set(Some(format!("Download couldn't start: {e}"))),
+        }
+    });
     rsx! {
         div { class: "scrim bottom",
             onpointerdown: move |_| pressed_backdrop.set(true),
@@ -743,6 +778,9 @@ fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<Stri
                     icons::IconButton { label: "Close", class: "glass", onclick: move |_| on_close.call(()), icons::Close {} }
                 }
                 div { class: "sheet-scroll",
+                    if let Some(note) = dl_note() {
+                        div { class: "notice glass", role: "status", span { class: "group-icon", icons::Download {} } span { "{note}" } }
+                    }
                     match sources() {
                         Load::Loading => rsx! { div { class: "rows", for i in 0..4 { div { key: "{i}", class: "row skeleton-row" } } } },
                         Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
@@ -753,7 +791,8 @@ fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<Stri
                                 for (i, src) in list.into_iter().enumerate() {
                                     SourceRow { key: "{i}", source: src.clone(), open: expanded() == Some(i),
                                         on_details: move |_| expanded.set(if expanded() == Some(i) { None } else { Some(i) }),
-                                        on_play: move |s: Source| play.call(s) }
+                                        on_play: move |s: Source| play.call(s),
+                                        on_download: move |s: Source| save_offline.call(s) }
                                 }
                             }
                         },
@@ -767,7 +806,7 @@ fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<Stri
 /// One source: quality and HDR chips, the file, its size and add-on; Details shows
 /// the add-on's own text verbatim. Torrents and external links are shown, not played.
 #[component]
-fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: EventHandler<Source>) -> Element {
+fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: EventHandler<Source>, on_download: EventHandler<Source>) -> Element {
     let playable = source.kind == SourceKind::Direct;
     let label = if !source.filename.is_empty() { source.filename.clone() }
         else { source.description.lines().next().unwrap_or(&source.name).to_owned() };
@@ -775,6 +814,7 @@ fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: 
         SourceKind::Torrent => Some("P2P streaming isn't supported yet"),
         SourceKind::External => Some("Links that open outside Veylo aren't supported yet") };
     let src = source.clone();
+    let src_dl = source.clone();
     rsx! {
         div { class: if playable { "source glass" } else { "source glass muted" },
             button { class: "source-main", disabled: !playable, title: why.unwrap_or(""),
@@ -792,6 +832,9 @@ fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: 
                     SourceKind::Torrent => rsx! { icons::Magnet {} },
                     SourceKind::External => rsx! { icons::Link {} },
                 } }
+            }
+            if playable {
+                icons::IconButton { label: "Download for offline playback", class: "small", onclick: move |_| on_download.call(src_dl.clone()), icons::Download {} }
             }
             icons::IconButton { label: if open { "Hide details" } else { "Details" }, class: "small", pressed: open, onclick: move |_| on_details.call(()), icons::Info {} }
             if open {

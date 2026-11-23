@@ -23,6 +23,10 @@ pub struct PlayRequest {
     pub subtitle: String,
     /// Offer a Next episode control.
     pub has_next: bool,
+    /// Next episode display label for the "Up Next" countdown card (e.g. "S2 E4 · Title").
+    pub next_label: Option<String>,
+    /// Next episode `(kind, video_id)` to prefetch near the end of playback so Next starts immediately.
+    pub next_video: Option<(String, String)>,
     pub url: String,
     pub start_ms: i64,
     /// Request headers the source requires (behaviorHints.proxyHeaders.request).

@@ -2,10 +2,18 @@ rules_version = '2';
 // Veylo's accounts (src/backend/account.rs). Paste into Firebase → Firestore Database → Rules.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each account's synced titles and episodes: only that account reads or writes them.
+    // Each account's synced titles, episodes, keys and diagnostics: only that account reads or writes them.
     match /users/{uid}/{rest=**} {
       allow read, write: if request.auth != null && request.auth.uid == uid
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+    // Redacted diagnostics from signed-out installs: create-only, never readable by clients.
+    match /diagnostics/{id} {
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasOnly(['kind', 'os', 'arch', 'version', 'device', 'screen', 'summary', 'details', 'created', 'synced'])
+        && request.resource.data.summary is string && request.resource.data.summary.size() <= 400
+        && request.resource.data.details is string && request.resource.data.details.size() <= 8000;
+      allow read, update, delete: if false;
     }
     // A computer's sign-in request (its QR code): the computer, signed in for the moment without
     // an account, creates and reads its own; a signed-in phone may only add the sealed answer.
@@ -14,6 +22,7 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['asker', 'created']);
       allow read, delete: if request.auth != null && resource.data.asker == request.auth.uid;
       allow update: if request.auth != null && request.auth.token.firebase.sign_in_provider != 'anonymous'
+        && !('sealed' in resource.data)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sealed'])
         && resource.data.created > request.time - duration.value(15, 'm');
     }

@@ -7,11 +7,12 @@ use crate::{backend, engine::{self, Finish, Segment, SegmentKind, State}};
 pub const ONLINE_SHOWN: usize = 60;
 
 pub const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-pub const KEYS: [(&[&str], &str); 20] = [
+pub const KEYS: [(&[&str], &str); 22] = [
     (&["Enter"], "Skip the intro or recap, when offered"),
     (&["Space", "K", "Enter"], "Play or pause"), (&["←", "→"], "Back or forward 10 seconds"), (&["J", "L"], "Back or forward 10 seconds"),
     (&["0–9"], "Jump to 0–90%"), (&["Home"], "Back to the start"), (&["↑", "↓"], "Volume"), (&["M"], "Mute"),
-    (&["A"], "Next audio track"), (&["C"], "Next subtitles, then off"), (&["S"], "Subtitles list"), (&["Z"], "Fit, fill, stretch"),
+    (&["A"], "Next audio track"), (&["C"], "Next subtitles, then off"), (&["S"], "Subtitles list"), (&[",", "."], "Subtitle delay −/+ 0.25 s"),
+    (&["B"], "Chapters"), (&["Z"], "Fit, fill, stretch"),
     (&["[", "]", "\\"], "Slower, faster, normal speed"), (&["I"], "Details"), (&["H", "?"], "Show or hide shortcuts"),
     (&["N"], "Next episode"), (&["Esc"], "Close panel, leave fullscreen, or close player"), (&["Q"], "Close player"),
     (&["F"], "Fullscreen"), (&["Tab"], "Next control; Shift+Tab goes back"),
@@ -21,6 +22,14 @@ pub const ANDROID: bool = cfg!(target_os = "android");
 /// The skip the player offers for a segment: credits only lead to the next episode.
 pub fn offer(segments: &[Segment], position: f64, has_next: bool) -> Option<Segment> {
     engine::skip_offer(segments, position).filter(|g| g.kind != SegmentKind::Credits || has_next)
+}
+
+/// Whether the floating "Up Next" auto-play countdown card should appear.
+pub fn up_next_due(position: f64, duration: f64, ended: bool, segments: &[Segment], has_next: bool, dismissed: bool) -> bool {
+    if !has_next || dismissed { return false; }
+    if ended { return true; }
+    if offer(segments, position, true).is_some_and(|g| g.kind == SegmentKind::Credits) { return true; }
+    duration > 180.0 && (duration - position) <= 25.0 && position > 0.0
 }
 
 pub fn skip(live: &engine::Live, g: Segment) {
@@ -51,19 +60,60 @@ pub enum Fallback {
 /// file can flag a default subtitle regardless), otherwise full subtitles in that language (text
 /// before image, never forced-only signs), else a download. Untagged audio says nothing, so the
 /// file's own choice stays.
+#[cfg(test)]
 pub fn fallback(tracks: &[engine::Track], key: Option<&str>) -> Fallback {
-    let Some(key) = key else { return Fallback::Off(None) };
+    fallback_with_pref(tracks, key, None).1
+}
+
+/// Per-series remembered audio/subtitle language preference takes priority over the global
+/// Audio-language setting when matching tracks exist in the current episode.
+/// Returns `(explicit_audio_id, subtitle_action)`.
+pub fn fallback_with_pref(tracks: &[engine::Track], global_key: Option<&str>, pref: Option<&backend::TrackPref>) -> (Option<i64>, Fallback) {
+    let audio_tracks: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
+    if let Some(p) = pref {
+        let mut chosen_audio = None;
+        if let Some(al) = p.audio_lang.as_deref() {
+            if let Some(t) = audio_tracks.iter().find(|t| lang_matches(&t.lang, al)) {
+                chosen_audio = Some(t.id);
+            }
+        }
+        if p.sub_off {
+            return (chosen_audio, Fallback::Off(chosen_audio));
+        }
+        if let Some(sl) = p.sub_lang.as_deref() {
+            let full = |t: &&engine::Track| !t.audio && !t.forced && lang_matches(&t.lang, sl);
+            if let Some(t) = tracks.iter().filter(full).find(|t| !t.image).or_else(|| tracks.iter().find(full)) {
+                return (chosen_audio, Fallback::Embedded(t.id));
+            }
+            return (chosen_audio, Fallback::Download);
+        }
+        if chosen_audio.is_some() {
+            return (chosen_audio, Fallback::Off(chosen_audio));
+        }
+    }
+    let Some(key) = global_key else { return (None, Fallback::Off(None)) };
     let in_language = |t: &engine::Track| backend::track_in_language(&t.lang, key);
-    let audio: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
-    if audio.is_empty() { return Fallback::Nothing; }
-    if let Some(t) = audio.iter().find(|t| in_language(t)) { return Fallback::Off(Some(t.id)); }
-    if audio.iter().any(|t| t.lang.is_empty()) { return Fallback::Nothing; }
-    if tracks.iter().any(|t| !t.audio && t.selected && !t.forced && in_language(t)) { return Fallback::Nothing; }
+    if audio_tracks.is_empty() { return (None, Fallback::Nothing); }
+    if let Some(t) = audio_tracks.iter().find(|t| in_language(t)) { return (Some(t.id), Fallback::Off(Some(t.id))); }
+    if audio_tracks.iter().any(|t| t.lang.is_empty()) { return (None, Fallback::Nothing); }
+    if tracks.iter().any(|t| !t.audio && t.selected && !t.forced && in_language(t)) { return (None, Fallback::Nothing); }
     let full = |t: &&engine::Track| !t.audio && !t.forced && in_language(t);
     match tracks.iter().filter(full).find(|t| !t.image).or_else(|| tracks.iter().find(full)) {
-        Some(t) => Fallback::Embedded(t.id),
-        None => Fallback::Download,
+        Some(t) => (None, Fallback::Embedded(t.id)),
+        None => (None, Fallback::Download),
     }
+}
+
+fn lang_matches(track_lang: &str, wanted: &str) -> bool {
+    if track_lang.is_empty() || wanted.is_empty() { return false; }
+    if track_lang.eq_ignore_ascii_case(wanted) { return true; }
+    let base_t = track_lang.split(['-', '_']).next().unwrap_or(track_lang);
+    let base_w = wanted.split(['-', '_']).next().unwrap_or(wanted);
+    if base_t.eq_ignore_ascii_case(base_w) { return true; }
+    crate::addons::LANGUAGES.iter().any(|l| {
+        (l.key.eq_ignore_ascii_case(wanted) || l.codes.iter().any(|c| c.eq_ignore_ascii_case(base_w)))
+            && l.codes.iter().any(|c| c.eq_ignore_ascii_case(base_t))
+    })
 }
 
 /// File details, plainly: what is decoded, how, and what the screen shows.
@@ -131,5 +181,26 @@ mod tests {
         assert_eq!(super::clock(605.4), "10:05");
         assert_eq!(super::clock(3725.0), "1:02:05");
         assert_eq!(super::clock(-3.0), "0:00");
+    }
+
+    #[test]
+    fn per_series_track_memory_overrides_global_language() {
+        let tracks = vec![track(1, true, "eng"), track(2, true, "jpn"), track(3, false, "eng"), track(4, false, "ita")];
+        let pref = crate::backend::TrackPref { audio_lang: Some("jpn".into()), sub_lang: Some("eng".into()), sub_off: false };
+        assert_eq!(super::fallback_with_pref(&tracks, Some("italian"), Some(&pref)), (Some(2), Fallback::Embedded(3)));
+        let off = crate::backend::TrackPref { audio_lang: Some("eng".into()), sub_lang: None, sub_off: true };
+        assert_eq!(super::fallback_with_pref(&tracks, Some("italian"), Some(&off)), (Some(1), Fallback::Off(Some(1))));
+    }
+
+    #[test]
+    fn up_next_triggers_on_credits_tail_or_eof_until_dismissed() {
+        use crate::engine::{Segment, SegmentKind};
+        let credits = [Segment { kind: SegmentKind::Credits, start: 1300.0, end: 1380.0 }];
+        assert!(!super::up_next_due(600.0, 1400.0, false, &credits, true, false));
+        assert!(super::up_next_due(1310.0, 1400.0, false, &credits, true, false));
+        assert!(super::up_next_due(1380.0, 1400.0, false, &[], true, false));
+        assert!(super::up_next_due(1400.0, 1400.0, true, &[], true, false));
+        assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, false, false));
+        assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, true, true));
     }
 }

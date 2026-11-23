@@ -51,6 +51,10 @@ pub enum SegmentKind { Intro, Recap, Credits }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Segment { pub kind: SegmentKind, pub start: f64, pub end: f64 }
 
+/// A named chapter in the file (from mpv's `chapter-list`), for seekbar ticks and the chapter picker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chapter { pub title: String, pub start: f64 }
+
 /// What the screen can show, as the platform declares it (Android's display, Windows' DXGI
 /// output the window is on); Linux output is SDR. `peak_nits`: the panel's peak, 0 if unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -95,6 +99,20 @@ pub struct State {
     pub segments: Vec<Segment>,
     /// The same from the online databases (IntroDB, AniSkip), for what the chapters don't name.
     pub online_segments: Vec<Segment>,
+    /// All chapters from the container, sorted by start time.
+    pub chapters: Vec<Chapter>,
+    /// Subtitle timing offset in seconds (positive delays subtitles).
+    pub sub_delay: f64,
+    /// Audio timing offset in seconds (positive delays audio).
+    pub audio_delay: f64,
+    /// Subtitle scale (0.6..=2.0).
+    pub sub_scale: f64,
+    /// Subtitle vertical position percent (70..=100).
+    pub sub_pos: i32,
+    /// Subtle dark pill behind subtitles.
+    pub sub_bg: bool,
+    /// Container frame rate (0 until known), used for Android TV/tablet refresh-rate matching.
+    pub fps: f64,
 }
 
 impl State {
@@ -142,10 +160,18 @@ impl Live {
         let (lock, cv) = &self.ready;
         if let Ok(mut r) = lock.lock() { *r = true; cv.notify_all(); }
     }
-    fn wait_ready(&self, timeout: Duration) -> bool {
+    fn wait_ready(&self, timeout: Duration, stop: &PlayerHandle) -> bool {
         let (lock, cv) = &self.ready;
-        let Ok(guard) = lock.lock() else { return false };
-        cv.wait_timeout_while(guard, timeout, |r| !*r).map(|(r, _)| *r).unwrap_or(false)
+        let deadline = Instant::now() + timeout;
+        let Ok(mut guard) = lock.lock() else { return false };
+        while !*guard {
+            if stop.stopped() || self.finish.lock().is_ok_and(|f| f.is_some()) { return false; }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return false };
+            let step = remaining.min(Duration::from_millis(200));
+            let Ok((g, _)) = cv.wait_timeout(guard, step) else { return false };
+            guard = g;
+        }
+        true
     }
 
     // ------------------------------------------------------------ commands from the controls
@@ -154,11 +180,40 @@ impl Live {
         if s.ended { let _ = self.mpv.command("seek", &["0", "absolute"]); }
         let _ = self.mpv.set_property("pause", !s.paused);
     }
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn set_paused(&self, paused: bool) { let _ = self.mpv.set_property("pause", paused); }
     pub fn seek_by(&self, seconds: f64) { let _ = self.mpv.command("seek", &[&format!("{seconds}"), "relative+exact"]); }
     pub fn seek_to(&self, seconds: f64) { let _ = self.mpv.command("seek", &[&format!("{:.3}", seconds.max(0.0)), "absolute"]); }
     pub fn set_speed(&self, speed: f64) { let _ = self.mpv.set_property("speed", speed); }
     pub fn set_volume(&self, volume: f64) { let _ = self.mpv.set_property("volume", volume.clamp(0.0, 130.0)); let _ = self.mpv.set_property("mute", false); }
     pub fn toggle_mute(&self) { let _ = self.mpv.set_property("mute", !self.state().muted); }
+    pub fn set_sub_delay(&self, seconds: f64) {
+        let v = (seconds * 100.0).round() / 100.0;
+        let _ = self.mpv.set_property("sub-delay", v);
+        self.update(|s| { let c = (s.sub_delay - v).abs() > 0.001; s.sub_delay = v; c });
+    }
+    pub fn set_audio_delay(&self, seconds: f64) {
+        let v = (seconds * 100.0).round() / 100.0;
+        let _ = self.mpv.set_property("audio-delay", v);
+        self.update(|s| { let c = (s.audio_delay - v).abs() > 0.001; s.audio_delay = v; c });
+    }
+    pub fn set_sub_scale(&self, scale: f64) {
+        let v = ((scale * 20.0).round() / 20.0).clamp(0.6, 2.0);
+        let _ = self.mpv.set_property("sub-scale", v);
+        self.update(|s| { let c = (s.sub_scale - v).abs() > 0.001; s.sub_scale = v; c });
+        backend::update_settings(|cfg| cfg.sub_scale = v);
+    }
+    pub fn set_sub_pos(&self, pos: i32) {
+        let v = pos.clamp(70, 100);
+        let _ = self.mpv.set_property("sub-pos", v as i64);
+        self.update(|s| { let c = s.sub_pos != v; s.sub_pos = v; c });
+        backend::update_settings(|cfg| cfg.sub_pos = v);
+    }
+    pub fn set_sub_bg(&self, on: bool) {
+        let _ = self.mpv.set_property("sub-back-color", if on { "#A8000000" } else { "#00000000" });
+        self.update(|s| { let c = s.sub_bg != on; s.sub_bg = on; c });
+        backend::update_settings(|cfg| cfg.sub_bg = on);
+    }
     pub fn select(&self, audio: bool, id: Option<i64>) {
         let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
         let _ = self.mpv.set_property(if audio { "aid" } else { "sid" }, value.as_str());
@@ -229,6 +284,7 @@ impl Live {
     }
     pub fn finish(&self, how: Finish) {
         if let Ok(mut f) = self.finish.lock() { if f.is_none() { *f = Some(how); } }
+        self.ready.1.notify_all();
         let _ = self.mpv.command("quit", &[]);
     }
 }
@@ -237,8 +293,13 @@ impl Live {
 pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle) -> anyhow::Result<()> {
     let screen = crate::display::screen();
     let direct = cfg!(target_os = "android");
-    let mpv = create(&req, direct)?;
-    let (state, _) = watch::channel(State { speed: 1.0, volume: 100.0, direct, ..Default::default() });
+    let cfg = backend::load_settings();
+    let mpv = create(&req, direct, &cfg)?;
+    let (state, _) = watch::channel(State {
+        speed: 1.0, volume: 100.0, direct,
+        sub_scale: cfg.sub_scale, sub_pos: cfg.sub_pos, sub_bg: cfg.sub_bg,
+        ..Default::default()
+    });
     let live = Arc::new(Live { mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
     if let Ok(mut a) = ACTIVE.lock() { *a = Some(live.clone()); }
     let _ = events.send(PlayerEvent::Attached(LiveRef(live.clone())));
@@ -247,7 +308,7 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
 }
 
 
-fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
+fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::Result<Mpv> {
     #[cfg(target_os = "windows")]
     let hdr_output = backend::hdr_output();
     // libmpv refuses to start unless numbers parse the C way; GTK/WebKit set the user's locale.
@@ -268,6 +329,10 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         o.set_property("hr-seek", "yes")?;
         o.set_property("cache", "yes")?;
         o.set_property("demuxer-max-back-bytes", "64MiB")?;
+        // Smooth lookahead and resilient HTTP streaming over Wi-Fi / CDN resets.
+        let _ = o.set_property("demuxer-readahead-secs", 60i64);
+        let _ = o.set_property("network-timeout", 20.0f64);
+        let _ = o.set_property("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=5");
         // HDR on an SDR target: per-scene peak detection (what HDR10+ metadata is for) and the default curve.
         o.set_property("hdr-compute-peak", "yes")?;
         // Your language's audio first, when the file has it (a MULTI or dual-audio release);
@@ -284,7 +349,9 @@ fn create(req: &PlayRequest, direct: bool) -> anyhow::Result<Mpv> {
         o.set_property("sub-font", "sans-serif")?;
         o.set_property("sub-color", "#F2EFEA")?;
         o.set_property("sub-border-color", "#DD000000")?;
-        o.set_property("sub-scale", 1.05)?;
+        o.set_property("sub-scale", cfg.sub_scale)?;
+        let _ = o.set_property("sub-pos", cfg.sub_pos as i64);
+        if cfg.sub_bg { let _ = o.set_property("sub-back-color", "#A8000000"); }
         if req.start_ms > 0 { o.set_property("start", format!("+{}", req.start_ms as f64 / 1000.0).as_str())?; }
         // Certificates are checked everywhere (mpv's default is not to): Android with mpv-android's CA
         // bundle below, Linux with the system's, Windows through Schannel and the Windows store.
@@ -347,12 +414,13 @@ fn add_headers(mpv: &Mpv, headers: &[(String, String)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-const OBSERVED: [(&str, Format); 19] = [
+const OBSERVED: [(&str, Format); 21] = [
     ("chapter-list", Format::String),
     ("frame-drop-count", Format::Int64),
     ("time-pos", Format::Double), ("duration", Format::Double), ("demuxer-cache-time", Format::Double),
     ("pause", Format::Flag), ("paused-for-cache", Format::Flag), ("seeking", Format::Flag), ("eof-reached", Format::Flag),
     ("speed", Format::Double), ("volume", Format::Double), ("mute", Format::Flag), ("sub-text", Format::String),
+    ("sub-delay", Format::Double), ("audio-delay", Format::Double),
     ("hwdec-current", Format::String), ("video-format", Format::String), ("track-list", Format::String),
     ("aid", Format::String), ("sid", Format::String), ("core-idle", Format::Flag),
 ];
@@ -361,32 +429,59 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     let mpv = &live.mpv;
     let _ = mpv.disable_deprecated_events();
     for (i, (name, format)) in OBSERVED.iter().enumerate() { let _ = mpv.observe_property(name, *format, i as u64 + 1); }
-    if !live.wait_ready(Duration::from_secs(10)) { eprintln!("veylo: video surface not ready, opening anyway"); }
+    if !live.wait_ready(Duration::from_secs(10), &stop) {
+        if stop.stopped() || live.finish.lock().is_ok_and(|f| f.is_some()) {
+            if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
+            let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
+            let _ = events.send(PlayerEvent::Finished {
+                position_ms: 0, duration_ms: 0,
+                next: how == Finish::Next, another: matches!(how, Finish::Another | Finish::OtherLanguage),
+                language: how == Finish::OtherLanguage,
+            });
+            return;
+        }
+        eprintln!("veylo: video surface not ready, opening anyway");
+    }
     if let Err(e) = mpv.command("loadfile", &[live.request.url.as_str(), "replace"]) {
+        backend::report_issue_bg("playback_error", format!("mpv loadfile failed ({e})"),
+            format!("quality={:?} hdr={:?} direct={}", live.request.quality, live.request.hdr, live.state().direct));
         live.update(|s| { s.error = Some(format!("This source couldn't be opened ({e}).")); true });
     }
     let (mut position, mut duration, mut cache_end) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut paused_for_cache, mut seeking, mut paused, mut dropped) = (false, false, false, 0i64);
+    let (mut stall_count, mut perf_reported) = (0u32, false);
     // The chapters, kept to place the last one's end once the duration is known.
     let mut chapters = String::new();
-    let mark = |chapters: &str, duration: f64| { let found = segments(chapters, duration); live.update(|s| { let c = s.segments != found; s.segments = found; c }); };
+    let mark = |chapters: &str, duration: f64| {
+        let found = segments(chapters, duration);
+        let parsed = parse_chapters(chapters);
+        live.update(|s| {
+            let c = s.segments != found || s.chapters != parsed;
+            s.segments = found;
+            s.chapters = parsed;
+            c
+        });
+    };
     let (mut announced, mut quitting, mut played) = (false, false, false);
     let mut checkpoint = Instant::now();
     let mut target_check = Instant::now();
     // Time actually played since the last report (seeks don't count), so "watched" means watched.
     let (mut last_tick, mut measured, mut speed) = (None::<f64>, 0.0f64, 1.0f64);
+    let mut last_recorded_pos = -1.0f64;
     // The title's metadata goes with this session's first report and its last one.
     let mut sent_meta = false;
-    let record = |position: f64, duration: f64, measured: &mut f64, sent_meta: &mut bool, last: bool| if let Some((media, video)) = &live.request.record {
-        if position > 0.0 && duration > 0.0 {
+    let record = |position: f64, duration: f64, measured: &mut f64, sent_meta: &mut bool, last_recorded_pos: &mut f64, last: bool| if let Some((media, video)) = &live.request.record {
+        if position > 0.0 && duration > 0.0 && (last || *measured > 0.0 || (position - *last_recorded_pos).abs() >= 1.0) {
             backend::record_progress(media.clone(), video.clone(), (position * 1000.0) as i64, (duration * 1000.0) as i64,
                 (*measured * 1000.0) as i64, !*sent_meta || last);
             *measured = 0.0;
             *sent_meta = true;
+            *last_recorded_pos = position;
         }
     };
     loop {
         if stop.stopped() && !quitting { quitting = true; live.finish(Finish::Close); }
-        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured, &mut sent_meta, false); }
+        if checkpoint.elapsed() > Duration::from_secs(15) { checkpoint = Instant::now(); record(position, duration, &mut measured, &mut sent_meta, &mut last_recorded_pos, false); }
         // What mpv sends to the screen is known once it renders, and changes when Windows HDR is
         // switched or the window moves to another screen: follow it, and say so.
         if target_check.elapsed() > Duration::from_secs(2) {
@@ -415,11 +510,13 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 let target: String = mpv.get_property("video-target-params/gamma").unwrap_or_default();
                 let codec: String = mpv.get_property("video-format").unwrap_or_default();
                 let hwdec: String = mpv.get_property("hwdec-current").unwrap_or_default();
+                let fps = mpv.get_property::<f64>("container-fps").unwrap_or(0.0);
                 live.update(|s| {
                     s.width = w; s.height = h; s.aspect = if dw > 0 && dh > 0 { dw as f64 / dh as f64 } else { 0.0 };
-                    s.transfer = transfer; s.target_transfer = target; s.codec = codec; s.hwdec = hwdec; true
+                    s.transfer = transfer; s.target_transfer = target; s.codec = codec; s.hwdec = hwdec; s.fps = fps; true
                 });
                 crate::video::layout(&live);
+                if fps > 10.0 && fps < 240.0 { crate::video::set_frame_rate(fps); }
                 // A subtitle chosen by default gets the same treatment as one picked by hand.
                 let sid = live.state().tracks.iter().find(|t| !t.audio && t.selected).map(|t| t.id);
                 if sid.is_some() { live.fit_subtitles(sid); }
@@ -439,37 +536,96 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                     last_tick = Some(v);
                     position = v;
                     if v > 1.0 { played = true; }
-                    live.update(|s| { let moved = (s.position - v).abs() >= 0.25; if moved { s.position = v; s.buffered = (cache_end - v).max(0.0); } moved });
+                    live.update(|s| {
+                        let moved = (s.position - v).abs() >= 0.25 || s.dropped != dropped;
+                        if moved { s.position = v; s.buffered = (cache_end - v).max(0.0); s.dropped = dropped; }
+                        moved
+                    });
                 }
                 ("duration", PropertyData::Double(v)) => { duration = v; live.update(|s| { s.duration = v; true }); mark(&chapters, duration); }
                 ("chapter-list", PropertyData::Str(j)) => { chapters = j.to_owned(); mark(&chapters, duration); }
-                ("demuxer-cache-time", PropertyData::Double(v)) => cache_end = v,
-                ("pause", PropertyData::Flag(v)) => live.update(|s| { s.paused = v; true }),
+                ("demuxer-cache-time", PropertyData::Double(v)) => {
+                    cache_end = v;
+                    if paused || paused_for_cache || seeking {
+                        let buf = (cache_end - position).max(0.0);
+                        live.update(|s| { let c = (s.buffered - buf).abs() >= 1.0; if c { s.buffered = buf; } c });
+                    }
+                }
+                ("pause", PropertyData::Flag(v)) => {
+                    paused = v;
+                    live.update(|s| { s.paused = v; true });
+                    #[cfg(target_os = "android")]
+                    let _ = crate::android::video_media_state(!v, (position * 1000.0) as i64, speed as f32);
+                }
                 ("paused-for-cache", PropertyData::Flag(v)) => {
+                    if v && played && !paused_for_cache { stall_count += 1; }
+                    paused_for_cache = v;
                     #[cfg(target_os = "android")]
                     crate::android::log(&format!("{} at {position:.1}s", if v { "buffering" } else { "buffered" }));
-                    live.update(|s| { s.buffering = v; true })
+                    let buf = paused_for_cache || seeking;
+                    live.update(|s| { let c = s.buffering != buf; s.buffering = buf; c });
+                    if !perf_reported && stall_count >= 3 {
+                        perf_reported = true;
+                        let s = live.state();
+                        backend::report_issue_bg("performance",
+                            format!("Repeated buffering stalls ({stall_count}x)"),
+                            format!("codec={} {}x{} fps={:.2} hwdec={} direct={} dropped={} stalls={stall_count}",
+                                s.codec, s.width, s.height, s.fps, s.hwdec, s.direct, dropped));
+                    }
                 }
-                ("seeking", PropertyData::Flag(v)) => live.update(|s| { let c = s.buffering != v; s.buffering = v; c }),
+                ("seeking", PropertyData::Flag(v)) => {
+                    seeking = v;
+                    let buf = paused_for_cache || seeking;
+                    live.update(|s| { let c = s.buffering != buf; s.buffering = buf; c })
+                }
                 ("eof-reached", PropertyData::Flag(true)) if played => {
                     live.update(|s| { s.ended = true; true });
-                    // The end of an episode moves on; anything else closes, as on Android.
-                    live.finish(if live.request.has_next { Finish::Next } else { Finish::Close });
+                    // If there is no next episode (or auto-next is disabled), close cleanly right away.
+                    // With a next episode and auto-next on, the UI runs the short "Up Next" countdown.
+                    if !live.request.has_next {
+                        live.finish(Finish::Close);
+                    } else if !backend::load_settings().auto_next {
+                        live.finish(Finish::Next);
+                    }
                 }
                 ("eof-reached", PropertyData::Flag(false)) => live.update(|s| { let c = s.ended; s.ended = false; c }),
-                ("frame-drop-count", PropertyData::Int64(v)) => live.update(|s| { let c = s.dropped != v; s.dropped = v; c }),
-                ("speed", PropertyData::Double(v)) => { speed = v; live.update(|s| { s.speed = v; true }) }
+                // Synced into State on time-pos ticks so a struggling decoder never causes a UI re-render storm.
+                ("frame-drop-count", PropertyData::Int64(v)) => {
+                    dropped = v;
+                    if !perf_reported && played && dropped >= 30 {
+                        perf_reported = true;
+                        let s = live.state();
+                        backend::report_issue_bg("performance",
+                            format!("High frame drops ({dropped}) during {} {} playback", s.codec, crate::player::resolution_label(s.width, s.height)),
+                            format!("codec={} {}x{} fps={:.2} hwdec={} direct={} transfer={} dropped={dropped}",
+                                s.codec, s.width, s.height, s.fps, s.hwdec, s.direct, s.transfer));
+                    }
+                }
+                ("speed", PropertyData::Double(v)) => {
+                    speed = v;
+                    live.update(|s| { s.speed = v; true });
+                    #[cfg(target_os = "android")]
+                    let _ = crate::android::video_media_state(!paused, (position * 1000.0) as i64, speed as f32);
+                }
                 ("volume", PropertyData::Double(v)) => live.update(|s| { s.volume = v; true }),
                 ("mute", PropertyData::Flag(v)) => live.update(|s| { s.muted = v; true }),
+                ("sub-delay", PropertyData::Double(v)) => live.update(|s| { let c = (s.sub_delay - v).abs() > 0.001; s.sub_delay = v; c }),
+                ("audio-delay", PropertyData::Double(v)) => live.update(|s| { let c = (s.audio_delay - v).abs() > 0.001; s.audio_delay = v; c }),
                 ("sub-text", PropertyData::Str(t)) => { let t = t.to_owned(); live.update(|s| { let c = s.subtitle != t; s.subtitle = t; c }) }
                 ("sub-text", PropertyData::None) => live.update(|s| { let c = !s.subtitle.is_empty(); s.subtitle.clear(); c }),
                 ("hwdec-current", PropertyData::Str(t)) => { let t = t.to_owned(); live.update(|s| { s.hwdec = t; true }) }
+                ("track-list", PropertyData::Str(j)) => refresh_tracks_from_json(&live, j),
                 ("track-list" | "aid" | "sid", _) => refresh_tracks(&live),
                 _ => {}
             },
             Ok(Event::EndFile(reason)) if reason == mpv_end_file_reason::Error && !quitting => {
                 #[cfg(target_os = "android")]
                 crate::android::log("end-file: error");
+                let s = live.state();
+                backend::report_issue_bg("playback_error",
+                    if played { "Playback stopped mid-stream (EndFile::Error)" } else { "Stream failed to start (EndFile::Error)" },
+                    format!("pos={position:.1}s codec={} {}x{} hwdec={} direct={} transfer={} dropped={dropped}",
+                        s.codec, s.width, s.height, s.hwdec, s.direct, s.transfer));
                 live.update(|s| { s.error = Some(if played { "The stream stopped." } else { "This source couldn't be played." }.into()); true });
             }
             Ok(Event::Shutdown) => break,
@@ -477,7 +633,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         }
         if live.finish.lock().map(|f| f.is_some()).unwrap_or(false) { quitting = true; }
     }
-    record(position, duration, &mut measured, &mut sent_meta, true);
+    record(position, duration, &mut measured, &mut sent_meta, &mut last_recorded_pos, true);
     if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
     let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
     let _ = events.send(PlayerEvent::Finished {
@@ -489,9 +645,27 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
 
 fn refresh_tracks(live: &Live) {
     let json: String = live.mpv.get_property("track-list").unwrap_or_default();
-    let tracks = parse_tracks(&json);
-    let dv = dv_profile(&json);
+    refresh_tracks_from_json(live, &json);
+}
+
+fn refresh_tracks_from_json(live: &Live, json: &str) {
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    let tracks = parse_tracks_list(&list);
+    let dv = dv_profile_list(&list);
     live.update(|s| { let c = s.tracks != tracks || s.dv_profile != dv; s.tracks = tracks; s.dv_profile = dv; c });
+}
+
+/// All chapters from mpv's `chapter-list` (JSON), sorted chronologically with sensible fallback names.
+pub fn parse_chapters(json: &str) -> Vec<Chapter> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    let mut out: Vec<Chapter> = list.iter().enumerate().filter_map(|(i, c)| {
+        let start = c["time"].as_f64()?.max(0.0);
+        let raw = c["title"].as_str().unwrap_or("").trim();
+        let title = if raw.is_empty() { format!("Chapter {}", i + 1) } else { raw.to_owned() };
+        Some(Chapter { title, start })
+    }).collect();
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
 }
 
 /// Intro, recap and credits from mpv's `chapter-list` (JSON). A chapter runs to the next one's
@@ -544,14 +718,18 @@ pub fn played_between(prev: f64, now: f64, speed: f64) -> f64 {
 }
 
 /// The selected video track's Dolby Vision profile, 0 without one.
-pub fn dv_profile(json: &str) -> i64 {
-    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+fn dv_profile_list(list: &[serde_json::Value]) -> i64 {
     list.iter().find(|t| t["type"] == "video" && t["selected"] == true)
         .and_then(|t| t["dolby-vision-profile"].as_i64()).unwrap_or(0)
 }
 
+#[cfg(test)]
 pub fn parse_tracks(json: &str) -> Vec<Track> {
     let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    parse_tracks_list(&list)
+}
+
+fn parse_tracks_list(list: &[serde_json::Value]) -> Vec<Track> {
     list.iter().filter_map(|t| {
         let audio = match t["type"].as_str()? { "audio" => true, "sub" => false, _ => return None };
         let id = t["id"].as_i64()?;
@@ -752,6 +930,11 @@ mod tests {
         assert_eq!(segments(r#"[{"title":"Story","time":30},{"title":"Intro","time":0}]"#, 600.0),
             vec![Segment { kind: SegmentKind::Intro, start: 0.0, end: 30.0 }]);
         assert!(segments("", 100.0).is_empty());
+        let ch = parse_chapters(r#"[{"title":"Act 2","time":300},{"title":"","time":0}]"#);
+        assert_eq!(ch, vec![
+            Chapter { title: "Chapter 2".into(), start: 0.0 },
+            Chapter { title: "Act 2".into(), start: 300.0 },
+        ]);
     }
     #[test]
     fn chapters_come_before_the_databases() {
@@ -799,15 +982,60 @@ mod tests {
     }
     #[test]
     fn tracks_read_like_a_menu() {
-        let json = r#"[{"id":1,"type":"video","codec":"hevc"},
+        let json = r#"[{"id":1,"type":"video","codec":"hevc","selected":true,"dolby-vision-profile":8},
             {"id":1,"type":"audio","lang":"eng","codec":"eac3","demux-channel-count":6,"selected":true},
             {"id":2,"type":"audio","lang":"ita","title":"Italiano","codec":"ac3","demux-channel-count":2},
-            {"id":1,"type":"sub","lang":"eng","codec":"hdmv_pgs_subtitle","image":true}]"#;
+            {"id":3,"type":"audio","lang":"und","title":"Director Commentary","codec":"aac","demux-channel-count":2},
+            {"id":1,"type":"sub","lang":"eng","codec":"hdmv_pgs_subtitle","image":true},
+            {"id":2,"type":"sub","lang":"ita","title":"Forced signs","codec":"ass","forced":true,"external":true}]"#;
+        let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert_eq!(dv_profile_list(&list), 8);
         let t = parse_tracks(json);
-        assert_eq!(t.len(), 3);
+        assert_eq!(t.len(), 5);
         assert_eq!(t[0].label, "English, 5.1, Dolby Digital Plus");
         assert!(t[0].selected && t[0].audio);
         assert_eq!(t[1].label, "Italiano, Stereo, Dolby Digital");
-        assert!(t[2].image && !t[2].audio);
+        assert!(t[2].lang.is_empty(), "undetermined language tags stay empty");
+        assert!(extra_audio(&t[2]), "commentary tracks are flagged as extra");
+        assert!(t[3].image && !t[3].audio);
+        assert!(t[4].styled && t[4].forced && t[4].label.contains("External"));
+    }
+
+    /// Against the real libmpv: streaming stability properties (HTTP reconnect, network timeout,
+    /// demuxer lookahead) are accepted and retained by the installed libmpv.
+    #[test]
+    fn streaming_resilience_options_reach_mpv() {
+        unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
+        let mpv = Mpv::with_initializer(|o| {
+            o.set_property("config", false)?;
+            o.set_property("vo", "null")?;
+            o.set_property("ao", "null")?;
+            o.set_property("demuxer-readahead-secs", 60i64)?;
+            o.set_property("network-timeout", 20.0f64)?;
+            o.set_property("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=5")?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(mpv.get_property::<i64>("demuxer-readahead-secs").unwrap(), 60);
+        assert!((mpv.get_property::<f64>("network-timeout").unwrap() - 20.0).abs() < 0.01);
+        let lavf: String = mpv.get_property("stream-lavf-o").unwrap();
+        assert!(lavf.contains("reconnect=1") && lavf.contains("reconnect_on_network_error=1"), "{lavf}");
+    }
+
+    /// Cancelling a session before its video surface attaches wakes wait_ready immediately.
+    #[test]
+    fn finish_wakes_wait_ready_without_blocking() {
+        unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
+        let mpv = Mpv::with_initializer(|o| { o.set_property("config", false)?; o.set_property("vo", "null")?; o.set_property("ao", "null")?; Ok(()) }).unwrap();
+        let (state, _) = watch::channel(State::default());
+        let live = Arc::new(Live { mpv, request: PlayRequest::default(), screen: None, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
+        let stop = PlayerHandle::default();
+        let live2 = live.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            live2.finish(Finish::Close);
+        });
+        let t0 = Instant::now();
+        assert!(!live.wait_ready(Duration::from_secs(10), &stop));
+        assert!(t0.elapsed() < Duration::from_secs(2), "wait_ready blocked for {:?}", t0.elapsed());
     }
 }

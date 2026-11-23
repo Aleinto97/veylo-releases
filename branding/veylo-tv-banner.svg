@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
+  <!-- Android TV launcher banner (320x180 dp): the mark and the name on the icon's warm black. -->
+  <defs>
+    <radialGradient id="bg" cx="0.2" cy="0.1" r="1.05">
+      <stop offset="0" stop-color="#26241f"/>
+      <stop offset="0.55" stop-color="#0d0c0b"/>
+      <stop offset="1" stop-color="#000"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="360" fill="url(#bg)"/>
+  <g transform="translate(116 106) scale(0.39) translate(-332 -324)">
+    <path d="M512 702 L692 324" stroke="#f2efea" stroke-opacity=".5" stroke-width="96" stroke-linecap="round"/>
+    <path d="M332 324 L512 702" stroke="#f2efea" stroke-width="96" stroke-linecap="round"/>
+  </g>
+  <text x="300" y="220" font-family="Archivo" font-weight="600" font-size="112" font-stretch="condensed" letter-spacing="-1" fill="#f2efea">Veylo</text>
+</svg>

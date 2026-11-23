@@ -2168,6 +2168,8 @@ async fn probe_accepts_only_real_film_sized_sources() {
     let film = probe("/film.mkv").await;
     assert_eq!(film["ok"], true);
     assert_eq!(film["bytes"], 20_864_945_180u64);
+    // Plain http test fixture must not populate https-only resolved_url.
+    assert!(film["resolved_url"].is_null());
     let uncached = probe("/resolve/uncached").await;
     assert_eq!(uncached["ok"], false);
     assert_eq!(uncached["debrid_status"], "downloading");

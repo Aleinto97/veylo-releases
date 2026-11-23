@@ -1,11 +1,45 @@
-//! Library as a viewing history: the last week as big cards, then every month as a grid.
-use crate::{backend::{self, Media, Seen}, components::PosterCard, icons, Shell};
+//! Library as a viewing history: the last week as big cards, then every month as a grid,
+//! with filters, in-library search, and offline downloads.
+use crate::{backend::{self, DownloadState, Media, Seen}, components::PosterCard, icons, Shell};
 use dioxus::prelude::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibFilter { All, Movies, Series, InProgress, Watched, Saved, Downloads }
+
+impl LibFilter {
+    const ALL: [LibFilter; 7] = [
+        LibFilter::All, LibFilter::Movies, LibFilter::Series,
+        LibFilter::InProgress, LibFilter::Watched, LibFilter::Saved, LibFilter::Downloads,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            LibFilter::All => "All",
+            LibFilter::Movies => "Movies",
+            LibFilter::Series => "Series",
+            LibFilter::InProgress => "In progress",
+            LibFilter::Watched => "Watched",
+            LibFilter::Saved => "Saved",
+            LibFilter::Downloads => "Downloads",
+        }
+    }
+    fn matches(self, m: &Media) -> bool {
+        match self {
+            LibFilter::All => true,
+            LibFilter::Movies => m.kind == "movie",
+            LibFilter::Series => m.kind != "movie",
+            LibFilter::InProgress => backend::in_progress(m),
+            LibFilter::Watched => m.watched,
+            LibFilter::Saved => m.saved,
+            LibFilter::Downloads => false,
+        }
+    }
+}
 
 #[component]
 pub fn Library() -> Element {
     // No title in front here: the accent goes back to neutral.
-    let mut lamp = use_context::<Shell>().lamp_source;
+    let shell = use_context::<Shell>();
+    let mut lamp = shell.lamp_source;
     use_hook(move || lamp.set(String::new()));
     let history = use_resource(|| async { backend::viewing_history().await });
     // Saved to watch (S or the bookmark on a title page), newest first as the store keeps them.
@@ -13,58 +47,164 @@ pub fn Library() -> Element {
     // Titles removed this visit vanish at once; the store already forgot them.
     let gone = use_signal(std::collections::HashSet::<String>::new);
     use_context_provider(|| Gone(gone));
+    let mut filter = use_signal(|| LibFilter::All);
+    let mut query = use_signal(String::new);
+    let mut downloads = use_signal(backend::list_downloads);
+    let mut active_dl = use_signal(backend::active_downloads);
+    // Poll active downloads gently while on Library so progress bars & newly completed files update live.
+    use_future(move || async move {
+        loop {
+            backend::sleep(1000).await;
+            let now_active = backend::active_downloads();
+            let prev_len = active_dl.peek().len();
+            if *active_dl.peek() != now_active { active_dl.set(now_active.clone()); }
+            if prev_len > 0 && now_active.len() < prev_len { downloads.set(backend::list_downloads()); }
+        }
+    });
+    let q = query().trim().to_lowercase();
+    let f = filter();
+    let text_match = |name: &str| q.is_empty() || name.to_lowercase().contains(&q);
     let now = backend::now_secs();
+    let dl_list: Vec<backend::DownloadEntry> = downloads.read().iter().filter(|d| text_match(&d.title)).cloned().collect();
+    let active_list: Vec<backend::DownloadProgress> = active_dl.read().iter().filter(|d| text_match(&d.title)).cloned().collect();
+    let show_downloads = f == LibFilter::Downloads || (f == LibFilter::All && (!dl_list.is_empty() || !active_list.is_empty()));
+    let show_saved = matches!(f, LibFilter::All | LibFilter::Saved | LibFilter::Movies | LibFilter::Series);
+    let show_history = f != LibFilter::Downloads && f != LibFilter::Saved;
     rsx! {
         div { class: "library",
             h1 { class: "display title", "Library" }
-            if let Some(list) = saved() {
-                if !list.is_empty() {
-                    section { class: "lib-section",
-                        div { class: "group-head", span { class: "group-icon", icons::Bookmark {} } span { class: "group-name", "Saved" }
-                            span { class: "tnum dim", "{list.len()}" } }
-                        div { class: "lib-grid",
-                            for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } } }
+            div { class: "lib-toolbar",
+                div { class: "lib-filters", role: "tablist", aria_label: "Filter library",
+                    for opt in LibFilter::ALL {
+                        button { key: "{opt.label()}", class: if f == opt { "pill accent small" } else { "pill glass small" },
+                            role: "tab", aria_selected: "{f == opt}",
+                            onclick: move |_| filter.set(opt),
+                            "{opt.label()}"
+                        }
+                    }
+                }
+                div { class: "lib-search",
+                    span { class: "sub-search-icon", aria_hidden: "true", icons::Search {} }
+                    input { r#type: "search", placeholder: "Filter library…", aria_label: "Filter library", value: "{query}",
+                        oninput: move |e| query.set(e.value()),
+                        onkeydown: move |e| e.stop_propagation(),
+                    }
+                    if !q.is_empty() {
+                        button { class: "bare sub-search-clear", aria_label: "Clear filter", onclick: move |_| query.set(String::new()), icons::Close {} }
+                    }
+                }
+            }
+            if show_downloads {
+                section { class: "lib-section",
+                    div { class: "group-head", span { class: "group-icon", icons::Download {} } span { class: "group-name", "Downloads" }
+                        span { class: "tnum dim", "{dl_list.len()}" } }
+                    if dl_list.is_empty() && active_list.is_empty() {
+                        p { class: "dim", "No offline downloads yet. Open any title's Sources list and tap Download." }
+                    }
+                    div { class: "addon-list",
+                        for job in active_list {
+                            {
+                                let pct = job.total.filter(|&t| t > 0).map(|t| (job.downloaded as f64 / t as f64 * 100.0).clamp(0.0, 100.0));
+                                let status = match &job.state {
+                                    DownloadState::Running => match (pct, job.total) {
+                                        (Some(p), Some(t)) => format!("{p:.0}% · {} / {}", backend::file_size_label(job.downloaded), backend::file_size_label(t)),
+                                        _ => format!("Downloading… {}", backend::file_size_label(job.downloaded)),
+                                    },
+                                    DownloadState::Failed(err) => format!("Failed: {err}"),
+                                };
+                                let key = job.key.clone();
+                                rsx! {
+                                    div { key: "dl-act-{job.key}", class: "addon-row glass",
+                                        span { class: "addon-name", "{job.title}" }
+                                        span { class: "dim tnum addon-offers", "{status}" }
+                                        span { class: "topbar-spacer" }
+                                        button { class: "pill glass small", onclick: move |_| { backend::cancel_download(&key); active_dl.set(backend::active_downloads()); }, icons::Close {} span { "Cancel" } }
+                                    }
+                                }
+                            }
+                        }
+                        for entry in dl_list {
+                            {
+                                let play_entry = entry.clone();
+                                let del_key = entry.key.clone();
+                                rsx! {
+                                    div { key: "dl-{entry.key}", class: "addon-row glass",
+                                        span { class: "addon-name", "{entry.title}" }
+                                        span { class: "dim tnum addon-offers", "{entry.subtitle} · {backend::file_size_label(entry.bytes)}" }
+                                        span { class: "topbar-spacer" }
+                                        button { class: "pill accent small", onclick: move |_| crate::title::play_offline(shell, play_entry.clone()), icons::Play {} span { "Play" } }
+                                        button { class: "pill glass small", aria_label: "Delete download", onclick: move |_| { let _ = backend::remove_download(&del_key); downloads.set(backend::list_downloads()); }, icons::Trash {} }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            match &*history.read() {
-                None => rsx! { div { class: "week-strip", for i in 0..3 { div { key: "{i}", class: "week-card skeleton-card" } } } },
-                Some(Err(e)) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
-                Some(Ok(list)) if list.is_empty() && saved().is_some_and(|s| !s.is_empty()) => rsx! {},
-                Some(Ok(list)) if list.is_empty() => rsx! {
-                    div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Stack {} } p { "Nothing watched yet" } } }
-                },
-                Some(Ok(list)) => {
-                    let list: Vec<Seen> = list.iter().filter(|s| !gone.read().contains(&s.media.key())).cloned().collect();
-                    let week: Vec<Seen> = list.iter().filter(|s| now - s.at < 7 * 86_400).cloned().collect();
-                    // Older viewing, grouped by calendar month, latest month first.
-                    let mut months: Vec<((i64, u32), Vec<Seen>)> = Vec::new();
-                    for s in list.iter().filter(|s| now - s.at >= 7 * 86_400) {
-                        let (y, m, _, _) = backend::civil(s.at);
-                        match months.last_mut() { Some((k, v)) if *k == (y, m) => v.push(s.clone()), _ => months.push(((y, m), vec![s.clone()])) }
-                    }
-                    let this_year = backend::civil(now).0;
-                    rsx! {
-                        if !week.is_empty() {
-                            section { class: "lib-section",
-                                div { class: "group-head", span { class: "group-icon", icons::Clock {} } span { class: "group-name", "This week" }
-                                    span { class: "tnum dim", "{week.len()}" } }
-                                div { class: "week-strip",
-                                    // Only the first few ask for their sources ahead: the ones Resume is likeliest on.
-                                    for (i, s) in week.into_iter().enumerate() { WeekCard { key: "{s.media.key()}", seen: s.clone(), now, ahead: i < 2 } }
+            if show_saved {
+                if let Some(list) = saved() {
+                    {
+                        let list: Vec<Media> = list.into_iter().filter(|m| !gone.read().contains(&m.key()) && f.matches(m) && text_match(&m.name)).collect();
+                        rsx! {
+                            if !list.is_empty() {
+                                section { class: "lib-section",
+                                    div { class: "group-head", span { class: "group-icon", icons::Bookmark {} } span { class: "group-name", "Saved" }
+                                        span { class: "tnum dim", "{list.len()}" } }
+                                    div { class: "lib-grid",
+                                        for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } } }
+                                    }
                                 }
+                            } else if f == LibFilter::Saved {
+                                p { class: "dim", "No saved titles match." }
                             }
                         }
-                        for ((y, m), items) in months {
-                            section { class: "lib-section", key: "{y}-{m}",
-                                div { class: "group-head",
-                                    span { class: "group-icon", icons::Calendar {} }
-                                    span { class: "group-name", if y == this_year { "{backend::month_name(m)}" } else { "{backend::month_name(m)} {y}" } }
-                                    span { class: "tnum dim", "{items.len()}" }
+                    }
+                }
+            }
+            if show_history {
+                match &*history.read() {
+                    None => rsx! { div { class: "week-strip", for i in 0..3 { div { key: "{i}", class: "week-card skeleton-card" } } } },
+                    Some(Err(e)) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
+                    Some(Ok(list)) if list.is_empty() && saved().is_some_and(|s| !s.is_empty()) => rsx! {},
+                    Some(Ok(list)) if list.is_empty() => rsx! {
+                        div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Stack {} } p { "Nothing watched yet" } } }
+                    },
+                    Some(Ok(list)) => {
+                        let list: Vec<Seen> = list.iter()
+                            .filter(|s| !gone.read().contains(&s.media.key()) && f.matches(&s.media) && text_match(&s.media.name))
+                            .cloned().collect();
+                        let week: Vec<Seen> = list.iter().filter(|s| now - s.at < 7 * 86_400).cloned().collect();
+                        // Older viewing, grouped by calendar month, latest month first.
+                        let mut months: Vec<((i64, u32), Vec<Seen>)> = Vec::new();
+                        for s in list.iter().filter(|s| now - s.at >= 7 * 86_400) {
+                            let (y, m, _, _) = backend::civil(s.at);
+                            match months.last_mut() { Some((k, v)) if *k == (y, m) => v.push(s.clone()), _ => months.push(((y, m), vec![s.clone()])) }
+                        }
+                        let this_year = backend::civil(now).0;
+                        rsx! {
+                            if list.is_empty() {
+                                p { class: "dim", "No titles match this filter." }
+                            }
+                            if !week.is_empty() {
+                                section { class: "lib-section",
+                                    div { class: "group-head", span { class: "group-icon", icons::Clock {} } span { class: "group-name", "This week" }
+                                        span { class: "tnum dim", "{week.len()}" } }
+                                    div { class: "week-strip",
+                                        // Only the first few ask for their sources ahead: the ones Resume is likeliest on.
+                                        for (i, s) in week.into_iter().enumerate() { WeekCard { key: "{s.media.key()}", seen: s.clone(), now, ahead: i < 2 } }
+                                    }
                                 }
-                                div { class: "lib-grid",
-                                    for s in items { div { key: "{s.media.key()}", class: "lib-item", PosterCard { media: s.media.clone() } Forget { media: s.media.clone() } } }
+                            }
+                            for ((y, m), items) in months {
+                                section { class: "lib-section", key: "{y}-{m}",
+                                    div { class: "group-head",
+                                        span { class: "group-icon", icons::Calendar {} }
+                                        span { class: "group-name", if y == this_year { "{backend::month_name(m)}" } else { "{backend::month_name(m)} {y}" } }
+                                        span { class: "tnum dim", "{items.len()}" }
+                                    }
+                                    div { class: "lib-grid",
+                                        for s in items { div { key: "{s.media.key()}", class: "lib-item", PosterCard { media: s.media.clone() } Forget { media: s.media.clone() } } }
+                                    }
                                 }
                             }
                         }

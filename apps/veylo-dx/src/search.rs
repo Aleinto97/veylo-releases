@@ -18,15 +18,15 @@ pub fn SearchOverlay() -> Element {
 
     // Each keystroke supersedes the previous request; only the latest may write.
     let mut run = move |q: String, delay: u64| {
-        let id = generation() + 1;
+        let id = *generation.peek() + 1;
         generation.set(id);
         spawn(async move {
             if delay > 0 { backend::sleep(delay).await; }
-            if generation() != id { return; }
+            if *generation.peek() != id { return; }
             if q.trim().is_empty() { outcome.set(None); searching.set(false); error.set(None); return; }
             searching.set(true);
             let result = backend::search(q).await;
-            if generation() != id { return; }
+            if *generation.peek() != id { return; }
             searching.set(false);
             match result {
                 Ok(o) => { error.set(None); outcome.set(Some(o)); }
@@ -54,11 +54,7 @@ pub fn SearchOverlay() -> Element {
     use_hook(move || if let Some(q) = shell.search_query.take() { spawn(async move { query.set(q.clone()); run(q, 0); }); });
     let q = query();
     let results = outcome.read().as_ref().map(|o| o.results.clone()).unwrap_or_default();
-    let several_addons = {
-        let mut names: Vec<&String> = results.iter().map(|(a, _)| a).collect();
-        names.dedup();
-        names.len() > 1
-    };
+    let several_addons = results.first().is_some_and(|(first, _)| results.iter().any(|(a, _)| a != first));
     let top = results.first().filter(|(_, m)| backend::search_rank(&q, &m.name) <= 3).cloned();
     let mut groups: Vec<(String, Vec<Media>)> = Vec::new();
     for (_, m) in results.iter().filter(|(_, m)| Some(m.key()) != top.as_ref().map(|(_, t)| t.key())) {

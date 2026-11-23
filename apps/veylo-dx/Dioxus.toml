@@ -21,6 +21,9 @@ gradle_dependencies = [
 ]
 
 # Updates: Veylo installs a downloaded release through PackageInstaller (android/kotlin/VeyloUpdate.kt).
+# Android TV: no touchscreen needed, and TV is supported without being required (banner: build.rs).
 [android.raw]
-manifest = """<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />"""
+manifest = """<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />"""
 

@@ -56,7 +56,7 @@ pub fn AccountBlock() -> Element {
                     }
                     div { class: "setting-row glass",
                         div { class: "setting-copy", span { class: "setting-name", "What syncs" }
-                            span { class: "dim setting-about", "Your library, where you are in each film and episode, what you watched, and your likes. Every device signed in to this account shares them." } }
+                            span { class: "dim setting-about", "Your library, where you are in each film and episode, what you watched, your likes, API keys and add-ons. Every device signed in to this account shares them automatically." } }
                     }
                     if cfg!(target_os = "android") {
                         div { class: "setting-row glass",
@@ -186,6 +186,32 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
                 span { class: "dim setting-about", "There: Settings → Account → Scan its code. This computer signs in to the same account." }
                 if let Some(p) = problem() { span { class: "addon-problem", icons::Alert {} span { "{p}" } } }
                 button { class: "pill glass", onclick: move |_| round += 1, icons::Refresh {} span { "New code" } }
+            }
+        }
+    }
+}
+
+/// Confirmation toast when your synced API keys and add-ons arrive automatically on this device.
+#[component]
+pub fn KeysPrompt() -> Element {
+    let mut arrived = use_signal(|| None::<String>);
+    use_future(move || async move {
+        loop {
+            if let Some(from) = backend::take_keys_arrived() {
+                arrived.set(Some(from));
+                spawn(async move { backend::sleep(7000).await; arrived.set(None); });
+            }
+            backend::sleep(2000).await;
+        }
+    });
+    rsx! {
+        if let Some(from) = arrived() {
+            div { class: "toast glass", role: "status",
+                span { class: "lamp", icons::Check {} }
+                span { class: "toast-title",
+                    if from.is_empty() { "Your keys and add-ons synced to this device" }
+                    else { "Your keys and add-ons arrived from {from}" }
+                }
             }
         }
     }

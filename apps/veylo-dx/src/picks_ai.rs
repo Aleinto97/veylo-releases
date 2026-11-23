@@ -174,7 +174,7 @@ fn paths() -> Result<(PathBuf, PathBuf)> {
     #[cfg(test)]
     {
         let dir = std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai/model"));
-        let target = if cfg!(target_os = "android") { "android-arm64" } else if cfg!(windows) { "windows-x64" } else if cfg!(target_os = "macos") { "macos-arm64" }
+        let target = if cfg!(all(target_os = "android", target_arch = "arm")) { "android-armv7" } else if cfg!(target_os = "android") { "android-arm64" } else if cfg!(windows) { "windows-x64" } else if cfg!(target_os = "macos") { "macos-arm64" }
             else if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x64" };
         let runtime = if std::env::var_os("VEYLO_PICKS_AI_TEST_ASSETS").is_some() { dir.join(RUNTIME_LIBRARY) }
             else { Path::new(env!("CARGO_MANIFEST_DIR")).join("picks-ai").join(target).join(RUNTIME_LIBRARY) };

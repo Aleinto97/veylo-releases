@@ -289,11 +289,21 @@ pub fn play_order_for(sources: &[Source], pack_episodes: Option<usize>, language
     out
 }
 
-/// What Play may choose: a direct 2D link, not labelled under 1080p (nor an unlabelled DVD rip
-/// or TV capture), and never a copy filmed in a cinema or a screener, whatever its resolution.
+static_re!(sample_clip, r"(?i)(?:\b|_)SAMPLE(?:\b|_)");
+
+/// Extensions that are never directly playable video streams (archives, disc images, text/subtitles).
+fn non_video_filename(name: &str) -> bool {
+    let ext = name.rsplit('.').next().filter(|_| name.contains('.')).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "iso" | "rar" | "zip" | "7z" | "tar" | "gz" | "nfo" | "txt" | "srt" | "sub" | "idx" | "exe" | "jpg" | "jpeg" | "png")
+}
+
+/// What Play may choose: a direct 2D video link, not labelled under 1080p (nor an unlabelled DVD rip
+/// or TV capture), never a cinema copy / screener, and never an archive, disc image, or tiny sample clip.
 pub(super) fn playable(s: &Source) -> bool {
     let low = match s.quality { Some(q) => quality_rank(Some(q)) > 2, None => low_source().is_match(&s.label) };
-    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !cinema_copy().is_match(&s.label)
+    let bad_file = !s.filename.is_empty() && non_video_filename(&s.filename);
+    let tiny_sample = sample_clip().is_match(&s.label) && s.size_bytes.is_some_and(|b| b < 200_000_000);
+    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !cinema_copy().is_match(&s.label) && !bad_file && !tiny_sample
 }
 
 pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u8, u64, i16, u8, u8)>);
@@ -327,8 +337,20 @@ pub(super) fn picture_class(s: &Source, size: u64) -> u8 {
     if size > 0 && size < floor { class.min(5 - quality_rank(Some("1080p"))) } else { class }
 }
 
+/// Whether the current display natively decodes Dolby Vision (cached cheaply per call).
+fn screen_supports_dv() -> bool {
+    #[cfg(test)]
+    { false }
+    #[cfg(not(test))]
+    { crate::display::screen().is_some_and(|s| s.dolby_vision) }
+}
+
 /// The Play-order sort key of one source whose file is `size` bytes: smaller plays first.
 pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Language>) -> OrderKey {
+    order_key_for(s, size, lang, screen_supports_dv())
+}
+
+pub(super) fn order_key_for(s: &Source, size: u64, lang: Option<&crate::addons::Language>, dolby_vision_screen: bool) -> OrderKey {
     let tier = match lang {
         None => 0,
         Some(l) if l.matches(&s.label) => 0,
@@ -337,10 +359,13 @@ pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Lang
     };
     let provider = if !crate::addons::is_free_addon(&s.addon) { 0 } else if s.label.to_uppercase().contains("FREE TRIAL") { 2 } else { 1 };
     let hdr = verified_hdr_tier(s);
-    // Dolby Vision alone ranks below SDR: without a DV decoder its colours are wrong.
-    let hdr_rank = match hdr { 1 => 0, 0 => 1, t => t };
+    // Dolby Vision alone (typically profile 5) ranks below SDR on screens without native DV,
+    // because without a DV decoder its colours are wrong; on a native DV panel it ranks with HDR.
+    let dv_penalty = hdr == 1 && !dolby_vision_screen;
+    let is_hdr = hdr >= 2 || (hdr == 1 && dolby_vision_screen);
+    let hdr_rank = match hdr { 1 if dolby_vision_screen => 2, 1 => 0, 0 => 1, t => t };
     // An upscale or regrade goes after every native file: its 4K and HDR are made up, its size padding.
-    (s.off_title, tier, provider, hdr == 1, upscaled().is_match(&s.label), s.quality.is_none(), std::cmp::Reverse((hdr >= 2,
+    (s.off_title, tier, provider, dv_penalty, upscaled().is_match(&s.label), s.quality.is_none(), std::cmp::Reverse((is_hdr,
         picture_class(s, size), size, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, codec_tier(&s.label))))
 }
 
@@ -402,8 +427,15 @@ pub async fn autoplay(kind: &str, video_id: &str, pack_episodes: Option<usize>, 
         return Pick { debrid: Some(BELOW_1080P.into()), ..Default::default() };
     }
     let pick = pick_source(order.clone(), pack_episodes).await;
-    dev_log(&format!("autoplay: {} sources, {} playable in {listed} ms; chose {} after {} ms",
-        list.len(), order.len(), pick.best.as_ref().map(source_summary).unwrap_or_else(|| "nothing".into()), started.elapsed().as_millis()));
+    let total_ms = started.elapsed().as_millis();
+    dev_log(&format!("autoplay: {} sources, {} playable in {listed} ms; chose {} after {total_ms} ms",
+        list.len(), order.len(), pick.best.as_ref().map(source_summary).unwrap_or_else(|| "nothing".into())));
+    if total_ms >= 8000 {
+        report_issue_bg("performance",
+            format!("Slow autoplay resolution ({total_ms} ms)"),
+            format!("kind={kind} sources={} playable={} list_ms={listed} total_ms={total_ms} picked={}",
+                list.len(), order.len(), pick.best.is_some()));
+    }
     pick
 }
 
@@ -467,6 +499,7 @@ pub(crate) fn source_summary(s: &Source) -> String {
 
 /// One line in the developer log (logcat "veylo" on Android, stderr elsewhere). Never URLs or keys.
 pub(crate) fn dev_log(message: &str) {
+    record_diag_line(message);
     #[cfg(target_os = "android")]
     crate::android::log(message);
     #[cfg(not(target_os = "android"))]
@@ -556,7 +589,8 @@ pub(super) fn rank_by_audio(working: Vec<Source>, verdicts: Vec<AudioVerdict>) -
 /// carry the same picture. None for encodes, whose size is their bitrate.
 pub(super) type RemuxClass = (Option<&'static str>, bool, bool, bool);
 pub(super) fn remux_class(s: &Source) -> Option<RemuxClass> {
-    (source_tier(&s.label) == Some(4)).then(|| (s.quality, hdr_tier(&s.label) >= 2, hdr_tier(&s.label) == 1, upscaled().is_match(&s.label)))
+    let hdr = verified_hdr_tier(s);
+    (source_tier(&s.label) == Some(4)).then(|| (s.quality, hdr >= 2, hdr == 1, upscaled().is_match(&s.label)))
 }
 
 /// Working remuxes of the best one's class wanted before probing stops, so their audio can decide.
@@ -614,7 +648,14 @@ pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
             probe = check().await.map_err(|_| None)?.map_err(|_| None)?;
         }
         let ok = probe["ok"] == true;
-        let (tracks, picture, resolved) = if ok { tokio::time::timeout(AUDIO_TIMEOUT, file_header(src)).await.unwrap_or_default() } else { (None, None, None) };
+        let playlist = probe["playlist"] == true;
+        let probe_resolved = probe["resolved_url"].as_str().filter(|u| u.starts_with("https://")).map(str::to_owned);
+        let (tracks, picture, header_resolved) = if ok && !playlist {
+            tokio::time::timeout(AUDIO_TIMEOUT, file_header(src, probe_resolved.clone())).await.unwrap_or_default()
+        } else {
+            (None, None, None)
+        };
+        let resolved = header_resolved.or(probe_resolved);
         let outcome = ProbeOutcome { ok, status: probe["status"].as_u64().unwrap_or(0), bytes: probe["bytes"].as_u64(), debrid: probe["debrid_status"].as_str().map(str::to_owned),
             tracks, picture, resolved };
         if ok { Ok(outcome) } else { Err(Some(outcome)) }
@@ -624,20 +665,39 @@ pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
     }
 }
 
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else { return false };
+    ua.scheme() == ub.scheme() && ua.host_str() == ub.host_str() && ua.port_or_known_default() == ub.port_or_known_default()
+}
+
 /// The audio tracks and the picture a file's header declares, read from its first bytes
 /// (stopping as soon as the tracks are known: the picture is in the same part of the header),
-/// and the https link the source's redirects end at.
-pub(super) async fn file_header(src: Source) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
-    let mut req = backend_http().get(&src.url).header("range", format!("bytes=0-{}", crate::tracks::HEAD_BYTES - 1));
-    for (k, v) in &src.headers { req = req.header(k.as_str(), v.as_str()); }
-    let Ok(mut response) = req.send().await else { return (None, None, None) };
-    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None, None); }
-    let resolved = Some(response.url().to_string()).filter(|u| u.starts_with("https://") && *u != src.url);
-    let mut head = Vec::new();
+/// and the https link the source's redirects end at. When `probe_resolved` is already known from
+/// the one-byte check, fetch directly from it to avoid a second debrid redirect/resolve.
+pub(super) async fn file_header(src: Source, probe_resolved: Option<String>) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
+    file_header_with_client(&backend_http(), src, probe_resolved).await
+}
+
+pub(super) async fn file_header_with_client(http: &reqwest::Client, src: Source, probe_resolved: Option<String>) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
+    let target = probe_resolved.as_deref().unwrap_or(&src.url);
+    let mut req = http.get(target).header("range", format!("bytes=0-{}", crate::tracks::HEAD_BYTES - 1));
+    // Forward origin-scoped headers only when fetching the original origin (never leak to redirected CDNs).
+    if same_origin(&src.url, target) {
+        for (k, v) in &src.headers { req = req.header(k.as_str(), v.as_str()); }
+    }
+    let Ok(mut response) = req.send().await else { return (None, None, probe_resolved) };
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None, probe_resolved); }
+    let resolved = Some(response.url().to_string()).filter(|u| u.starts_with("https://") && *u != src.url).or(probe_resolved);
+    let mut head = Vec::with_capacity(65536);
+    // Avoid re-parsing the EBML/MP4 header on every ~16 KiB TCP chunk; parse at geometric milestones.
+    let mut next_parse = 16 * 1024;
     while head.len() < crate::tracks::HEAD_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else { break };
         head.extend_from_slice(&chunk);
-        if let Some(tracks) = crate::tracks::audio_tracks(&head) { return (Some(tracks), crate::tracks::picture(&head), resolved); }
+        if head.len() >= next_parse {
+            if let Some(tracks) = crate::tracks::audio_tracks(&head) { return (Some(tracks), crate::tracks::picture(&head), resolved); }
+            next_parse = (next_parse * 2).min(crate::tracks::HEAD_BYTES);
+        }
     }
     (crate::tracks::audio_tracks(&head), crate::tracks::picture(&head), resolved)
 }
@@ -737,6 +797,120 @@ pub fn no_source_message(debrid: Option<&str>) -> &'static str {
         Some("busy") => "Your sources are refusing requests for a moment (too many at once). Try again in a minute.",
         Some(BELOW_1080P) => "No source is 1080p or better, so Play didn't choose one. Pick one from the list.",
         _ => "No source responded. Try again or choose another source.",
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn playable_rejects_non_video_extensions_and_tiny_samples() {
+        let mk = |title: &str, filename: &str, bytes: u64| source_of("A", &json!({
+            "title": title, "url": "https://x.invalid/v",
+            "behaviorHints": {"filename": filename, "videoSize": bytes}
+        }));
+        assert!(!playable(&mk("Film 2160p HDR", "Film.2160p.iso", 50_000_000_000)));
+        assert!(!playable(&mk("Film 2160p HDR", "Film.2160p.rar", 50_000_000_000)));
+        assert!(!playable(&mk("Film 2160p HDR", "Film.2160p.srt", 100_000)));
+        assert!(!playable(&mk("Film.2025.2160p.SAMPLE.mkv", "Film.2025.2160p.sample.mkv", 50_000_000)));
+        assert!(playable(&mk("Film.2025.2160p.HDR.mkv", "Film.2025.2160p.HDR.mkv", 25_000_000_000)));
+        // A full film whose title happens to contain "Sample" is not rejected.
+        assert!(playable(&mk("The Sample 2025 1080p WEB-DL", "The.Sample.2025.1080p.mkv", 5_000_000_000)));
+    }
+
+    #[test]
+    fn dolby_vision_only_ranks_with_hdr_on_dv_screens_only() {
+        let src = |title: &str| source_of("A", &json!({"title": title, "url": "https://x.invalid/a"}));
+        let dv = src("Film 2025 2160p DV WEB-DL 💾 25 GB");
+        let sdr = src("Film 2025 2160p WEB-DL 💾 30 GB");
+        // Non-DV screen: SDR beats DV-only.
+        assert!(order_key_for(&sdr, 30_000_000_000, None, false) < order_key_for(&dv, 25_000_000_000, None, false));
+        // Native DV screen: DV-only beats SDR.
+        assert!(order_key_for(&dv, 25_000_000_000, None, true) < order_key_for(&sdr, 30_000_000_000, None, true));
+    }
+
+    #[test]
+    fn remux_class_uses_verified_header_hdr() {
+        use crate::tracks::{Picture, Transfer};
+        let mut unlabeled_hdr = source_of("A", &json!({"title": "Film 2160p REMUX 60 GB", "url": "https://x.invalid/1"}));
+        unlabeled_hdr = with_picture(unlabeled_hdr, Picture { width: 3840, height: 2160, transfer: Transfer::Pq, dolby_vision: None, seconds: Some(7200.0) });
+        let labeled_hdr = source_of("A", &json!({"title": "Film 2160p HDR REMUX 65 GB", "url": "https://x.invalid/2"}));
+        assert_eq!(remux_class(&unlabeled_hdr), remux_class(&labeled_hdr));
+    }
+
+    #[test]
+    fn same_origin_guards_redirected_header_forwarding() {
+        assert!(same_origin("https://addon.example/a", "https://addon.example/b"));
+        assert!(!same_origin("https://addon.example/a", "https://cdn.other.example/file.mkv"));
+        assert!(!same_origin("https://addon.example:8443/a", "https://addon.example/a"));
+    }
+
+    #[test]
+    fn autoplay_ranking_matrix_language_free_trial_and_rivals() {
+        let mk = |addon: &str, title: &str, url: &str| source_of(addon, &json!({"title": title, "url": url}));
+        let ita_free = mk("Absolute Cinema", "Film 2025 2160p HDR ITA 💾 20 GB", "https://x.invalid/ita-free");
+        let ita_trial = mk("Absolute Cinema", "Film 2025 2160p HDR ITA FREE TRIAL 💾 30 GB", "https://x.invalid/ita-trial");
+        let ita_rd = mk("Torrentio", "Film 2025 1080p ITA 💾 12 GB", "https://x.invalid/ita-rd");
+        let multi_rd = mk("Torrentio", "Film 2025 2160p HDR MULTI 💾 40 GB", "https://x.invalid/multi-rd");
+        let eng_only = mk("Torrentio", "Film 2025 2160p HDR ENG 💾 50 GB", "https://x.invalid/eng-rd");
+        let order = play_order_for(&[eng_only.clone(), ita_trial.clone(), multi_rd.clone(), ita_free.clone(), ita_rd.clone()], None, Some("italian"));
+        let urls: Vec<&str> = order.iter().map(|s| s.url.as_str()).collect();
+        // Tier 0 (Italian claimed): RD > Free > Free trial; Tier 1 (untagged/MULTI); Tier 2 (other language only).
+        assert_eq!(urls, [ita_rd.url.as_str(), ita_free.url.as_str(), ita_trial.url.as_str(), multi_rd.url.as_str(), eng_only.url.as_str()]);
+
+        // Rivals wanted asks for up to REMUX_RIVALS working remuxes of the best class.
+        let r1 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 65 GB", "https://x.invalid/r1");
+        let r2 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 60 GB", "https://x.invalid/r2");
+        let r3 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 58 GB", "https://x.invalid/r3");
+        assert!(rivals_wanted(&[r1.clone(), r2.clone()], None, None).is_some());
+        assert!(rivals_wanted(&[r1, r2, r3], None, None).is_none());
+    }
+
+    #[test]
+    fn file_header_reads_chunked_206_and_never_leaks_headers_cross_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let clip = include_bytes!("../../assets/selftest.mp4");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen_headers = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen_srv = seen_headers.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let mut req_buf = [0u8; 2048];
+                    let n = sock.read(&mut req_buf).await.unwrap_or(0);
+                    seen_srv.lock().unwrap().push(String::from_utf8_lossy(&req_buf[..n]).to_lowercase());
+                    let resp = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        clip.len() - 1, clip.len(), clip.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(clip).await;
+                }
+            });
+            let client = reqwest::Client::new();
+            let local_url = format!("http://127.0.0.1:{port}/video.mp4");
+            // Same-origin fetch: Authorization header is sent; picture and audio track parse.
+            let mut src = source_of("A", &json!({"title": "Film 2160p", "url": local_url}));
+            src.headers.push(("Authorization".into(), "Bearer secret-token".into()));
+            let (tracks, pic, _) = file_header_with_client(&client, src.clone(), None).await;
+            assert_eq!(tracks.as_ref().map(Vec::len), Some(1));
+            assert_eq!(pic.map(|p| (p.width, p.height)), Some((320, 240)));
+
+            // Cross-origin resolved URL: Authorization header MUST NOT be forwarded.
+            src.url = "https://addon.origin.invalid/resolve/123".into();
+            let (tracks2, pic2, _) = file_header_with_client(&client, src, Some(local_url)).await;
+            assert_eq!(tracks2.as_ref().map(Vec::len), Some(1));
+            assert_eq!(pic2.map(|p| (p.width, p.height)), Some((320, 240)));
+
+            server.await.unwrap();
+            let reqs = seen_headers.lock().unwrap();
+            assert!(reqs[0].contains("authorization: bearer secret-token"), "same-origin must send header");
+            assert!(!reqs[1].contains("secret-token"), "cross-origin resolved URL must never receive origin secret headers");
+        });
     }
 }
 

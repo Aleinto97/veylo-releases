@@ -2,7 +2,7 @@
 //! The picture itself is under the transparent WebView (video.rs); everything here is the
 //! app's own design, lit by the title's accent. Keys arrive through the shell (Shell::player_key).
 use crate::{backend::{self, OnlineSubtitle}, engine::{self, Finish, Fit, LiveRef, SegmentKind, State}, icons, Shell};
-use crate::player_rules::{clock, details, fallback, offer, skip, Fallback, ANDROID, KEYS, ONLINE_SHOWN, SPEEDS};
+use crate::player_rules::{clock, details, fallback_with_pref, offer, skip, up_next_due, Fallback, ANDROID, KEYS, ONLINE_SHOWN, SPEEDS};
 use dioxus::prelude::*;
 
 /// Subtitles the add-ons offer for this video, fetched the first time the sheet opens.
@@ -11,7 +11,7 @@ enum Online { Idle, Loading, Ready(Vec<OnlineSubtitle>), Failed }
 
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Sheet { Audio, Subtitles, Speed, Picture, Info, Keys }
+enum Sheet { Audio, Subtitles, Chapters, Speed, Picture, Info, Keys }
 
 
 #[component]
@@ -19,10 +19,28 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut shell = use_context::<Shell>();
     let mut state = use_signal(|| live.0.state());
     let mut shown = use_signal(|| true);
-    let mut activity = use_signal(|| 0u64);
+    let mut hide_at = use_signal(|| None::<std::time::Instant>);
+    let mut timer_running = use_signal(|| false);
+    let mut last_move = use_signal(|| None::<std::time::Instant>);
     let mut sheet = use_signal(|| None::<Sheet>);
     let mut scrub = use_signal(|| None::<f64>);
     let mut fullscreen = use_signal(|| false);
+    let mut rotation_locked = use_signal(|| false);
+    let mut up_next_dismissed = use_signal(|| false);
+    let mut up_next_secs = use_signal(|| None::<u8>);
+    let mut up_next_task = use_signal(|| false);
+    let auto_next_on = use_hook(|| backend::load_settings().auto_next);
+    // Touch gesture state (Android phone/tablet): double-tap seek, vertical brightness/volume drag, long-press 2×.
+    #[cfg(target_os = "android")]
+    let mut touch_start = use_signal(|| None::<(f64, f64, std::time::Instant, f32, f32, u64)>);
+    #[cfg(target_os = "android")]
+    let mut touch_drag = use_signal(|| None::<bool>); // Some(true)=brightness(left), Some(false)=volume(right)
+    #[cfg(target_os = "android")]
+    let mut touch_boost = use_signal(|| None::<f64>); // previous speed while long-pressing 2×
+    #[cfg(target_os = "android")]
+    let mut last_tap = use_signal(|| None::<(std::time::Instant, f64)>);
+    #[cfg(target_os = "android")]
+    let mut suppress_click = use_signal(|| false);
     let mut online = use_signal(|| Online::Idle);
     let sub_query = use_signal(String::new);
     let mut automatic_language = use_signal(|| None::<String>);
@@ -31,6 +49,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut sub_added = use_signal(std::collections::HashMap::<String, i64>::new);
     // The video whose subtitles can be downloaded: the episode, or the film itself.
     let wanted = live.0.request.record.as_ref().map(|(m, v)| (m.kind.clone(), v.clone().unwrap_or_else(|| m.id.clone())));
+    let media_key = live.0.request.record.as_ref().map(|(m, _)| m.key());
     use_effect(move || {
         // Reopening the sheet retries a failed lookup, without a retry loop while it stays open.
         if sheet() == Some(Sheet::Subtitles) && *online.peek() == Online::Failed { online.set(Online::Idle); }
@@ -75,14 +94,43 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     use_hook(move || crate::video::attach(&attach.0));
     use_drop(crate::video::detach);
 
-    // Controls fade three seconds after the last touch, key or pointer movement.
+    // Controls fade three seconds after the last touch, key or pointer movement (one timer task,
+    // never spawning per mousemove pixel).
     let mut poke = move || {
-        shown.set(true);
-        let n = *activity.peek() + 1;
-        activity.set(n);
-        spawn(async move { backend::sleep(3000).await; if *activity.peek() == n { shown.set(false); } });
+        if !*shown.peek() { shown.set(true); }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        hide_at.set(Some(deadline));
+        if !*timer_running.peek() {
+            timer_running.set(true);
+            spawn(async move {
+                loop {
+                    let Some(target) = *hide_at.peek() else { break };
+                    let now = std::time::Instant::now();
+                    if now >= target {
+                        shown.set(false);
+                        break;
+                    }
+                    backend::sleep((target - now).as_millis().max(50) as u64).await;
+                }
+                timer_running.set(false);
+            });
+        }
     };
     use_hook(poke);
+
+    // Prefetch the next episode's sources once playback enters the last quarter (or last 3 minutes)
+    // so clicking "Next episode" or reaching credits starts almost instantly.
+    let next_ep = live.0.request.next_video.clone();
+    let mut next_prefetched = use_signal(|| false);
+    use_effect(move || {
+        if *next_prefetched.peek() { return; }
+        let Some((kind, id)) = next_ep.as_ref() else { return };
+        let s = state.read();
+        if s.duration > 60.0 && (s.position >= s.duration * 0.75 || s.duration - s.position <= 180.0) {
+            next_prefetched.set(true);
+            backend::prefetch_sources(kind, id);
+        }
+    });
 
     let s: State = state();
     let l = live.0.clone();
@@ -103,7 +151,48 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let sub_on = s.tracks.iter().any(|t| !t.audio && t.selected);
     // Direct output: mpv can't draw into the picture, so text subtitles are drawn here.
     let caption = (s.direct && sub_on && !s.subtitle.trim().is_empty()).then(|| s.subtitle.clone());
-    let skippable = offer(&s.skips(), s.position, req.has_next).filter(|_| sheet().is_none() && s.error.is_none() && scrub().is_none());
+    let up_next_active = auto_next_on
+        && up_next_due(s.position, s.duration, s.ended, &s.skips(), req.has_next, up_next_dismissed())
+        && sheet().is_none() && s.error.is_none() && scrub().is_none();
+    let skippable = offer(&s.skips(), s.position, req.has_next)
+        .filter(|g| sheet().is_none() && s.error.is_none() && scrub().is_none() && !(up_next_active && g.kind == SegmentKind::Credits));
+
+    // Up Next auto-play countdown (5s at end of episode, 10s when credits begin).
+    let next_live = live.clone();
+    use_effect(move || {
+        let s = state.read();
+        let active = auto_next_on
+            && up_next_due(s.position, s.duration, s.ended, &s.skips(), next_live.0.request.has_next, up_next_dismissed())
+            && sheet().is_none() && s.error.is_none() && scrub().is_none();
+        if !active {
+            if up_next_secs.peek().is_some() { up_next_secs.set(None); }
+            return;
+        }
+        if !*up_next_task.peek() {
+            let start = if s.ended { 5 } else { 10 };
+            up_next_secs.set(Some(start));
+            up_next_task.set(true);
+            let live = next_live.0.clone();
+            spawn(async move {
+                loop {
+                    backend::sleep(1000).await;
+                    let cur = *up_next_secs.peek();
+                    let Some(rem) = cur else { break };
+                    if *up_next_dismissed.peek() { up_next_secs.set(None); break; }
+                    let st = state.peek().clone();
+                    if st.paused && !st.ended { continue; }
+                    if sheet.peek().is_some() { continue; }
+                    if rem <= 1 {
+                        up_next_secs.set(None);
+                        live.finish(Finish::Next);
+                        break;
+                    }
+                    up_next_secs.set(Some(rem - 1));
+                }
+                up_next_task.set(false);
+            });
+        }
+    });
 
     // Keys routed from the shell.
     // A short word on screen for what a key just did ("Fill", "Speed 1.25×").
@@ -116,23 +205,43 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
     // Tap a downloadable subtitle: download it, add it as a track and turn it on.
     let get = live.clone();
+    let dl_key = media_key.clone();
     // `tapped`: chosen in the sheet (which then closes), not added on its own by the fallback.
     let add_online = use_callback(move |(sub, tapped): (OnlineSubtitle, bool)| {
         let live = get.0.clone();
-        if let Some(id) = sub_added.peek().get(&sub.id).copied() { live.select(false, Some(id)); if tapped { sheet.set(None); } return; }
+        if let Some(id) = sub_added.peek().get(&sub.id).copied() {
+            live.select(false, Some(id));
+            if tapped {
+                if let Some(mk) = &dl_key {
+                    let code = sub.code.clone();
+                    backend::save_track_pref(mk, |p| { p.sub_lang = Some(code); p.sub_off = false; });
+                }
+                sheet.set(None);
+            }
+            return;
+        }
         if sub_busy.peek().is_some() { return; }
         sub_busy.set(Some(sub.id.clone()));
         let mut say = say;
+        let mk_save = dl_key.clone();
         spawn(async move {
             let file = backend::fetch_subtitle(&sub.url).await;
             let (title, code) = (sub.language.clone(), sub.code.clone());
+            let code_for_pref = code.clone();
             let added = backend::on_runtime(async move { tokio::task::spawn_blocking(move || live.add_subtitle(&file, &title, &code)).await }).await;
             sub_busy.set(None);
             match added {
                 Ok(Ok(Ok(id))) => {
                     sub_added.write().insert(sub.id.clone(), id);
-                    if tapped { sheet.set(None); say(format!("Subtitles: {}", sub.language)); }
-                    else { say(format!("No {0} audio: {0} subtitles on", sub.language)); }
+                    if tapped {
+                        if let Some(mk) = &mk_save {
+                            backend::save_track_pref(mk, |p| { p.sub_lang = Some(code_for_pref); p.sub_off = false; });
+                        }
+                        sheet.set(None);
+                        say(format!("Subtitles: {}", sub.language));
+                    } else {
+                        say(format!("No {0} audio: {0} subtitles on", sub.language));
+                    }
                 }
                 _ => say("Those subtitles couldn’t be loaded".into()),
             }
@@ -140,31 +249,34 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     });
     let download = use_callback(move |sub: OnlineSubtitle| add_online.call((sub, true)));
 
-    // Subtitles follow the Audio language setting, once per video: off when that language is in
-    // the audio (or the setting is Any), otherwise the file's own full subtitles in that language,
-    // else the best download. Untagged audio says nothing, so it is left as is.
+    // Subtitles follow per-series remembered preference first, then the global Audio language
+    // setting, once per video: off when that language is in the audio, otherwise the file's own
+    // full subtitles, else the best download.
     let mut fallback_done = use_signal(|| false);
     // Re-runs only when the video becomes ready, not on every position tick.
     let ready = use_memo(move || { let s = state.read(); s.loaded && !s.tracks.is_empty() });
-    let (fb_live, fb_wanted) = (live.clone(), wanted.clone());
+    let (fb_live, fb_wanted, fb_mkey) = (live.clone(), wanted.clone(), media_key.clone());
     use_effect(move || {
         if !ready() || *fallback_done.peek() { return; }
         fallback_done.set(true);
         let s = state.peek().clone();
         let key = backend::stream_language();
+        let pref = fb_mkey.as_deref().and_then(backend::load_track_pref);
         let name = key.as_deref().map(backend::subtitle_language_of).unwrap_or_default();
         let mut say = say;
-        let found = fallback(&s.tracks, key.as_deref());
+        let (pref_audio, found) = fallback_with_pref(&s.tracks, key.as_deref(), pref.as_ref());
         let langs: Vec<&str> = s.tracks.iter().filter(|t| t.audio).map(|t| if t.lang.is_empty() { "?" } else { t.lang.as_str() }).collect();
         backend::dev_log(&format!("audio tracks [{}]{}", langs.join(" "), if matches!(found, Fallback::Embedded(_) | Fallback::Download) { ": none in your language" } else { "" }));
-        if matches!(found, Fallback::Embedded(_) | Fallback::Download) && fb_live.0.request.language_check && s.position < 120.0 {
+        if pref.is_none() && matches!(found, Fallback::Embedded(_) | Fallback::Download) && fb_live.0.request.language_check && s.position < 120.0 {
             say(format!("No {name} audio in this file: trying another source"));
             fb_live.0.finish(Finish::OtherLanguage);
             return;
         }
+        if let Some(id) = pref_audio {
+            if !s.tracks.iter().any(|t| t.audio && t.selected && t.id == id) { fb_live.0.select(true, Some(id)); }
+        }
         match found {
             Fallback::Off(audio) => {
-                // mpv's alang normally picked this already; make it explicit when it did not.
                 if let Some(id) = audio {
                     if !s.tracks.iter().any(|t| t.audio && t.selected && t.id == id) { fb_live.0.select(true, Some(id)); }
                 }
@@ -172,12 +284,13 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             }
             Fallback::Embedded(id) => {
                 fb_live.0.select(false, Some(id));
-                say(format!("No {name} audio: {name} subtitles on"));
+                if pref.is_none() { say(format!("No {name} audio: {name} subtitles on")); }
             }
             Fallback::Download => {
-                let Some(key) = key else { return };
+                let want_lang = pref.as_ref().and_then(|p| p.sub_lang.clone()).or(key);
+                let Some(lang) = want_lang else { return };
                 if fb_wanted.is_none() { return; }
-                automatic_language.set(Some(key));
+                automatic_language.set(Some(lang));
             }
             Fallback::Nothing => {}
         }
@@ -229,6 +342,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "a" | "A" => { let t = live.cycle_track(true); say(format!("Audio: {t}")); }
             "c" | "C" => { let t = live.cycle_track(false); say(format!("Subtitles: {t}")); }
             "s" | "S" => sheet.set(Some(Sheet::Subtitles)),
+            "," => { let d = now.sub_delay - 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
+            "." => { let d = now.sub_delay + 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
+            "b" | "B" if !now.chapters.is_empty() => sheet.set(if sheet() == Some(Sheet::Chapters) { None } else { Some(Sheet::Chapters) }),
             "z" | "Z" => {
                 let next = Fit::ALL[(Fit::ALL.iter().position(|f| *f == now.fit).unwrap_or(0) + 1) % Fit::ALL.len()];
                 live.set_fit(next); say(next.name().into());
@@ -250,10 +366,136 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     rsx! {
         div { class: if visible { "player" } else { "player calm" },
             // A tap also sends a synthetic mousemove first: on touch screens only the tap counts.
-            onmousemove: move |_| if !ANDROID { poke() },
+            // Throttle desktop mousemove to avoid reactive churn while the cursor glides.
+            onmousemove: move |_| if !ANDROID {
+                let now = std::time::Instant::now();
+                let due = last_move.peek().is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(250));
+                if due || !*shown.peek() {
+                    last_move.set(Some(now));
+                    poke();
+                }
+            },
             // The picture: a tap shows the controls; with them up, a click pauses (desktop) or hides them (touch).
+            // On Android phones/tablets: double-tap left/right seeks ±10s, vertical drag left/right
+            // adjusts brightness/volume, and long-press temporarily boosts to 2× speed.
             div { class: "player-surface",
+                ontouchstart: { let live_ts = lc(); move |e: TouchEvent| {
+                    #[cfg(target_os = "android")]
+                    {
+                        let touches = e.data.touches();
+                        if let Some(t) = touches.first() {
+                            let pt = t.client_coordinates();
+                            let b = crate::android::video_get_brightness();
+                            let v = crate::android::video_get_volume();
+                            let seq = (*touch_start.peek()).map(|x| x.5 + 1).unwrap_or(1);
+                            touch_start.set(Some((pt.x, pt.y, std::time::Instant::now(), b, v, seq)));
+                            touch_drag.set(None);
+                            let live_lp = live_ts.clone();
+                            let mut say_lp = say;
+                            spawn(async move {
+                                backend::sleep(450).await;
+                                let still = (*touch_start.peek()).is_some_and(|x| x.5 == seq);
+                                if still && touch_drag.peek().is_none() && sheet.peek().is_none() {
+                                    let prev = live_lp.state().speed;
+                                    touch_boost.set(Some(prev));
+                                    suppress_click.set(true);
+                                    live_lp.set_speed(2.0);
+                                    say_lp("2× speed".into());
+                                }
+                            });
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    let _ = (e, &live_ts);
+                } },
+                ontouchmove: move |e: TouchEvent| {
+                    #[cfg(target_os = "android")]
+                    {
+                        let Some((sx, sy, _, sb, sv, _)) = *touch_start.peek() else { return };
+                        let touches = e.data.touches();
+                        let Some(t) = touches.first() else { return };
+                        let pt = t.client_coordinates();
+                        let dx = pt.x - sx;
+                        let dy = sy - pt.y; // swipe up = positive
+                        let cur_drag = *touch_drag.peek();
+                        if cur_drag.is_none() {
+                            if dy.abs() > 22.0 && dy.abs() > dx.abs() * 1.4 && touch_boost.peek().is_none() {
+                                // Rough midpoint: left half controls brightness, right half volume.
+                                let left = sx < 480.0;
+                                touch_drag.set(Some(left));
+                                suppress_click.set(true);
+                            } else {
+                                return;
+                            }
+                        }
+                        if let Some(left) = *touch_drag.peek() {
+                            let delta = (dy / 260.0) as f32;
+                            if left {
+                                let lvl = (sb + delta).clamp(0.05, 1.0);
+                                let _ = crate::android::video_set_brightness(lvl);
+                                say(format!("Brightness {:.0}%", lvl * 100.0));
+                            } else {
+                                let lvl = (sv + delta).clamp(0.0, 1.0);
+                                let _ = crate::android::video_set_volume(lvl);
+                                say(format!("Volume {:.0}%", lvl * 100.0));
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    let _ = e;
+                },
+                ontouchend: { let live_te = lc(); move |_e: TouchEvent| {
+                    #[cfg(target_os = "android")]
+                    {
+                        if let Some(prev) = touch_boost.take() {
+                            live_te.set_speed(prev);
+                            say(if (prev - 1.0).abs() < 0.01 { "Normal speed".into() } else { format!("Speed {prev}×") });
+                            touch_start.set(None);
+                            touch_drag.set(None);
+                            return;
+                        }
+                        let dragged = touch_drag.take().is_some();
+                        let start = touch_start.take();
+                        if !dragged {
+                            if let Some((sx, _, _, _, _, _)) = start {
+                                let now = std::time::Instant::now();
+                                let prev_tap = *last_tap.peek();
+                                if let Some((prev_t, prev_x)) = prev_tap {
+                                    if now.duration_since(prev_t) < std::time::Duration::from_millis(320) && (sx - prev_x).abs() < 120.0 {
+                                        last_tap.set(None);
+                                        if sx < 320.0 {
+                                            suppress_click.set(true);
+                                            live_te.seek_by(-10.0);
+                                            say("−10 s".into());
+                                            return;
+                                        } else if sx > 580.0 {
+                                            suppress_click.set(true);
+                                            live_te.seek_by(10.0);
+                                            say("+10 s".into());
+                                            return;
+                                        }
+                                    }
+                                }
+                                last_tap.set(Some((now, sx)));
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    let _ = &live_te;
+                } },
+                ontouchcancel: { let live_tc = lc(); move |_| {
+                    #[cfg(target_os = "android")]
+                    {
+                        if let Some(prev) = touch_boost.take() { live_tc.set_speed(prev); }
+                        touch_start.set(None);
+                        touch_drag.set(None);
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    let _ = &live_tc;
+                } },
                 onclick: { let live = lc(); move |_| {
+                    #[cfg(target_os = "android")]
+                    if *suppress_click.peek() { suppress_click.set(false); return; }
                     if sheet().is_some() { sheet.set(None); }
                     else if !visible { poke(); }
                     else if ANDROID { shown.set(false); }
@@ -262,11 +504,33 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 ondoubleclick: move |_| if !ANDROID { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); },
             }
             if let Some(text) = caption {
-                div { class: if visible { "player-caption lifted" } else { "player-caption" }, aria_live: "polite",
-                    for line in text.lines().map(str::to_owned).collect::<Vec<_>>() { span { "{line}" } }
+                {
+                    let sub_bottom = (107 - s.sub_pos).clamp(5, 35);
+                    let cls = format!("player-caption{}{}", if visible { " lifted" } else { "" }, if s.sub_bg { " bg" } else { "" });
+                    rsx! {
+                        div { class: "{cls}", style: "--sub-scale: {s.sub_scale}; --sub-bottom: {sub_bottom}%", aria_live: "polite",
+                            for line in text.lines().map(str::to_owned).collect::<Vec<_>>() { span { "{line}" } }
+                        }
+                    }
                 }
             }
             if let Some((text, n)) = osd() { div { key: "{n}", class: "player-osd", role: "status", "{text}" } }
+            // Floating "Up Next" auto-play countdown card during credits or end of episode.
+            if up_next_active {
+                div { class: if visible { "player-upnext lifted" } else { "player-upnext" }, role: "region", aria_label: "Up next",
+                    span { class: "player-upnext-meta",
+                        match up_next_secs() {
+                            Some(n) => format!("Up next in {n} s"),
+                            None => "Up next".into(),
+                        }
+                    }
+                    span { class: "player-upnext-title display", "{req.next_label.as_deref().unwrap_or(\"Next episode\")}" }
+                    div { class: "player-upnext-actions",
+                        button { class: "pill accent", onclick: { let live = lc(); move |_| live.finish(Finish::Next) }, icons::Play {} span { "Play now" } }
+                        button { class: "pill glass", onclick: move |_| { up_next_dismissed.set(true); up_next_secs.set(None); }, span { "Stay" } }
+                    }
+                }
+            }
             // Over the picture even when the controls have faded, as long as the segment lasts.
             if let Some(g) = skippable {
                 button { class: if visible { "pill glass player-skip lifted" } else { "pill glass player-skip" }, title: "Enter",
@@ -311,6 +575,32 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         }
                     }
                     span { class: "topbar-spacer" }
+                    if ANDROID && !crate::is_tv() {
+                        button { class: "bare",
+                            aria_label: if rotation_locked() { "Unlock orientation" } else { "Lock orientation" },
+                            title: if rotation_locked() { "Unlock orientation" } else { "Lock orientation" },
+                            aria_pressed: "{rotation_locked()}",
+                            onclick: move |_| {
+                                let next = !rotation_locked();
+                                rotation_locked.set(next);
+                                #[cfg(target_os = "android")]
+                                let _ = crate::android::video_set_rotation_lock(next);
+                                say(if next { "Rotation locked".into() } else { "Rotation unlocked".into() });
+                            },
+                            if rotation_locked() { icons::Lock {} } else { icons::Unlock {} }
+                        }
+                        button { class: "bare", aria_label: "Picture-in-picture", title: "Picture-in-picture",
+                            onclick: move |_| {
+                                #[cfg(target_os = "android")]
+                                {
+                                    let st = state.peek();
+                                    let ok = crate::android::video_enter_pip(st.width as i32, st.height as i32);
+                                    if !ok { say("Picture-in-picture isn't available".into()); }
+                                }
+                            },
+                            icons::Pip {}
+                        }
+                    }
                     button { class: "bare", aria_label: "Player shortcuts (H / ?)", title: "Player shortcuts (H / ?)", aria_pressed: "{sheet() == Some(Sheet::Keys)}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Keys) { None } else { Some(Sheet::Keys) }), icons::Keyboard {} }
                     button { class: "bare", aria_label: "Details (I)", title: "Details (I)", aria_pressed: "{sheet() == Some(Sheet::Info)}",
@@ -329,13 +619,23 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
                 div { class: "player-bottom",
                     span { class: "player-time tnum", "{clock(position)}" }
-                    input { class: "scrubber", r#type: "range", aria_label: "Position", min: "0", max: "{duration.max(1.0)}", step: "0.5",
-                        value: "{position}", disabled: duration <= 0.0, style: "--played: {played}%; --buffered: {buffered}%",
-                        oninput: move |e| { scrub.set(e.value().parse().ok()); poke(); },
-                        onchange: { let live = lc(); move |e: FormEvent| { if let Ok(v) = e.value().parse::<f64>() { live.seek_to(v); } scrub.set(None); } },
+                    div { class: "scrubber-wrap",
+                        input { class: "scrubber", r#type: "range", aria_label: "Position", min: "0", max: "{duration.max(1.0)}", step: "0.5",
+                            value: "{position}", disabled: duration <= 0.0, style: "--played: {played}%; --buffered: {buffered}%",
+                            oninput: move |e| { scrub.set(e.value().parse().ok()); poke(); },
+                            onchange: { let live = lc(); move |e: FormEvent| { if let Ok(v) = e.value().parse::<f64>() { live.seek_to(v); } scrub.set(None); } },
+                        }
+                        if duration > 0.0 {
+                            for ch in s.chapters.iter().filter(|c| c.start > 1.0 && c.start < duration - 1.0) {
+                                span { key: "ch-{ch.start:.1}", class: "chapter-tick", style: "left: {pct(ch.start)}%", title: "{ch.title}" }
+                            }
+                        }
                     }
                     span { class: "player-time tnum dim", if duration > 0.0 { "-{clock(duration - position)}" } }
                     div { class: "player-actions",
+                        if !s.chapters.is_empty() {
+                            button { class: "bare", aria_label: "Chapters (B)", title: "Chapters (B)", aria_pressed: "{sheet() == Some(Sheet::Chapters)}", onclick: move |_| sheet.set(Some(Sheet::Chapters)), icons::List {} }
+                        }
                         button { class: "bare", aria_label: "Audio tracks (A cycles them)", title: "Audio tracks (A cycles them)", aria_pressed: "{sheet() == Some(Sheet::Audio)}", onclick: move |_| sheet.set(Some(Sheet::Audio)), icons::Audio {} }
                         button { class: "bare", aria_label: "Subtitles (S)", title: "Subtitles (S)", disabled: !has_subs, aria_pressed: "{sheet() == Some(Sheet::Subtitles)}", onclick: move |_| sheet.set(Some(Sheet::Subtitles)), icons::Subtitles {} }
                         button { class: "bare", aria_label: "Speed ([ ])", title: "Speed ([ ])", aria_pressed: "{sheet() == Some(Sheet::Speed)}", onclick: move |_| sheet.set(Some(Sheet::Speed)), icons::Gauge {} }
@@ -369,16 +669,66 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             Sheet::Audio | Sheet::Subtitles => {
                                 let audio = which == Sheet::Audio;
                                 let tracks: Vec<engine::Track> = s.tracks.iter().filter(|t| t.audio == audio).cloned().collect();
+                                let mk_sheet = media_key.clone();
                                 rsx! {
+                                    if audio {
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Audio sync" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let d = s.audio_delay; move |_| live.set_audio_delay(d - 0.1) }, "−0.1s" }
+                                                button { class: "player-step-btn player-step-val tnum", title: "Reset sync", onclick: { let live = lc(); move |_| live.set_audio_delay(0.0) }, "{s.audio_delay:+.2} s" }
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let d = s.audio_delay; move |_| live.set_audio_delay(d + 0.1) }, "+0.1s" }
+                                            }
+                                        }
+                                    } else {
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Subtitle sync" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let d = s.sub_delay; move |_| live.set_sub_delay(d - 0.25) }, "−0.25s" }
+                                                button { class: "player-step-btn player-step-val tnum", title: "Reset sync", onclick: { let live = lc(); move |_| live.set_sub_delay(0.0) }, "{s.sub_delay:+.2} s" }
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let d = s.sub_delay; move |_| live.set_sub_delay(d + 0.25) }, "+0.25s" }
+                                            }
+                                        }
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Size" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v - 0.1) }, "−" }
+                                                button { class: "player-step-btn player-step-val tnum", title: "Reset size", onclick: { let live = lc(); move |_| live.set_sub_scale(1.05) }, "{s.sub_scale * 100.0:.0}%" }
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v + 0.1) }, "+" }
+                                            }
+                                        }
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Position & box" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_pos; move |_| live.set_sub_pos(v - 4) }, "Up" }
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_pos; move |_| live.set_sub_pos(v + 4) }, "Down" }
+                                                button { class: "player-step-btn", aria_pressed: "{s.sub_bg}", onclick: { let live = lc(); let bg = s.sub_bg; move |_| live.set_sub_bg(!bg) }, if s.sub_bg { "Box on" } else { "Box off" } }
+                                            }
+                                        }
+                                    }
                                     if !audio && !tracks.is_empty() { p { class: "player-options-head", "In this video" } }
                                     if !audio {
-                                        OptionRow { on: !sub_on, label: "Off", about: String::new(), pick: { let live = lc(); move |_| { live.select(false, None); sheet.set(None); } } }
+                                        OptionRow { on: !sub_on, label: "Off", about: String::new(), pick: { let live = lc(); let mk = mk_sheet.clone(); move |_| {
+                                            live.select(false, None);
+                                            if let Some(mk) = &mk { backend::save_track_pref(mk, |p| { p.sub_off = true; p.sub_lang = None; }); }
+                                            sheet.set(None);
+                                        } } }
                                     }
                                     for t in tracks {
                                         OptionRow { key: "{t.id}", on: t.selected, label: t.label.clone(),
                                             about: if audio || !s.direct { String::new() } else if t.image { "Image subtitles: drawn by mpv, off the direct path".to_string() }
                                                 else if t.styled { "Styled: full look on SDR, plain text over HDR".to_string() } else { String::new() },
-                                            pick: { let live = lc(); let id = t.id; move |_| { live.select(audio, Some(id)); sheet.set(None); } } }
+                                            pick: { let live = lc(); let id = t.id; let lang = t.lang.clone(); let mk = mk_sheet.clone(); move |_| {
+                                                live.select(audio, Some(id));
+                                                if let Some(mk) = &mk {
+                                                    let lang = lang.clone();
+                                                    backend::save_track_pref(mk, |p| {
+                                                        if audio { if !lang.is_empty() { p.audio_lang = Some(lang); } }
+                                                        else { p.sub_off = false; if !lang.is_empty() { p.sub_lang = Some(lang); } }
+                                                    });
+                                                }
+                                                sheet.set(None);
+                                            } } }
                                     }
                                     if audio && s.tracks.iter().all(|t| !t.audio) { p { class: "dim player-empty", "No audio tracks." } }
                                     if !audio && wanted.is_some() {
@@ -387,6 +737,19 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                     }
                                 }
                             }
+                            Sheet::Chapters => rsx! {
+                                for (idx, ch) in s.chapters.iter().enumerate() {
+                                    {
+                                        let next_start = s.chapters.get(idx + 1).map(|c| c.start).unwrap_or(f64::INFINITY);
+                                        let active = position >= ch.start && position < next_start;
+                                        let start = ch.start;
+                                        rsx! {
+                                            OptionRow { key: "{idx}-{start:.1}", on: active, label: ch.title.clone(), about: clock(start),
+                                                pick: { let live = lc(); move |_| { live.seek_to(start); sheet.set(None); } } }
+                                        }
+                                    }
+                                }
+                            },
                             Sheet::Speed => rsx! {
                                 for v in SPEEDS {
                                     OptionRow { key: "{v}", on: (s.speed - v).abs() < 0.01, label: if v == 1.0 { "Normal".to_string() } else { format!("{v}×") }, about: String::new(),
@@ -429,7 +792,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
 
 fn sheet_name(s: Sheet) -> &'static str {
-    match s { Sheet::Audio => "Audio", Sheet::Subtitles => "Subtitles", Sheet::Speed => "Speed", Sheet::Picture => "Picture", Sheet::Info => "Details", Sheet::Keys => "Shortcuts" }
+    match s { Sheet::Audio => "Audio", Sheet::Subtitles => "Subtitles", Sheet::Chapters => "Chapters", Sheet::Speed => "Speed", Sheet::Picture => "Picture", Sheet::Info => "Details", Sheet::Keys => "Shortcuts" }
 }
 
 

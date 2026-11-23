@@ -29,17 +29,21 @@ macro_rules! static_re { ($name:ident, $pat:expr) => {
 }; }
 
 mod account;
+mod downloads;
 mod metadata;
 mod open;
 mod sources;
 mod store;
 mod subtitles;
+mod telemetry;
 pub use account::*;
+pub use downloads::*;
 pub use metadata::*;
 pub use open::*;
 pub use sources::*;
 pub use store::*;
 pub use subtitles::*;
+pub use telemetry::*;
 
 const CINEMETA: &str = "https://v3-cinemeta.strem.io/manifest.json";
 /// Kitsu stays installed only so anime already in your Library keeps opening (its titles have
@@ -90,12 +94,18 @@ fn data_dir() -> PathBuf {
 pub fn init() -> Result<()> {
     // Android can launch the UI again in the same process (activity recreated): keep the backend.
     if BACKEND.get().is_some() { return Ok(()); }
+    let workers = std::thread::available_parallelism().map(|n| n.get().clamp(2, 4)).unwrap_or(2);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .enable_all()
         .build()?;
     let dir = data_dir();
     std::fs::create_dir_all(&dir).context("Couldn't create the data folder")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     // Some Android builds (Huawei) hide app logs: keep the last panic in the app's own folder.
     let panic_file = dir.join("last-panic.txt");
     let default_hook = std::panic::take_hook();
@@ -112,6 +122,7 @@ pub fn init() -> Result<()> {
     let saved: Value = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     BETTER_POSTERS.store(saved["better_posters"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(saved["hdr_output"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+    set_telemetry_enabled(saved["telemetry_enabled"].as_bool().unwrap_or(true));
     set_stream_language(Some(audio_language(&saved)));
     set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     RUNTIME.set(runtime).map_err(|_| anyhow!("Backend already started"))?;
@@ -120,6 +131,7 @@ pub fn init() -> Result<()> {
         .map_err(|_| anyhow!("Backend already started"))?;
     // Signed in: your devices' changes come in, and this one's go out, from launch on.
     start_sync();
+    upload_pending_panic();
     Ok(())
 }
 
@@ -259,23 +271,37 @@ pub fn group_label(kind: &str) -> String {
 
 // ---------------------------------------------------------------- catalogs
 
-/// Loads the bundled public catalogs so Picks has candidates to rank.
+/// Loads the bundled public catalogs concurrently so Picks has candidates to rank quickly.
 /// Failures are tolerated: whatever arrives is still usable.
 pub async fn seed_catalogs() -> Vec<Media> {
-    let requests = [(CINEMETA, "movie", "top"), (CINEMETA, "series", "top")];
-    let mut out = Vec::new();
-    if better_posters_on() {
-        for (kind, id) in [("movie", "trakt-trending"), ("series", "trakt-trending")] {
-            if let Some(v) = bp_get(format!("catalog/{kind}/{id}.json")).await { out.extend(bp_titles(&v, CINEMETA)); }
+    let bp_on = better_posters_on();
+    on_runtime(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        let mut idx = 0usize;
+        if bp_on {
+            for (kind, id) in [("movie", "trakt-trending"), ("series", "trakt-trending")] {
+                let order = idx; idx += 1;
+                jobs.spawn(async move {
+                    let items = bp_get(format!("catalog/{kind}/{id}.json")).await.map(|v| bp_titles(&v, CINEMETA)).unwrap_or_default();
+                    (order, items)
+                });
+            }
         }
-    }
-    for (addon, kind, id) in requests {
-        let req = json!({"op":"catalog","addon_url":addon,"type":kind,"id":id});
-        if let Ok(v) = exec(req).await {
-            out.extend(metas(&v, addon));
+        for (addon, kind, id) in [(CINEMETA, "movie", "top"), (CINEMETA, "series", "top")] {
+            let order = idx; idx += 1;
+            jobs.spawn(async move {
+                let req = json!({"op":"catalog","addon_url":addon,"type":kind,"id":id});
+                let items = backend().core.execute(req).await.ok().map(|v| metas(&v, addon)).unwrap_or_default();
+                (order, items)
+            });
         }
-    }
-    out
+        let mut results: Vec<(usize, Vec<Media>)> = Vec::new();
+        while let Some(done) = jobs.join_next().await {
+            if let Ok(pair) = done { results.push(pair); }
+        }
+        results.sort_by_key(|(o, _)| *o);
+        results.into_iter().flat_map(|(_, items)| items).collect()
+    }).await.unwrap_or_default()
 }
 
 fn metas(v: &Value, origin: &str) -> Vec<Media> {
@@ -460,7 +486,12 @@ pub fn record_progress(media: Media, video_id: Option<String>, position_ms: i64,
     let queue = PROGRESS.get_or_init(|| {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressWrite>();
         runtime.spawn(async move { while let Some(write) = rx.recv().await {
-            match write { ProgressWrite::Update(req) => { let _ = backend().core.execute(req).await; }, ProgressWrite::Barrier(done) => { let _ = done.send(()); } }
+            match write {
+                ProgressWrite::Update(req) => {
+                    if backend().core.execute(req).await.is_ok() { sync_soon(); }
+                }
+                ProgressWrite::Barrier(done) => { let _ = done.send(()); }
+            }
         } });
         tx
     });
@@ -595,7 +626,8 @@ fn episodes_from_meta(meta: &Value) -> Vec<Episode> {
 
 pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
     let request = exec(json!({"op":"meta","type":media.kind,"id":media.id,"addon_url":media.addon_url}));
-    let (addon, bp) = tokio::join!(request, bp_meta(media));
+    // Fetch add-on meta, BetterPosters overlay and TMDB artwork concurrently instead of serially.
+    let (addon, bp, art) = tokio::join!(request, bp_meta(media), artwork(media));
     let meta = match (addon, bp) {
         (Ok(v), bp) => merge_meta(v.get("meta").cloned().unwrap_or(v), bp.as_ref()),
         // A title Cinemeta doesn't know yet: BetterPosters alone.
@@ -617,7 +649,6 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
     let mut seen_trailers = HashSet::new();
     trailers.retain(|t| seen_trailers.insert(t.clone()));
     // TMDB's trailers follow the add-on's, as alternatives where one is blocked or missing.
-    let art = artwork(media).await;
     let mut genres: Vec<String> = meta["genres"].as_array().into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect();
     for genre in art.as_ref().map(|a| a.genres.as_slice()).unwrap_or_default() { if !genres.contains(genre) { genres.push(genre.clone()); } }
     for key in art.map(|a| a.trailers).unwrap_or_default() {
@@ -914,11 +945,17 @@ pub fn when_label(at: i64, now: i64) -> String {
 /// watched. Unfinished series stay available with Resume. Also match by title/year.
 pub async fn watched_ids() -> HashSet<String> {
     let history = viewing_history().await.unwrap_or_default();
-    // Each series is checked on its own (its episodes, maybe its metadata), all at once.
+    // Bound concurrency so large watch histories don't stampede SQLite and metadata add-ons.
     let finished = on_runtime(async move {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
         let mut checks = tokio::task::JoinSet::new();
         for item in history {
-            checks.spawn(async move { let m = item.media; finished_title(&m).await.then_some(m) });
+            let gate = gate.clone();
+            checks.spawn(async move {
+                let _permit = gate.acquire_owned().await;
+                let m = item.media;
+                finished_title(&m).await.then_some(m)
+            });
         }
         let mut finished = Vec::new();
         while let Some(done) = checks.join_next().await { if let Ok(Some(m)) = done { finished.push(m); } }
@@ -958,15 +995,18 @@ pub async fn accent(url: String) -> Option<String> {
             if bytes.len() + chunk.len() > LIMIT { return None; }
             bytes.extend_from_slice(&chunk);
         }
-        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(256 * 1024 * 1024);
-        limits.max_image_width = Some(12_000);
-        limits.max_image_height = Some(12_000);
-        reader.limits(limits);
-        let img = reader.decode().ok()?.thumbnail(48, 48).to_rgba8();
-        let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
-        artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+        // Offload CPU-intensive image decoding & thumbnailing off the Tokio async I/O workers.
+        tokio::task::spawn_blocking(move || {
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(256 * 1024 * 1024);
+            limits.max_image_width = Some(12_000);
+            limits.max_image_height = Some(12_000);
+            reader.limits(limits);
+            let img = reader.decode().ok()?.thumbnail(48, 48).to_rgba8();
+            let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
+            artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+        }).await.ok().flatten()
     }).await.ok().flatten();
     if let Ok(mut cache) = backend().accents.lock() { cache_insert(&mut cache, 2000, key, computed.clone()); }
     computed

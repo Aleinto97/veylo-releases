@@ -20,6 +20,7 @@ set -euo pipefail
 REPO=${VEYLO_REPO:-Aleinto97/veylo-releases}
 WIN_ASSET=veylo-windows-x64.zip
 APK_ASSET=veylo-android-arm64.apk
+APK_ARMV7_ASSET=veylo-android-armv7.apk
 publish=${VEYLO_PUBLISH:-1}
 root=$(cd "$(dirname "$0")/.." && pwd)
 app="$root/apps/veylo-dx"
@@ -51,7 +52,7 @@ pass_file="$work/keystore.pass"
 remap="--remap-path-prefix=$HOME=~ --remap-path-prefix=$root=veylo"
 
 # Model assets and native runtimes are bundled: classification never downloads at runtime.
-python3 "$root/tools/picks-ai/fetch.py" windows-x64 android-arm64
+python3 "$root/tools/picks-ai/fetch.py" windows-x64 android-arm64 android-armv7
 
 # ---------------------------------------------------------------- Windows
 mpv="$app/windows/mpv"
@@ -79,26 +80,40 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
 fi
 # ARM64 hosts run Gradle's x86 aapt2 under qemu (README).
 if [ -d "$HOME/Android/host-tools/x86_64-root" ]; then export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-$HOME/Android/host-tools/x86_64-root}; fi
-[ -f "$app/android/mpv/arm64-v8a/libmpv.so" ] || "$app/android/fetch-mpv.sh"
+[ -f "$app/android/mpv/arm64-v8a/libmpv.so" ] && [ -f "$app/android/mpv/armeabi-v7a/libmpv.so" ] || "$app/android/fetch-mpv.sh"
 strip_tool=${LLVM_STRIP:-$(command -v llvm-strip || ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)}
-RUSTFLAGS="$remap" dx build --android --target aarch64-linux-android --release
-project="$app/target/dx/veylo-dx/release/android/app"
-# The C parts (ring) keep build paths in debug info only: ship the app's library without it (smaller too).
-"$strip_tool" --strip-debug "$project/app/src/main/jniLibs/arm64-v8a/libmain.so"
-# dx always writes versionCode 1; Android only updates to a higher one.
-sed -i "s/versionCode = [0-9]*/versionCode = $version_code/; s/versionName = \"[^\"]*\"/versionName = \"$version\"/" "$project/app/build.gradle.kts"
-(cd "$project" && ./gradlew assembleDebug -q)
 build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-# Gradle signs with this machine's debug key; the release carries Veylo's own key instead.
-# (PKCS12: the key's password is the keystore's. Passing the same file twice would make apksigner read a second line.)
-"$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias veylo --ks-pass "file:$pass_file" \
-    --out "$stage/$APK_ASSET" "$project/app/build/outputs/apk/debug/app-debug.apk"
-rm -f "$stage/$APK_ASSET.idsig"
-"$build_tools/apksigner" verify --print-certs "$stage/$APK_ASSET" | grep 'SHA-256' | sed 's/^/APK /'
+
+build_android() {
+    local rust_target="$1" abi="$2" out_asset="$3"
+    RUSTFLAGS="$remap" dx build --android --target "$rust_target" --release
+    local project="$app/target/dx/veylo-dx/release/android/app"
+    # The C parts (ring) keep build paths in debug info only: ship the app's library without it (smaller too).
+    "$strip_tool" --strip-debug "$project/app/src/main/jniLibs/$abi/libmain.so"
+    # dx reuses the same generated Gradle project across ABI builds; keep only this APK's ABI.
+    find "$project/app/src/main/jniLibs" -mindepth 1 -maxdepth 1 -type d ! -name "$abi" -exec rm -rf {} +
+    # dx always writes versionCode 1; Android only updates to a higher one.
+    sed -i "s/versionCode = [0-9]*/versionCode = $version_code/; s/versionName = \"[^\"]*\"/versionName = \"$version\"/" "$project/app/build.gradle.kts"
+    (cd "$project" && ./gradlew assembleRelease -q)
+    local unsigned="$project/app/build/outputs/apk/release/app-release-unsigned.apk"
+    [ -f "$unsigned" ] || unsigned="$project/app/build/outputs/apk/release/app-release.apk"
+    # Sign the release APK with Veylo's own key (never debuggable).
+    # (PKCS12: the key's password is the keystore's. Passing the same file twice would make apksigner read a second line.)
+    "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias veylo --ks-pass "file:$pass_file" \
+        --out "$stage/$out_asset" "$unsigned"
+    rm -f "$stage/$out_asset.idsig"
+    "$build_tools/apksigner" verify --print-certs "$stage/$out_asset" | grep 'SHA-256' | sed "s/^/APK ($abi) /"
+}
+
+build_android aarch64-linux-android arm64-v8a "$APK_ASSET"
+build_android armv7-linux-androideabi armeabi-v7a "$APK_ARMV7_ASSET"
 
 # ---------------------------------------------------------------- privacy check
 # Unpack everything that will be public and refuse if a key from your settings.json or your home path is inside.
-mkdir -p "$work/check" && cp -r "$work/win/"* "$work/check/" && bsdtar -xf "$stage/$APK_ASSET" -C "$work/check"
+mkdir -p "$work/check" && cp -r "$work/win/"* "$work/check/"
+mkdir -p "$work/check/arm64" "$work/check/armv7"
+bsdtar -xf "$stage/$APK_ASSET" -C "$work/check/arm64"
+bsdtar -xf "$stage/$APK_ARMV7_ASSET" -C "$work/check/armv7"
 for f in ${extra[@]+"${extra[@]}"}; do mkdir -p "$work/check/extra/$(basename "$f")" && bsdtar -xf "$f" -C "$work/check/extra/$(basename "$f")"; done
 settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
 python3 - "$settings" "$HOME" "$work/check" <<'PY'
@@ -117,9 +132,13 @@ for dirpath, _, files in os.walk(folder):
 print("Privacy check: no keys or local paths in the release files.")
 PY
 
-mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$stage/$APK_ASSET" ${extra[@]+"${extra[@]}"} "$out_dir/"
+# Publish SHA-256 checksums for every release asset so the in-app updater can verify downloads.
+for f in ${extra[@]+"${extra[@]}"}; do cp "$f" "$stage/"; done
+(cd "$stage" && sha256sum "$WIN_ASSET" "$APK_ASSET" "$APK_ARMV7_ASSET" $(for f in ${extra[@]+"${extra[@]}"}; do basename "$f"; done) > "$stage/SHA256SUMS.txt")
+
+mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$stage/$APK_ARMV7_ASSET" "$stage/SHA256SUMS.txt" ${extra[@]+"${extra[@]}"} "$out_dir/"
 if [ "$publish" != 1 ]; then echo "Built $tag (not published): $out_dir"; exit 0; fi
 # On Actions the tag goes on the commit that was built.
 target=(); [ -n "${GITHUB_SHA:-}" ] && target=(--target "$GITHUB_SHA")
-gh release create "$tag" "$stage/$WIN_ASSET" "$stage/$APK_ASSET" ${extra[@]+"${extra[@]}"} --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
+gh release create "$tag" "$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$stage/$APK_ARMV7_ASSET" "$stage/SHA256SUMS.txt" ${extra[@]+"${extra[@]}"} --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
 echo "Published $tag (Android versionCode $version_code): installs and in-app updates now get it."

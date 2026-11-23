@@ -36,7 +36,19 @@
       cancel_on_tap_outside: false,
       callback: answer => {
         say('Signed in. Going back to Veylo…');
-        location.replace('http://127.0.0.1:' + port + '/?state=' + encodeURIComponent(state) + '&id_token=' + encodeURIComponent(answer.credential));
+        // Submit over POST so the ID token never appears in a URL or browser history.
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = 'http://127.0.0.1:' + port + '/';
+        for (const [name, value] of [['state', state], ['id_token', answer.credential]]) {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = name;
+          input.value = value;
+          form.appendChild(input);
+        }
+        document.body.appendChild(form);
+        form.submit();
       },
     });
     // The button stays for a browser that doesn't show the prompt (it opens Google in a popup).

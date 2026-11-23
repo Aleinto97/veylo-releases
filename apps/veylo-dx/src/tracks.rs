@@ -474,4 +474,22 @@ mod tests {
         let cut = &wide[..wide.len() - 10];
         assert_eq!(audio_tracks(cut), None);
     }
+
+    /// Against the real bundled FFmpeg test clips: MP4 container parsing reads real dimensions
+    /// and audio tracks cleanly without panicking or misreporting absent `colr` boxes.
+    #[test]
+    fn real_bundled_mp4_clips_parse_picture_and_audio() {
+        let sdr_clip = include_bytes!("../assets/selftest.mp4");
+        let hdr_clip = include_bytes!("../assets/selftest-hdr.mp4");
+        let p_sdr = picture(sdr_clip).expect("SDR clip header should parse");
+        assert_eq!((p_sdr.width, p_sdr.height), (320, 240));
+        assert_eq!(p_sdr.transfer, Transfer::Unknown);
+        let a_sdr = audio_tracks(sdr_clip).expect("SDR clip audio tracks should parse");
+        assert_eq!(a_sdr.len(), 1);
+
+        let p_hdr = picture(hdr_clip).expect("HDR clip header should parse");
+        assert_eq!((p_hdr.width, p_hdr.height), (320, 240));
+        // selftest-hdr.mp4 is a video-only clip (no audio track).
+        assert_eq!(audio_tracks(hdr_clip).unwrap().len(), 0);
+    }
 }

@@ -97,18 +97,22 @@ pub fn Picks() -> Element {
     // random pages of popular, well-rated titles (TMDB, else Cinemeta) and a TVmaze sample, so every visit brings
     // new titles. Titles you keep pull in more like them as you go (expand, below).
     use_future(move || async move {
-        let mut items = backend::picks().await.map(|p| p.items).unwrap_or_default();
+        let (picks_res, history_res) = tokio::join!(backend::picks(), backend::viewing_history());
+        let mut items = picks_res.map(|p| p.items).unwrap_or_default();
         if items.len() < 6 { items.extend(backend::seed_catalogs().await); }
         // Core discovery omits started titles. Add history back to the pool so unfinished
         // series can actually appear with Resume; Hide watched below removes completed ones.
-        items.extend(backend::viewing_history().await.unwrap_or_default().into_iter().map(|s| s.media));
+        items.extend(history_res.unwrap_or_default().into_iter().map(|s| s.media));
         let mut first = Vec::new();
         rules::merge(&mut first, items);
         pool.set(first);
         loading.set(false);
         let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 25) as u32).collect();
-        let mut more = backend::discover_candidates(None, None, Style::Both, None, None, pages).await;
-        more.extend(backend::tvmaze_candidates(None, Style::Both, None, None).await);
+        let (mut more, tvmaze) = tokio::join!(
+            backend::discover_candidates(None, None, Style::Both, None, None, pages),
+            backend::tvmaze_candidates(None, Style::Both, None, None),
+        );
+        more.extend(tvmaze);
         pool.with_mut(|p| rules::merge(p, more));
         pool_complete.set(true);
     });

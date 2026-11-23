@@ -62,11 +62,40 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
 .player-error-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
 
 /* Direct output: text subtitles drawn here, above the picture and clear of the dock. */
-.player-caption { position: absolute; left: 8%; right: 8%; bottom: 7%; display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none;
+.player-caption { position: absolute; left: 8%; right: 8%; bottom: var(--sub-bottom, 7%); display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none;
   transition: bottom .28s ease; text-align: center; }
-.player-caption.lifted { bottom: 84px; }
-.player-caption span { font: 600 clamp(20px, 3.2vw, 40px)/1.25 var(--ui); color: #f2efea; padding: 0 .3em;
-  text-shadow: 0 0 3px #000, 0 0 3px #000, 0 2px 6px rgba(0,0,0,.9); }
+.player-caption.lifted { bottom: max(84px, var(--sub-bottom, 7%)); }
+.player-caption span { font: 600 calc(clamp(20px, 3.2vw, 40px) * var(--sub-scale, 1)) / 1.25 var(--ui); color: #f2efea; padding: 0 .3em;
+  text-shadow: 0 0 3px #000, 0 0 3px #000, 0 2px 6px rgba(0,0,0,.9); border-radius: 8px; }
+.player-caption.bg span { background: rgba(0, 0, 0, .68); padding: .12em .48em; }
+.player-surface { touch-action: none; }
+
+/* Scrubber wrapper with subtle chapter markers. */
+.scrubber-wrap { position: relative; flex: 1; min-width: 80px; display: flex; align-items: center; }
+.scrubber-wrap .scrubber { width: 100%; }
+.chapter-tick { position: absolute; top: 50%; transform: translate(-50%, -50%); width: 3px; height: 9px; border-radius: 2px;
+  background: rgba(242,239,234,.55); pointer-events: none; z-index: 1; }
+@media (max-width: 760px) { .player-bottom .scrubber-wrap { order: -1; flex-basis: 100%; } }
+
+/* Timing & subtitle appearance stepper rows inside player sheets. */
+.player-stepper { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-radius: 16px;
+  background: rgba(255,255,255,.04); margin: 4px 0; }
+.player-stepper-label { font-weight: 600; font-size: 14px; }
+.player-stepper-controls { display: flex; align-items: center; gap: 6px; }
+.player-step-btn { min-width: 36px; height: 34px; padding: 0 10px; border-radius: 10px; background: rgba(255,255,255,.09); color: var(--bone);
+  font: 650 13px/1 var(--ui); display: inline-grid; place-items: center; }
+.player-step-btn:hover { background: rgba(255,255,255,.16); }
+.player-step-val { min-width: 58px; text-align: center; font-size: 13px; font-weight: 650; }
+
+/* Floating Up Next auto-play countdown card. */
+.player-upnext { position: absolute; right: 24px; bottom: 32px; z-index: 3; width: min(340px, calc(100vw - 32px)); padding: 14px 16px;
+  border-radius: 20px; background: var(--glass-strong); border: 1px solid rgba(242,239,234,.22); display: flex; flex-direction: column; gap: 10px;
+  animation: arrive .18s ease-out; transition: bottom .28s ease; }
+.player-upnext.lifted { bottom: 88px; }
+.player-upnext-meta { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--lamp); }
+.player-upnext-title { font-weight: 700; font-size: 16px; line-height: 1.25; }
+.player-upnext-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) { .player-upnext { right: 12px; bottom: 20px; } .player-upnext.lifted { bottom: 132px; } }
 
 .player-sheet { position: absolute; right: 20px; bottom: 72px; width: min(420px, calc(100vw - 56px)); max-height: calc(100vh - 220px); overflow-y: auto;
   border-radius: 24px; z-index: 2; background: var(--glass-strong); animation: rise-sheet .18s ease-out; }

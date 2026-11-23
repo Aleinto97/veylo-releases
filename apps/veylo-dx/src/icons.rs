@@ -92,3 +92,9 @@ pub fn IconButton(
 
 #[component] pub fn Moon() -> Element { rsx! { Glyph { d: "M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10Z" } } }
 #[component] pub fn Keyboard() -> Element { rsx! { Glyph { d: "M3 6h18v12H3zM6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 12h.01M9 12h.01M12 12h.01M15 12h.01M18 12h.01M7 15h10" } } }
+#[component] pub fn Lock() -> Element { rsx! { Glyph { d: "M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 0 1 7 0v3" } } }
+#[component] pub fn Unlock() -> Element { rsx! { Glyph { d: "M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 0 1 6.8-1.2" } } }
+#[component] pub fn Pip() -> Element { rsx! { Glyph { d: "M3.5 5.5h17v13h-17zM12.5 12h6v4.5h-6z" } } }
+#[component] pub fn Copy() -> Element { rsx! { Glyph { d: "M9 9h10v11H9zM5 15H4.5A1.5 1.5 0 0 1 3 13.5v-8A1.5 1.5 0 0 1 4.5 4h8A1.5 1.5 0 0 1 14 5.5V6" } } }
+#[component] pub fn Upload() -> Element { rsx! { Glyph { d: "M12 15V4m-5 5 5-5 5 5M5 20h14" } } }
+#[component] pub fn Plus() -> Element { rsx! { Glyph { d: "M12 5v14M5 12h14" } } }

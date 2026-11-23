@@ -130,20 +130,39 @@ pub(super) static IDENTS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new
 /// own solid background would turn into a white box, so it is left out. Kept for the session.
 pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
     let cache = IDENTS.get_or_init(Default::default);
-    let mut out = Vec::new();
-    for st in studios {
+    let mut results: Vec<Option<Studio>> = vec![None; studios.len()];
+    let mut pending = Vec::new();
+    for (i, st) in studios.into_iter().enumerate() {
         let known = cache.lock().ok().and_then(|c| c.get(&st.logo).copied());
-        let ok = match known {
-            Some(ok) => ok,
-            None => {
-                let ok = transparent_edges(st.logo.replace("/w185/", "/w92/")).await.unwrap_or(false);
-                if let Ok(mut c) = cache.lock() { c.insert(st.logo.clone(), ok); }
-                ok
-            }
-        };
-        if ok { out.push(st); }
+        match known {
+            Some(true) => results[i] = Some(st),
+            Some(false) => {}
+            None => pending.push((i, st)),
+        }
     }
-    out
+    if !pending.is_empty() {
+        let checked = on_runtime(async move {
+            let mut jobs = tokio::task::JoinSet::new();
+            for (i, st) in pending {
+                jobs.spawn(async move {
+                    let ok = transparent_edges(st.logo.replace("/w185/", "/w92/")).await.unwrap_or(false);
+                    (i, st, ok)
+                });
+            }
+            let mut done = Vec::new();
+            while let Some(res) = jobs.join_next().await {
+                if let Ok(item) = res { done.push(item); }
+            }
+            done
+        }).await.unwrap_or_default();
+        if let Ok(mut c) = cache.lock() {
+            for (_, st, ok) in &checked { cache_insert(&mut c, 500, st.logo.clone(), *ok); }
+        }
+        for (i, st, ok) in checked {
+            if ok { results[i] = Some(st); }
+        }
+    }
+    results.into_iter().flatten().collect()
 }
 
 /// Whether the logo is a mark on see-through ground: a transparent corner, and ink over less than
@@ -152,12 +171,16 @@ pub(super) async fn transparent_edges(url: String) -> Option<bool> {
     let bytes = on_runtime(async move {
         backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?.bytes().await.ok()
     }).await.ok().flatten()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 { return None; }
-    let corner = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].iter().any(|&(x, y)| img.get_pixel(x, y)[3] < 128);
-    let ink = img.pixels().filter(|p| p[3] >= 128).count() as f64 / (w as f64 * h as f64);
-    Some(corner && ink < 0.55)
+    on_runtime(async move {
+        tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let (w, h) = img.dimensions();
+            if w == 0 || h == 0 { return None; }
+            let corner = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].iter().any(|&(x, y)| img.get_pixel(x, y)[3] < 128);
+            let ink = img.pixels().filter(|p| p[3] >= 128).count() as f64 / (w as f64 * h as f64);
+            Some(corner && ink < 0.55)
+        }).await.ok().flatten()
+    }).await.ok().flatten()
 }
 
 /// Its place in BetterPosters' "today" chart (TMDB's most watched today; 1 is the top), if it is in it.
@@ -525,17 +548,27 @@ pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option
     let cell = TVMAZE.get_or_init(tokio::sync::OnceCell::new);
     // An empty answer (offline, TVmaze down) is not kept: the next visit asks again.
     let shows = cell.get_or_try_init(|| async {
-        let mut all = Vec::new();
-        for page in [0u32, 4, 8, 12, 16, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] {
-            let fetched = on_runtime(async move {
-                let r = backend().http.get(format!("https://api.tvmaze.com/shows?page={page}")).send().await.ok()?.error_for_status().ok()?;
-                r.json::<Vec<Value>>().await.ok()
-            }).await.ok().flatten();
-            if let Some(list) = fetched {
-                all.extend(list.into_iter().filter(|s| s["externals"]["imdb"].is_string() && s["weight"].as_i64().unwrap_or(0) >= 70
-                    && s["rating"]["average"].as_f64().unwrap_or(0.0) >= 6.8));
+        // Fetch sampled pages with bounded concurrency (4 at a time) instead of 16 sequential requests.
+        let all = on_runtime(async move {
+            let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+            let mut jobs = tokio::task::JoinSet::new();
+            for page in [0u32, 4, 8, 12, 16, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] {
+                let gate = gate.clone();
+                jobs.spawn(async move {
+                    let _permit = gate.acquire_owned().await;
+                    let r = backend().http.get(format!("https://api.tvmaze.com/shows?page={page}")).send().await.ok()?.error_for_status().ok()?;
+                    r.json::<Vec<Value>>().await.ok()
+                });
             }
-        }
+            let mut all = Vec::new();
+            while let Some(done) = jobs.join_next().await {
+                if let Ok(Some(list)) = done {
+                    all.extend(list.into_iter().filter(|s| s["externals"]["imdb"].is_string() && s["weight"].as_i64().unwrap_or(0) >= 70
+                        && s["rating"]["average"].as_f64().unwrap_or(0.0) >= 6.8));
+                }
+            }
+            all
+        }).await.unwrap_or_default();
         if all.is_empty() { Err(()) } else { Ok(all) }
     }).await;
     let Ok(shows) = shows else { return Vec::new() };

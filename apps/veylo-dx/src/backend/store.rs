@@ -22,6 +22,26 @@ pub struct Settings {
     pub rd_key_removed: bool,
     /// Windows: send HDR to the screen when it is in HDR (off: always tone-map to SDR).
     pub hdr_output: bool,
+    /// Subtitle font scale (0.6..=2.0, default 1.05).
+    pub sub_scale: f64,
+    /// Subtitle vertical position from top in percent (75..=100, default 100).
+    pub sub_pos: i32,
+    /// Draw a subtle dark pill behind subtitles for legibility over bright scenes.
+    pub sub_bg: bool,
+    /// Automatically count down to the next episode at credits or end of episode.
+    pub auto_next: bool,
+    /// Send redacted crashes, UI errors, playback failures and performance reports to Firebase.
+    pub telemetry_enabled: bool,
+}
+
+static TELEMETRY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn telemetry_enabled() -> bool {
+    TELEMETRY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) fn set_telemetry_enabled(on: bool) {
+    TELEMETRY_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The audio language when none was chosen, or the saved one is unknown.
@@ -32,7 +52,15 @@ pub(super) fn audio_language(saved: &Value) -> String {
     saved["stream_language"].as_str().filter(|l| crate::addons::language(l).is_some()).unwrap_or(DEFAULT_LANGUAGE).to_owned()
 }
 
-impl Default for Settings { fn default() -> Self { Settings { better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None, stream_language: Some(DEFAULT_LANGUAGE.into()), rd_key_removed: false, hdr_output: true } } }
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None,
+            stream_language: Some(DEFAULT_LANGUAGE.into()), rd_key_removed: false, hdr_output: true,
+            sub_scale: 1.05, sub_pos: 100, sub_bg: false, auto_next: true, telemetry_enabled: true,
+        }
+    }
+}
 
 pub fn load_settings() -> Settings {
     let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
@@ -45,17 +73,286 @@ pub fn load_settings() -> Settings {
         stream_language: Some(audio_language(&v)),
         rd_key_removed: v["rd_key_removed"].as_bool().unwrap_or(false),
         hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
+        sub_scale: v["sub_scale"].as_f64().unwrap_or(1.05).clamp(0.6, 2.0),
+        sub_pos: v["sub_pos"].as_i64().unwrap_or(100).clamp(70, 100) as i32,
+        sub_bg: v["sub_bg"].as_bool().unwrap_or(false),
+        auto_next: v["auto_next"].as_bool().unwrap_or(true),
+        telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(true),
     }
 }
 
+/// Write a file that may hold credentials or tokens, restricting it to owner-only (0600) on Unix.
+pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        f.write_all(bytes)?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    { std::fs::write(path, bytes) }
+}
+
 pub fn save_settings(settings: &Settings) {
-    let _ = std::fs::write(backend().data_dir.join("settings.json"), json!({"better_posters": settings.better_posters, "tmdb_key": settings.tmdb_key, "picks_hide_watched": settings.picks_hide_watched, "rd_key": settings.rd_key, "stream_language": settings.stream_language, "rd_key_removed": settings.rd_key_removed, "hdr_output": settings.hdr_output}).to_string());
+    let data = json!({
+        "better_posters": settings.better_posters,
+        "tmdb_key": settings.tmdb_key,
+        "picks_hide_watched": settings.picks_hide_watched,
+        "rd_key": settings.rd_key,
+        "stream_language": settings.stream_language,
+        "rd_key_removed": settings.rd_key_removed,
+        "hdr_output": settings.hdr_output,
+        "sub_scale": settings.sub_scale.clamp(0.6, 2.0),
+        "sub_pos": settings.sub_pos.clamp(70, 100),
+        "sub_bg": settings.sub_bg,
+        "auto_next": settings.auto_next,
+        "telemetry_enabled": settings.telemetry_enabled,
+    }).to_string();
+    let _ = write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
+    set_telemetry_enabled(settings.telemetry_enabled);
     set_stream_language(settings.stream_language.clone());
     set_tmdb_key(settings.tmdb_key.clone());
     // The key and language decide which add-ons answer and with which links.
     forget_sources();
+    sync_soon();
+}
+
+// ---------------------------------------------------------------- per-title track preferences
+
+/// Remembered audio and subtitle language for a series or film (`track-prefs.json`).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TrackPref {
+    pub audio_lang: Option<String>,
+    pub sub_lang: Option<String>,
+    pub sub_off: bool,
+}
+
+fn track_prefs_path() -> PathBuf { backend().data_dir.join("track-prefs.json") }
+
+static TRACK_PREFS: Mutex<Option<HashMap<String, TrackPref>>> = Mutex::new(None);
+
+fn read_track_prefs_from(path: &std::path::Path) -> HashMap<String, TrackPref> {
+    let v: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    v.as_object().into_iter().flatten().map(|(k, entry)| {
+        let pref = TrackPref {
+            audio_lang: entry["audio"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            sub_lang: entry["sub"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            sub_off: entry["sub_off"].as_bool().unwrap_or(false),
+        };
+        (k.clone(), pref)
+    }).collect()
+}
+
+fn write_track_prefs_json(map: &HashMap<String, TrackPref>) -> String {
+    let obj: serde_json::Map<String, Value> = map.iter().map(|(k, p)| {
+        (k.clone(), json!({"audio": p.audio_lang, "sub": p.sub_lang, "sub_off": p.sub_off}))
+    }).collect();
+    Value::Object(obj).to_string()
+}
+
+pub fn load_track_pref(media_key: &str) -> Option<TrackPref> {
+    let mut guard = TRACK_PREFS.lock().ok()?;
+    let map = guard.get_or_insert_with(|| {
+        flush_writes();
+        read_track_prefs_from(&track_prefs_path())
+    });
+    map.get(media_key).cloned()
+}
+
+pub fn save_track_pref(media_key: &str, update: impl FnOnce(&mut TrackPref)) {
+    let Ok(mut guard) = TRACK_PREFS.lock() else { return };
+    let map = guard.get_or_insert_with(|| {
+        flush_writes();
+        read_track_prefs_from(&track_prefs_path())
+    });
+    let entry = map.entry(media_key.to_owned()).or_default();
+    update(entry);
+    // Keep the file bounded to 400 recent titles.
+    if map.len() > 400 {
+        let drop_key = map.keys().find(|k| k.as_str() != media_key).cloned();
+        if let Some(k) = drop_key { map.remove(&k); }
+    }
+    write_soon(track_prefs_path(), write_track_prefs_json(map));
+}
+
+// ---------------------------------------------------------------- redacted diagnostics
+
+static DIAG_RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+
+/// Strip URLs, API keys and tokens from diagnostic lines so logs are always safe to share.
+pub fn redact_diagnostic(line: &str) -> String {
+    static_re!(url_re, r"https?://[^\s\x22'<>]+");
+    static_re!(secret_re, r"(?i)(api[_-]?key|token|secret|password|authorization|rd_key|tmdb_key)\s*[:=]\s*[^\s&,\x22']+");
+    let step = url_re().replace_all(line, "[URL]");
+    secret_re().replace_all(&step, "$1=[REDACTED]").into_owned()
+}
+
+pub fn record_diag_line(message: &str) {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let clean = redact_diagnostic(message);
+    if let Ok(mut q) = DIAG_RING.lock() {
+        if q.len() >= 200 { q.pop_front(); }
+        q.push_back(format!("{ms} {clean}"));
+    }
+}
+
+/// A shareable, redacted diagnostic snapshot (version, OS/arch, HDR screen, recent events, last panic).
+pub fn diagnostic_report() -> String {
+    let mut out = String::new();
+    let settings = load_settings();
+    let (screen_title, _) = crate::display::summary(crate::display::screen(), settings.hdr_output);
+    out.push_str(&format!("Veylo {} ({}/{})\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
+    out.push_str(&format!("Screen: {screen_title}\n"));
+    out.push_str(&format!("Language: {} | RD key: {} | TMDB key: {} | Account: {}\n",
+        settings.stream_language.as_deref().unwrap_or(DEFAULT_LANGUAGE),
+        if settings.rd_key.is_some() { "set" } else { "none" },
+        if settings.tmdb_key.is_some() { "set" } else { "none" },
+        if account().is_some() { "signed in" } else { "signed out" },
+    ));
+    out.push_str("--- Recent events ---\n");
+    let mut lines: Vec<String> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(backend().data_dir.join("dev-log.txt")) {
+        for l in raw.lines().rev().take(120).collect::<Vec<_>>().into_iter().rev() {
+            lines.push(redact_diagnostic(l));
+        }
+    }
+    if lines.is_empty() {
+        if let Ok(q) = DIAG_RING.lock() { lines.extend(q.iter().cloned()); }
+    }
+    if lines.is_empty() { out.push_str("(no recent events)\n"); }
+    else { for l in lines { out.push_str(&l); out.push('\n'); } }
+    if let Ok(panic_text) = std::fs::read_to_string(backend().data_dir.join("last-panic.txt")) {
+        let snippet: String = panic_text.lines().take(25).map(redact_diagnostic).collect::<Vec<_>>().join("\n");
+        if !snippet.trim().is_empty() {
+            out.push_str("--- Last panic ---\n");
+            out.push_str(&snippet);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- watch-history import & export (Trakt / IMDb / Veylo)
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedTitle {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub year: String,
+    pub watched: bool,
+    pub saved: bool,
+    pub liked: i64,
+}
+
+/// Parse a Trakt watched JSON export (`[{"movie":{...}}]` / `[{"show":{...}}]`), a Veylo JSON
+/// export (`{"veylo_export":1,"items":[...]}`), or an IMDb CSV / plain list of `tt...` IDs.
+pub fn parse_watch_history_import(raw: &str) -> Vec<ImportedTitle> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    fn push_item(out: &mut Vec<ImportedTitle>, seen: &mut HashSet<String>, item: ImportedTitle) {
+        if item.id.is_empty() { return; }
+        let k = format!("{}|{}", item.kind, item.id);
+        if seen.insert(k) { out.push(item); }
+    }
+
+    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        // Veylo JSON export
+        if let Some(items) = v.get("items").and_then(Value::as_array) {
+            for e in items {
+                let id = s(e, "id");
+                let kind = Some(s(e, "type")).filter(|k| !k.is_empty()).unwrap_or_else(|| "movie".into());
+                let name = Some(s(e, "name")).filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
+                let year = s(e, "year");
+                let watched = e["watched"].as_bool().unwrap_or(true);
+                let saved = e["saved"].as_bool().unwrap_or(false);
+                let liked = e["liked"].as_i64().unwrap_or(0).clamp(-1, 1);
+                push_item(&mut out, &mut seen, ImportedTitle { id, kind, name, year, watched, saved, liked });
+            }
+            return out;
+        }
+        // Trakt watched / history / watchlist JSON array
+        if let Some(arr) = v.as_array() {
+            for e in arr {
+                if let Some(m) = e.get("movie") {
+                    let id = s(&m["ids"], "imdb");
+                    let name = Some(s(m, "title")).filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
+                    let year = m["year"].as_i64().map(|y| y.to_string()).unwrap_or_default();
+                    let saved = e.get("listed_at").is_some();
+                    push_item(&mut out, &mut seen, ImportedTitle { id, kind: "movie".into(), name, year, watched: !saved, saved, liked: 0 });
+                } else if let Some(sh) = e.get("show") {
+                    let id = s(&sh["ids"], "imdb");
+                    let name = Some(s(sh, "title")).filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone());
+                    let year = sh["year"].as_i64().map(|y| y.to_string()).unwrap_or_default();
+                    let saved = e.get("listed_at").is_some();
+                    push_item(&mut out, &mut seen, ImportedTitle { id, kind: "series".into(), name, year, watched: !saved, saved, liked: 0 });
+                }
+            }
+            if !out.is_empty() { return out; }
+        }
+    }
+
+    // Fallback: IMDb CSV export or plain text containing `tt1234567` IDs.
+    static_re!(imdb_re, r"\b(tt\d{7,9})\b");
+    for line in raw.lines() {
+        let Some(caps) = imdb_re().captures(line) else { continue };
+        let id = caps[1].to_owned();
+        let lower = line.to_lowercase();
+        let kind = if lower.contains("tv series") || lower.contains("tv mini") || lower.contains("series") { "series" } else { "movie" }.to_owned();
+        // Best-effort title from CSV if present (column after id or quoted title).
+        let name = line.split(',').nth(5)
+            .map(|c| c.trim().trim_matches('"').to_owned())
+            .filter(|n| !n.is_empty() && !n.starts_with("http"))
+            .unwrap_or_else(|| id.clone());
+        push_item(&mut out, &mut seen, ImportedTitle { id, kind, name, year: String::new(), watched: true, saved: false, liked: 0 });
+    }
+    out
+}
+
+/// Export watched, saved, and liked titles as a portable JSON backup (zero keys or addon secrets).
+pub async fn export_watch_history() -> Result<String> {
+    let items = library().await?;
+    let rows: Vec<Value> = items.into_iter().filter(|m| m.watched || m.saved || m.liked != 0 || m.position_ms > 0).map(|m| json!({
+        "id": m.id,
+        "type": m.kind,
+        "name": m.name,
+        "year": m.year,
+        "watched": m.watched,
+        "saved": m.saved,
+        "liked": m.liked,
+    })).collect();
+    let payload = json!({"veylo_export": 1, "exported_at": now_secs(), "items": rows});
+    let text = serde_json::to_string_pretty(&payload)?;
+    let _ = write_private_file(&backend().data_dir.join("veylo-history-export.json"), text.as_bytes());
+    Ok(text)
+}
+
+/// Import titles from Trakt JSON, Veylo JSON, or IMDb CSV into the local library & Picks taste.
+pub async fn import_watch_history(raw: &str) -> Result<usize> {
+    let parsed = parse_watch_history_import(raw);
+    anyhow::ensure!(!parsed.is_empty(), "No titles found. Paste a Trakt watched JSON, Veylo export JSON, or IMDb CSV.");
+    let mut count = 0usize;
+    for item in parsed {
+        let meta = json!({
+            "id": item.id,
+            "type": item.kind,
+            "name": item.name,
+            "releaseInfo": item.year,
+        });
+        let Some(media) = Media::from_json(&meta, CINEMETA) else { continue };
+        if item.watched { let _ = set_watched(&media, true).await; }
+        if item.saved { let _ = set_saved(&media, true).await; }
+        if item.liked != 0 { let _ = feedback(&media, item.liked).await; }
+        count += 1;
+    }
+    sync_soon();
+    Ok(count)
 }
 
 /// Change one or more settings: read, changed, saved and applied; returns what was saved.
@@ -109,12 +406,23 @@ pub async fn genre_candidates(genre: &str) -> Vec<Media> {
             }
         }
     }
-    let mut out = Vec::new();
-    for req in requests.into_iter().take(6) {
-        let origin = s(&req, "addon_url");
-        if let Ok(v) = exec(req).await { out.extend(metas(&v, &origin)); }
-    }
-    out
+    let requests: Vec<Value> = requests.into_iter().take(6).collect();
+    on_runtime(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        for (i, req) in requests.into_iter().enumerate() {
+            jobs.spawn(async move {
+                let origin = s(&req, "addon_url");
+                let items = backend().core.execute(req).await.ok().map(|v| metas(&v, &origin)).unwrap_or_default();
+                (i, items)
+            });
+        }
+        let mut results: Vec<(usize, Vec<Media>)> = Vec::new();
+        while let Some(done) = jobs.join_next().await {
+            if let Ok(pair) = done { results.push(pair); }
+        }
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().flat_map(|(_, items)| items).collect()
+    }).await.unwrap_or_default()
 }
 
 pub(super) fn duel_state_path() -> PathBuf { backend().data_dir.join("picks-duel.json") }
@@ -152,8 +460,8 @@ fn write_soon(path: std::path::PathBuf, text: String) {
 static PENDING_WRITES: Mutex<Option<HashMap<std::path::PathBuf, String>>> = Mutex::new(None);
 static WRITING: Mutex<()> = Mutex::new(());
 
-/// Write what `write_soon` still holds, now: before a file is read back.
-fn flush_writes() {
+/// Write what `write_soon` still holds, now: before a file is read back or the app exits.
+pub fn flush_writes() {
     let _turn = WRITING.lock();
     let batch = PENDING_WRITES.lock().ok().and_then(|mut p| p.take()).unwrap_or_default();
     for (path, text) in batch { let _ = std::fs::write(path, text); }
@@ -251,4 +559,87 @@ pub fn clear_history(h: &mut History) {
     *h = History::default();
     // Through the same writer, so a save still pending can't bring the old history back.
     save_history(h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_private_file_enforces_owner_only_permissions_on_unix() {
+        let dir = std::env::temp_dir().join(format!("veylo-store-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("secret.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Start with world-readable 0644 and verify write_private_file tightens it to 0600.
+        std::fs::write(&path, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write_private_file(&path, b"{\"key\":\"top-secret\"}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"key\":\"top-secret\"}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "secret file mode was {mode:o}, expected 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_soon_coalesces_and_flush_writes_persists_immediately() {
+        let dir = std::env::temp_dir().join(format!("veylo-store-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        for i in 1..=20 {
+            write_soon(path.clone(), format!("{{\"rev\":{i}}}"));
+        }
+        flush_writes();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"rev\":20}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_prefs_roundtrip_and_redaction() {
+        let dir = std::env::temp_dir().join(format!("veylo-track-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track-prefs.json");
+        let mut map = HashMap::new();
+        map.insert("series|tt1|a".into(), TrackPref { audio_lang: Some("jpn".into()), sub_lang: Some("eng".into()), sub_off: false });
+        std::fs::write(&path, write_track_prefs_json(&map)).unwrap();
+        assert_eq!(read_track_prefs_from(&path), map);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let clean = redact_diagnostic("fetch https://torrentio.strem.fun/rd=SECRET/manifest.json api_key=12345 token=abc");
+        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc"), "{clean}");
+        assert!(clean.contains("[URL]") && clean.contains("[REDACTED]"), "{clean}");
+    }
+
+    #[test]
+    fn parses_trakt_veylo_and_imdb_history_imports() {
+        let trakt = r#"[
+            {"plays":1,"movie":{"title":"Dune","year":2021,"ids":{"imdb":"tt1160419"}}},
+            {"plays":2,"show":{"title":"Severance","year":2022,"ids":{"imdb":"tt11280740"}}}
+        ]"#;
+        let t = parse_watch_history_import(trakt);
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].id.as_str(), t[0].kind.as_str(), t[0].name.as_str(), t[0].watched), ("tt1160419", "movie", "Dune", true));
+        assert_eq!((t[1].id.as_str(), t[1].kind.as_str(), t[1].name.as_str()), ("tt11280740", "series", "Severance"));
+
+        let veylo = r#"{"veylo_export":1,"items":[{"id":"tt0133093","type":"movie","name":"The Matrix","year":"1999","watched":true,"saved":true,"liked":1}]}"#;
+        let v = parse_watch_history_import(veylo);
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].id.as_str(), v[0].saved, v[0].liked), ("tt0133093", true, 1));
+
+        let csv = "Const,Your Rating,Date Rated,Title Type,URL,Title\ntt0468569,10,2024-01-01,Movie,https://imdb.com,The Dark Knight\ntt0903747,10,2024-01-02,TV Series,https://imdb.com,Breaking Bad\n";
+        let c = parse_watch_history_import(csv);
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].id.as_str(), c[0].kind.as_str(), c[0].name.as_str()), ("tt0468569", "movie", "The Dark Knight"));
+        assert_eq!((c[1].id.as_str(), c[1].kind.as_str(), c[1].name.as_str()), ("tt0903747", "series", "Breaking Bad"));
+    }
 }

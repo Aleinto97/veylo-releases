@@ -38,8 +38,18 @@ use dioxus::prelude::*;
 
 /// The app's styles, in cascade order (src/styles).
 const STYLE: &str = concat!(include_str!("styles/base.css"), include_str!("styles/screens.css"), include_str!("styles/sizes.css"),
-    include_str!("styles/addons.css"), include_str!("styles/player.css"), include_str!("styles/pages.css"), include_str!("styles/motion.css"));
+    include_str!("styles/addons.css"), include_str!("styles/player.css"), include_str!("styles/pages.css"), include_str!("styles/motion.css"),
+    include_str!("styles/tv.css"));
 const ARCHIVO: &[u8] = include_bytes!("../assets/fonts/archivo.ttf");
+
+/// Whether Veylo runs on a television (Android TV and TVs that say so): Back never leaves the app,
+/// shelves are shorter, and tv.js drives focus from the remote.
+pub fn is_tv() -> bool {
+    #[cfg(target_os = "android")]
+    { android::is_tv() }
+    #[cfg(not(target_os = "android"))]
+    { false }
+}
 
 /// Destinations, in the Android app's order.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -345,8 +355,9 @@ fn Shell_() -> Element {
     let mut insets = use_signal(system_bar_insets);
 
     // Android Back closes a page, Search or the videos, like Esc; on a top-level screen it leaves the app.
+    // On a TV it never leaves: Back only goes back (to Home at most), and the remote's Home key leaves.
     #[cfg(target_os = "android")]
-    use_effect(move || { let _ = android::set_back_enabled(shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
+    use_effect(move || { let _ = android::set_back_enabled(is_tv() || shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
         || (shell.trailer)().is_some() || matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))); });
     // A failure says why once; it doesn't stay over the app (a new playback replaces it sooner).
     let mut status = shell.player_status;
@@ -427,6 +438,8 @@ fn Shell_() -> Element {
             }
             Key::Escape if search_open() => close_search(shell),
             Key::Escape if opened.read().is_some() => opened.set(None),
+            // A TV's Back on another tab goes to Home (it never leaves the app).
+            Key::Escape if is_tv() && tab() != Tab::Home => go(tab, opened, Tab::Home),
             _ if search_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
             Key::Backspace if opened.read().is_some() => opened.set(None),
             Key::Character(c) if c == "?" => shortcuts_open.set(!shortcuts_open()),
@@ -445,6 +458,53 @@ fn Shell_() -> Element {
     use_hook(|| { document::eval(r#"window.addEventListener('keydown', e => {
         if (e.target === document.body) { const a = document.querySelector('.app'); if (a) { a.focus(); a.dispatchEvent(new KeyboardEvent('keydown', e)); } }
     });"#); });
+    // Android TV: the remote moves focus and focus lights the room (tv.js, styles/tv.css).
+    use_hook(|| if cfg!(target_os = "android") { document::eval(include_str!("tv.js")); });
+    // Lightweight WebView monitor: forwards JS runtime errors and sheet/dialog horizontal layout
+    // overflows to Firebase diagnostics when telemetry is enabled.
+    use_future(|| async move {
+        let mut eval = document::eval(r#"(() => {
+            const seen = new Set();
+            const send = (summary, details) => {
+                const key = summary.slice(0, 80);
+                if (seen.has(key) || seen.size > 10) return;
+                seen.add(key);
+                dioxus.send({ summary, details });
+            };
+            window.addEventListener('error', e => {
+                send('JS error: ' + (e.message || 'unknown'), (e.filename || '') + ':' + (e.lineno || 0) + ':' + (e.colno || 0));
+            });
+            window.addEventListener('unhandledrejection', e => {
+                const msg = e.reason ? String(e.reason) : 'unhandled rejection';
+                send('Unhandled promise: ' + msg.slice(0, 140), msg);
+            });
+            let timer = null;
+            const checkLayout = () => {
+                const vw = window.innerWidth || 0;
+                if (vw <= 0) return;
+                for (const el of document.querySelectorAll('.bottom-sheet, .player-sheet, .panel')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) continue;
+                    if (r.right > vw + 16 || r.left < -16) {
+                        send('UI overflow on .' + (el.className || '').split(' ')[0],
+                            'class=' + el.className + ' rect=' + Math.round(r.left) + '..' + Math.round(r.right) + ' width=' + Math.round(r.width) + ' viewport=' + vw);
+                        break;
+                    }
+                }
+            };
+            new MutationObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(checkLayout, 350);
+            }).observe(document.body, { childList: true, subtree: true });
+        })();"#);
+        while let Ok(v) = eval.recv::<serde_json::Value>().await {
+            let summary = v["summary"].as_str().unwrap_or_default();
+            let details = v["details"].as_str().unwrap_or_default();
+            if !summary.is_empty() {
+                backend::report_issue_bg("ui_error", summary.to_owned(), details.to_owned());
+            }
+        }
+    });
     // The top bar gathers smoke once the page scrolls under it (styles/base.css, .scrolled). Checked on
     // scroll and, at most once a frame, when the page changes (a new tab or title starts at the top).
     use_hook(|| { document::eval(r#"(() => {
@@ -552,6 +612,8 @@ fn Shell_() -> Element {
                 }
             } }
             if let Some(live) = (shell.player)() { player_ui::PlayerScreen { live } }
+            // Another of your devices asking for your keys, or yours arriving here.
+            if (shell.player)().is_none() { account_ui::KeysPrompt {} }
             if search_open() { search::SearchOverlay {} }
             if shortcuts_open() { shortcuts::AppShortcuts {} }
             // Windows, macOS and Android install releases; Linux builds from source.

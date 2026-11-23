@@ -17,6 +17,20 @@ fn with_activity<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result
 }
 
 /// Context.getFilesDir(): private to this app, kept until it is uninstalled.
+/// A system property ("ro.product.model"), None when unset.
+pub fn property(name: &std::ffi::CStr) -> Option<String> {
+    let mut value = [0 as libc::c_char; 92]; // PROP_VALUE_MAX
+    // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer, as bionic requires.
+    let n = unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    (n > 0).then(|| unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// Whether this device is a television: TVs say so in ro.build.characteristics ("tv").
+pub fn is_tv() -> bool {
+    static TV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TV.get_or_init(|| property(c"ro.build.characteristics").is_some_and(|v| v.split(',').any(|c| c.trim() == "tv")))
+}
+
 pub fn files_dir() -> Result<PathBuf> {
     with_activity(|env, activity| {
         let dir = env.call_method(activity, "getFilesDir", "()Ljava/io/File;", &[])?.l()?;
@@ -158,6 +172,55 @@ pub fn video_hide() -> Result<()> { video_call("hide", "(Landroid/app/Activity;)
 pub fn video_layout(aspect: f64, fit: i32) -> Result<()> {
     video_call("layout", "(Landroid/app/Activity;DI)V", &[JValue::Double(aspect), JValue::Int(fit)])
 }
+pub fn video_frame_rate(fps: f64) -> Result<()> {
+    video_call("setFrameRate", "(Landroid/app/Activity;D)V", &[JValue::Double(fps)])
+}
+pub fn video_media_meta(title: &str, subtitle: &str) -> Result<()> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let t = env.new_string(title)?;
+        let s = env.new_string(subtitle)?;
+        env.call_static_method(&class, "setMediaMetadata", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(activity), JValue::Object(&t), JValue::Object(&s)])?;
+        Ok(())
+    })
+}
+pub fn video_media_state(playing: bool, position_ms: i64, speed: f32) -> Result<()> {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        env.call_static_method(&class, "setMediaState", "(ZJF)V",
+            &[JValue::Bool(playing.into()), JValue::Long(position_ms), JValue::Float(speed)])?;
+        Ok(())
+    })
+}
+pub fn video_get_brightness() -> f32 {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        env.call_static_method(&class, "getBrightness", "(Landroid/app/Activity;)F", &[JValue::Object(activity)])?.f()
+    }).unwrap_or(0.5)
+}
+pub fn video_set_brightness(level: f32) -> Result<()> {
+    video_call("setBrightness", "(Landroid/app/Activity;F)V", &[JValue::Float(level)])
+}
+pub fn video_get_volume() -> f32 {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        env.call_static_method(&class, "getVolume", "(Landroid/app/Activity;)F", &[JValue::Object(activity)])?.f()
+    }).unwrap_or(0.5)
+}
+pub fn video_set_volume(level: f32) -> Result<()> {
+    video_call("setVolume", "(Landroid/app/Activity;F)V", &[JValue::Float(level)])
+}
+pub fn video_set_rotation_lock(locked: bool) -> Result<()> {
+    video_call("setRotationLock", "(Landroid/app/Activity;Z)V", &[JValue::Bool(locked.into())])
+}
+pub fn video_enter_pip(w: i32, h: i32) -> bool {
+    with_activity(|env, activity| {
+        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        env.call_static_method(&class, "enterPip", "(Landroid/app/Activity;II)Z",
+            &[JValue::Object(activity), JValue::Int(w), JValue::Int(h)])?.z()
+    }).unwrap_or(false)
+}
 
 /// What the panel declares (Display.HdrCapabilities).
 pub fn screen() -> Result<crate::engine::Screen> {
@@ -247,6 +310,24 @@ pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(env: JNIEnv, _
     if let Some(live) = &live { give_surface(live, wid, width, height); }
 }
 
+/// VeyloVideo.nativeCommand: playback commands from AudioFocus, headphone disconnect, or MediaSession.
+#[no_mangle]
+pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeCommand(mut env: JNIEnv, _class: JClass, cmd: JString) {
+    let Ok(cmd_str) = env.get_string(&cmd) else { return };
+    let cmd: String = cmd_str.into();
+    let Some(live) = crate::engine::active() else { return };
+    match cmd.as_str() {
+        "play" => live.set_paused(false),
+        "pause" => live.set_paused(true),
+        "toggle" => live.toggle_pause(),
+        "seek_fwd" => live.seek_by(10.0),
+        "seek_back" => live.seek_by(-10.0),
+        "next" if live.request.has_next => live.finish(crate::engine::Finish::Next),
+        "stop" => live.finish(crate::engine::Finish::Close),
+        _ => {}
+    }
+}
+
 /// One line in logcat under "veylo" (stderr is not shown on Android). Never URLs or keys.
 /// Some builds (Honor, Huawei) hide app logs, so the line also goes, timed, into the app's own
 /// files/dev-log.txt (`adb shell run-as dev.veylo.dx cat files/dev-log.txt`), kept under 64 KiB.
@@ -259,6 +340,8 @@ pub fn log(message: &str) {
         Some(path) => path,
         None => match files_dir() { Ok(dir) => FILE.get_or_init(|| dir.join("dev-log.txt")), Err(_) => return },
     };
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOG_LOCK.lock();
     if std::fs::metadata(path).is_ok_and(|m| m.len() > 64 * 1024) { let _ = std::fs::rename(path, path.with_extension("old.txt")); }
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     use std::io::Write;

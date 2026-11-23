@@ -6,11 +6,13 @@
 //! - a computer linked from a signed-in phone or tablet: the computer shows a QR code, the phone
 //!   scans it and hands the computer its session, sealed with the key in that code.
 //!
-//! What syncs: titles with history (saved, watched, rated, progress) and each episode's record,
-//! as the core lists them (`sync_changes`), newest change winning (`sync_apply`). Each document
-//! carries the server's time, so a device whose clock is off still sees every change.
-//! The session (its refresh token) is kept in the app's private folder, like settings.json; it
-//! is never logged.
+//! What syncs: titles with history (saved, watched, rated, progress), each episode's record
+//! (`sync_changes` / `sync_apply`, newest change winning), and your API keys, audio language and
+//! add-ons (`users/{uid}/config/keys`, readable and writable only by your signed-in account).
+//! Signing in on any OS automatically pulls your keys and add-ons with no extra steps. Each
+//! document carries the server's time, so a device whose clock is off still sees every change.
+//! The session (its refresh token) is kept in the app's private folder (0600 on Unix), like
+//! settings.json; it is never logged.
 use super::*;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -54,6 +56,9 @@ struct Session { account: Account, refresh: String, id_token: String, expires: i
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static LOADED: OnceLock<()> = OnceLock::new();
+static LAST_SYNCED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static STATE_LOCK: Mutex<()> = Mutex::new(());
+static FORGOTTEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
 fn session_path() -> PathBuf { backend().data_dir.join("account.json") }
 
@@ -64,6 +69,7 @@ fn load_session() {
         if !refresh.is_empty() && config().is_some() {
             let account = Account { uid: s(&v, "uid"), email: s(&v, "email"), name: s(&v, "name"), provider: s(&v, "provider") };
             if let Ok(mut slot) = SESSION.lock() { *slot = Some(Session { account, refresh, ..Session::default() }); }
+            LAST_SYNCED.store(load_state().last, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }
@@ -73,7 +79,8 @@ fn save_session(session: Option<&Session>) {
     match session {
         Some(x) => {
             let a = &x.account;
-            let _ = std::fs::write(&path, json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":x.refresh}).to_string());
+            let data = json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":x.refresh}).to_string();
+            let _ = write_private_file(&path, data.as_bytes());
         }
         None => { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(state_path()); }
     }
@@ -91,6 +98,12 @@ fn set_session(session: Session) -> Account {
     if let Ok(mut slot) = SESSION.lock() { *slot = Some(session); }
     start_sync();
     sync_soon();
+    // Pull synced library, API keys and add-ons right away on sign-in.
+    if let Some(runtime) = RUNTIME.get() {
+        runtime.spawn(async {
+            if let Err(e) = sync_now().await { dev_log(&format!("sync: {e}")); }
+        });
+    }
     account
 }
 
@@ -159,7 +172,11 @@ pub async fn reset_password(email: String) -> Result<()> {
 
 /// Sign in with a Google ID token (from Android's account sheet or the computer's browser).
 async fn sign_in_google_token(id_token: String) -> Result<Account> {
-    let v = identity("signInWithIdp", json!({"postBody":format!("id_token={id_token}&providerId=google.com"),
+    let post_body: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("id_token", &id_token)
+        .append_pair("providerId", "google.com")
+        .finish();
+    let v = identity("signInWithIdp", json!({"postBody":post_body,
         "requestUri":"http://localhost","returnIdpCredential":true,"returnSecureToken":true})).await?;
     Ok(set_session(session_from(&v, "google")?))
 }
@@ -174,7 +191,7 @@ pub async fn sign_in_google() -> Result<Account> {
 async fn google_id_token() -> Result<String> {
     let client = config().and_then(|c| c.web_client).context("Google sign-in isn't set up in this build")?;
     crate::android::google_id_token(client)?;
-    loop {
+    for _ in 0..1200 {
         sleep(250).await;
         match crate::android::account_result() {
             Some(r) if r.starts_with("token:") => return Ok(r["token:".len()..].to_owned()),
@@ -183,10 +200,28 @@ async fn google_id_token() -> Result<String> {
             _ => {}
         }
     }
+    anyhow::bail!("Sign-in took too long. Try again.")
+}
+
+/// Parse `state` and `id_token` from either a POST form body (preferred: keeps tokens out of
+/// browser history) or a GET query string (fallback for older sign-in pages).
+#[cfg_attr(target_os = "android", allow(dead_code))]
+fn parse_callback_params(request: &str) -> HashMap<String, String> {
+    let first_line = request.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or("/");
+    if method.eq_ignore_ascii_case("POST") {
+        let body = request.split_once("\r\n\r\n").or_else(|| request.split_once("\n\n")).map(|(_, b)| b).unwrap_or_default();
+        return url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+    }
+    url::Url::parse(&format!("http://127.0.0.1{path}")).ok()
+        .map(|u| u.query_pairs().into_owned().collect())
+        .unwrap_or_default()
 }
 
 /// On a computer: the project's sign-in page (Firebase Hosting, firebase/hosting/sign-in.html) in
-/// the browser, where Google's button gives an ID token for the web client; the page hands it to
+/// the browser, where Google's button gives an ID token for the web client; the page posts it to
 /// a one-off local address (127.0.0.1) with the check value Veylo gave it.
 #[cfg(not(target_os = "android"))]
 async fn google_id_token() -> Result<String> {
@@ -202,13 +237,34 @@ async fn google_id_token() -> Result<String> {
         tokio::time::timeout(Duration::from_secs(300), async {
             loop {
                 let (mut stream, _) = listener.accept().await?;
-                let mut buf = vec![0u8; 16384];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                let Ok(answer) = url::Url::parse(&format!("http://127.0.0.1{path}")) else { continue };
-                let q: HashMap<String, String> = answer.query_pairs().into_owned().collect();
-                if q.get("state") != Some(&state) { continue; }
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                while buf.len() < 65536 {
+                    let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await else { break };
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let head = String::from_utf8_lossy(&buf[..pos]);
+                            content_len = head.lines().find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok()).flatten()
+                            }).unwrap_or(0).min(65536);
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_len { break; }
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let q = parse_callback_params(&request);
+                if q.get("state") != Some(&state) {
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    continue;
+                }
                 let token = q.get("id_token").cloned().filter(|t| !t.is_empty());
                 let page = if token.is_some() { "You're signed in. You can close this tab and go back to Veylo." } else { "Sign-in was cancelled. You can close this tab." };
                 let body = format!("<!doctype html><meta charset=utf-8><title>Veylo</title><body style=\"font:18px system-ui;background:#0e0e10;color:#f2efea;display:grid;place-items:center;height:90vh\">{page}</body>");
@@ -261,6 +317,8 @@ async fn id_token() -> Result<(String, String)> {
 
 fn forget_session() {
     if let Ok(mut slot) = SESSION.lock() { *slot = None; }
+    if let Ok(mut f) = FORGOTTEN.lock() { f.clear(); }
+    LAST_SYNCED.store(0, std::sync::atomic::Ordering::Relaxed);
     save_session(None);
 }
 
@@ -277,6 +335,19 @@ pub async fn delete_account() -> Result<()> {
         let writes: Vec<Value> = docs.iter().map(|(name, _)| json!({"delete": name})).collect();
         commit(&token, writes).await?;
     }
+    if let Some(base) = documents() {
+        // Synced keys & add-ons config document.
+        let _ = commit(&token, vec![json!({"delete": format!("{base}/users/{uid}/config/keys")})]).await;
+        // Any legacy key handoff requests and diagnostic reports, paginated to completion.
+        for coll in ["handoff", "diagnostics"] {
+            loop {
+                let list = get_doc(&token, format!("{base}/users/{uid}/{coll}?pageSize=300")).await.ok().flatten().unwrap_or_default();
+                let writes: Vec<Value> = list["documents"].as_array().into_iter().flatten().filter_map(|d| d["name"].as_str()).map(|n| json!({"delete": n})).collect();
+                if writes.is_empty() { break; }
+                commit(&token, writes).await?;
+            }
+        }
+    }
     identity("delete", json!({"idToken":token})).await?;
     forget_session();
     Ok(())
@@ -287,6 +358,15 @@ pub async fn delete_account() -> Result<()> {
 fn documents() -> Option<String> {
     config().map(|c| format!("projects/{}/databases/(default)/documents", c.project))
 }
+
+pub(super) fn documents_pub() -> Option<String> { documents() }
+pub(super) async fn id_token_pub() -> Result<(String, String)> { id_token().await }
+pub(super) async fn commit_pub(token: &str, writes: Vec<Value>) -> Result<()> { commit(token, writes).await }
+pub(super) async fn get_doc_pub(token: &str, path: String) -> Result<Option<Value>> { get_doc(token, path).await }
+pub(super) fn device_name_pub() -> String { device_name() }
+pub(super) fn random_id_pub(bytes: usize) -> String { random_text(bytes).replace(['-', '_'], "x") }
+pub(super) async fn anon_sign_up_pub() -> Result<Value> { identity("signUp", json!({"returnSecureToken": true})).await }
+pub(super) async fn anon_delete_pub(token: &str) -> Result<Value> { identity("delete", json!({"idToken": token})).await }
 
 async fn commit(token: &str, writes: Vec<Value>) -> Result<()> {
     let base = documents().context("Accounts aren't set up in this build")?;
@@ -322,31 +402,64 @@ fn doc_id(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes()
 // ---------------------------------------------------------------- sync
 
 /// Where sync is up to: the last local change sent (seconds, this device's clock), the last
-/// server change taken, and the (key, time) of rows exchanged lately so none is sent back.
+/// server change taken, the (key, time) of rows exchanged lately so none is sent back, and the
+/// hash/timestamp of the last keys & add-ons snapshot synced with the account.
 #[derive(Default)]
-struct State { sent_until: i64, taken_until: Option<String>, seen: BTreeMap<String, i64>, known: std::collections::BTreeSet<String>, forgotten: Vec<Value>, last: i64 }
+struct State {
+    sent_until: i64,
+    taken_until: Option<String>,
+    seen: BTreeMap<String, i64>,
+    known: std::collections::BTreeSet<String>,
+    forgotten: Vec<Value>,
+    last: i64,
+    keys_hash: String,
+    keys_updated: i64,
+}
 
 fn state_path() -> PathBuf { backend().data_dir.join("sync-state.json") }
 
 fn load_state() -> State {
+    let _guard = STATE_LOCK.lock();
     let v: Value = std::fs::read_to_string(state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let last = v["last"].as_i64().unwrap_or(0);
+    LAST_SYNCED.store(last, std::sync::atomic::Ordering::Relaxed);
     State {
         sent_until: v["sent_until"].as_i64().unwrap_or(0),
         taken_until: v["taken_until"].as_str().map(str::to_owned),
         seen: v["seen"].as_object().map(|o| o.iter().filter_map(|(k, t)| Some((k.clone(), t.as_i64()?))).collect()).unwrap_or_default(),
         known: v["known"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
         forgotten: v["forgotten"].as_array().cloned().unwrap_or_default(),
-        last: v["last"].as_i64().unwrap_or(0),
+        last,
+        keys_hash: s(&v, "keys_hash"),
+        keys_updated: v["keys_updated"].as_i64().unwrap_or(0),
     }
 }
 
 fn save_state(st: &State) {
+    let _guard = STATE_LOCK.lock();
     // Only the newest exchanged rows are worth remembering.
     let mut seen: Vec<(&String, &i64)> = st.seen.iter().collect();
     seen.sort_by_key(|(_, t)| std::cmp::Reverse(**t));
     let seen: serde_json::Map<String, Value> = seen.into_iter().take(5000).map(|(k, t)| (k.clone(), json!(t))).collect();
-    let _ = std::fs::write(state_path(), json!({"sent_until":st.sent_until,"taken_until":st.taken_until,"seen":seen,
-        "known":st.known,"forgotten":st.forgotten,"last":st.last}).to_string());
+    // Merge any tombstones queued while a sync was in flight so they are never clobbered.
+    let mut forgotten = st.forgotten.clone();
+    if let Ok(pending) = FORGOTTEN.lock() {
+        for item in pending.iter() {
+            if !forgotten.contains(item) { forgotten.push(item.clone()); }
+        }
+    }
+    LAST_SYNCED.store(st.last, std::sync::atomic::Ordering::Relaxed);
+    let data = json!({
+        "sent_until": st.sent_until,
+        "taken_until": st.taken_until,
+        "seen": seen,
+        "known": st.known,
+        "forgotten": forgotten,
+        "last": st.last,
+        "keys_hash": st.keys_hash,
+        "keys_updated": st.keys_updated,
+    }).to_string();
+    let _ = write_private_file(&state_path(), data.as_bytes());
 }
 
 /// The fields of a title's metadata worth syncing (the rest comes back from its add-on).
@@ -375,7 +488,9 @@ fn row_key(row: &Value) -> String {
 static SYNCING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// When the last sync finished (seconds), 0 if never.
-pub fn last_synced() -> i64 { if account().is_some() { load_state().last } else { 0 } }
+pub fn last_synced() -> i64 {
+    if account().is_some() { LAST_SYNCED.load(std::sync::atomic::Ordering::Relaxed) } else { 0 }
+}
 
 /// Take the other devices' changes, then send this one's. Returns how many rows came and went.
 pub async fn sync_now() -> Result<(usize, usize)> {
@@ -421,15 +536,30 @@ pub async fn sync_now() -> Result<(usize, usize)> {
         st.seen.insert(key.clone(), updated);
         st.known.insert(key);
     }
-    for gone in std::mem::take(&mut st.forgotten) {
-        let key = row_key(&gone);
-        writes.push(item_write(&base, &uid, &doc_id(&key), &gone));
+    // Drain both persisted and concurrently queued tombstones; restore on commit failure.
+    let mut pending_forgotten = std::mem::take(&mut st.forgotten);
+    if let Ok(mut queued) = FORGOTTEN.lock() {
+        for item in queued.drain(..) {
+            if !pending_forgotten.contains(&item) { pending_forgotten.push(item); }
+        }
+    }
+    for gone in &pending_forgotten {
+        let key = row_key(gone);
+        writes.push(item_write(&base, &uid, &doc_id(&key), gone));
     }
     let sent = writes.len();
-    commit(&token, writes).await?;
+    if let Err(e) = commit(&token, writes).await {
+        if let Ok(mut queued) = FORGOTTEN.lock() {
+            for item in pending_forgotten {
+                if !queued.contains(&item) { queued.push(item); }
+            }
+        }
+        return Err(e);
+    }
     // A second's changes may still be coming: the next sync looks at that second again.
     st.sent_until = (newest - 1).max(st.sent_until);
     st.last = now_secs();
+    if let Err(e) = sync_keys(&token, &uid, &base, &mut st).await { dev_log(&format!("keys: {e}")); }
     save_state(&st);
     Ok((taken, sent))
 }
@@ -437,8 +567,10 @@ pub async fn sync_now() -> Result<(usize, usize)> {
 /// A title forgotten here is forgotten on the other devices too.
 pub fn sync_forgotten(media: &Media) {
     if account().is_none() { return; }
-    let mut st = load_state();
-    st.forgotten.push(json!({"t":"m","type":media.kind,"id":media.id,"addon_url":media.addon_url,"updated":now_secs(),"deleted":true}));
+    let entry = json!({"t":"m","type":media.kind,"id":media.id,"addon_url":media.addon_url,"updated":now_secs(),"deleted":true});
+    if let Ok(mut queued) = FORGOTTEN.lock() { queued.push(entry); }
+    // Also persist immediately so a crash before the next sync keeps the tombstone.
+    let st = load_state();
     save_state(&st);
     sync_soon();
 }
@@ -470,6 +602,231 @@ pub fn start_sync() {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------- automatic API keys & add-ons sync
+// Your Real-Debrid key, TMDB key, audio language and add-ons sync automatically through your
+// account's private Firestore document (`users/{uid}/config/keys`, readable/writable only by your
+// signed-in account). Signing in on any OS pulls them automatically without prompting another device.
+
+/// The device the keys came from, once they arrived here (shown once).
+static ARRIVED: Mutex<Option<String>> = Mutex::new(None);
+
+/// What this device is called in sync metadata.
+fn device_name() -> String {
+    #[cfg(target_os = "android")]
+    { crate::android::property(c"ro.product.model").unwrap_or_else(|| "Android device".into()) }
+    #[cfg(windows)]
+    { std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into()) }
+    #[cfg(target_os = "macos")]
+    { "Mac".into() }
+    #[cfg(all(not(target_os = "android"), not(windows), not(target_os = "macos")))]
+    { std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).unwrap_or_else(|| "Computer".into()) }
+}
+
+/// The keys this device can hand over, None when it has neither.
+fn keys_here() -> Option<Value> {
+    let s = load_settings();
+    (s.rd_key.is_some() || s.tmdb_key.is_some()).then(|| json!({"rd_key": s.rd_key, "tmdb_key": s.tmdb_key, "stream_language": s.stream_language}))
+}
+
+/// The device your keys just came from (once).
+pub fn take_keys_arrived() -> Option<String> { ARRIVED.lock().ok()?.take() }
+
+async fn get_doc(token: &str, path: String) -> Result<Option<Value>> {
+    let token = token.to_owned();
+    on_runtime(async move {
+        let r = backend().http.get(format!("https://firestore.googleapis.com/v1/{path}")).bearer_auth(token).timeout(Duration::from_secs(15)).send().await?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None) }
+        anyhow::ensure!(r.status().is_success(), "Firestore answered {}", r.status());
+        Ok(Some(r.json::<Value>().await?))
+    }).await?
+}
+
+fn keys_digest(payload: &Value) -> String {
+    format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
+}
+
+fn has_any_key(payload: &Value) -> bool {
+    payload["rd_key"].as_str().is_some_and(|v| !v.trim().is_empty())
+        || payload["tmdb_key"].as_str().is_some_and(|v| !v.trim().is_empty())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeysSyncAction { Adopt, Push, KeepSynced, Noop }
+
+struct KeysSyncInput<'a> {
+    local_has_keys: bool,
+    local_rd_removed: bool,
+    local_hash: &'a str,
+    last_synced_hash: &'a str,
+    last_synced_updated: i64,
+    remote_has_keys: bool,
+    remote_hash: Option<&'a str>,
+    remote_updated: i64,
+}
+
+/// Decide whether this device should pull remote keys, push local keys, or do nothing.
+fn decide_keys_sync(i: &KeysSyncInput<'_>) -> KeysSyncAction {
+    let local_changed = !i.last_synced_hash.is_empty() && i.local_hash != i.last_synced_hash;
+    // A newly signed-in device (any OS) without keys automatically adopts the account's keys.
+    if !i.local_has_keys && !i.local_rd_removed && i.remote_has_keys && !local_changed {
+        return KeysSyncAction::Adopt;
+    }
+    // Local keys, language or add-ons were edited on this device since last sync: push them.
+    if local_changed {
+        return KeysSyncAction::Push;
+    }
+    // First sync on a device that already has keys configured.
+    if i.last_synced_hash.is_empty() && i.local_has_keys {
+        return match i.remote_hash {
+            Some(rh) if rh == i.local_hash => KeysSyncAction::KeepSynced,
+            _ => KeysSyncAction::Push,
+        };
+    }
+    // Another device pushed a newer configuration.
+    if let Some(rh) = i.remote_hash {
+        if i.remote_updated > i.last_synced_updated && rh != i.local_hash {
+            return KeysSyncAction::Adopt;
+        }
+        if rh == i.local_hash && i.last_synced_hash != i.local_hash {
+            return KeysSyncAction::KeepSynced;
+        }
+    }
+    KeysSyncAction::Noop
+}
+
+/// Derive a per-account 256-bit AES-GCM key so synced API keys & add-ons are never stored
+/// in plaintext in Firestore while remaining automatically decryptable on every OS signed in
+/// to this account.
+fn keys_envelope_key(uid: &str, project: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"veylo-account-keys-v2\0");
+    h.update(project.as_bytes());
+    h.update(b"\0");
+    h.update(uid.as_bytes());
+    h.finalize().into()
+}
+
+fn seal_keys_payload(uid: &str, project: &str, payload: &Value) -> Result<String> {
+    let key = keys_envelope_key(uid, project);
+    seal(&key, payload.to_string().as_bytes())
+}
+
+fn open_keys_payload(uid: &str, project: &str, fields: &Value) -> Option<Value> {
+    if let Some(sealed) = fields["sealed"]["stringValue"].as_str() {
+        let key = keys_envelope_key(uid, project);
+        let plain = open_sealed(&key, sealed)?;
+        return serde_json::from_slice::<Value>(&plain).ok();
+    }
+    // Seamless migration from v1 plaintext documents.
+    fields["data"]["stringValue"].as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
+}
+
+/// Automatically sync API keys, audio language and add-ons through `users/{uid}/config/keys`.
+async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result<()> {
+    let project = config().map(|c| c.project).unwrap_or_default();
+    let settings = load_settings();
+    let local_addons = crate::addons::for_handoff().await;
+    let local = json!({
+        "rd_key": settings.rd_key,
+        "tmdb_key": settings.tmdb_key,
+        "stream_language": settings.stream_language,
+        "addons": local_addons,
+    });
+    let local_hash = keys_digest(&local);
+    let local_has_keys = has_any_key(&local);
+
+    let doc_path = format!("{base}/users/{uid}/config/keys");
+    let remote_doc = get_doc(token, doc_path.clone()).await?;
+    let remote_fields = remote_doc.as_ref().map(|d| &d["fields"]);
+    let remote_is_legacy_plain = remote_fields.is_some_and(|f| f["sealed"]["stringValue"].is_null() && f["data"]["stringValue"].is_string());
+    let remote_data = remote_fields.and_then(|f| open_keys_payload(uid, project, f));
+    let remote_updated = remote_fields
+        .and_then(|f| f["updated"]["integerValue"].as_str())
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or(0);
+    let remote_device = remote_fields
+        .and_then(|f| f["device"]["stringValue"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let remote_hash = remote_data.as_ref().map(keys_digest);
+    let remote_has_keys = remote_data.as_ref().is_some_and(has_any_key);
+
+    let mut action = decide_keys_sync(&KeysSyncInput {
+        local_has_keys,
+        local_rd_removed: settings.rd_key_removed,
+        local_hash: &local_hash,
+        last_synced_hash: &st.keys_hash,
+        last_synced_updated: st.keys_updated,
+        remote_has_keys,
+        remote_hash: remote_hash.as_deref(),
+        remote_updated,
+    });
+    // Upgrade legacy plaintext documents to sealed v2 once local matches.
+    if remote_is_legacy_plain && matches!(action, KeysSyncAction::KeepSynced | KeysSyncAction::Noop) && local_has_keys {
+        action = KeysSyncAction::Push;
+    }
+
+    match action {
+        KeysSyncAction::Adopt => {
+            if let Some(remote) = remote_data {
+                adopt_keys(&remote).await;
+                let after = load_settings();
+                let adopted = json!({
+                    "rd_key": after.rd_key,
+                    "tmdb_key": after.tmdb_key,
+                    "stream_language": after.stream_language,
+                    "addons": crate::addons::for_handoff().await,
+                });
+                st.keys_hash = keys_digest(&adopted);
+                st.keys_updated = remote_updated;
+                if has_any_key(&remote) {
+                    if let Ok(mut a) = ARRIVED.lock() { *a = Some(remote_device); }
+                }
+                dev_log("keys: synced automatically from account");
+            }
+        }
+        KeysSyncAction::Push => {
+            let updated = now_secs().max(remote_updated + 1);
+            let sealed = seal_keys_payload(uid, project, &local)?;
+            commit(token, vec![json!({
+                "update": {
+                    "name": doc_path,
+                    "fields": {
+                        "sealed": {"stringValue": sealed},
+                        "v": {"integerValue": "2"},
+                        "updated": {"integerValue": updated.to_string()},
+                        "device": {"stringValue": device_name()},
+                    }
+                },
+                "updateTransforms": [{"fieldPath": "synced", "setToServerValue": "REQUEST_TIME"}],
+            })]).await?;
+            st.keys_hash = local_hash;
+            st.keys_updated = updated;
+            dev_log("keys: saved (sealed) to account");
+        }
+        KeysSyncAction::KeepSynced => {
+            st.keys_hash = local_hash;
+            st.keys_updated = remote_updated;
+        }
+        KeysSyncAction::Noop => {}
+    }
+    Ok(())
+}
+
+/// Keys from your account or another device: saved here, then add-ons set up with them.
+async fn adopt_keys(v: &Value) {
+    let text = |k: &str| v[k].as_str().map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
+    let (rd, tmdb, language) = (text("rd_key"), text("tmdb_key"), text("stream_language"));
+    update_settings(|s| {
+        if rd.is_some() { s.rd_key = rd.clone(); s.rd_key_removed = false; }
+        else if v.get("rd_key").is_some_and(Value::is_null) { s.rd_key = None; s.rd_key_removed = true; }
+        if tmdb.is_some() { s.tmdb_key = tmdb.clone(); }
+        else if v.get("tmdb_key").is_some_and(Value::is_null) { s.tmdb_key = None; }
+        if let Some(l) = language.clone().filter(|l| crate::addons::language(l).is_some()) { s.stream_language = Some(l); }
+    });
+    crate::addons::adopt(&v["addons"]).await;
 }
 
 // ---------------------------------------------------------------- linking a computer
@@ -514,6 +871,7 @@ pub async fn take_link(offer: &LinkOffer) -> Result<Option<Account>> {
         refresh: s(&v, "refresh"), ..Session::default()
     };
     anyhow::ensure!(!session.refresh.is_empty(), "The code didn't match. Show a new one and scan it again.");
+    if v["keys"].is_object() && keys_here().is_none() { adopt_keys(&v["keys"]).await; }
     let account = set_session(session);
     id_token().await?;
     Ok(Some(account))
@@ -530,7 +888,10 @@ pub async fn answer_link(code: &str) -> Result<()> {
     let (token, _) = id_token().await?;
     let session = SESSION.lock().ok().and_then(|x| x.clone()).context("Not signed in")?;
     let a = &session.account;
-    let plain = json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":session.refresh}).to_string();
+    // Your keys and add-ons go along, sealed the same way: the computer is set up like this phone.
+    let mut keys = keys_here().unwrap_or(Value::Null);
+    if !keys.is_null() { keys["addons"] = crate::addons::for_handoff().await; }
+    let plain = json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":session.refresh,"keys":keys}).to_string();
     let sealed = seal(&key, plain.as_bytes())?;
     let base = documents().context("Accounts aren't set up in this build")?;
     post(format!("https://firestore.googleapis.com/v1/{base}:commit"), json!({"writes":[{
@@ -544,19 +905,20 @@ pub async fn answer_link(code: &str) -> Result<()> {
 #[cfg(target_os = "android")]
 pub async fn scan_and_link() -> Result<()> {
     crate::android::scan_code()?;
-    let code = loop {
+    let mut found = None;
+    for _ in 0..1200 {
         sleep(250).await;
         match crate::android::account_result() {
-            Some(r) if r.starts_with("code:") => break r["code:".len()..].to_owned(),
+            Some(r) if r.starts_with("code:") => { found = Some(r["code:".len()..].to_owned()); break; }
             Some(r) if r.starts_with("cancel:") => anyhow::bail!("Scan cancelled."),
             Some(r) if r.starts_with("error:") => anyhow::bail!("The scanner didn't open: {}", &r["error:".len()..]),
             _ => {}
         }
-    };
+    }
+    let code = found.context("Scan took too long. Try again.")?;
     answer_link(&code).await
 }
 
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn seal(key: &[u8], plain: &[u8]) -> Result<String> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
     let sealing = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| anyhow!("bad key"))?);
@@ -592,12 +954,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_keys_sync_decision_covers_cross_os_flows() {
+        // Fresh device on a different OS (no keys): adopts automatically from account.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: false, local_rd_removed: false, local_hash: "h0", last_synced_hash: "", last_synced_updated: 0,
+            remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
+        }), KeysSyncAction::Adopt);
+        // First device with keys, empty account: pushes automatically.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "", last_synced_updated: 0,
+            remote_has_keys: false, remote_hash: None, remote_updated: 0,
+        }), KeysSyncAction::Push);
+        // Local edit after syncing: pushes new keys.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: true, local_rd_removed: false, local_hash: "h2", last_synced_hash: "h1", last_synced_updated: 100,
+            remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
+        }), KeysSyncAction::Push);
+        // Another device pushed newer keys: adopts automatically.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
+            remote_has_keys: true, remote_hash: Some("h2"), remote_updated: 200,
+        }), KeysSyncAction::Adopt);
+        // Already in sync: noop.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
+            remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
+        }), KeysSyncAction::Noop);
+        // Key removed locally after syncing: pushes removal.
+        assert_eq!(decide_keys_sync(&KeysSyncInput {
+            local_has_keys: false, local_rd_removed: true, local_hash: "h_empty", last_synced_hash: "h1", last_synced_updated: 100,
+            remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
+        }), KeysSyncAction::Push);
+    }
+
+    #[test]
+    fn google_callback_accepts_post_body_and_get_fallback() {
+        let post = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 31\r\n\r\nstate=abc123&id_token=tok.en_1";
+        let q = parse_callback_params(post);
+        assert_eq!(q.get("state").map(String::as_str), Some("abc123"));
+        assert_eq!(q.get("id_token").map(String::as_str), Some("tok.en_1"));
+
+        let get = "GET /?state=xyz&id_token=legacy HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let q2 = parse_callback_params(get);
+        assert_eq!(q2.get("state").map(String::as_str), Some("xyz"));
+        assert_eq!(q2.get("id_token").map(String::as_str), Some("legacy"));
+    }
+
+    #[test]
     fn a_sealed_session_opens_only_with_its_key() {
         let key = [7u8; 32];
         let sealed = seal(&key, b"{\"refresh\":\"r\"}").unwrap();
         assert_eq!(open_sealed(&key, &sealed).unwrap(), b"{\"refresh\":\"r\"}");
         assert_eq!(open_sealed(&[8u8; 32], &sealed), None);
         assert_eq!(open_sealed(&key, "bm9wZQ"), None);
+    }
+
+    #[test]
+    fn account_keys_seal_roundtrip_and_uid_isolation() {
+        let payload = json!({"rd_key": "RD-SECRET-123", "tmdb_key": "TMDB-999", "stream_language": "italian", "addons": []});
+        let sealed = seal_keys_payload("uid-alice", "veylo-proj", &payload).unwrap();
+        assert!(!sealed.contains("RD-SECRET-123"), "sealed blob must not leak keys");
+        let fields = json!({"sealed": {"stringValue": sealed}});
+        assert_eq!(open_keys_payload("uid-alice", "veylo-proj", &fields), Some(payload.clone()));
+        assert_eq!(open_keys_payload("uid-bob", "veylo-proj", &fields), None, "other uid must not decrypt");
+        // Legacy v1 plaintext documents remain readable during migration.
+        let legacy = json!({"data": {"stringValue": payload.to_string()}});
+        assert_eq!(open_keys_payload("uid-alice", "veylo-proj", &legacy), Some(payload));
     }
 
     #[test]

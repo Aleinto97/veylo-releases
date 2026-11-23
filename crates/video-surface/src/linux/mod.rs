@@ -330,12 +330,17 @@ mod subsurface {
                         (c.width, c.height, c.quit)
                     };
                     if quit { break; }
-                    if (w, h) != size {
+                    let resized = (w, h) != size;
+                    if resized {
                         size = (w, h);
                         if let Ok(win) = egl_window.0.lock() { if let Some(win) = win.as_ref() { win.resize(w, h, 0, 0); } }
                     }
-                    render_frame(render, 0, w, h);
-                    (e.swap_buffers)(dpy, surf);
+                    let flags = sys::mpv_render_context_update(render);
+                    if resized || (flags & sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) != 0 {
+                        render_frame(render, 0, w, h);
+                        (e.swap_buffers)(dpy, surf);
+                        sys::mpv_render_context_report_swap(render);
+                    }
                 }
                 sys::mpv_render_context_set_update_callback(render, None, std::ptr::null_mut());
                 sys::mpv_render_context_free(render);
@@ -447,7 +452,9 @@ mod glarea {
         if REDRAW_QUEUED.swap(true, Ordering::AcqRel) { return; }
         gtk::glib::idle_add_once(|| {
             REDRAW_QUEUED.store(false, Ordering::Release);
-            VIDEO.with(|v| if let Ok(v) = v.try_borrow() { if let Some(v) = v.as_ref() { v.area.queue_render(); v.web.queue_draw(); } });
+            VIDEO.with(|v| if let Ok(v) = v.try_borrow() {
+                if let Some(v) = v.as_ref().filter(|v| !v.render.is_null()) { v.area.queue_render(); v.web.queue_draw(); }
+            });
         });
     }
 

@@ -214,8 +214,9 @@ impl MediaProxy {
         // Status clips and error pages are a few MB at most; a film is not.
         let ok =
             matches!(status, 200 | 206) && (playlist || bytes.is_none_or(|n| n >= PROBE_MIN_BYTES));
+        let resolved_url = (ok && final_url.scheme() == "https").then(|| final_url.as_str());
         Ok(
-            json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist}),
+            json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist, "resolved_url": resolved_url}),
         )
     }
     /// "downloading" or "failed" when the current source turned out to be a

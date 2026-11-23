@@ -160,7 +160,8 @@ fn load() -> Store {
 
 fn save(store: &Store) {
     let v = json!({"managed": store.managed, "seen": store.seen});
-    let _ = std::fs::write(store_path(), v.to_string());
+    let _ = backend::write_private_file(&store_path(), v.to_string().as_bytes());
+    backend::sync_soon();
 }
 
 /// The installed add-ons (core descriptors: the manifest plus `manifest_url`).
@@ -181,6 +182,11 @@ pub struct Row {
     pub curated: Option<Curated>,
     /// Installed add-on's link: kept inside the app for Update and Remove, never displayed.
     url: String,
+}
+
+impl Row {
+    /// Custom user-installed add-ons can be removed; Cinemeta is the built-in metadata core.
+    pub fn removable(&self) -> bool { !self.url.contains("v3-cinemeta.strem.io") }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -448,7 +454,47 @@ pub async fn remove(row: &Row) -> Result<()> {
         store.managed.insert(removed_key(c), json!(true));
         save(&store);
     }
+    backend::sync_soon();
     Ok(())
+}
+
+/// Normalize a user-provided Stremio add-on URL (`stremio://` -> `https://`, appending
+/// `/manifest.json` if omitted). Rejects non-HTTPS remote URLs; never echoes the URL in errors.
+pub fn normalize_custom_addon_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    ensure!(!trimmed.is_empty(), "Paste a Stremio add-on manifest URL.");
+    let normalized = if let Some(rest) = trimmed.strip_prefix("stremio://") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_owned()
+    };
+    let parsed = url::Url::parse(&normalized).map_err(|_| anyhow::anyhow!("That doesn't look like a valid add-on URL."))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let is_local = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    ensure!(parsed.scheme() == "https" || (parsed.scheme() == "http" && is_local),
+        "Add-on links must start with https:// (or stremio://).");
+    let mut url = normalized;
+    if !parsed.path().ends_with("/manifest.json") {
+        let base = url.trim_end_matches('/');
+        url = format!("{base}/manifest.json");
+    }
+    Ok(url)
+}
+
+/// Install any user-supplied Stremio add-on manifest URL (for TorBox, AllDebrid, Premiumize,
+/// custom ElfHosted instances, or community catalogs). Never logs or echoes the URL.
+pub async fn install_custom(raw: String) -> Result<String> {
+    let url = normalize_custom_addon_url(&raw)?;
+    let _one = CHANGING.lock().await;
+    let addon = exec(json!({"op":"install_addon","url":url})).await
+        .map_err(|_| anyhow::anyhow!("That add-on couldn't be installed. Check the link and your connection."))?;
+    let mut store = load();
+    mark_seen(&mut store, &addon);
+    save(&store);
+    backend::forget_sources();
+    backend::sync_soon();
+    let name = s(&addon, "name");
+    Ok(if name.is_empty() { "Custom add-on".into() } else { name })
 }
 
 /// Apply a newer version: curated add-ons are set up again (so new defaults apply), others
@@ -473,6 +519,33 @@ pub async fn reconfigure() -> Result<()> {
         if row.is_some() && c.needs_key() { if let Err(e) = install_unlocked(c).await { first_error.get_or_insert(e); } }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Your add-ons for another of your devices, inside the sealed key handoff (backend/account.rs):
+/// the curated ones by name (set up there again with the key) and the links of any others (a link
+/// can hold a key, so it never travels outside that sealed message).
+pub async fn for_handoff() -> Value {
+    let all = installed().await;
+    let curated: Vec<&str> = Curated::ALL.into_iter()
+        .filter(|c| all.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host())).map(Curated::id).collect();
+    let others: Vec<String> = all.iter().map(|a| s(a, "manifest_url"))
+        .filter(|u| !u.is_empty() && Curated::ALL.iter().all(|c| host_of(u) != c.host())).collect();
+    json!({"curated": curated, "others": others})
+}
+
+/// Set up the add-ons another device handed over (after its key was saved here). Add-ons already
+/// here stay; each failure is skipped so the rest still arrive.
+pub async fn adopt(handoff: &Value) {
+    let _one = CHANGING.lock().await;
+    let here: Vec<String> = installed().await.iter().map(|a| s(a, "manifest_url")).collect();
+    for id in handoff["curated"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let Some(c) = Curated::ALL.into_iter().find(|c| c.id() == id) else { continue };
+        if c.needs_key() || !here.iter().any(|u| host_of(u) == c.host()) { let _ = install_unlocked(c).await; }
+    }
+    for url in handoff["others"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if !here.iter().any(|u| u == url) { let _ = exec(json!({"op":"install_addon","url":url})).await; }
+    }
+    backend::forget_sources();
 }
 
 /// "Remove key": forget the Real-Debrid key, and take out the add-ons Veylo set up with it
@@ -636,5 +709,14 @@ mod tests {
         assert!(newer("2.40.0", "2.38.1"));
         assert!(!newer("2.38.1", "2.38.1"));
         assert!(!newer("1.9", "1.10"));
+    }
+
+    #[test]
+    fn normalizes_and_validates_custom_addon_urls() {
+        assert_eq!(normalize_custom_addon_url("stremio://example.com/cfg").unwrap(), "https://example.com/cfg/manifest.json");
+        assert_eq!(normalize_custom_addon_url("https://example.com/manifest.json").unwrap(), "https://example.com/manifest.json");
+        assert_eq!(normalize_custom_addon_url("http://127.0.0.1:7000/").unwrap(), "http://127.0.0.1:7000/manifest.json");
+        assert!(normalize_custom_addon_url("http://remote.example.com/manifest.json").is_err());
+        assert!(normalize_custom_addon_url("not-a-url").is_err());
     }
 }

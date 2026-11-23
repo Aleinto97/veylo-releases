@@ -13,6 +13,8 @@ pub fn attach(live: &Arc<Live>) { imp::attach(live) }
 pub fn detach() { imp::detach() }
 /// The picture's aspect or fit changed (any thread).
 pub fn layout(live: &Live) { imp::layout(live) }
+/// Hint the content frame rate (e.g. 23.976 Hz) to the display surface where supported (Android 11+).
+pub fn set_frame_rate(fps: f64) { imp::set_frame_rate(fps) }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
 /// Windows: the app window, for the screen's HDR state (display.rs).
@@ -39,6 +41,7 @@ mod imp {
     use crate::engine::Fit;
     pub fn attach(live: &Arc<Live>) {
         let _ = crate::android::video_show();
+        let _ = crate::android::video_media_meta(&live.request.title, &live.request.subtitle);
         crate::android::attach_surface(live);
     }
     pub fn detach() { let _ = crate::android::video_hide(); }
@@ -47,6 +50,7 @@ mod imp {
         let fit = match s.fit { Fit::Fit => 0, Fit::Fill => 1, Fit::Stretch => 2 };
         let _ = crate::android::video_layout(s.aspect, fit);
     }
+    pub fn set_frame_rate(fps: f64) { let _ = crate::android::video_frame_rate(fps); }
     pub fn set_fullscreen(_on: bool) {}
 }
 
@@ -95,6 +99,7 @@ mod imp {
         set_fullscreen(false);
     }
     pub fn layout(live: &Live) { veylo_video_surface::layout(live, crate::backend::hdr_output()); }
+    pub fn set_frame_rate(_fps: f64) {}
     pub fn set_fullscreen(on: bool) {
         let w = dioxus::desktop::window();
         w.window.set_fullscreen(on.then_some(dioxus::desktop::tao::window::Fullscreen::Borderless(None)));

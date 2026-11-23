@@ -22,7 +22,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     std::fs::create_dir_all(path)?;
     let mut db = Connection::open(path.join("core.sqlite3"))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON;")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > 3 {
         bail!("Database was created by a newer core");
@@ -91,6 +91,11 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
         )?;
         tx.commit()?;
     }
+    // Idempotent indexes for hot sync and recommendation queries (compatible with existing DBs).
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS media_updated ON media(updated DESC, key);
+         CREATE INDEX IF NOT EXISTS playback_updated ON playback(updated);",
+    )?;
     Ok(db)
 }
 
