@@ -1,187 +1,164 @@
-# Veylo
+<p align="center">
+  <img src="branding/veylo-icon.png" width="96" alt="Veylo">
+</p>
 
-<img src="branding/veylo-icon.png" width="96" alt="Veylo">
+<h1 align="center">Veylo</h1>
 
-A quiet, all-Rust media client for Android tablets and the Linux, Windows and macOS desktop, built with [Dioxus](https://dioxuslabs.com).
+<p align="center">
+  <strong>A fast, quiet, all-Rust media client for Android, Android TV, macOS, Windows, and Linux.</strong><br>
+  Built with <a href="https://dioxuslabs.com">Dioxus</a>, native <code>libmpv</code> HDR playback, on-device ONNX AI recommendations, offline downloads, and encrypted cross-OS sync.
+</p>
 
-- **Home**: Tonight's pick (why it was chosen, Play, Not tonight and the next picks), then today's charts from
-  [BetterPosters](https://btttr.cc) and your add-ons' catalogues. The top bar shows what is on the player: one tap carries on.
-- **Title pages**: the film's own logo, stills, tagline, chart rank, studios, cast and crew, season art, trailers, and an
-  episode grid that splits long seasons into ranges.
-- **Picks**: an endless two-card duel run by one local taste model over synopsis embeddings: match scores, reasons, moods, a shortlist of tonight's winners, Like and Not for me on every card, and nothing shown twice in a night.
-- **Library**: saved titles and what you watched, with per-episode progress.
-- **Player**: one player everywhere, libmpv driven from Rust with Dioxus controls (`engine.rs`, `player_ui.rs`), its picture
-  under the page through a bridge per OS (`crates/video-surface`; Android's in `video.rs`): a SurfaceView on Android, a GL area or Wayland subsurface on Linux,
-  mpv's own child window on Windows, a Core Animation OpenGL layer on macOS (HDR through EDR on screens that have it).
+<p align="center">
+  <a href="https://github.com/Aleinto97/veylo-releases/releases/latest"><img src="https://img.shields.io/github/v/release/Aleinto97/veylo-releases?style=flat-square&color=111111" alt="Latest release"></a>
+  <a href="https://github.com/Aleinto97/veylo-releases/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Aleinto97/veylo-releases/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/Aleinto97/veylo-releases/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/Aleinto97/veylo-releases/release.yml?branch=main&style=flat-square&label=Release" alt="Release"></a>
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License">
+</p>
+
+---
+
+## Highlights
+
+| Area | What Veylo does |
+| --- | --- |
+| **Native `libmpv` HDR Player** | One player on every platform with glass Dioxus controls over a native video surface (`SurfaceView` + MediaCodec direct HDR10/HLG/HDR10+ on Android/TV, D3D11 + HDR swapchain on Windows, Core Animation EDR on macOS, Wayland subsurface / GL area on Linux). Includes Dolby Vision Profile 5 reshaping, FFmpeg HTTP reconnect resilience, subtitle & audio sync (`±` delay), subtitle sizing/positioning/box, chapter ticks & picker, intro/recap/credits skipping (chapters + IntroDB + AniSkip), floating **Up Next** countdown, and per-series audio/subtitle memory. |
+| **Smart Autoplay** | Queries add-ons in parallel, verifies direct files with chunked header inspection (real resolution, HDR/Dolby Vision tier, audio tracks, and duration), rejects broken/sample/non-video links, respects your screen's HDR/Dolby Vision capabilities, and prefetches the next episode near the end of playback. |
+| **Android, Tablet & TV Native** | Full Android TV D-pad/remote navigation and Leanback banner (`arm64` + 32-bit `armv7` APKs), `AudioFocus`, headphone/Bluetooth disconnect auto-pause, system `MediaSession` controls, `Surface.setFrameRate` matching, tablet touch gestures (double-tap ±10s, brightness/volume swipe, long-press 2×), rotation lock, and Picture-in-Picture. |
+| **Local AI Picks** | Endless two-card taste duel powered by an on-device INT8 `bge-small-en-v1.5` embedding model (ONNX Runtime, zero cloud inference) and online Bayesian preference learning with moods, match reasons, and a live shortlist. |
+| **Library & Offline Downloads** | Chronological history, filter tabs (*All, Movies, Series, In progress, Watched, Saved, Downloads*), in-library search, personalized **New for your shows** shelf, direct offline downloads with automatic offline playback, and Trakt / IMDb / Veylo JSON watch-history import & export. |
+| **Cross-OS Account & Key Sync** | Optional Firebase account (Email, Google, or QR-code desktop linking) that automatically syncs watch progress, library, likes, add-ons, and API keys (sealed with per-account AES-256-GCM) across all your devices. |
+| **Add-ons & Diagnostics** | One-key Real-Debrid setup for curated add-ons, custom Stremio manifest URL install (TorBox, AllDebrid, Premiumize, self-hosted AIOStreams, etc.) with credentials masked and never logged, SHA-256 verified in-app updates, and opt-out redacted cross-OS diagnostics. |
+
+---
 
 ## Install
 
-**Windows** 10 or 11, 64-bit: in PowerShell or Windows Terminal run
-
-```powershell
-irm https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.ps1 | iex
-```
-
-Veylo installs to `%LOCALAPPDATA%\Programs\Veylo` (no admin rights) with Start menu and desktop shortcuts. Running
-the command again reinstalls the latest version. To uninstall, delete that folder and the two shortcuts; your
-library is in `%LOCALAPPDATA%\veylo-dx`.
-
-**macOS** on Apple silicon (M1 or later): in Terminal run
+### macOS (Apple Silicon — M1 or later)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.sh | sh
 ```
 
-Veylo installs to `/Applications` (or `~/Applications`) and opens. Running the command again reinstalls the latest
-version. To uninstall, move Veylo to the Bin; your library is in `~/Library/Application Support/veylo-dx`.
+Installs `Veylo.app` into `/Applications` (or `~/Applications`) and launches it. Re-run to update. To uninstall, move Veylo to the Bin; your data stays in `~/Library/Application Support/veylo-dx`.
 
-**Android** 8 or later, 64-bit: on the device open
-https://github.com/Aleinto97/veylo-releases/releases/latest/download/veylo-android-arm64.apk, open the downloaded
-file and allow your browser to install apps when Android asks.
+### Windows 10 / 11 (64-bit)
 
-**Updates:** when a new version is out, Veylo shows **Veylo x.y is available** with an **Update** button. On
-Android the first Update asks you to allow Veylo to install apps: allow it, come back and press Update again.
+```powershell
+irm https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.ps1 | iex
+```
 
-## Layout
+Installs to `%LOCALAPPDATA%\Programs\Veylo` (no admin rights required) with Start menu and desktop shortcuts. Re-run to update. Your data lives in `%LOCALAPPDATA%\veylo-dx`.
+
+### Android & Android TV (Android 8+)
+
+* **Phones, tablets & 64-bit TVs (`arm64-v8a`)**:
+  [Download `veylo-android-arm64.apk`](https://github.com/Aleinto97/veylo-releases/releases/latest/download/veylo-android-arm64.apk)
+* **32-bit Android TVs (`armeabi-v7a`)**:
+  [Download `veylo-android-armv7.apk`](https://github.com/Aleinto97/veylo-releases/releases/latest/download/veylo-android-armv7.apk)
+
+Open the APK on the device and allow app installation when prompted.
+
+### Updates
+
+Veylo checks the latest GitHub release at launch, verifies downloads against `SHA256SUMS.txt` (or the release SHA-256 digest), and offers a one-click **Update** button. On Android, the first in-app update asks for "Install unknown apps" permission once.
+
+---
+
+## Repository Layout
 
 | Path | What |
 | --- | --- |
-| `apps/veylo-dx/` | the app (Dioxus UI, Android glue in `android/`, fonts in `assets/`) |
-| `crates/core/` | addon protocol, SQLite library/history, recommendations, subtitles |
-| `crates/media-proxy/` | token-scoped loopback media relay |
-| `crates/video-surface/` | the desktop picture under the page, one path per OS, with fallbacks (part of the app's workspace) |
-| `crates/picture-check/` | CI's picture test: a clip of colour bars and the check that a screenshot shows them (app's workspace) |
-| `crates/torrent/`, `crates/aio-meta/` | P2P and embedded metadata crates (not used by the app yet) |
-| `tools/build-macos.sh`, `tools/release.sh` | the macOS app bundle; the release build and publish |
-| `tools/ci/` | CI launch checks (start the app, screenshot it) |
-| `tools/media3-ffmpeg/` | reproducible build of the Media3 FFmpeg audio decoder (the app no longer ships it) |
-| `branding/` | logo sources |
+| `apps/veylo-dx/` | All-Rust Dioxus application (`src/` UI + backend, `android/` Kotlin JNI bridges & TV resources, `firebase/` rules & sign-in page) |
+| `crates/core/` | Stremio add-on protocol, SQLite library/history/sync store, recommendations, subtitle parser & cache |
+| `crates/media-proxy/` | Token-scoped loopback media relay and header-safe stream prober |
+| `crates/video-surface/` | Desktop video surface bridges (Wayland subsurface / GTK GL area, Windows D3D11, macOS Core Animation EDR) |
+| `crates/picture-check/` | Colour-bar picture verification test used by CI |
+| `crates/torrent/`, `crates/aio-meta/` | Supporting P2P and metadata crates |
+| `tools/` | `release.sh`, `build-macos.sh`, `picks-ai/fetch.py`, and CI launch checks (`tools/ci/`) |
+| `branding/` | App icon and Android TV banner sources |
 
-## Build
+---
+
+## Building from Source
+
+### Linux Desktop
 
 ```sh
 cd apps/veylo-dx
-python3 ../../tools/picks-ai/fetch.py linux-x64  # linux-aarch64 on ARM64 Linux
-cargo run --release              # Linux desktop
-./android/fetch-mpv.sh           # libmpv for Android (the player), once
-python3 ../../tools/picks-ai/fetch.py android-arm64
-dx build --platform android      # Android APK (needs the Android SDK/NDK)
+python3 ../../tools/picks-ai/fetch.py linux-x64   # use linux-aarch64 on ARM64 Linux
+cargo run --release
 ```
 
-Windows (x64, needs the Rust MSVC toolchain and the WebView2 runtime that ships with Windows 10/11). First prepare the assets with `python3 tools/picks-ai/fetch.py windows-x64` (requires bsdtar/libarchive; the Linux release builder does this automatically):
+### Android (`arm64-v8a` / `armeabi-v7a`)
+
+Requires the Android SDK (platform 36, build-tools 36), NDK 28, JDK 17, and `dioxus-cli` (`dx` 0.7.10):
+
+```sh
+cd apps/veylo-dx
+./android/fetch-mpv.sh
+python3 ../../tools/picks-ai/fetch.py android-arm64 android-armv7
+dx build --android --target aarch64-linux-android --release
+```
+
+### Windows (x64)
+
+Requires the Rust MSVC toolchain, WebView2 (ships with Windows 10/11), and `bsdtar`/`libarchive`:
 
 ```powershell
+python3 tools\picks-ai\fetch.py windows-x64
 cd apps\veylo-dx
-powershell -ExecutionPolicy Bypass -File windows\fetch-mpv.ps1   # pinned libmpv-2.dll + import library
-cargo build --release   # target\release\veylo-dx.exe, with libmpv-2.dll copied beside it
+powershell -ExecutionPolicy Bypass -File windows\fetch-mpv.ps1
+cargo build --release
 ```
 
-macOS (Apple silicon, with Homebrew): `brew install mpv dylibbundler`, then `cargo run --release` in `apps/veylo-dx`
-runs it against Homebrew's libmpv, and `tools/build-macos.sh` builds the self-contained `Veylo.app` that releases ship
-(`dist/veylo-macos-arm64.zip`: libmpv and FFmpeg inside, signed ad hoc).
+Keep `veylo-dx.exe`, `libmpv-2.dll`, and the `picks-ai/` directory together when distributing. From Linux, cross-build with `cargo xwin build --target x86_64-pc-windows-msvc --release`.
 
-Ship `veylo-dx.exe` together with `libmpv-2.dll` and the complete `picks-ai/` directory from the build output. From Linux, `cargo xwin build --target x86_64-pc-windows-msvc --release`
-cross-builds the same with `VEYLO_MPV_DIR` pointing at the extracted mpv files.
+### macOS (Apple Silicon)
 
-## Testing on every OS
+```sh
+brew install mpv dylibbundler
+python3 tools/picks-ai/fetch.py macos-arm64
+cd apps/veylo-dx && cargo run --release   # or run tools/build-macos.sh for a self-contained Veylo.app
+```
 
-`.github/workflows/ci.yml` runs on every push, natively on Linux, Windows and macOS: clippy and `cargo test`, then
-the self-test, and on Windows and macOS it also packages the app, installs it with `install.ps1` or `install.sh` and
-tests the installed copy. A launch check starts the app with an empty library, fails if it exits or panics, and keeps a
-screenshot (the run's **Artifacts**: `screenshots-<os>`, plus the Windows and macOS builds to try by hand).
+---
 
-The self-test runs anywhere, without a window, on a temporary library (yours is never touched):
+## Testing & Verification
+
+Run the test suites in both workspaces:
+
+```sh
+cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cd apps/veylo-dx && cargo test && cargo clippy --all-targets -- -D warnings
+```
+
+Run the standalone headless self-test anywhere (uses an isolated temporary store; your library is never touched):
 
 ```sh
 veylo-dx --self-test [--online] [--report <file>]
 ```
 
-It checks the files the app loads (model, tokenizer, ONNX Runtime, libmpv), that the store saves and reads back,
-that the Picks model runs and its embeddings make sense, that libmpv plays a bundled H.264/AAC clip to the end and,
-with `--online`, TLS and the release channel. On a Mac it is `/Applications/Veylo.app/Contents/MacOS/veylo-dx
---self-test`; on Windows `%LOCALAPPDATA%\Programs\Veylo\veylo-dx.exe --self-test`. CI runners have no real GPU, so
-what they can't judge is the picture itself: check playback by hand on real machines.
+It validates bundled model/runtime/libmpv assets, store persistence, on-device Picks embeddings, H.264/AAC & HDR playback through `libmpv`, and (with `--online`) TLS and the release channel. `.github/workflows/ci.yml` runs tests, clippy, self-tests, and packaged install/launch checks natively on Linux, Windows, and macOS on every push.
+
+---
 
 ## Releases
 
-Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` builds Windows and Android on GitHub
-Actions (`.github/workflows/release.yml`, which runs `tools/release.sh`), and macOS on a Mac runner
-(`tools/build-macos.sh`), and publishes them as a release here.
-Installed copies check this repo's latest release at launch and show **Veylo x.y is available — Update**
-(`apps/veylo-dx/src/updater.rs`): Windows and macOS replace their files and restart; Android downloads the APK and opens the
-system's "Update this app?" screen (`android/kotlin/VeyloUpdate.kt`).
+Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` triggers `.github/workflows/release.yml`, building signed Android (`arm64` + `armv7`), Windows (`x64`), and macOS (`arm64`) binaries plus `SHA256SUMS.txt` and publishing them automatically. `tools/release.sh` runs the same build locally (`VEYLO_PUBLISH=0` builds into `dist/` without publishing) and runs a privacy check ensuring no local paths or API keys appear in release artifacts.
 
-The APK is signed with Veylo's release key, kept out of the repo: in the `ANDROID_KEYSTORE_B64` and
-`ANDROID_KEYSTORE_PASSWORD` Actions secrets, and locally in `~/.config/veylo/` (`release.jks`, alias `veylo`, and
-`release.pass`). Android only updates an app from an APK signed with the same key, so the key never changes. To
-put a build of your own on a device that has the release, sign it with that key too. `tools/release.sh` also runs
-locally (`VEYLO_PUBLISH=0` builds into `dist/` without publishing). It refuses to publish if a key from your
-settings or a local path is inside the files.
+<details>
+<summary><strong>How on-device Picks AI works</strong></summary>
 
-Picks inference runs entirely on the CPU, in Rust through ONNX Runtime 1.22.0. Releases bundle
-the pinned INT8 bge-small-en-v1.5 model (MIT), tokenizer, native runtime and licences; the APK needs
-no model download or Python. Android extracts the model once into app-private storage. The
-model is about 34 MB before APK compression, and the app needs extra private storage for the
-extracted copy. Linux and Windows load `picks-ai/` beside the executable. Preserve that directory
-when distributing a desktop build. The Windows bundle includes its app-local VC++ runtime DLLs.
+* **Local inference**: Runs entirely on the CPU in Rust via ONNX Runtime 1.22.0 with the pinned INT8 `bge-small-en-v1.5` model (MIT, ~34 MB bundled in releases — no Python or runtime downloads).
+* **Enrichment & caching**: Synopses are enriched in the background with TMDB keywords (when configured) or Wikidata/TVmaze metadata, cached in bounded local files (`picks-metadata-v1.json`, `picks-embeddings-v1.json`, max 1,024 entries; zero API keys or URLs written).
+* **Bayesian taste model (`apps/veylo-dx/src/brain.rs`)**: Projects 384-dim embeddings onto catalog PCA directions combined with genre, type, style, decade, and rating. Online Bayesian logistic regression tracks both lasting taste (likes, finishes, saves, plays) and tonight's session mood, using Thompson sampling so duels balance likely favorites with unexplored directions.
+* **Controls**: `←` / `→` keep a card, `S` skips a pair, `N` resets tonight's direction, `?` opens page-specific shortcuts, and **Settings → Learned taste → Start over** resets learned preferences while keeping the model cache.
 
-Picks enriches available synopses with TMDB movie/TV keywords using the existing Settings key.
-Enrichment runs in the background, with per-title request deduplication, rate limiting
-and a bounded `picks-metadata-v1.json` cache (1,024 titles). Successful results refresh after seven
-days; missing results after one day; failures retry after five minutes while keeping stale data.
-No API key or authenticated request is written to these caches. The model still runs entirely locally.
-Its 256-token input is the title, year, synopsis and keywords (genres are separate taste features);
-the name and keywords keep a reserved share so a long synopsis never crowds them out.
+</details>
 
-Each title becomes a 384-dimension embedding, cached locally by model version and input hash
-(`picks-embeddings-v1.json`, at most 1,024 entries). Changed enrichment embeds the title again. Titles
-without a usable synopsis keep metadata ranking. An inference failure shows a status message and
-preserves the duel with metadata ranking.
-One taste model (`apps/veylo-dx/src/brain.rs`) is the brain of Picks and of Home's Tonight's pick.
-Each title's features are its embedding projected onto the main directions the catalogue varies along
-(PCA over the embedded titles, whitened, refitted as the catalogue grows), plus genre, type, style,
-decade and rating. Taste is a Gaussian belief over those weights (online Bayesian logistic regression),
-so the model knows how sure it is. Lasting taste learns from likes and dislikes, finishes, saves and
-long watches in the library, plays from Picks and, lightly, duel votes; tonight starts from lasting
-taste with room to move, is steered by duel votes, Neither and moods, and lets older votes fade.
-The duel never stops: the card you keep meets the favourite of one plausible taste drawn from the
-belief (Thompson sampling), which balances showing likely winners with testing uncertain directions.
-A card that wins four in a row joins tonight's shortlist. Within a night a title is never shown twice
-(under any source's key, IMDb id or name and year) until every title for the filters has been seen,
-then Picks says it is reshuffling. Moods (chips or typed words) are embedded by the same model as
-search queries and steer tonight; the same mood words describe what tonight leans to and how a card
-feels. Every signal is kept in a local event log (`picks-brain-events.jsonl`, titles' features in
-`picks-brain-items.json`, never add-on URLs) and replayed, so a new projection or model loses nothing.
-Genre, type and decade weights of the earlier `picks-taste.json` profile seed lasting taste. Not for me
-removes a title from Picks for good; Settings > Learned taste forgets everything. When TMDB knows a
-title, its genres decide whether it is animated (catalogues sometimes tag live-action films Animation).
-Continue preserves the cumulative choice count, comparisons, current mood and lasting taste;
-a checkpoint requires four fresh confirmations before another proposal. It never silently
-starts a new duel when challengers run out. A bounded private `picks-decisions.json` records the
-last 128 actions, titles, pre-vote margins, counts and stopping reasons, without provider keys,
-URLs, credentials or raw metadata. Older round-by-round choices cannot be reconstructed.
-Every third challenger tests a different genre direction when available. Play is always available.
-S changes the pair without a vote; N clears tonight’s direction and seeks a different pair without
-changing lasting preferences; C continues from a suggestion. Left/right arrows keep a card.
-Keep this retains its arrow keycaps. Other controls use icons, accessible names and tooltips.
-A keyboard icon beside Search opens shortcuts for the current page, including Search and title
-pages. The player has the same icon beside Details and its own H / ? sheet; reading it does not
-execute playback shortcuts. ? also opens the app’s page-specific shortcut sheet.
-"Start over" resets learned preferences; it does not remove the model or embedding cache.
+---
 
-Style verification combines full add-on/TMDB genres with TVmaze's show type; missing animation
-tags from a sparse catalogue are repaired before a card can be selected. Deduplication preserves
-richer genre/style evidence and already open cards are rechecked when it arrives. The action bar
-keeps Keep this, Play/Resume, trailer and details on one line; longer playback labels can shrink.
+## Licence
 
-Duel cards and final picks have Play/Resume controls. New series begin at the first released
-regular episode; existing progress resumes the saved episode and position, or continues after
-the last finished episode. Hide watched removes completed films and series whose released
-regular episodes are all watched. Started titles are included in the candidate pool so unfinished series can appear with Resume. The filter and
-buttons refresh after playback and manual episode changes; progress writes finish before the
-playback-completion refresh. These actions use the existing player and do not cast a duel vote.
-
-Tests: `cargo test` in the repo root (core crates) and in `apps/veylo-dx`.
-
-Licence: MIT. Archivo is under the SIL Open Font License. libmpv/FFmpeg ship as built by mpv-android (Android) and
-mpv-winbuild-cmake (Windows), under their licences; the Media3 FFmpeg licences are in `tools/media3-ffmpeg/licenses`.
+MIT. The bundled **Archivo** font is licensed under the SIL Open Font License. `libmpv`/FFmpeg ship as built by `mpv-android` (Android) and `mpv-winbuild-cmake` (Windows) under their respective licences; ONNX Runtime and `bge-small-en-v1.5` notices are bundled in `picks-ai/`.
