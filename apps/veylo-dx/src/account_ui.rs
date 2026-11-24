@@ -58,12 +58,12 @@ pub fn AccountBlock() -> Element {
                         div { class: "setting-copy", span { class: "setting-name", "What syncs" }
                             span { class: "dim setting-about", "Your library, where you are in each film and episode, what you watched, your likes, API keys and add-ons. Every device signed in to this account shares them automatically." } }
                     }
-                    if cfg!(target_os = "android") {
+                    if cfg!(target_os = "android") && !crate::is_tv() {
                         div { class: "setting-row glass",
-                            div { class: "setting-copy", span { class: "setting-name", "Sign in on a computer" }
-                                span { class: "dim setting-about", "On the computer: Settings → Account → Sign in with your phone. Then scan the code it shows." } }
+                            div { class: "setting-copy", span { class: "setting-name", "Sign in on a computer or TV" }
+                                span { class: "dim setting-about", "On the computer or TV: Settings → Account → Sign in with your phone. Then scan the code it shows." } }
                             button { class: "pill glass", disabled: working.is_some(),
-                                onclick: move |_| run("scan", Box::pin(async { scan().await?; Ok(Some("The computer is signed in.".into())) })),
+                                onclick: move |_| run("scan", Box::pin(async { scan().await?; Ok(Some("The device is signed in.".into())) })),
                                 icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan its code" } } }
                         }
                     }
@@ -101,7 +101,7 @@ pub fn AccountBlock() -> Element {
                         }
                         button { class: if panel() == Panel::Email { "pill glass on" } else { "pill glass" }, disabled: working.is_some(),
                             onclick: move |_| panel.set(if panel() == Panel::Email { Panel::Choices } else { Panel::Email }), icons::Pen {} span { "Use email" } }
-                        if !cfg!(target_os = "android") {
+                        if !cfg!(target_os = "android") || crate::is_tv() {
                             button { class: if panel() == Panel::Qr { "pill glass on" } else { "pill glass" }, disabled: working.is_some() && panel() != Panel::Qr,
                                 onclick: move |_| panel.set(if panel() == Panel::Qr { Panel::Choices } else { Panel::Qr }), icons::Grid {} span { "Sign in with your phone" } }
                         }
@@ -183,7 +183,7 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
             }
             div { class: "setting-copy",
                 span { class: "setting-name", "Scan with Veylo on your phone or tablet" }
-                span { class: "dim setting-about", "There: Settings → Account → Scan its code. This computer signs in to the same account." }
+                span { class: "dim setting-about", "There: Settings → Account → Scan its code. This device signs in to the same account." }
                 if let Some(p) = problem() { span { class: "addon-problem", icons::Alert {} span { "{p}" } } }
                 button { class: "pill glass", onclick: move |_| round += 1, icons::Refresh {} span { "New code" } }
             }

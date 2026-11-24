@@ -161,6 +161,16 @@ pub fn Picks() -> Element {
     let mut rejected = use_signal(HashSet::<String>::new);
     let mut checking = use_signal(HashSet::<String>::new);
     let filtered = use_memo(move || {
+        let saved_only = (shell.picks_saved_only)();
+        if saved_only {
+            let lib = library.read().clone().unwrap_or_default();
+            let gone = rejected.read();
+            let not_for_me = disliked.read();
+            let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
+            return lib.into_iter()
+                .filter(|m| m.saved && !gone.contains(&m.key()) && !finished(&seen, m) && !not_for_me.contains(&brain::id(m)))
+                .collect::<Vec<_>>();
+        }
         let this_year = backend::civil(backend::now_secs()).0 as i32;
         let out = rules::filter_picks(&pool.read(), kind().as_deref(), style(), genre().as_deref(), from(), to(), this_year);
         let gone = rejected.read();
@@ -677,6 +687,11 @@ pub fn Picks() -> Element {
                     }
                 }
                 div { class: "chips",
+                    if (shell.picks_saved_only)() {
+                        button { class: "chip-btn glass on", title: "Dueling your Saved watchlist — tap to return to full catalog",
+                            onclick: move |_| { shell.picks_saved_only.set(false); start_duel(); },
+                            icons::Bookmark {} span { "Saved only" } icons::Close {} }
+                    }
                     button { class: if slot() == Some(Slot::Mood) || !moods.is_empty() { "chip-btn glass on" } else { "chip-btn glass" },
                         disabled: ai_failed, title: if ai_failed { "Moods need the local AI" } else { "Set tonight's mood" },
                         onclick: move |_| slot.set(if slot() == Some(Slot::Mood) { None } else { Some(Slot::Mood) }), icons::Sparkles {} span { "Mood" } }

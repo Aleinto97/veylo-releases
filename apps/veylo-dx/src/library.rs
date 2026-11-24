@@ -46,7 +46,7 @@ static LIB_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<LibSnapshot>> = std::s
 #[component]
 pub fn Library() -> Element {
     // No title in front here: the accent goes back to neutral.
-    let shell = use_context::<Shell>();
+    let mut shell = use_context::<Shell>();
     let mut lamp = shell.lamp_source;
     use_hook(move || lamp.set(String::new()));
     let snap = LIB_SNAPSHOT.get().and_then(|m| m.lock().ok()).map(|s| s.clone()).unwrap_or_default();
@@ -97,9 +97,29 @@ pub fn Library() -> Element {
     let show_downloads = f == LibFilter::Downloads || (f == LibFilter::All && (!dl_list.is_empty() || !active_list.is_empty()));
     let show_saved = matches!(f, LibFilter::All | LibFilter::Saved | LibFilter::Movies | LibFilter::Series);
     let show_history = f != LibFilter::Downloads && f != LibFilter::Saved;
+    let stats_line = {
+        let hist_count = history.read().as_ref().and_then(|r| r.as_ref().ok()).map(|l| {
+            let watched_movies = l.iter().filter(|s| s.media.kind == "movie" && s.media.watched).count();
+            let watched_series = l.iter().filter(|s| s.media.kind != "movie" && s.media.watched).count();
+            let in_prog = l.iter().filter(|s| backend::in_progress(&s.media)).count();
+            (watched_movies, watched_series, in_prog)
+        });
+        let saved_n = saved().map(|s| s.len()).unwrap_or(0);
+        let dl_bytes: u64 = downloads.read().iter().map(|d| d.bytes).sum();
+        let mut parts = Vec::new();
+        if let Some((wm, ws, ip)) = hist_count {
+            if wm > 0 { parts.push(format!("{wm} film{} watched", if wm == 1 { "" } else { "s" })); }
+            if ws > 0 { parts.push(format!("{ws} series finished")); }
+            if ip > 0 { parts.push(format!("{ip} in progress")); }
+        }
+        if saved_n > 0 { parts.push(format!("{saved_n} saved")); }
+        if dl_bytes > 0 { parts.push(format!("{} offline", backend::file_size_label(dl_bytes))); }
+        parts.join(" · ")
+    };
     rsx! {
         div { class: "library",
             h1 { class: "display title", "Library" }
+            if !stats_line.is_empty() { p { class: "dim tnum", style: "margin: -8px 0 14px; font-size: 13px", "{stats_line}" } }
             div { class: "lib-toolbar",
                 div { class: "lib-filters", role: "tablist", aria_label: "Filter library",
                     for opt in LibFilter::ALL {
@@ -140,12 +160,17 @@ pub fn Library() -> Element {
                                     DownloadState::Failed(err) => format!("Failed: {err}"),
                                 };
                                 let key = job.key.clone();
+                                let retry_key = job.key.clone();
+                                let failed = matches!(job.state, DownloadState::Failed(_));
                                 rsx! {
                                     div { key: "dl-act-{job.key}", class: "addon-row glass",
                                         span { class: "addon-name", "{job.title}" }
                                         span { class: "dim tnum addon-offers", "{status}" }
                                         span { class: "topbar-spacer" }
-                                        button { class: "pill glass small", onclick: move |_| { backend::cancel_download(&key); active_dl.set(backend::active_downloads()); }, icons::Close {} span { "Cancel" } }
+                                        if failed {
+                                            button { class: "pill accent small", onclick: move |_| { let _ = backend::retry_download(&retry_key); active_dl.set(backend::active_downloads()); }, icons::Refresh {} span { "Retry" } }
+                                        }
+                                        button { class: "pill glass small", onclick: move |_| { backend::cancel_download(&key); active_dl.set(backend::active_downloads()); }, icons::Close {} span { if failed { "Dismiss" } else { "Cancel" } } }
                                     }
                                 }
                             }
@@ -176,7 +201,18 @@ pub fn Library() -> Element {
                             if !list.is_empty() {
                                 section { class: "lib-section",
                                     div { class: "group-head", span { class: "group-icon", icons::Bookmark {} } span { class: "group-name", "Saved" }
-                                        span { class: "tnum dim", "{list.len()}" } }
+                                        span { class: "tnum dim", "{list.len()}" }
+                                        if list.len() >= 2 {
+                                            span { class: "topbar-spacer" }
+                                            button { class: "pill glass small", title: "Duel only your saved titles in Picks",
+                                                onclick: move |_| {
+                                                    shell.picks_saved_only.set(true);
+                                                    shell.tab.set(crate::Tab::Picks);
+                                                },
+                                                icons::Sparkles {} span { "Pick from Saved" }
+                                            }
+                                        }
+                                    }
                                     div { class: "lib-grid",
                                         for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } } }
                                     }

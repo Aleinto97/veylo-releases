@@ -30,13 +30,30 @@ pub fn TitlePage(media: Media) -> Element {
     let mut season = use_signal(move || init_season);
     let mut liked = use_signal(|| media.liked);
     let mut saved = use_signal(|| media.saved);
-    // Films: one "Already watched" switch (marked, or played through). Series: per episode.
+    // Films: one "Already watched" switch (marked, or played through). Series: per episode + whole series.
     let mut watched = use_signal(|| media.watched);
     let mut seen = use_signal(std::collections::HashSet::<String>::new);
+    let mut ep_progress = use_signal(std::collections::HashMap::<String, (i64, i64, bool)>::new);
     // Up next is only named once the watched episodes are known (no "S1 E1" flashing first).
     let mut seen_ready = use_signal(|| false);
     let for_seen = media.clone();
-    use_hook(move || { spawn(async move { seen.set(backend::watched_episodes(&for_seen).await); seen_ready.set(true); }); });
+    use_hook(move || { spawn(async move {
+        let (w, prog) = tokio::join!(backend::watched_episodes(&for_seen), backend::episode_playback_map(&for_seen));
+        seen.set(w);
+        ep_progress.set(prog);
+        seen_ready.set(true);
+    }); });
+    // Collection (franchise parts) and "More like this" shelves loaded lazily below credits.
+    let mut collection = use_signal(|| None::<backend::CollectionShelf>);
+    let mut similar = use_signal(Vec::<Media>::new);
+    let for_rel = media.clone();
+    use_hook(move || { spawn(async move {
+        let (col, sim) = tokio::join!(backend::collection_parts(&for_rel), backend::similar_titles(&for_rel));
+        collection.set(col);
+        similar.set(sim);
+    }); });
+    let mut person_sheet = use_signal(|| None::<backend::Person>);
+    let mut dl_toast = use_signal(|| None::<String>);
     // A title opened from a shelf, Search or Picks carries the add-on's data only: what you did
     // with it (saved, watched, liked) comes from the store.
     // A choice made before the answer arrives wins (`touched`).
@@ -78,6 +95,18 @@ pub fn TitlePage(media: Media) -> Element {
     let mut rank = use_signal(|| None::<u64>);
     let for_rank = media.clone();
     use_hook(move || { spawn(async move { rank.set(backend::today_rank(&for_rank).await); }); });
+    // Verified HD/4K release availability from free srrDB + PreDB metadata (cached; warms autoplay).
+    let init_intel = (media.kind == "movie").then(|| backend::cached_release_intel(&media.id)).flatten();
+    let mut rel_intel = use_signal(move || init_intel);
+    let for_intel = media.clone();
+    use_hook(move || {
+        if for_intel.kind != "movie" { return; }
+        spawn(async move {
+            if let Some(info) = backend::release_intel(&for_intel.id, Some(&for_intel.name)).await {
+                rel_intel.set(Some(info));
+            }
+        });
+    });
     // The backdrop dissolves through the production's own textless frames every 9 seconds.
     let mut frame = use_signal(|| 0usize);
     use_future(move || async move {
@@ -111,27 +140,68 @@ pub fn TitlePage(media: Media) -> Element {
         if let Some(id) = id { backend::prefetch_sources(&for_ahead.kind, &id); }
     });
 
-    // Play: the Android app's order, then the one-byte check on at most four candidates.
+    // Play: check offline downloads first, otherwise the automatic Play order + probe.
     let play_media = media.clone();
     let autoplay = use_callback(move |(video, label): (String, Option<String>)| {
         let media = play_media.clone();
         if busy.peek().is_some() { return; }
+        let all_eps = episodes();
+        let next = next_episode(&all_eps, &video);
+        let prev = prev_episode(&all_eps, &video);
+        let season_eps: Vec<Episode> = all_eps.iter().find(|e| e.id == video)
+            .map(|cur| all_eps.iter().filter(|e| e.season == cur.season).cloned().collect())
+            .unwrap_or_default();
+        if let Some(offline) = backend::find_download(&media.key(), &video) {
+            play_offline(shell, offline);
+            return;
+        }
         let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
         busy.set(Some(video.clone()));
         let ticket = crate::finding(shell, title.clone());
         // Season packs: a labelled size covers the whole season.
-        let pack = label.as_ref().and_then(|_| {
-            let list = episodes();
-            let s = list.iter().find(|e| e.id == video)?.season;
-            Some(list.iter().filter(|e| e.season == s).count())
-        });
-        let next = next_episode(&episodes(), &video);
+        let pack = label.as_ref().map(|_| season_eps.len()).filter(|&n| n > 0);
         spawn(async move {
-            let pick = backend::autoplay(&media.kind, &video, pack, &media.name, (media.kind == "movie").then(|| media.first_year()).flatten()).await;
+            let ctx = backend::autoplay_context_for_media(&media, &video, pack);
+            let pick = backend::autoplay_for(&media.kind, &video, ctx).await;
             busy.set(None);
             if !crate::still_wanted(shell, ticket) { return; }
             // Nothing played: every source can be chosen by hand.
-            if !play_pick(shell, &media, &video, &title, pick, pack, next.map(|e| (e.id.clone(), Some(e.label())))) { chooser.set(Some(Chooser { video, label })); }
+            if !play_pick(shell, &media, &video, &title, pick, pack,
+                next.map(|e| (e.id.clone(), Some(e.label()))),
+                prev.map(|e| (e.id.clone(), Some(e.label()))),
+                season_eps) {
+                chooser.set(Some(Chooser { video, label }));
+            }
+        });
+    });
+
+    // One-tap offline download for a movie or episode using the automatic source selector.
+    let dl_media = media.clone();
+    let quick_download = use_callback(move |(video, label): (String, Option<String>)| {
+        let media = dl_media.clone();
+        let all_eps = episodes();
+        let pack = label.as_ref().and_then(|_| {
+            let s = all_eps.iter().find(|e| e.id == video)?.season;
+            Some(all_eps.iter().filter(|e| e.season == s).count())
+        });
+        let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
+        dl_toast.set(Some(format!("Finding best source to download {title}…")));
+        spawn(async move {
+            let ctx = backend::autoplay_context_for_media(&media, &video, pack);
+            let pick = backend::autoplay_for(&media.kind, &video, ctx).await;
+            match pick.best {
+                Some(src) => {
+                    let sub = [src.quality.map(str::to_owned), src.hdr.map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join(" ");
+                    let fname = (!src.filename.is_empty()).then(|| src.filename.clone());
+                    match backend::start_download(media.clone(), video, title.clone(), if sub.is_empty() { src.addon.clone() } else { sub }, src.url, src.headers, fname) {
+                        Ok(()) => dl_toast.set(Some(format!("Downloading {title} — see Library → Downloads."))),
+                        Err(e) => dl_toast.set(Some(format!("Download couldn't start: {e}"))),
+                    }
+                }
+                None => dl_toast.set(Some(backend::no_source_message(pick.debrid.as_deref()).into())),
+            }
+            backend::sleep(5000).await;
+            dl_toast.set(None);
         });
     });
 
@@ -353,6 +423,15 @@ pub fn TitlePage(media: Media) -> Element {
                         }
                         if !media.genres.is_empty() { span { class: "fact genres", title: media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", "), icons::Tag {} span { {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", ")} } } }
                         if let Some(c) = production.certificate.clone() { span { class: "fact cert", title: "Certificate", "{c}" } }
+                        if film {
+                            if let Some(info) = rel_intel() {
+                                if let Some(badge) = info.best_badge {
+                                    span { class: "fact", title: "Verified release on srrDB", icons::Sparkles {} span { "{badge}" } }
+                                } else if media.first_year().is_some_and(|y| y >= 2025) {
+                                    span { class: "fact", title: "No verified HD/WEB/Blu-ray release on srrDB yet", icons::Alert {} span { "No HD release yet" } }
+                                }
+                            }
+                        }
                     }
                     div { class: "title-actions",
                         // A series carries on where you are: the started episode, else the one after the last you watched.
@@ -395,8 +474,39 @@ pub fn TitlePage(media: Media) -> Element {
                                     move |_| crate::theatre::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None) }, icons::Clapper {} }
                         }
                         if film {
+                            icons::IconButton { label: "Download for offline playback", class: "glass",
+                                onclick: { let id = media.id.clone(); move |_| quick_download.call((id.clone(), None)) }, icons::Download {} }
                             icons::IconButton { label: "Choose a source", class: "glass", onclick: { let id = media.id.clone(); move |_| chooser.set(Some(Chooser { video: id.clone(), label: None })) }, icons::List {} }
                         }
+                        if !film && !episodes().is_empty() {
+                            {
+                                let all_reg: Vec<String> = episodes().into_iter().filter(|e| e.season != 0).map(|e| e.id).collect();
+                                let all_done = !all_reg.is_empty() && all_reg.iter().all(|id| seen.read().contains(id));
+                                let m_all = media.clone();
+                                rsx! {
+                                    button { class: if all_done { "pill glass watched-switch on" } else { "pill glass watched-switch" },
+                                        role: "switch", aria_checked: "{all_done}", title: "Mark entire series watched",
+                                        onclick: move |_| {
+                                            let next = !all_done;
+                                            let ids = all_reg.clone();
+                                            let m = m_all.clone();
+                                            seen.with_mut(|s| for id in &ids { if next { s.insert(id.clone()); } else { s.remove(id); } });
+                                            watched.set(next);
+                                            spawn(async move {
+                                                let _ = backend::set_episodes_watched(&m, ids, next).await;
+                                                let _ = backend::set_watched(&m, next).await;
+                                                *shell.picks_dirty.write() += 1;
+                                            });
+                                        },
+                                        if all_done { icons::Check {} } else { icons::EyeOff {} }
+                                        span { if all_done { "Series watched" } else { "Mark series watched" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(msg) = dl_toast() {
+                        div { class: "notice glass", role: "status", style: "margin-top: 10px", span { class: "group-icon", icons::Download {} } span { "{msg}" } }
                     }
                 }
             }
@@ -418,18 +528,46 @@ pub fn TitlePage(media: Media) -> Element {
                     Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
                     Load::Ready(m) => rsx! {
                         if !film { Episodes { list: m.episodes.clone(), media: media.clone(), season: season, last: media.last_video_id.clone(), busy: busy(), seen: seen,
+                            progress: ep_progress,
                             posters: production.season_posters.clone(),
                             on_play: move |(id, label): (String, String)| autoplay.call((id, Some(label))),
+                            on_download: move |(id, label): (String, String)| quick_download.call((id, Some(label))),
                             on_sources: move |(id, label): (String, String)| chooser.set(Some(Chooser { video: id, label: Some(label) })) } }
                         Videos { videos: production.videos.clone(), about: crate::theatre::About::of(&media, Some(&m), Some(&production)), trailers: m.trailers.clone() }
-                        Credits { meta: m.clone(), production: production.clone() }
+                        Credits { meta: m.clone(), production: production.clone(), on_person: move |p: backend::Person| person_sheet.set(Some(p)) }
+                        if let Some(col) = collection() {
+                            section { class: "shelf", style: "margin-top: 28px",
+                                div { class: "group-head", span { class: "group-icon", icons::Stack {} } span { class: "group-name", "{col.name}" }
+                                    span { class: "tnum dim", "{col.parts.len()}" } }
+                                div { class: "strip poster-strip",
+                                    for item in col.parts { crate::components::PosterCard { key: "col-{item.key()}", media: item } }
+                                }
+                            }
+                        }
+                        if !similar.read().is_empty() {
+                            section { class: "shelf", style: "margin-top: 24px",
+                                div { class: "group-head", span { class: "group-icon lamp", icons::Sparkles {} } span { class: "group-name", "More like this" } }
+                                div { class: "strip poster-strip",
+                                    for item in similar.read().iter().cloned() { crate::components::PosterCard { key: "sim-{item.key()}", media: item } }
+                                }
+                            }
+                        }
                     },
                 }
             }
 
             if let Some(c) = chooser() {
-                for c in [c] { SourceSheet { key: "{c.video}", media: m4.clone(), chooser: c.clone(), next: next_episode(&episodes(), &c.video).map(|e| (e.id.clone(), Some(e.label()))),
+                for c in [c] { SourceSheet { key: "{c.video}", media: m4.clone(), chooser: c.clone(),
+                    next: next_episode(&episodes(), &c.video).map(|e| (e.id.clone(), Some(e.label()))),
+                    prev: prev_episode(&episodes(), &c.video).map(|e| (e.id.clone(), Some(e.label()))),
+                    season_eps: {
+                        let all = episodes();
+                        all.iter().find(|e| e.id == c.video).map(|cur| all.iter().filter(|e| e.season == cur.season).cloned().collect()).unwrap_or_default()
+                    },
                     on_close: move |_| chooser.set(None) } }
+            }
+            if let Some(p) = person_sheet() {
+                for p in [p] { PersonSheet { key: "{p.name}", person: p, on_close: move |_| person_sheet.set(None) } }
             }
         }
     }
@@ -449,10 +587,27 @@ fn next_episode(list: &[Episode], video: &str) -> Option<Episode> {
     list.get(at + 1).filter(|e| e.season != 0).cloned()
 }
 
-/// Start the platform player for a checked source and record progress for this video.
-/// `rest`: the Play-order candidates after this one, for "Another source".
-fn start(shell: Shell, media: &Media, video: &str, title: &str, src: Source, next: Option<(String, Option<String>)>) {
-    start_with(shell, media, video, title, src, None, next, Vec::new(), None, 0)
+fn prev_episode(list: &[Episode], video: &str) -> Option<Episode> {
+    let at = list.iter().position(|e| e.id == video)?;
+    (at > 0).then(|| list.get(at - 1).filter(|e| e.season != 0).cloned()).flatten()
+}
+
+/// Start the platform player for a manually chosen source, keeping remaining direct candidates
+/// available for in-player switching and fallback.
+#[allow(clippy::too_many_arguments)]
+fn start(
+    shell: Shell,
+    media: &Media,
+    video: &str,
+    title: &str,
+    src: Source,
+    all_direct: Vec<Source>,
+    next: Option<(String, Option<String>)>,
+    prev: Option<(String, Option<String>)>,
+    season_eps: Vec<Episode>,
+) {
+    let rest: Vec<Source> = all_direct.into_iter().filter(|s| s.url != src.url).collect();
+    start_with(shell, media, video, title, src, None, next, prev, season_eps, rest, None, 0)
 }
 
 /// How many times an automatic choice may move on because its audio is not in your language.
@@ -462,20 +617,41 @@ const LANGUAGE_RETRIES: u8 = 2;
 /// `checks`: while above 0 (automatic choices), a file whose tagged audio lacks the Audio-language
 /// setting's language makes way for the next source instead of turning subtitles on.
 #[allow(clippy::too_many_arguments)]
-fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source, pack: Option<usize>, next: Option<(String, Option<String>)>, mut rest: Vec<Source>, at: Option<i64>, checks: u8) {
+fn start_with(
+    shell: Shell,
+    media: &Media,
+    video: &str,
+    title: &str,
+    src: Source,
+    pack: Option<usize>,
+    next: Option<(String, Option<String>)>,
+    prev: Option<(String, Option<String>)>,
+    season_eps: Vec<Episode>,
+    mut rest: Vec<Source>,
+    at: Option<i64>,
+    checks: u8,
+) {
     // The same file from another scraper would fail the same way.
     if !src.filename.is_empty() { rest.retain(|s| s.filename != src.filename); }
+    let mut all_sources = Vec::with_capacity(1 + rest.len().min(19));
+    all_sources.push(src.clone());
+    all_sources.extend(rest.iter().take(19).cloned());
     let language_check = checks > 0 && rest.iter().any(backend::claims_language);
     let resume = at.filter(|p| *p > 0).unwrap_or_else(|| if backend::in_progress(media) && (media.last_video_id.as_deref() == Some(video) || media.kind == "movie") { media.position_ms } else { 0 });
     let full_title = title.to_owned();
     let subtitle = if video != media.id { media.name.clone() } else { media.meta_line(true) };
-    let title = title.strip_prefix(&format!("{} ", media.name)).filter(|_| video != media.id).unwrap_or(title).to_owned();
+    let short_title = title.strip_prefix(&format!("{} ", media.name)).filter(|_| video != media.id).unwrap_or(title).to_owned();
     let next_video = next.as_ref().map(|(id, _)| (media.kind.clone(), id.clone()));
     let next_label = next.as_ref().and_then(|(_, label)| label.clone());
+    let filename = (!src.filename.is_empty()).then(|| src.filename.clone());
     let another = {
-        let (media, video, full_title, next) = (media.clone(), video.to_owned(), full_title.clone(), next.clone());
+        let (media, video, full_title, next, prev, season_eps, rest) = (
+            media.clone(), video.to_owned(), full_title.clone(), next.clone(), prev.clone(), season_eps.clone(), rest.clone(),
+        );
         Box::new(move |shell: Shell, position: i64, language: bool| {
-            let (media, video, full_title, next, rest) = (media.clone(), video.clone(), full_title.clone(), next.clone(), rest.clone());
+            let (media, video, full_title, next, prev, season_eps, rest) = (
+                media.clone(), video.clone(), full_title.clone(), next.clone(), prev.clone(), season_eps.clone(), rest.clone(),
+            );
             let ticket = crate::finding(shell, full_title.clone());
             spawn(async move {
                 // Not in your language: the sources whose label names it, then the rest.
@@ -486,21 +662,55 @@ fn start_with(shell: Shell, media: &Media, video: &str, title: &str, src: Source
                     pick.best.as_ref().map(backend::source_summary).unwrap_or_else(|| "nothing".into())));
                 if !crate::still_wanted(shell, ticket) { return; }
                 match pick.best {
-                    Some(found) => start_with(shell, &media, &video, &full_title, found, pack, next, pick.rest, Some(position), if pick.audio_known { 0 } else { checks.saturating_sub(1) }),
+                    Some(found) => start_with(shell, &media, &video, &full_title, found, pack, next, prev, season_eps, pick.rest, Some(position), if pick.audio_known { 0 } else { checks.saturating_sub(1) }),
                     None => { no_source(shell, pick.debrid.as_deref()); open_page(shell, &media); }
                 }
             });
         }) as crate::TryAnother
     };
-    crate::start_playback_with(shell, PlayRequest {
-        title, subtitle, url: src.url, start_ms: resume, headers: src.headers,
-        size: src.size.clone(), hdr: src.hdr.map(str::to_owned), quality: src.quality.map(str::to_owned),
-        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))), has_next: next.is_some(), next_label, next_video, language_check,
-        ..Default::default()
-    }, next.map(|(id, label)| {
+    let on_switch_source = {
+        let (media, video, full_title, next, prev, season_eps, all_sources) = (
+            media.clone(), video.to_owned(), full_title.clone(), next.clone(), prev.clone(), season_eps.clone(), all_sources.clone(),
+        );
+        Box::new(move |shell: Shell, idx: usize, position: i64| {
+            let Some(chosen) = all_sources.get(idx).cloned() else { return };
+            let others: Vec<Source> = all_sources.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, s)| s.clone()).collect();
+            start_with(shell, &media, &video, &full_title, chosen, pack, next.clone(), prev.clone(), season_eps.clone(), others, Some(position), 0);
+        }) as Box<dyn Fn(Shell, usize, i64)>
+    };
+    let on_switch_episode = {
         let media = media.clone();
-        Box::new(move |shell: Shell| play_next(shell, media.clone(), id.clone(), label.clone())) as Box<dyn Fn(Shell)>
-    }), Some(another));
+        Box::new(move |shell: Shell, ep_id: String| {
+            let label = backend::episode_label(&ep_id);
+            play_next(shell, media.clone(), ep_id, label);
+        }) as Box<dyn Fn(Shell, String)>
+    };
+    let hooks = crate::PlaybackHooks {
+        on_next: next.map(|(id, label)| {
+            let media = media.clone();
+            Box::new(move |shell: Shell| play_next(shell, media.clone(), id.clone(), label.clone())) as Box<dyn Fn(Shell)>
+        }),
+        on_prev: prev.clone().map(|(id, label)| {
+            let media = media.clone();
+            Box::new(move |shell: Shell| play_next(shell, media.clone(), id.clone(), label.clone())) as Box<dyn Fn(Shell)>
+        }),
+        on_another: Some(another),
+        on_switch_source: Some(on_switch_source),
+        on_switch_episode: Some(on_switch_episode),
+    };
+    crate::start_playback_hooks(shell, PlayRequest {
+        title: short_title, subtitle, url: src.url, filename, start_ms: resume, headers: src.headers,
+        size: src.size.clone(), hdr: src.hdr.map(str::to_owned), quality: src.quality.map(str::to_owned),
+        record: Some((media.clone(), (video != media.id).then(|| video.to_owned()))),
+        has_next: hooks.on_next.is_some(),
+        has_prev: prev.is_some(),
+        next_label, next_video,
+        sources: all_sources,
+        episodes: season_eps,
+        current_video_id: (video != media.id).then(|| video.to_owned()),
+        language_check,
+        ..Default::default()
+    }, hooks);
 }
 
 /// Ask for the sources `resume_now` would play while its button is on screen: the film, or the
@@ -540,24 +750,53 @@ pub(crate) fn play_from_card(shell: Shell, media: Media, video: String) {
     play_next(shell, media, video, label);
 }
 
-/// Play an offline downloaded file immediately with zero network access.
+/// Play an offline downloaded file immediately with zero network access, reading fresh SQLite
+/// resume position and chaining to the next downloaded episode when present.
 pub fn play_offline(shell: Shell, entry: backend::DownloadEntry) {
-    let resume = if backend::in_progress(&entry.media)
-        && (entry.media.last_video_id.as_deref() == Some(entry.video_id.as_str()) || entry.media.kind == "movie")
-    {
-        entry.media.position_ms
-    } else {
-        0
-    };
-    crate::start_playback(shell, PlayRequest {
-        title: entry.title,
-        subtitle: format!("Offline · {}", entry.subtitle),
-        url: entry.path.to_string_lossy().into_owned(),
-        start_ms: resume,
-        size: Some(backend::file_size_label(entry.bytes)),
-        record: Some((entry.media.clone(), (entry.video_id != entry.media.id).then_some(entry.video_id))),
-        ..Default::default()
-    }, None);
+    spawn(async move {
+        let resume = if entry.video_id != entry.media.id {
+            let (pos, dur, watched) = backend::single_episode_playback(&entry.media, &entry.video_id).await;
+            if !watched && pos > 5_000 && (dur <= 0 || pos < dur - 15_000) { pos } else { 0 }
+        } else if let Some(fresh) = backend::stored(&entry.media).await {
+            if backend::in_progress(&fresh) { fresh.position_ms } else { 0 }
+        } else if backend::in_progress(&entry.media) {
+            entry.media.position_ms
+        } else {
+            0
+        };
+        // Find the next downloaded episode for this series (by season:episode suffix) for offline Up Next.
+        let next_dl = if entry.video_id != entry.media.id {
+            let parts: Vec<&str> = entry.video_id.split(':').collect();
+            if parts.len() >= 3 {
+                if let (Ok(s), Ok(e)) = (parts[parts.len() - 2].parse::<i64>(), parts[parts.len() - 1].parse::<i64>()) {
+                    let prefix = parts[..parts.len() - 2].join(":");
+                    let next_same = format!("{prefix}:{s}:{}", e + 1);
+                    let next_season = format!("{prefix}:{}:1", s + 1);
+                    backend::find_download(&entry.media.key(), &next_same)
+                        .or_else(|| backend::find_download(&entry.media.key(), &next_season))
+                } else { None }
+            } else { None }
+        } else { None };
+        let next_label = next_dl.as_ref().map(|d| d.title.clone());
+        let has_next = next_dl.is_some();
+        let on_next = next_dl.map(|next_entry| {
+            Box::new(move |shell: Shell| play_offline(shell, next_entry.clone())) as Box<dyn Fn(Shell)>
+        });
+        let filename = entry.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        crate::start_playback(shell, PlayRequest {
+            title: entry.title,
+            subtitle: format!("Offline · {}", entry.subtitle),
+            url: entry.path.to_string_lossy().into_owned(),
+            filename,
+            file_size: Some(entry.bytes),
+            start_ms: resume,
+            size: Some(backend::file_size_label(entry.bytes)),
+            record: Some((entry.media.clone(), (entry.video_id != entry.media.id).then_some(entry.video_id))),
+            has_next,
+            next_label,
+            ..Default::default()
+        }, on_next);
+    });
 }
 
 /// Play one video now with the automatic choice, without the page (Resume, Next episode).
@@ -573,18 +812,34 @@ fn play_next(shell: Shell, media: Media, video: String, label: Option<String>) {
         let label = label.or_else(|| list.iter().find(|e| e.id == video).map(Episode::label));
         let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
         let after = next_episode(&list, &video).map(|e| (e.id.clone(), Some(e.label())));
-        let pack = list.iter().find(|e| e.id == video).map(|e| list.iter().filter(|x| x.season == e.season).count());
-        let pick = backend::autoplay(&media.kind, &video, pack, &media.name, (media.kind == "movie").then(|| media.first_year()).flatten()).await;
+        let before = prev_episode(&list, &video).map(|e| (e.id.clone(), Some(e.label())));
+        let season_eps: Vec<Episode> = list.iter().find(|e| e.id == video)
+            .map(|cur| list.iter().filter(|x| x.season == cur.season).cloned().collect())
+            .unwrap_or_default();
+        let pack = (!season_eps.is_empty()).then_some(season_eps.len());
+        let ctx = backend::autoplay_context_for_media(&media, &video, pack);
+        let pick = backend::autoplay_for(&media.kind, &video, ctx).await;
         if !crate::still_wanted(shell, ticket) { return; }
         // Nothing played: the title page, where every source can be chosen.
-        if !play_pick(shell, &media, &video, &title, pick, pack, after) { open_page(shell, &media); }
+        if !play_pick(shell, &media, &video, &title, pick, pack, after, before, season_eps) { open_page(shell, &media); }
     });
 }
 
 /// Play Play's automatic choice; false (having said why) when there is none.
-fn play_pick(shell: Shell, media: &Media, video: &str, title: &str, pick: backend::Pick, pack: Option<usize>, next: Option<(String, Option<String>)>) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn play_pick(
+    shell: Shell,
+    media: &Media,
+    video: &str,
+    title: &str,
+    pick: backend::Pick,
+    pack: Option<usize>,
+    next: Option<(String, Option<String>)>,
+    prev: Option<(String, Option<String>)>,
+    season_eps: Vec<Episode>,
+) -> bool {
     match pick.best {
-        Some(src) => { start_with(shell, media, video, title, src, pack, next, pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }); true }
+        Some(src) => { start_with(shell, media, video, title, src, pack, next, prev, season_eps, pick.rest, None, if pick.audio_known { 0 } else { LANGUAGE_RETRIES }); true }
         None => { no_source(shell, pick.debrid.as_deref()); false }
     }
 }
@@ -606,7 +861,11 @@ const EPISODE_PAGE: usize = 24;
 /// automatic choice; its list icon opens the manual chooser instead.
 #[component]
 fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last: Option<String>, busy: Option<String>,
-            seen: Signal<std::collections::HashSet<String>>, on_play: EventHandler<(String, String)>, on_sources: EventHandler<(String, String)>,
+            seen: Signal<std::collections::HashSet<String>>,
+            progress: Signal<std::collections::HashMap<String, (i64, i64, bool)>>,
+            on_play: EventHandler<(String, String)>,
+            on_download: EventHandler<(String, String)>,
+            on_sources: EventHandler<(String, String)>,
             #[props(default)] posters: std::collections::HashMap<i64, String>) -> Element {
     let mut shell = use_context::<Shell>();
     let mut season = season;
@@ -758,6 +1017,15 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                                 }
                                 if is_next { span { class: "ep-next", "Up next" } }
                                 span { class: "ep-play", if busy.as_deref() == Some(e.id.as_str()) { span { class: "spinner" } } else { icons::Play {} } }
+                                {
+                                    let frac = if done { 0.0 } else {
+                                        progress.read().get(&e.id)
+                                            .filter(|(pos, dur, w)| !*w && *pos > 5_000 && *dur > 0)
+                                            .map(|(pos, dur, _)| (*pos as f64 / *dur as f64).clamp(0.0, 1.0))
+                                            .unwrap_or(0.0)
+                                    };
+                                    rsx! { if frac > 0.0 { div { class: "card-progress", div { style: "width: {frac * 100.0:.1}%" } } } }
+                                }
                             }
                             div { class: "ep-copy",
                                 div { class: "ep-head",
@@ -770,9 +1038,18 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
                         }
                         div { class: "ep-foot",
                             span { class: "ep-date dim tnum", if !e.released.is_empty() { "{backend::date_label(&e.released)}" } }
-                            icons::IconButton { label: if done { format!("Watched E{}: unmark it and later episodes", e.number) } else { format!("Watched up to E{}", e.number) },
+                            icons::IconButton { label: if done { format!("Unmark E{} watched", e.number) } else { format!("Mark E{} watched (Shift+click marks up to E{})", e.number, e.number) },
                                 class: if done { "small ep-seen on" } else { "small ep-seen" }, pressed: done,
-                                onclick: move |_| mark.call((ids.clone(), !done)), icons::Check {} }
+                                onclick: {
+                                    let ep_id = e.id.clone();
+                                    move |ev: MouseEvent| {
+                                        if ev.modifiers().shift() { mark.call((ids.clone(), !done)); }
+                                        else { mark.call((vec![ep_id.clone()], !done)); }
+                                    }
+                                }, icons::Check {} }
+                            icons::IconButton { label: "Download episode", class: "small",
+                                onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_download.call((id.clone(), l.clone())) },
+                                icons::Download {} }
                             icons::IconButton { label: "Choose a source", class: "small",
                                 onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_sources.call((id.clone(), l.clone())) },
                                 icons::List {} }
@@ -788,16 +1065,15 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
 }
 
 #[component]
-fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> Element {
-    let mut shell = use_context::<Shell>();
+fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork, on_person: EventHandler<backend::Person>) -> Element {
     let row = |label: &'static str, icon: Element, names: Vec<String>| rsx! {
         if !names.is_empty() {
             div { class: "credit-row",
                 span { class: "credit-icon", title: label, aria_label: label, {icon} }
                 div { class: "credit-chips",
                     for n in names.into_iter().take(12) {
-                        button { class: "name-chip glass", title: "Search {n}",
-                            onclick: { let n = n.clone(); move |_| { shell.search_query.set(Some(n.clone())); shell.search_open.set(true); } }, "{n}" }
+                        button { class: "name-chip glass", title: "View filmography: {n}",
+                            onclick: { let n = n.clone(); move |_| on_person.call(backend::Person { name: n.clone(), ..Default::default() }) }, "{n}" }
                     }
                 }
             }
@@ -837,8 +1113,8 @@ fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> E
                 div { class: "group-head", span { class: "group-icon", icons::Users {} } span { class: "group-name", if makers.is_empty() { "Cast" } else { "Cast & crew" } } }
                 div { class: "people",
                     for p in makers.into_iter().chain(if faces { people } else { Vec::new() }) {
-                        button { key: "{p.role}|{p.name}", class: "person", title: "Search {p.name}",
-                            onclick: { let n = p.name.clone(); move |_| { shell.search_query.set(Some(n.clone())); shell.search_open.set(true); } },
+                        button { key: "{p.role}|{p.name}", class: "person", title: "View filmography: {p.name}",
+                            onclick: { let p = p.clone(); move |_| on_person.call(p.clone()) },
                             span { class: "face",
                                 if let Some(src) = p.photo.clone() {
                                     crate::components::FallbackImg {
@@ -864,8 +1140,8 @@ fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork) -> E
                             for (i, p) in crew_people.into_iter().enumerate() {
                                 span { key: "{p.name}",
                                     if i > 0 { ", " }
-                                    button { class: "crew-name", title: "Search {p.name}",
-                                        onclick: { let n = p.name.clone(); move |_| { shell.search_query.set(Some(n.clone())); shell.search_open.set(true); } }, "{p.name}" }
+                                    button { class: "crew-name", title: "View filmography: {p.name}",
+                                        onclick: { let p = p.clone(); move |_| on_person.call(p.clone()) }, "{p.name}" }
                                 }
                             }
                         }
@@ -921,7 +1197,14 @@ fn Videos(videos: Vec<backend::Video>, about: crate::theatre::About, trailers: V
 
 /// Manual choice: every add-on's sources for one video, in a sheet from the bottom.
 #[component]
-fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<String>)>, on_close: EventHandler<()>) -> Element {
+fn SourceSheet(
+    media: Media,
+    chooser: Chooser,
+    next: Option<(String, Option<String>)>,
+    prev: Option<(String, Option<String>)>,
+    season_eps: Vec<Episode>,
+    on_close: EventHandler<()>,
+) -> Element {
     let shell = use_context::<Shell>();
     let mut sources = use_signal(|| Load::<(Vec<Source>, Vec<String>)>::Loading);
     let mut expanded = use_signal(|| None::<usize>);
@@ -932,12 +1215,20 @@ fn SourceSheet(media: Media, chooser: Chooser, next: Option<(String, Option<Stri
     }); });
     let title = chooser.label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
     let (m, t, v) = (media.clone(), title.clone(), chooser.video.clone());
-    let play = use_callback(move |src: Source| { start(shell, &m, &v, &t, src, next.clone()); on_close.call(()); });
+    let play = use_callback(move |src: Source| {
+        let direct_list: Vec<Source> = match sources.peek().clone() {
+            Load::Ready((list, _)) => list.into_iter().filter(|s| s.kind == SourceKind::Direct).collect(),
+            _ => Vec::new(),
+        };
+        start(shell, &m, &v, &t, src, direct_list, next.clone(), prev.clone(), season_eps.clone());
+        on_close.call(());
+    });
     let mut dl_note = use_signal(|| None::<String>);
     let (dm, dt, dv) = (media.clone(), title.clone(), chooser.video.clone());
     let save_offline = use_callback(move |src: Source| {
         let sub = [src.quality.map(str::to_owned), src.hdr.map(str::to_owned)].into_iter().flatten().collect::<Vec<_>>().join(" ");
-        match backend::start_download(dm.clone(), dv.clone(), dt.clone(), if sub.is_empty() { src.addon.clone() } else { sub }, src.url, src.headers) {
+        let fname = (!src.filename.is_empty()).then(|| src.filename.clone());
+        match backend::start_download(dm.clone(), dv.clone(), dt.clone(), if sub.is_empty() { src.addon.clone() } else { sub }, src.url, src.headers, fname) {
             Ok(()) => dl_note.set(Some("Saving for offline playback — see Library → Downloads.".into())),
             Err(e) => dl_note.set(Some(format!("Download couldn't start: {e}"))),
         }
@@ -1019,6 +1310,77 @@ fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: 
                     if !source.name.is_empty() { p { "{source.name}" } }
                     if !source.description.is_empty() { p { class: "dim", "{source.description}" } }
                     if !source.filename.is_empty() { p { class: "dim", "{source.filename}" } }
+                }
+            }
+        }
+    }
+}
+
+/// Filmography sheet for a tapped actor, director, or crew member.
+#[component]
+fn PersonSheet(person: backend::Person, on_close: EventHandler<()>) -> Element {
+    let mut shell = use_context::<Shell>();
+    let mut pressed_backdrop = use_signal(|| false);
+    let mut loading = use_signal(|| true);
+    let mut filmography = use_signal(|| backend::Filmography { person: person.clone(), ..Default::default() });
+    let p_fetch = person.clone();
+    use_hook(move || {
+        spawn(async move {
+            let f = backend::person_filmography(&p_fetch).await;
+            filmography.set(f);
+            loading.set(false);
+        });
+    });
+    let f = filmography();
+    let search_name = person.name.clone();
+    rsx! {
+        div { class: "scrim bottom",
+            onpointerdown: move |_| pressed_backdrop.set(true),
+            onclick: move |_| { if pressed_backdrop() { on_close.call(()); } pressed_backdrop.set(false); },
+            section { class: "bottom-sheet glass", role: "dialog", aria_modal: "true", aria_label: "{f.person.name}",
+                onpointerdown: move |e| e.stop_propagation(), onclick: move |e| e.stop_propagation(),
+                div { class: "sheet-head",
+                    span { class: "group-icon", icons::Users {} }
+                    span { class: "group-name", "{f.person.name}" }
+                    span { class: "topbar-spacer" }
+                    button { class: "pill glass small",
+                        onclick: move |_| {
+                            shell.search_query.set(Some(search_name.clone()));
+                            shell.search_open.set(true);
+                            on_close.call(());
+                        },
+                        icons::Search {} span { "Search catalogs" }
+                    }
+                    icons::IconButton { label: "Close", class: "glass", onclick: move |_| on_close.call(()), icons::Close {} }
+                }
+                div { class: "sheet-scroll",
+                    if !f.bio.is_empty() { p { class: "dim", style: "margin: 0 0 14px; line-height: 1.45", "{f.bio}" } }
+                    if loading() {
+                        div { class: "rows", for i in 0..3 { div { key: "{i}", class: "row skeleton-row" } } }
+                    } else if f.credits.is_empty() {
+                        p { class: "dim", "No filmography found from metadata sources. Try “Search catalogs” above." }
+                    } else {
+                        for (section_name, items) in f.credits {
+                            div { key: "{section_name}", style: "margin-bottom: 18px",
+                                div { class: "group-head",
+                                    span { class: "group-name", "{section_name}" }
+                                    span { class: "tnum dim", "{items.len()}" }
+                                }
+                                div { class: "strip poster-strip",
+                                    for item in items {
+                                        crate::components::PosterButton {
+                                            key: "pf-{item.key()}",
+                                            media: item.clone(),
+                                            on_press: move |m: Media| {
+                                                on_close.call(());
+                                                shell.opened.set(Some(m));
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

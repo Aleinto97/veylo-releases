@@ -23,11 +23,17 @@ pub struct PlayRequest {
     pub subtitle: String,
     /// Offer a Next episode control.
     pub has_next: bool,
+    /// Offer a Previous episode control.
+    pub has_prev: bool,
     /// Next episode display label for the "Up Next" countdown card (e.g. "S2 E4 · Title").
     pub next_label: Option<String>,
     /// Next episode `(kind, video_id)` to prefetch near the end of playback so Next starts immediately.
     pub next_video: Option<(String, String)>,
     pub url: String,
+    /// Playing release filename (for subtitle add-on `extra` & release-sync ranking).
+    pub filename: Option<String>,
+    /// Playing file size in bytes when known.
+    pub file_size: Option<u64>,
     pub start_ms: i64,
     /// Request headers the source requires (behaviorHints.proxyHeaders.request).
     pub headers: Vec<(String, String)>,
@@ -39,6 +45,12 @@ pub struct PlayRequest {
     pub accent: String,
     /// Library title whose progress is recorded (and the episode's video id); None for previews and tests.
     pub record: Option<(Media, Option<String>)>,
+    /// Alternative direct sources available for in-player switching without closing playback.
+    pub sources: Vec<crate::backend::Source>,
+    /// Episodes in the current season for in-player episode switching.
+    pub episodes: Vec<crate::backend::Episode>,
+    /// Video id of the currently playing episode (highlighted in the in-player episode picker).
+    pub current_video_id: Option<String>,
     /// An automatic choice with others left: when its audio tracks are tagged and none is in the
     /// Audio-language setting's language, the next source is tried instead of subtitles.
     pub language_check: bool,
@@ -64,9 +76,17 @@ pub enum PlayerEvent {
     Attached(crate::engine::LiveRef),
     /// Video is on screen. `decoder` is the hardware API in use, or None for software.
     Started { decoder: Option<String>, codec: String, facts: Facts },
-    /// `next`: the viewer asked for the next episode; `another`: this source failed, try the next one
-    /// (`language`: because its audio is not in your language).
-    Finished { position_ms: i64, duration_ms: i64, next: bool, another: bool, language: bool },
+    /// `next`/`prev`: episode navigation; `another`: try next source; `switch_source`/`switch_episode`: in-player pickers.
+    Finished {
+        position_ms: i64,
+        duration_ms: i64,
+        next: bool,
+        prev: bool,
+        another: bool,
+        language: bool,
+        switch_source: Option<usize>,
+        switch_episode: Option<String>,
+    },
     Failed(String),
 }
 

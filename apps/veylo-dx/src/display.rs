@@ -20,7 +20,7 @@ pub fn summary(screen: Option<Screen>, hdr_output: bool) -> (String, String) {
             if s.hdr10_plus { kinds.push("HDR10+"); }
             if s.hdr10 { kinds.push("HDR10"); }
             if s.hlg { kinds.push("HLG"); }
-            let about = if cfg!(target_os = "windows") && !hdr_output { "HDR output is set to Always SDR: HDR videos are tone-mapped." }
+            let about = if cfg!(any(target_os = "windows", target_os = "macos")) && !hdr_output { "HDR output is set to Always SDR: HDR videos are tone-mapped." }
                 else { "HDR videos play in HDR." };
             (format!("HDR: {}{}", kinds.join(", "), peak(&s)), about.into())
         }

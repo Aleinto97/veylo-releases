@@ -19,8 +19,14 @@
     };
     const usable = el => !el.disabled && el.tabIndex >= 0 && !el.closest('[inert]')
         && visible(el) && (r => r.width > 0 && r.height > 0)(el.getBoundingClientRect());
-    // An open dialog keeps focus inside it.
-    const scope = () => [...document.querySelectorAll('[aria-modal="true"]')].filter(visible).pop() || document;
+    // An open dialog keeps focus inside it (including player sheets, error modal, and Up Next).
+    const scope = () => {
+        const playerModal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
+        if (playerModal && visible(playerModal)) return playerModal;
+        const player = document.querySelector('.app.playing .player:not(.calm)');
+        if (player && visible(player)) return player;
+        return [...document.querySelectorAll('[aria-modal="true"]')].filter(visible).pop() || document;
+    };
     const typing = el => el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT'
         || (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'submit', 'reset'].includes(el.type));
     const gap = (a0, a1, b0, b1) => Math.max(0, b0 - a1, a0 - b1);
@@ -63,7 +69,14 @@
     window.addEventListener('keydown', e => {
         const dir = DIRS[e.key];
         if (!dir || !e.isTrusted || e.altKey || e.ctrlKey || e.metaKey) return;
-        if (document.querySelector('.app.playing')) return;
+        if (document.querySelector('.app.playing')) {
+            const playerModal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
+            const calm = document.querySelector('.app.playing .player.calm');
+            // When controls are hidden and no sheet/error/up-next is open, let the player take arrows (←/→ seek, ↑/↓ reveal HUD).
+            if (calm && !(playerModal && visible(playerModal))) return;
+            // On the seekbar scrubber, ← and → scrub directly rather than moving focus away.
+            if (dir[0] && document.activeElement && document.activeElement.classList.contains('scrubber')) return;
+        }
         if (dir[0] && document.querySelector('.theatre')) return;
         const active = document.activeElement;
         const inside = !idle() && usable(active);
@@ -145,7 +158,19 @@
     let queued = false, waiting = 0;
     const settle = () => {
         queued = false;
-        if (!idle() || document.querySelector('.app.playing')) { waiting = 0; return; }
+        if (document.querySelector('.app.playing')) {
+            const modal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
+            if (modal && visible(modal) && !modal.contains(document.activeElement)) {
+                const target = [...modal.querySelectorAll(FOCUSABLE)].find(usable);
+                if (target) target.focus({ preventScroll: true });
+            } else if (!document.querySelector('.app.playing .player.calm') && idle()) {
+                const playBtn = document.querySelector('.app.playing .player-big, .app.playing .player-actions button');
+                if (playBtn && usable(playBtn)) playBtn.focus({ preventScroll: true });
+            }
+            waiting = 0;
+            return;
+        }
+        if (!idle()) { waiting = 0; return; }
         const title = document.querySelector('.title-page');
         const button = title && title.querySelector('.play-big, .title-actions .pill.accent');
         const play = button && !button.disabled ? button : null;

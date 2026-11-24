@@ -11,26 +11,53 @@ pub fn SearchOverlay() -> Element {
     // Kept in the shell, so Esc and Back (which close Search from the app root) remember it too.
     let mut query = shell.search_draft;
     let mut outcome = use_signal(|| None::<SearchOutcome>);
+    let mut vibe_mode = use_signal(|| false);
+    let mut vibe_results = use_signal(|| None::<Vec<Media>>);
     let mut searching = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut generation = use_signal(|| 0u64);
-    let ideas = use_resource(|| async { backend::picks().await.map(|p| p.items).unwrap_or_default() });
+    let ideas = use_resource(|| async {
+        let items = backend::picks().await.map(|p| p.items).unwrap_or_default();
+        if items.len() <= 1 { return items; }
+        let fallback = items.clone();
+        backend::on_runtime(async move {
+            tokio::task::spawn_blocking(move || {
+                let taste = crate::brain::load(0);
+                let mut scored: Vec<(f64, Media)> = items.into_iter().enumerate()
+                    .map(|(i, m)| (taste.lasting(&m) - (i as f64) * 0.02, m)).collect();
+                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+            }).await.unwrap_or(fallback)
+        }).await.unwrap_or_default()
+    });
 
     // Each keystroke supersedes the previous request; only the latest may write.
-    let mut run = move |q: String, delay: u64| {
+    let mut run = move |q: String, delay: u64, vibe: bool| {
         let id = *generation.peek() + 1;
         generation.set(id);
         spawn(async move {
             if delay > 0 { backend::sleep(delay).await; }
             if *generation.peek() != id { return; }
-            if q.trim().is_empty() { outcome.set(None); searching.set(false); error.set(None); return; }
+            if q.trim().is_empty() { outcome.set(None); vibe_results.set(None); searching.set(false); error.set(None); return; }
             searching.set(true);
-            let result = backend::search(q).await;
-            if *generation.peek() != id { return; }
-            searching.set(false);
-            match result {
-                Ok(o) => { error.set(None); outcome.set(Some(o)); }
-                Err(e) => { outcome.set(None); error.set(Some(format!("{e:#}"))); }
+            if vibe {
+                let result = backend::semantic_search(q).await;
+                if *generation.peek() != id { return; }
+                searching.set(false);
+                outcome.set(None);
+                match result {
+                    Ok(list) => { error.set(None); vibe_results.set(Some(list)); }
+                    Err(e) => { vibe_results.set(None); error.set(Some(format!("{e:#}"))); }
+                }
+            } else {
+                let result = backend::search(q).await;
+                if *generation.peek() != id { return; }
+                searching.set(false);
+                vibe_results.set(None);
+                match result {
+                    Ok(o) => { error.set(None); outcome.set(Some(o)); }
+                    Err(e) => { outcome.set(None); error.set(Some(format!("{e:#}"))); }
+                }
             }
         });
     };
@@ -44,14 +71,14 @@ pub fn SearchOverlay() -> Element {
         shell.opened.set(Some(m));
         crate::close_search(shell);
     };
-    let mut set_query = move |q: String, delay: u64| { query.set(q.clone()); run(q, delay); };
+    let mut set_query = move |q: String, delay: u64| { let v = *vibe_mode.peek(); query.set(q.clone()); run(q, delay, v); };
 
     // Developer option: VEYLO_DX_SEARCH=<query> opens Search with that query.
     use_hook(move || if let Ok(q) = std::env::var("VEYLO_DX_SEARCH") {
-        if !q.trim().is_empty() { spawn(async move { query.set(q.clone()); run(q, 0); }); }
+        if !q.trim().is_empty() { spawn(async move { query.set(q.clone()); run(q, 0, false); }); }
     });
     // A name tapped on a title page arrives as a query.
-    use_hook(move || if let Some(q) = shell.search_query.take() { spawn(async move { query.set(q.clone()); run(q, 0); }); });
+    use_hook(move || if let Some(q) = shell.search_query.take() { spawn(async move { query.set(q.clone()); run(q, 0, false); }); });
     let q = query();
     let results = outcome.read().as_ref().map(|o| o.results.clone()).unwrap_or_default();
     let several_addons = results.first().is_some_and(|(first, _)| results.iter().any(|(a, _)| a != first));
@@ -83,21 +110,35 @@ pub fn SearchOverlay() -> Element {
             }
             div { class: "search-head",
                 div { class: if searching() { "search-field glass busy" } else { "search-field glass" },
-                    span { class: "search-glyph", icons::Search {} }
+                    span { class: "search-glyph", if vibe_mode() { icons::Sparkles {} } else { icons::Search {} } }
                     input {
                         class: "query display",
                         r#type: "search",
-                        placeholder: "Search",
+                        placeholder: if vibe_mode() { "Describe a vibe or plot…" } else { "Search" },
                         aria_label: "Search films, series and anime",
                         autocomplete: "off",
                         spellcheck: "false",
                         value: "{q}",
                         onmounted: move |e| async move { let _ = e.set_focus(true).await; },
-                        oninput: move |e| set_query(e.value(), DEBOUNCE_MS),
-                        onkeydown: move |e| if e.key() == Key::Enter { remember(); run(query(), 0); },
+                        oninput: move |e| set_query(e.value(), if vibe_mode() { 420 } else { DEBOUNCE_MS }),
+                        onkeydown: move |e| if e.key() == Key::Enter { remember(); run(query(), 0, vibe_mode()); },
                     }
                     if !q.is_empty() {
                         icons::IconButton { label: "Clear", class: "small", onclick: move |_| set_query(String::new(), 0), icons::Backspace {} }
+                    }
+                }
+                if !crate::picks_ai::failed() {
+                    button {
+                        class: if vibe_mode() { "pill accent small" } else { "pill glass small" },
+                        title: "On-device semantic search by mood, plot or vibe",
+                        aria_pressed: "{vibe_mode()}",
+                        onclick: move |_| {
+                            let next = !vibe_mode();
+                            vibe_mode.set(next);
+                            let cur = query.peek().clone();
+                            if !cur.trim().is_empty() { run(cur, 0, next); }
+                        },
+                        icons::Sparkles {} span { "Vibe" }
                     }
                 }
                 crate::shortcuts::ShortcutButton {}
@@ -128,6 +169,34 @@ pub fn SearchOverlay() -> Element {
                             for m in list.into_iter().take(10) {
                                 PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
                             }
+                        }
+                    }
+                } else if vibe_mode() {
+                    if let Some(list) = vibe_results() {
+                        if list.is_empty() && !searching() {
+                            div { class: "center-note",
+                                div { class: "glass panel",
+                                    span { class: "dim big-icon", icons::Sparkles {} }
+                                    p { "No matching vibes in your catalog yet" }
+                                }
+                            }
+                        } else if !list.is_empty() {
+                            div { class: "group-head",
+                                span { class: "group-icon lamp", icons::Sparkles {} }
+                                span { class: "group-name", "Vibe matches" }
+                                span { class: "tnum dim", "{list.len()}" }
+                            }
+                            div { class: "grid",
+                                for m in list {
+                                    PosterButton { key: "vibe-{m.key()}", media: m.clone(), on_press: open }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = error() {
+                        div { class: "notice glass", role: "alert",
+                            span { class: "warn-icon", icons::Alert {} }
+                            span { "{err}" }
                         }
                     }
                 } else {
@@ -164,7 +233,7 @@ pub fn SearchOverlay() -> Element {
                         div { class: "notice glass", role: "alert",
                             span { class: "warn-icon", icons::Alert {} }
                             span { if error().is_some() { "Search unavailable" } else { "{failed.join(\", \")} offline" } }
-                            icons::IconButton { label: "Try again", class: "small", onclick: move |_| run(query(), 0), icons::Refresh {} }
+                            icons::IconButton { label: "Try again", class: "small", onclick: move |_| run(query(), 0, false), icons::Refresh {} }
                         }
                     }
                     if !searching() && outcome.read().is_some() && results.is_empty() && failed.is_empty() {
@@ -172,6 +241,12 @@ pub fn SearchOverlay() -> Element {
                             div { class: "glass panel",
                                 span { class: "dim big-icon", icons::Search {} }
                                 p { if catalogs == 0 { "No add-on can search" } else { "No results" } }
+                                if !crate::picks_ai::failed() {
+                                    button { class: "pill accent small",
+                                        onclick: move |_| { vibe_mode.set(true); run(query(), 0, true); },
+                                        icons::Sparkles {} span { "Try Vibe search" }
+                                    }
+                                }
                             }
                         }
                     }

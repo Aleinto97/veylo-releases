@@ -149,3 +149,23 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
   border: 1px solid rgba(242,239,234,.22); animation: arrive .18s ease-out; transition: bottom .28s ease, transform .12s; }
 .player .player-skip.lifted { bottom: 84px; }
 @media (max-width: 760px) { .player .player-skip { right: 12px; bottom: 20px; } .player .player-skip.lifted { bottom: 128px; } }
+
+/* Scrubber hover timestamp & chapter tooltip. */
+.scrub-tip { position: absolute; bottom: 34px; transform: translateX(-50%); padding: 4px 10px; border-radius: 10px;
+  background: rgba(12,12,15,.88); border: 1px solid rgba(242,239,234,.18); font: 650 12px/1.2 var(--ui); color: var(--bone);
+  white-space: nowrap; pointer-events: none; z-index: 3; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,.55); }
+.scrub-tip-ch { display: block; font-size: 11px; font-weight: 500; color: var(--dust); max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+
+/* Live Stats-for-Nerds HUD overlay. */
+.player-stats-hud { position: absolute; top: 76px; left: 20px; z-index: 2; padding: 10px 14px; border-radius: 16px;
+  background: rgba(10,10,14,.76); border: 1px solid rgba(242,239,234,.14); font: 600 12px/1.45 var(--ui); color: var(--bone);
+  pointer-events: none; display: grid; gap: 2px; min-width: 220px; }
+.player-stats-hud span { display: flex; justify-content: space-between; gap: 16px; }
+.player-stats-hud b { color: var(--dust); font-weight: 500; }
+
+/* Subtitle color swatches & local file picker row. */
+.sub-colors { display: flex; align-items: center; gap: 8px; }
+.sub-swatch { width: 26px; height: 26px; border-radius: 50%; border: 2px solid rgba(255,255,255,.22); padding: 0; }
+.sub-swatch.on { border-color: var(--lamp); box-shadow: 0 0 0 2px rgba(242,239,234,.35); transform: scale(1.1); }
+.player-sleep-badge { font-size: 12px; font-weight: 700; color: var(--lamp); margin-left: 4px; }
+.player-unlock { position: absolute; right: 20px; top: 20px; z-index: 4; }

@@ -87,13 +87,75 @@ mod imp {
     /// WebView's own background (macOS: the window is transparent and the page paints its own black).
     const CLEAR_PAGE: bool = cfg!(any(target_os = "linux", target_os = "windows"));
 
+    /// Keep the desktop display awake while video plays; released automatically on detach.
+    mod wake_lock {
+        #[cfg(target_os = "windows")]
+        pub fn acquire() {
+            #[link(name = "kernel32")]
+            extern "system" { fn SetThreadExecutionState(flags: u32) -> u32; }
+            const ES_CONTINUOUS: u32 = 0x8000_0000;
+            const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+            const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED); }
+        }
+        #[cfg(target_os = "windows")]
+        pub fn release() {
+            #[link(name = "kernel32")]
+            extern "system" { fn SetThreadExecutionState(flags: u32) -> u32; }
+            const ES_CONTINUOUS: u32 = 0x8000_0000;
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS); }
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        static CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+        #[cfg(target_os = "macos")]
+        pub fn acquire() {
+            release();
+            let pid = std::process::id().to_string();
+            if let Ok(child) = std::process::Command::new("/usr/bin/caffeinate")
+                .args(["-d", "-i", "-w", &pid])
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Ok(mut g) = CHILD.lock() { *g = Some(child); }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        pub fn acquire() {
+            release();
+            if let Ok(child) = std::process::Command::new("systemd-inhibit")
+                .args(["--what=idle", "--who=Veylo", "--why=Playing video", "--mode=block", "sleep", "infinity"])
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Ok(mut g) = CHILD.lock() { *g = Some(child); }
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub fn release() {
+            if let Ok(mut g) = CHILD.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        pub fn acquire() {}
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        pub fn release() {}
+    }
+
     pub fn attach(live: &Arc<Live>) {
+        wake_lock::acquire();
         let path = veylo_video_surface::attach(&host(), live.clone());
         if path.is_some() && CLEAR_PAGE { let _ = dioxus::desktop::window().webview.set_background_color((0, 0, 0, 0)); }
         // Without a picture mpv still plays the sound.
         live.mark_ready();
     }
     pub fn detach() {
+        wake_lock::release();
         veylo_video_surface::detach();
         if CLEAR_PAGE { let _ = dioxus::desktop::window().webview.set_background_color((0, 0, 0, 255)); }
         set_fullscreen(false);

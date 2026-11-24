@@ -113,6 +113,8 @@ pub struct Shell {
     pub player_key: Signal<Option<String>>,
     /// Bumped when the viewer backs out of the player while its source is still being found.
     pub play_ticket: Signal<u64>,
+    /// When true, Picks duels exclusively over titles saved in the user's Library ("Pick from Saved").
+    pub picks_saved_only: Signal<bool>,
 }
 
 impl Shell {
@@ -156,21 +158,38 @@ fn main() {
     launch_desktop();
 }
 
-/// Developer command: `veylo-dx --sources <type> <video-id> [episodes in the season]` prints the Play order and which
-/// source passes the one-byte check. File names, sizes and labels only; never URLs.
+/// Developer command: `veylo-dx --sources <type> <video-id> [episodes in the season] [title] [year]`
+/// prints the Play order and which source passes the check. File names, sizes and labels only; never URLs.
 #[cfg(not(target_os = "android"))]
-fn print_sources(kind: &str, id: &str, pack: Option<usize>) {
+fn print_sources(kind: &str, id: &str, pack: Option<usize>, title: Option<&str>, year: Option<i32>) {
     if let Err(e) = backend::init() { eprintln!("{e:#}"); return; }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let (list, failed) = match backend::sources(kind, id).await { Ok(r) => r, Err(e) => { eprintln!("{e:#}"); return; } };
+        let (mut list, failed) = match backend::sources(kind, id).await { Ok(r) => r, Err(e) => { eprintln!("{e:#}"); return; } };
         println!("{} sources, offline add-ons: {failed:?}", list.len());
-        let order = backend::play_order(&list, pack);
-        for (i, s) in order.iter().take(8).enumerate() {
-            println!("{:>2}. [{} {}] {} | {} | {}", i + 1, s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"),
-                if s.filename.is_empty() { s.description.lines().next().unwrap_or("") } else { &s.filename }, s.size.as_deref().unwrap_or("size?"), s.addon);
-        }
-        let pick = backend::pick_source(order, pack).await;
+        let mut ctx = backend::AutoplayContext::simple(title.unwrap_or(""), year, pack);
+        ctx.episode_code = backend::parse_video_episode(id);
+        let pick = if title.is_some() {
+            let order = backend::play_order_for_cli(&mut list, &ctx);
+            for (i, s) in order.iter().take(20).enumerate() {
+                println!("{:>2}. [{} {}{}] {} | {} | {}", i + 1, s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"),
+                    if s.off_title { " OFF-TITLE" } else { "" },
+                    if s.filename.is_empty() { s.description.lines().next().unwrap_or("") } else { &s.filename }, s.size.as_deref().unwrap_or("size?"), s.addon);
+            }
+            let exact: Vec<_> = order.into_iter().filter(|s| !s.off_title).collect();
+            if exact.is_empty() {
+                backend::Pick { debrid: Some("no-matching-title".into()), ..Default::default() }
+            } else {
+                backend::pick_source_with(exact, &ctx).await
+            }
+        } else {
+            let order = backend::play_order(&list, pack);
+            for (i, s) in order.iter().take(20).enumerate() {
+                println!("{:>2}. [{} {}] {} | {} | {}", i + 1, s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"),
+                    if s.filename.is_empty() { s.description.lines().next().unwrap_or("") } else { &s.filename }, s.size.as_deref().unwrap_or("size?"), s.addon);
+            }
+            backend::pick_source_with(order, &ctx).await
+        };
         let (best, debrid) = (pick.best, pick.debrid);
         println!("Play would start: {}", best.map(|s| if s.filename.is_empty() { s.description.lines().next().unwrap_or("").to_owned() } else { s.filename }).unwrap_or_else(|| format!("nothing ({debrid:?})")));
     });
@@ -220,7 +239,10 @@ fn launch_desktop() {
         const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
     }
-    if args.get(1).map(String::as_str) == Some("--sources") && args.len() >= 4 { print_sources(&args[2], &args[3], args.get(4).and_then(|n| n.parse().ok())); return; }
+    if args.get(1).map(String::as_str) == Some("--sources") && args.len() >= 4 {
+        print_sources(&args[2], &args[3], args.get(4).and_then(|n| n.parse().ok()), args.get(5).map(String::as_str), args.get(6).and_then(|y| y.parse().ok()));
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--addons") { print_addons(); return; }
     if args.get(1).map(String::as_str) == Some("--self-test") { std::process::exit(selftest::run(&args[2..])); }
     if args.get(1).map(String::as_str) == Some("--check-picture") && args.len() >= 3 {
@@ -310,6 +332,7 @@ fn Shell_() -> Element {
         player: Signal::new(None),
         player_key: Signal::new(None),
         play_ticket: Signal::new(0),
+        picks_saved_only: Signal::new(false),
     });
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
@@ -736,25 +759,36 @@ fn StatusChip(status: PlayerStatus) -> Element {
 
 /// Tries the next source from where the failed one stopped, told whether it was for the audio language.
 pub type TryAnother = Box<dyn Fn(Shell, i64, bool)>;
+pub type SwitchSource = Box<dyn Fn(Shell, usize, i64)>;
+pub type SwitchEpisode = Box<dyn Fn(Shell, String)>;
+
+/// Optional callbacks fired when playback finishes with a navigation or source-switch action.
+#[derive(Default)]
+pub struct PlaybackHooks {
+    pub on_next: Option<Box<dyn Fn(Shell)>>,
+    pub on_prev: Option<Box<dyn Fn(Shell)>>,
+    pub on_another: Option<TryAnother>,
+    pub on_switch_source: Option<SwitchSource>,
+    pub on_switch_episode: Option<SwitchEpisode>,
+}
 
 /// Play through the platform player and narrate what it is doing. `on_next` plays the next episode.
 pub fn start_playback(shell: Shell, request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>) {
-    start_playback_with(shell, request, on_next, None)
+    start_playback_hooks(shell, request, PlaybackHooks { on_next, ..Default::default() })
 }
 
-/// `start_playback`, with `on_another` trying the next source when this one failed (told whether
-/// it was for the audio language).
-pub fn start_playback_with(mut shell: Shell, mut request: player::PlayRequest, on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<TryAnother>) {
+/// `start_playback`, with full navigation and source-switching hooks.
+pub fn start_playback_hooks(mut shell: Shell, mut request: player::PlayRequest, hooks: PlaybackHooks) {
     if request.accent.is_empty() { request.accent = try_consume_context::<Accent>().map(|a| a.0.peek().clone()).unwrap_or_default(); }
     let title = request.title.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     shell.player_status.set(Some(PlayerStatus::Opening(title.clone())));
     player::play(request, tx);
-    follow_playback_events(shell, title, rx, on_next, on_another);
+    follow_playback_events(shell, title, rx, hooks);
 }
 
 fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<player::PlayerEvent>,
-    on_next: Option<Box<dyn Fn(Shell)>>, on_another: Option<TryAnother>) {
+    hooks: PlaybackHooks) {
     // Playback belongs to the app, even when its source chooser closes immediately.
     dioxus::core::spawn_forever(async move {
         // This playback's in-app session: only it may take the player off screen.
@@ -766,13 +800,16 @@ fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::
                     shell.player_status.set(Some(PlayerStatus::Playing { title: title.clone(), codec, hardware: decoder, facts })),
                 player::PlayerEvent::Attached(live) => { mine = Some(live.clone()); shell.player.set(Some(live)); }
                 player::PlayerEvent::Failed(error) => { clear(&mine); shell.player_status.set(Some(PlayerStatus::Failed(error))); break; }
-                player::PlayerEvent::Finished { next, another, language, position_ms, .. } => {
+                player::PlayerEvent::Finished { next, prev, another, language, switch_source, switch_episode, position_ms, .. } => {
                     clear(&mine);
                     shell.player_status.set(None);
                     backend::flush_progress().await;
                     *shell.picks_dirty.write() += 1;
-                    if next { if let Some(play_next) = &on_next { play_next(shell); } }
-                    if another { if let Some(try_another) = &on_another { try_another(shell, position_ms, language); } }
+                    if let Some(idx) = switch_source { if let Some(cb) = &hooks.on_switch_source { cb(shell, idx, position_ms); } }
+                    else if let Some(ep) = switch_episode { if let Some(cb) = &hooks.on_switch_episode { cb(shell, ep); } }
+                    else if next { if let Some(play_next) = &hooks.on_next { play_next(shell); } }
+                    else if prev { if let Some(play_prev) = &hooks.on_prev { play_prev(shell); } }
+                    else if another { if let Some(try_another) = &hooks.on_another { try_another(shell, position_ms, language); } }
                     break;
                 }
             }
@@ -865,7 +902,7 @@ mod playback_lifetime_tests {
                 title_command: Signal::new(None), search_query: Signal::new(None), opened: Signal::new(None),
                 lamp_source: Signal::new(String::new()), pick_command: Signal::new(None),
                 history: Signal::new(backend::History::default()), picks_dirty: Signal::new(0), addon_updates: Signal::new(0),
-                player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0),
+                player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0), picks_saved_only: Signal::new(false),
             }
         });
         rsx! { if show() { TestSourceChooser {} } }
@@ -878,7 +915,7 @@ mod playback_lifetime_tests {
         use_hook(move || {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             *probe.sender.borrow_mut() = Some(tx);
-            follow_playback_events(shell, "Test film".into(), rx, None, None);
+            follow_playback_events(shell, "Test film".into(), rx, PlaybackHooks::default());
         });
         rsx! { div {} }
     }

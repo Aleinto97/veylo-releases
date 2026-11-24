@@ -244,12 +244,25 @@ pub struct Artwork {
     pub studios: Vec<Studio>,
     pub certificate: Option<String>,
     pub language: Option<String>,
+    /// ISO 639-1 original language code (e.g. "en", "ko", "ja", "it") for autoplay fallback.
+    pub original_language: Option<String>,
+    /// Original and localized alternate titles (e.g. "Scontrarsi a Natale") for autoplay matching.
+    pub alt_titles: Vec<String>,
+    /// Expected movie/episode duration in seconds, for pre-probe bitrate and trailer rejection.
+    pub runtime_secs: Option<f64>,
     pub season_posters: HashMap<i64, String>,
     pub videos: Vec<Video>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct Person { pub name: String, pub role: String, pub photo: Option<String> }
+pub struct Person {
+    pub name: String,
+    pub role: String,
+    pub photo: Option<String>,
+    pub tmdb_id: Option<i64>,
+    pub tvmaze_id: Option<i64>,
+    pub wikidata_id: Option<String>,
+}
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Studio { pub name: String, pub logo: String }
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -280,10 +293,12 @@ pub(super) fn production(details: &Value, kind: &str, backdrop: Option<&str>) ->
         name: s(c, "name"),
         role: if tv { c["roles"][0]["character"].as_str().unwrap_or_default().to_owned() } else { s(c, "character") },
         photo: img("h632", &c["profile_path"]),
+        tmdb_id: c["id"].as_i64(),
+        ..Default::default()
     }).filter(|p| !p.name.is_empty()).collect();
     let mut crew: Vec<(String, Vec<Person>)> = Vec::new();
     let mut credit = |label: &str, c: &Value| {
-        let person = Person { name: s(c, "name"), role: String::new(), photo: img("h632", &c["profile_path"]) };
+        let person = Person { name: s(c, "name"), role: String::new(), photo: img("h632", &c["profile_path"]), tmdb_id: c["id"].as_i64(), ..Default::default() };
         if person.name.is_empty() { return; }
         match crew.iter_mut().find(|(l, _)| l == label) {
             Some((_, people)) => if !people.iter().any(|p| p.name == person.name) && people.len() < 3 { people.push(person) },
@@ -316,6 +331,23 @@ pub(super) fn production(details: &Value, kind: &str, backdrop: Option<&str>) ->
     let original = s(details, "original_language");
     let language = details["spoken_languages"].as_array().into_iter().flatten().find(|l| l["iso_639_1"] == original.as_str())
         .map(|l| s(l, "english_name")).filter(|x| !x.is_empty());
+    let mut alt_titles: Vec<String> = Vec::new();
+    for field in ["original_title", "original_name"] {
+        let t = s(details, field);
+        if !t.is_empty() && !alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&t)) { alt_titles.push(t); }
+    }
+    let alts = details["alternative_titles"]["titles"].as_array()
+        .or_else(|| details["alternative_titles"]["results"].as_array());
+    for entry in alts.into_iter().flatten() {
+        let t = s(entry, "title");
+        if !t.is_empty() && !alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&t)) && alt_titles.len() < 40 {
+            alt_titles.push(t);
+        }
+    }
+    let runtime_mins = details["runtime"].as_u64()
+        .or_else(|| details["episode_run_time"].as_array().and_then(|a| a.first()).and_then(Value::as_u64))
+        .filter(|m| *m > 0 && *m <= 600);
+    let runtime_secs = runtime_mins.map(|m| (m * 60) as f64);
     let season_posters = details["seasons"].as_array().into_iter().flatten()
         .filter_map(|x| Some((x["season_number"].as_i64()?, img("w500", &x["poster_path"])?))).collect();
     // The production's own videos first: official trailers, teasers, clips, then the rest.
@@ -326,7 +358,16 @@ pub(super) fn production(details: &Value, kind: &str, backdrop: Option<&str>) ->
         .filter(|v| !v.youtube.is_empty()).collect();
     videos.sort_by_key(|v| std::cmp::Reverse((v.official, rank(&v.kind))));
     videos.truncate(12);
-    Artwork { stills, tagline: Some(s(details, "tagline")).filter(|t| !t.is_empty()), cast, crew, studios, certificate, language, season_posters, videos, ..Artwork::default() }
+    Artwork {
+        stills,
+        tagline: Some(s(details, "tagline")).filter(|t| !t.is_empty()),
+        cast, crew, studios, certificate, language,
+        original_language: (!original.is_empty()).then_some(original),
+        alt_titles,
+        runtime_secs,
+        season_posters, videos,
+        ..Artwork::default()
+    }
 }
 
 pub(super) static ARTWORK: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
@@ -380,8 +421,8 @@ pub async fn tmdb_artwork(m: &Media) -> Option<Artwork> {
     // result whose year agrees within one year, so another title's art is never borrowed.
     let found = match by_imdb { Some(x) => Some(x), None => tmdb_by_name(m).await };
     let (kind, id) = found?;
-    // Images and videos in one request.
-    let extra = if kind == "tv" { "images,videos,aggregate_credits,content_ratings" } else { "images,videos,credits,release_dates" };
+    // Images, videos, credits and localized alternate titles in one request.
+    let extra = if kind == "tv" { "images,videos,aggregate_credits,content_ratings,alternative_titles" } else { "images,videos,credits,release_dates,alternative_titles" };
     let details = tmdb(format!("{kind}/{id}"), vec![("append_to_response", extra.into()), ("include_image_language", "en,null".into())]).await.unwrap_or_default();
     let images = &details["images"];
     let mut videos: Vec<&Value> = details["videos"]["results"].as_array().into_iter().flatten()
@@ -620,7 +661,7 @@ pub(super) async fn tmdb_titles(tk: &str, results: Vec<Value>, genre: Option<&st
             "releaseInfo": release,
             "poster": r["poster_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w780{p}")).unwrap_or_default(),
             "background": r["backdrop_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")).unwrap_or_default(),
-            "genres": genre_names, "imdbRating": r["vote_average"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_default(),
+            "genres": genre_names, "tmdbRating": r["vote_average"].as_f64().filter(|&v| v > 0.0).map(|v| format!("{v:.1}")).unwrap_or_default(),
             "tmdb_id": r["id"],
         });
         if let Some(m) = Media::from_json(&meta, CINEMETA) { out.push(crate::picks_rules::tidy(m)); }

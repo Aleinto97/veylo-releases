@@ -254,6 +254,8 @@ impl SubtitleCache {
             .unwrap_or(content.len());
         let extension = if content[first..].starts_with(b"WEBVTT") {
             "vtt"
+        } else if content[first..].starts_with(b"[Script Info]") {
+            "ass"
         } else {
             "srt"
         };

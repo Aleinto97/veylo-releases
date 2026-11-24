@@ -98,13 +98,19 @@ pub(super) fn tvmaze_production(show: &Value) -> Artwork {
     for c in e["cast"].as_array().into_iter().flatten() {
         let name = s(&c["person"], "name");
         if name.is_empty() || cast.iter().any(|p| p.name == name) { continue; }
-        cast.push(Person { name, role: s(&c["character"], "name"), photo: tvmaze_image(&c["person"]).or_else(|| tvmaze_image(&c["character"])) });
+        cast.push(Person {
+            name,
+            role: s(&c["character"], "name"),
+            photo: tvmaze_image(&c["person"]).or_else(|| tvmaze_image(&c["character"])),
+            tvmaze_id: c["person"]["id"].as_i64(),
+            ..Default::default()
+        });
         if cast.len() == 15 { break; }
     }
     let mut crew: Vec<(String, Vec<Person>)> = Vec::new();
     for (kind, label) in [("Creator", "Created by"), ("Music", "Music by"), ("Director Of Photography", "Cinematography by")] {
         let people: Vec<Person> = e["crew"].as_array().into_iter().flatten().filter(|c| c["type"] == kind)
-            .map(|c| Person { name: s(&c["person"], "name"), role: String::new(), photo: tvmaze_image(&c["person"]) })
+            .map(|c| Person { name: s(&c["person"], "name"), role: String::new(), photo: tvmaze_image(&c["person"]), tvmaze_id: c["person"]["id"].as_i64(), ..Default::default() })
             .filter(|p| !p.name.is_empty()).take(3).collect();
         if !people.is_empty() { crew.push((label.into(), people)); }
     }
@@ -114,9 +120,22 @@ pub(super) fn tvmaze_production(show: &Value) -> Artwork {
     // so only keep the highest-res one as a single fallback backdrop, never as cycling hero stills.
     let backdrop = tvmaze_embedded_images(show, "background").into_iter().next();
     let poster = tvmaze_embedded_images(show, "poster").into_iter().next().or_else(|| tvmaze_image(show));
+    let runtime_secs = show["averageRuntime"].as_u64()
+        .or_else(|| show["runtime"].as_u64())
+        .filter(|m| *m > 0 && *m <= 600)
+        .map(|m| (m * 60) as f64);
+    let mut alt_titles: Vec<String> = Vec::new();
+    for aka in e["akas"].as_array().into_iter().flatten() {
+        let name = s(aka, "name");
+        if !name.is_empty() && !alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+            alt_titles.push(name);
+        }
+    }
     Artwork {
         backdrop, poster, cast, crew, season_posters,
         language: Some(s(show, "language")).filter(|l| !l.is_empty()),
+        alt_titles,
+        runtime_secs,
         ..Artwork::default()
     }
 }
@@ -287,7 +306,7 @@ pub(super) fn tvmaze_media(s: &Value) -> Option<Media> {
         "id": imdb, "type": "series", "name": s["name"], "description": summary,
         "releaseInfo": match (year, ended) { (0, _) => String::new(), (y, Some(e)) if e != y => format!("{y}–{e}"), (y, Some(_)) => y.to_string(), (y, None) => format!("{y}–") },
         "poster": s["image"]["original"].as_str().or(s["image"]["medium"].as_str()).unwrap_or_default(),
-        "genres": tvmaze_genres(s), "imdbRating": s["rating"]["average"].as_f64().map(|v| format!("{v:.1}")).unwrap_or_default(),
+        "genres": tvmaze_genres(s), "tvmazeRating": s["rating"]["average"].as_f64().filter(|&v| v > 0.0).map(|v| format!("{v:.1}")).unwrap_or_default(),
     });
     Media::from_json(&meta, CINEMETA).map(crate::picks_rules::tidy)
 }
@@ -383,16 +402,19 @@ pub(super) fn wikidata_production(rows: &Value) -> Artwork {
     // Wikidata keeps no billing order: the named parts first, then those with a photo (the
     // title page puts the add-on's top-billed names before both).
     let mut cast: Vec<(bool, bool, Person)> = Vec::new();
+    let qid_of = |uri: &str| uri.rsplit('/').next().filter(|q| q.len() > 1 && q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())).map(str::to_owned);
     for r in of(&rows, "cast") {
         let Some(name) = label(r, "vLabel") else { continue };
         let role = Some(field(r, "role").to_owned()).filter(|x| !x.is_empty()).or_else(|| label(r, "chLabel")).unwrap_or_default();
         let photo = commons(field(r, "img"), 360);
+        let qid = qid_of(field(r, "v"));
         match cast.iter_mut().find(|(_, _, p)| p.name == name) {
             Some((has_role, has_photo, p)) => {
                 if p.role.is_empty() && !role.is_empty() { p.role = role; *has_role = true; }
                 if p.photo.is_none() && photo.is_some() { p.photo = photo; *has_photo = true; }
+                if p.wikidata_id.is_none() { p.wikidata_id = qid; }
             }
-            None => cast.push((!role.is_empty(), photo.is_some(), Person { name, role, photo })),
+            None => cast.push((!role.is_empty(), photo.is_some(), Person { name, role, photo, wikidata_id: qid, ..Default::default() })),
         }
     }
     cast.sort_by_key(|(role, photo, _)| std::cmp::Reverse((*role, *photo)));
@@ -402,9 +424,13 @@ pub(super) fn wikidata_production(rows: &Value) -> Artwork {
         for r in of(&rows, job) {
             let Some(name) = label(r, "vLabel") else { continue };
             let photo = commons(field(r, "img"), 360);
+            let qid = qid_of(field(r, "v"));
             match people.iter_mut().find(|p| p.name == name) {
-                Some(p) => if p.photo.is_none() { p.photo = photo },
-                None => if people.len() < 3 { people.push(Person { name, role: String::new(), photo }) },
+                Some(p) => {
+                    if p.photo.is_none() { p.photo = photo; }
+                    if p.wikidata_id.is_none() { p.wikidata_id = qid; }
+                }
+                None => if people.len() < 3 { people.push(Person { name, role: String::new(), photo, wikidata_id: qid, ..Default::default() }) },
             }
         }
         if !people.is_empty() { crew.push((job.into(), people)); }
@@ -575,6 +601,9 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
             if let Some(m) = extra.cast.iter().find(|e| e.name.eq_ignore_ascii_case(&p.name)) {
                 if p.photo.is_none() && m.photo.is_some() { p.photo = m.photo.clone(); }
                 if p.role.is_empty() && !m.role.is_empty() { p.role = m.role.clone(); }
+                if p.tmdb_id.is_none() { p.tmdb_id = m.tmdb_id; }
+                if p.tvmaze_id.is_none() { p.tvmaze_id = m.tvmaze_id; }
+                if p.wikidata_id.is_none() { p.wikidata_id = m.wikidata_id.clone(); }
             }
         }
         // If free cast has few portraits, supplement with photo-bearing cast from fallback.
@@ -595,10 +624,11 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
             match art.crew.iter_mut().find(|(j, _)| j == &job) {
                 Some((_, existing)) => {
                     for p in existing.iter_mut() {
-                        if p.photo.is_none() {
-                            if let Some(m) = people.iter().find(|e| e.name.eq_ignore_ascii_case(&p.name)) {
-                                p.photo = m.photo.clone();
-                            }
+                        if let Some(m) = people.iter().find(|e| e.name.eq_ignore_ascii_case(&p.name)) {
+                            if p.photo.is_none() { p.photo = m.photo.clone(); }
+                            if p.tmdb_id.is_none() { p.tmdb_id = m.tmdb_id; }
+                            if p.tvmaze_id.is_none() { p.tvmaze_id = m.tvmaze_id; }
+                            if p.wikidata_id.is_none() { p.wikidata_id = m.wikidata_id.clone(); }
                         }
                     }
                 }
@@ -619,8 +649,120 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
     }
     art.certificate = art.certificate.or(extra.certificate);
     art.language = art.language.or(extra.language);
+    art.original_language = art.original_language.or(extra.original_language);
+    art.runtime_secs = art.runtime_secs.or(extra.runtime_secs);
+    for t in extra.alt_titles {
+        if art.alt_titles.len() >= 40 { break; }
+        if !art.alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            art.alt_titles.push(t);
+        }
+    }
     if art.videos.is_empty() { art.videos = extra.videos; }
     art
+}
+
+/// Filmography for a cast or crew member tapped on a title page.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Filmography {
+    pub person: Person,
+    pub bio: String,
+    pub credits: Vec<(String, Vec<Media>)>,
+}
+
+/// Fetch a person's real filmography (TMDB when configured, else keyless TVmaze / Wikidata).
+pub async fn person_filmography(person: &Person) -> Filmography {
+    let mut out = Filmography { person: person.clone(), ..Default::default() };
+    // 1. TMDB combined credits when a TMDB key is configured (richest: movies + series + bio).
+    if tmdb_ready() {
+        let tid = match person.tmdb_id {
+            Some(id) => Some(id),
+            None => tmdb("search/person".into(), vec![("query", person.name.clone())]).await
+                .and_then(|v| v["results"][0]["id"].as_i64()),
+        };
+        if let Some(id) = tid {
+            if let Some(d) = tmdb(format!("person/{id}"), vec![("append_to_response", "combined_credits".into())]).await {
+                if let Some(bio) = d["biography"].as_str().map(str::trim).filter(|b| !b.is_empty()) {
+                    out.bio = bio.lines().next().unwrap_or(bio).chars().take(360).collect();
+                }
+                if out.person.photo.is_none() {
+                    if let Some(p) = d["profile_path"].as_str().filter(|p| !p.is_empty()) {
+                        out.person.photo = Some(format!("{TMDB_IMG}/h632{p}"));
+                    }
+                }
+                let pick_top = |arr: Option<&Vec<Value>>, filter_crew: bool| -> Vec<(String, Value)> {
+                    let mut seen = HashSet::new();
+                    let mut items: Vec<(i64, String, Value)> = arr.into_iter().flatten()
+                        .filter(|v| matches!(v["media_type"].as_str(), Some("movie" | "tv")))
+                        .filter(|v| !filter_crew || matches!(v["job"].as_str(), Some("Director" | "Creator" | "Screenplay" | "Writer" | "Executive Producer")))
+                        .filter(|v| v["vote_count"].as_i64().unwrap_or(0) >= 20)
+                        .filter_map(|v| {
+                            let mt = v["media_type"].as_str()?.to_owned();
+                            let vid = v["id"].as_i64()?;
+                            if !seen.insert((mt.clone(), vid)) { return None; }
+                            let pop = (v["popularity"].as_f64().unwrap_or(0.0) * 100.0) as i64 + v["vote_count"].as_i64().unwrap_or(0);
+                            Some((pop, mt, v.clone()))
+                        }).collect();
+                    items.sort_by_key(|(pop, _, _)| std::cmp::Reverse(*pop));
+                    items.into_iter().take(12).map(|(_, mt, v)| (mt, v)).collect()
+                };
+                let crew_raw = pick_top(d["combined_credits"]["crew"].as_array(), true);
+                let cast_raw = pick_top(d["combined_credits"]["cast"].as_array(), false);
+                let resolve_group = |raw: Vec<(String, Value)>| async move {
+                    let movies: Vec<Value> = raw.iter().filter(|(k, _)| k == "movie").map(|(_, v)| v.clone()).collect();
+                    let series: Vec<Value> = raw.iter().filter(|(k, _)| k == "tv").map(|(_, v)| v.clone()).collect();
+                    let (mut m, s) = tokio::join!(tmdb_titles("movie", movies, None), tmdb_titles("tv", series, None));
+                    m.extend(s);
+                    m
+                };
+                let (crew_media, cast_media) = tokio::join!(resolve_group(crew_raw), resolve_group(cast_raw));
+                if !crew_media.is_empty() { out.credits.push(("Directing & Writing".into(), crew_media)); }
+                if !cast_media.is_empty() { out.credits.push(("Acting".into(), cast_media)); }
+                if !out.credits.is_empty() { return out; }
+            }
+        }
+    }
+    // 2. Keyless TVmaze cast credits (series).
+    if let Some(tvm_id) = person.tvmaze_id {
+        if let Some(list) = get_json(format!("https://api.tvmaze.com/people/{tvm_id}/castcredits"), vec![("embed", "show".into())]).await {
+            let mut seen = HashSet::new();
+            let shows: Vec<Media> = list.as_array().into_iter().flatten()
+                .filter_map(|e| tvmaze_media(&e["_embedded"]["show"]))
+                .filter(|m| seen.insert(m.key()))
+                .take(18).collect();
+            if !shows.is_empty() {
+                out.credits.push(("Series".into(), shows));
+                return out;
+            }
+        }
+    }
+    // 3. Keyless Wikidata SPARQL filmography (movies & series with IMDb IDs).
+    if let Some(qid) = person.wikidata_id.as_deref().filter(|q| q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())) {
+        let query = format!(r#"SELECT DISTINCT ?imdb ?fLabel ?year ?isTv WHERE {{
+  {{ ?f wdt:P57 wd:{qid}. }} UNION {{ ?f wdt:P161 wd:{qid}. }} UNION {{ ?f wdt:P170 wd:{qid}. }}
+  ?f wdt:P345 ?imdb.
+  OPTIONAL {{ ?f wdt:P577 ?date. BIND(YEAR(?date) AS ?year) }}
+  BIND(EXISTS {{ ?f wdt:P31/wdt:P279* wd:Q5398426 }} AS ?isTv)
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
+}} ORDER BY DESC(?year) LIMIT 24"#);
+        if let Some(rows) = sparql(query).await {
+            let mut seen = HashSet::new();
+            let mut items = Vec::new();
+            for r in rows.as_array().into_iter().flatten() {
+                let imdb = field(r, "imdb");
+                if !imdb.starts_with("tt") || !seen.insert(imdb.to_owned()) { continue; }
+                let Some(name) = label(r, "fLabel") else { continue };
+                let kind = if field(r, "isTv") == "true" { "series" } else { "movie" };
+                let year = field(r, "year");
+                let meta = json!({
+                    "id": imdb, "type": kind, "name": name, "releaseInfo": year,
+                    "poster": format!("https://images.metahub.space/poster/medium/{imdb}/img"),
+                });
+                if let Some(m) = Media::from_json(&meta, CINEMETA) { items.push(m); }
+            }
+            if !items.is_empty() { out.credits.push(("Known for".into(), items)); }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- Cinemeta
@@ -802,10 +944,10 @@ mod tests {
         let mut free = Artwork {
             backdrop: Some("https://free.example/bg.jpg".into()),
             cast: vec![
-                Person { name: "Actor A".into(), role: "Hero".into(), photo: Some("https://free.example/a.jpg".into()) },
-                Person { name: "Actor B".into(), role: String::new(), photo: None },
+                Person { name: "Actor A".into(), role: "Hero".into(), photo: Some("https://free.example/a.jpg".into()), ..Default::default() },
+                Person { name: "Actor B".into(), role: String::new(), photo: None, ..Default::default() },
             ],
-            crew: vec![("Created by".into(), vec![Person { name: "Creator X".into(), role: String::new(), photo: None }])],
+            crew: vec![("Created by".into(), vec![Person { name: "Creator X".into(), role: String::new(), photo: None, ..Default::default() }])],
             studios: vec![Studio { name: "MAPPA".into(), logo: "https://free.example/mappa.png".into() }],
             ..Artwork::default()
         };
@@ -817,12 +959,12 @@ mod tests {
             logo: Some("https://tmdb.example/logo.png".into()),
             tagline: Some("A tagline".into()),
             cast: vec![
-                Person { name: "Actor A".into(), role: "Other".into(), photo: Some("https://tmdb.example/a.jpg".into()) },
-                Person { name: "actor b".into(), role: "Rival".into(), photo: Some("https://tmdb.example/b.jpg".into()) },
+                Person { name: "Actor A".into(), role: "Other".into(), photo: Some("https://tmdb.example/a.jpg".into()), ..Default::default() },
+                Person { name: "actor b".into(), role: "Rival".into(), photo: Some("https://tmdb.example/b.jpg".into()), ..Default::default() },
             ],
             crew: vec![
-                ("Created by".into(), vec![Person { name: "creator x".into(), role: String::new(), photo: Some("https://tmdb.example/x.jpg".into()) }]),
-                ("Music by".into(), vec![Person { name: "Composer Y".into(), role: String::new(), photo: Some("https://tmdb.example/y.jpg".into()) }]),
+                ("Created by".into(), vec![Person { name: "creator x".into(), role: String::new(), photo: Some("https://tmdb.example/x.jpg".into()), ..Default::default() }]),
+                ("Music by".into(), vec![Person { name: "Composer Y".into(), role: String::new(), photo: Some("https://tmdb.example/y.jpg".into()), ..Default::default() }]),
             ],
             studios: vec![
                 Studio { name: "mappa".into(), logo: "https://tmdb.example/mappa.png".into() },

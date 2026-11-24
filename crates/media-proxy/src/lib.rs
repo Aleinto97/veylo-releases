@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -38,6 +38,53 @@ const PROBE_MIN_BYTES: u64 = 50 * 1024 * 1024;
 /// Pause after a transient accept() failure (EMFILE, ECONNABORTED) instead of
 /// abandoning the lease's listener for good.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Window of streamed media bytes between passive CDN throughput samples.
+const BANDWIDTH_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+/// Minimum sample size and active read time for a valid throughput reading.
+const BANDWIDTH_MIN_BYTES: u64 = 256 * 1024;
+const BANDWIDTH_MIN_ELAPSED: Duration = Duration::from_millis(5);
+/// How long a passive/probed CDN throughput reading stays fresh before decaying out.
+const BANDWIDTH_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Rolling EWMA of sustained upstream CDN download throughput (Mbps).
+/// Updated passively during streaming (measuring only active upstream reads, not
+/// player-throttled writes) and seeded during autoplay probing.
+#[derive(Default)]
+struct BandwidthTracker {
+    state: Mutex<Option<(f64, Instant)>>,
+}
+
+impl BandwidthTracker {
+    fn record(&self, bytes: u64, elapsed: Duration) {
+        if bytes < BANDWIDTH_MIN_BYTES || elapsed < BANDWIDTH_MIN_ELAPSED {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            return;
+        }
+        let sample = (bytes as f64 * 8.0 / secs / 1e6).clamp(0.5, 2000.0);
+        let now = Instant::now();
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let next = match *guard {
+            Some((prev, at)) if now.duration_since(at) < BANDWIDTH_TTL => {
+                // React faster when bandwidth drops so buffering is avoided promptly.
+                let alpha = if sample < prev * 0.7 { 0.55 } else { 0.35 };
+                prev * (1.0 - alpha) + sample * alpha
+            }
+            _ => sample,
+        };
+        *guard = Some((next, now));
+    }
+
+    fn estimated_mbps(&self) -> Option<f64> {
+        let guard = self.state.lock().ok()?;
+        let (mbps, at) = (*guard)?;
+        (at.elapsed() < BANDWIDTH_TTL).then_some(mbps)
+    }
+}
 
 /// Own one active media lease. Replacement, stop and Drop cancel all lease IO.
 pub struct MediaProxy {
@@ -46,6 +93,7 @@ pub struct MediaProxy {
     /// Per-read/write idle deadline for streaming bodies. Injectable so tests can
     /// verify expiry without waiting out the production CDN-miss allowance.
     stream_timeout: Duration,
+    bandwidth: Arc<BandwidthTracker>,
 }
 struct Active {
     id: String,
@@ -66,6 +114,7 @@ struct Lease {
     source_bytes: Arc<AtomicU64>,
     /// Set when the source redirected to a debrid status clip instead of the file.
     debrid_status: Arc<Mutex<Option<&'static str>>>,
+    bandwidth: Arc<BandwidthTracker>,
 }
 impl Default for MediaProxy {
     fn default() -> Self {
@@ -112,7 +161,18 @@ impl MediaProxy {
             active: Mutex::new(None),
             client,
             stream_timeout,
+            bandwidth: Arc::new(BandwidthTracker::default()),
         }
+    }
+    /// Estimated sustained upstream CDN throughput in Mbps from recent playback
+    /// or autoplay probes; None when no fresh reading exists.
+    pub fn estimated_mbps(&self) -> Option<f64> {
+        self.bandwidth.estimated_mbps()
+    }
+    /// Feed a throughput measurement (e.g. from an autoplay header burst) into
+    /// the rolling CDN estimator.
+    pub fn record_bandwidth_sample(&self, bytes: u64, elapsed: Duration) {
+        self.bandwidth.record(bytes, elapsed);
     }
     /// Validate before replacing the previous lease. No upstream request occurs here.
     pub async fn prepare(&self, url: &str, headers: &Value, allow_http: bool) -> Result<Value> {
@@ -138,6 +198,7 @@ impl MediaProxy {
             stream_timeout: self.stream_timeout,
             source_bytes: Arc::clone(&source_bytes),
             debrid_status: Arc::clone(&debrid_status),
+            bandwidth: Arc::clone(&self.bandwidth),
         });
         let local = lease.local_url(&url)?;
         let mut active = self
@@ -181,6 +242,7 @@ impl MediaProxy {
             stream_timeout: self.stream_timeout,
             source_bytes: Arc::new(AtomicU64::new(0)),
             debrid_status: Arc::new(Mutex::new(None)),
+            bandwidth: Arc::clone(&self.bandwidth),
         };
         let mut range = HeaderMap::new();
         range.insert("range", HeaderValue::from_static("bytes=0-0"));
@@ -205,15 +267,25 @@ impl MediaProxy {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
             .to_ascii_lowercase();
         let path = final_url.path().to_ascii_lowercase();
         let playlist = content_type.contains("mpegurl")
             || content_type.contains("dash+xml")
             || path.ends_with(".m3u8")
             || path.ends_with(".mpd");
+        let non_media = !playlist
+            && (content_type.starts_with("text/")
+                || content_type.contains("html")
+                || content_type.contains("json")
+                || content_type.contains("xml"));
         // Status clips and error pages are a few MB at most; a film is not.
-        let ok =
-            matches!(status, 200 | 206) && (playlist || bytes.is_none_or(|n| n >= PROBE_MIN_BYTES));
+        let ok = matches!(status, 200 | 206)
+            && !non_media
+            && (playlist || bytes.is_none_or(|n| n >= PROBE_MIN_BYTES));
         let resolved_url = (ok && final_url.scheme() == "https").then(|| final_url.as_str());
         Ok(
             json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist, "resolved_url": resolved_url}),
@@ -1233,7 +1305,22 @@ async fn relay<W: AsyncWriteExt + Unpin>(
         } else {
             let mut sent = prefix.len() as u64;
             write_bytes(writer, &prefix, lease.stream_timeout).await?;
-            while let Some(bytes) = chunk(&mut response, lease.stream_timeout).await? {
+            let mut window_bytes = 0u64;
+            let mut active_read = Duration::ZERO;
+            loop {
+                let read_started = Instant::now();
+                let Some(bytes) = chunk(&mut response, lease.stream_timeout).await? else {
+                    break;
+                };
+                if is_source {
+                    active_read += read_started.elapsed();
+                    window_bytes += bytes.len() as u64;
+                    if window_bytes >= BANDWIDTH_WINDOW_BYTES {
+                        lease.bandwidth.record(window_bytes, active_read);
+                        window_bytes = 0;
+                        active_read = Duration::ZERO;
+                    }
+                }
                 sent = sent
                     .checked_add(bytes.len() as u64)
                     .ok_or_else(|| anyhow!("body length overflow"))?;
@@ -1242,6 +1329,9 @@ async fn relay<W: AsyncWriteExt + Unpin>(
                     "oversized range body"
                 );
                 write_bytes(writer, &bytes, lease.stream_timeout).await?;
+            }
+            if is_source && window_bytes >= BANDWIDTH_MIN_BYTES {
+                lease.bandwidth.record(window_bytes, active_read);
             }
             ensure!(
                 range_length.is_none_or(|n| sent == n),
@@ -1293,7 +1383,24 @@ mod tests {
             stream_timeout: STREAM_TIMEOUT,
             source_bytes: Arc::new(AtomicU64::new(0)),
             debrid_status: Arc::new(Mutex::new(None)),
+            bandwidth: Arc::new(BandwidthTracker::default()),
         }
+    }
+    #[test]
+    fn bandwidth_tracker_computes_ewma_and_reacts_to_drops() {
+        let tracker = BandwidthTracker::default();
+        assert!(tracker.estimated_mbps().is_none());
+        // Too tiny a sample is ignored (TCP slow-start noise).
+        tracker.record(16 * 1024, Duration::from_millis(10));
+        assert!(tracker.estimated_mbps().is_none());
+        // 2 MiB in 160 ms ≈ 104.85 Mbps.
+        tracker.record(2 * 1024 * 1024, Duration::from_millis(160));
+        let first = tracker.estimated_mbps().expect("sample recorded");
+        assert!((first - 104.86).abs() < 1.0, "got {first}");
+        // Sudden drop to ~16.8 Mbps pulls EWMA down quickly (alpha = 0.55).
+        tracker.record(2 * 1024 * 1024, Duration::from_millis(1000));
+        let after_drop = tracker.estimated_mbps().expect("updated");
+        assert!(after_drop < 60.0 && after_drop > 45.0, "got {after_drop}");
     }
     #[test]
     fn debrid_status_clips_are_recognised() {

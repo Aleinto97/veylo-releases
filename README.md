@@ -74,7 +74,6 @@ Veylo checks the latest GitHub release at launch, verifies downloads against `SH
 | `crates/media-proxy/` | Token-scoped loopback media relay and header-safe stream prober |
 | `crates/video-surface/` | Desktop video surface bridges (Wayland subsurface / GTK GL area, Windows D3D11, macOS Core Animation EDR) |
 | `crates/picture-check/` | Colour-bar picture verification test used by CI |
-| `crates/torrent/`, `crates/aio-meta/` | Supporting P2P and metadata crates |
 | `tools/` | `release.sh`, `build-macos.sh`, `picks-ai/fetch.py`, and CI launch checks (`tools/ci/`) |
 | `branding/` | App icon and Android TV banner sources |
 

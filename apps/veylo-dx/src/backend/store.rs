@@ -28,13 +28,26 @@ pub struct Settings {
     pub sub_pos: i32,
     /// Draw a subtle dark pill behind subtitles for legibility over bright scenes.
     pub sub_bg: bool,
+    /// Subtitle text color as CSS hex (default "#F2EFEA").
+    pub sub_color: String,
+    /// Dynamic range compression / dialogue boost for quiet 5.1/7.1 tracks on speakers.
+    pub audio_night_mode: bool,
+    /// HDMI bitstream audio passthrough (AC3/EAC3/DTS/TrueHD) for AVRs and soundbars.
+    pub audio_passthrough: bool,
+    /// Desktop hardware decoding mode: "auto", "copy", or "no".
+    pub hwdec_mode: String,
     /// Automatically count down to the next episode at credits or end of episode.
     pub auto_next: bool,
+    /// Streaming bitrate cap for autoplay: None = Auto (match connection speed),
+    /// Some(0) = Unlimited (always highest quality), Some(n) = cap at n Mbps.
+    pub max_bitrate_mbps: Option<u32>,
     /// Send redacted crashes, UI errors, playback failures and performance reports to Firebase.
     pub telemetry_enabled: bool,
 }
 
 static TELEMETRY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// -1 = Auto (match connection), 0 = Unlimited, >0 = manual cap in Mbps.
+static MAX_BITRATE_MBPS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 pub fn telemetry_enabled() -> bool {
     TELEMETRY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
@@ -42,6 +55,20 @@ pub fn telemetry_enabled() -> bool {
 
 pub(super) fn set_telemetry_enabled(on: bool) {
     TELEMETRY_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn max_bitrate_mbps() -> Option<u32> {
+    let raw = MAX_BITRATE_MBPS.load(std::sync::atomic::Ordering::Relaxed);
+    (raw >= 0).then_some(raw as u32)
+}
+
+pub(super) fn set_max_bitrate_mbps(cap: Option<u32>) {
+    MAX_BITRATE_MBPS.store(cap.map_or(-1, i64::from), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live measured CDN download speed in Mbps from recent playback or autoplay probes, if fresh.
+pub fn connection_mbps() -> Option<f64> {
+    BACKEND.get().and_then(|b| b.proxy.estimated_mbps())
 }
 
 /// The audio language when none was chosen, or the saved one is unknown.
@@ -57,9 +84,18 @@ impl Default for Settings {
         Settings {
             better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None,
             stream_language: Some(DEFAULT_LANGUAGE.into()), rd_key_removed: false, hdr_output: true,
-            sub_scale: 1.05, sub_pos: 100, sub_bg: false, auto_next: true, telemetry_enabled: true,
+            sub_scale: 1.05, sub_pos: 100, sub_bg: false, sub_color: "#F2EFEA".into(),
+            audio_night_mode: false, audio_passthrough: false, hwdec_mode: "auto".into(),
+            auto_next: true, max_bitrate_mbps: None, telemetry_enabled: true,
         }
     }
+}
+
+pub(super) fn parse_max_bitrate(v: &Value) -> Option<u32> {
+    v.get("max_bitrate_mbps")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= 500)
+        .map(|n| n as u32)
 }
 
 pub fn load_settings() -> Settings {
@@ -76,7 +112,12 @@ pub fn load_settings() -> Settings {
         sub_scale: v["sub_scale"].as_f64().unwrap_or(1.05).clamp(0.6, 2.0),
         sub_pos: v["sub_pos"].as_i64().unwrap_or(100).clamp(70, 100) as i32,
         sub_bg: v["sub_bg"].as_bool().unwrap_or(false),
+        sub_color: v["sub_color"].as_str().filter(|c| c.starts_with('#') && c.len() == 7).unwrap_or("#F2EFEA").to_owned(),
+        audio_night_mode: v["audio_night_mode"].as_bool().unwrap_or(false),
+        audio_passthrough: v["audio_passthrough"].as_bool().unwrap_or(false),
+        hwdec_mode: match v["hwdec_mode"].as_str() { Some("copy") => "copy", Some("no") => "no", _ => "auto" }.to_owned(),
         auto_next: v["auto_next"].as_bool().unwrap_or(true),
+        max_bitrate_mbps: parse_max_bitrate(&v),
         telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(true),
     }
 }
@@ -109,13 +150,19 @@ pub fn save_settings(settings: &Settings) {
         "sub_scale": settings.sub_scale.clamp(0.6, 2.0),
         "sub_pos": settings.sub_pos.clamp(70, 100),
         "sub_bg": settings.sub_bg,
+        "sub_color": settings.sub_color,
+        "audio_night_mode": settings.audio_night_mode,
+        "audio_passthrough": settings.audio_passthrough,
+        "hwdec_mode": settings.hwdec_mode,
         "auto_next": settings.auto_next,
+        "max_bitrate_mbps": settings.max_bitrate_mbps,
         "telemetry_enabled": settings.telemetry_enabled,
     }).to_string();
     let _ = write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
     set_telemetry_enabled(settings.telemetry_enabled);
+    set_max_bitrate_mbps(settings.max_bitrate_mbps);
     set_stream_language(settings.stream_language.clone());
     set_tmdb_key(settings.tmdb_key.clone());
     // The key and language decide which add-ons answer and with which links.
@@ -179,6 +226,42 @@ pub fn save_track_pref(media_key: &str, update: impl FnOnce(&mut TrackPref)) {
         if let Some(k) = drop_key { map.remove(&k); }
     }
     write_soon(track_prefs_path(), write_track_prefs_json(map));
+    sync_soon();
+}
+
+pub(super) fn export_track_prefs_value() -> Value {
+    let Ok(mut guard) = TRACK_PREFS.lock() else { return json!({}) };
+    let map = guard.get_or_insert_with(|| {
+        flush_writes();
+        read_track_prefs_from(&track_prefs_path())
+    });
+    let obj: serde_json::Map<String, Value> = map.iter().map(|(k, p)| {
+        (k.clone(), json!({"audio": p.audio_lang, "sub": p.sub_lang, "sub_off": p.sub_off}))
+    }).collect();
+    Value::Object(obj)
+}
+
+pub(super) fn merge_track_prefs_value(v: &Value) {
+    let Some(remote) = v.as_object() else { return };
+    let Ok(mut guard) = TRACK_PREFS.lock() else { return };
+    let map = guard.get_or_insert_with(|| {
+        flush_writes();
+        read_track_prefs_from(&track_prefs_path())
+    });
+    let mut changed = false;
+    for (k, entry) in remote {
+        if map.contains_key(k) || map.len() >= 400 { continue; }
+        let pref = TrackPref {
+            audio_lang: entry["audio"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            sub_lang: entry["sub"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            sub_off: entry["sub_off"].as_bool().unwrap_or(false),
+        };
+        map.insert(k.clone(), pref);
+        changed = true;
+    }
+    if changed {
+        write_soon(track_prefs_path(), write_track_prefs_json(map));
+    }
 }
 
 // ---------------------------------------------------------------- redacted diagnostics

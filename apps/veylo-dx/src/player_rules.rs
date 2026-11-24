@@ -7,15 +7,17 @@ use crate::{backend, engine::{self, Finish, Segment, SegmentKind, State}};
 pub const ONLINE_SHOWN: usize = 60;
 
 pub const SPEEDS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-pub const KEYS: [(&[&str], &str); 22] = [
+pub const KEYS: [(&[&str], &str); 25] = [
     (&["Enter"], "Skip the intro or recap, when offered"),
     (&["Space", "K", "Enter"], "Play or pause"), (&["←", "→"], "Back or forward 10 seconds"), (&["J", "L"], "Back or forward 10 seconds"),
     (&["0–9"], "Jump to 0–90%"), (&["Home"], "Back to the start"), (&["↑", "↓"], "Volume"), (&["M"], "Mute"),
     (&["A"], "Next audio track"), (&["C"], "Next subtitles, then off"), (&["S"], "Subtitles list"), (&[",", "."], "Subtitle delay −/+ 0.25 s"),
-    (&["B"], "Chapters"), (&["Z"], "Fit, fill, stretch"),
-    (&["[", "]", "\\"], "Slower, faster, normal speed"), (&["I"], "Details"), (&["H", "?"], "Show or hide shortcuts"),
-    (&["N"], "Next episode"), (&["Esc"], "Close panel, leave fullscreen, or close player"), (&["Q"], "Close player"),
-    (&["F"], "Fullscreen"), (&["Tab"], "Next control; Shift+Tab goes back"),
+    (&["B"], "Chapters"), (&["E"], "Episodes"), (&["O"], "Switch source"), (&["Z"], "Fit, fill, stretch"),
+    (&["[", "]", "\\"], "Slower, faster, normal speed"), (&["<", ">"], "Step one frame back or forward"),
+    (&["I"], "Details & live stats"), (&["H", "?"], "Show or hide shortcuts"),
+    (&["N", "P"], "Next or previous episode"), (&["T"], "Sleep timer"),
+    (&["Esc"], "Close panel, leave fullscreen, or close player"), (&["Q"], "Close player"),
+    (&["F"], "Fullscreen"),
 ];
 pub const ANDROID: bool = cfg!(target_os = "android");
 
@@ -132,6 +134,10 @@ pub fn details(live: &engine::Live, s: &State, facts: &crate::player::Facts, hw:
     if let Some(label) = &live.request.hdr { rows.push(("Source says", label.clone())); }
     if s.dv_profile > 0 { rows.push(("Dolby Vision", format!("Profile {}", s.dv_profile))); }
     if s.loaded { rows.push(("Dropped frames", s.dropped.to_string())); }
+    if s.fps > 0.0 { rows.push(("Frame rate", format!("{:.3} fps", s.fps))); }
+    if s.video_bitrate > 0.0 { rows.push(("Video bitrate", format!("{:.1} Mbps", s.video_bitrate / 1_000_000.0))); }
+    if s.audio_bitrate > 0.0 { rows.push(("Audio bitrate", format!("{:.0} kbps", s.audio_bitrate / 1_000.0))); }
+    if s.loaded { rows.push(("Buffer ahead", format!("{:.1} s", s.buffered.max(0.0)))); }
     if !facts.size.is_empty() { rows.push(("File size", facts.size.clone())); }
     if let Some(a) = s.tracks.iter().find(|t| t.audio && t.selected) { rows.push(("Audio", a.label.clone())); }
     rows

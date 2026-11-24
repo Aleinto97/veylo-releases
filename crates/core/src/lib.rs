@@ -23,7 +23,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 /// search catalogs and make the whole manifest get copied once per catalog.
 const MAX_SEARCH_CATALOGS_PER_ADDON: usize = 32;
 const MAX_SEARCH_TASKS: usize = 64;
-/// Manifest id of the embedded metadata addon (crates/aio-meta).
+/// Manifest id of the legacy embedded metadata addon (kept for history migration compatibility).
 const LOCAL_ADDON_ID: &str = "com.aio.metadata.rs";
 
 /// Which loopback port the embedded metadata addon is actually serving on.
@@ -333,6 +333,7 @@ impl Core {
             }
             "migrate_local_history" => self.migrate_local_history(&request),
             "playback" => self.playback(&request),
+            "playback_all" => self.playback_all(&request),
             "watched_videos" => self.watched_videos(&request),
             "item" => {
                 // One title as the store has it (saved, watched, liked, progress), or null.
@@ -789,6 +790,30 @@ impl Core {
             Ok(json!({"video_id":video,"position_ms":position,"duration_ms":duration,"watched_ms":watched_ms,"watched":watched}))
         })
     }
+    /// All per-episode playback entries for one title (under any addon), for episode progress bars.
+    fn playback_all(&self, req: &Value) -> Result<Value> {
+        let kind = text(req, "type")?.to_owned();
+        let id = text(req, "id")?.to_owned();
+        self.with_db(|db| {
+            let mut q = db.prepare(
+                "SELECT p.video_id, p.position_ms, p.duration_ms, p.watched_ms, p.watched
+                 FROM playback p JOIN media m ON m.key=p.media_key
+                 WHERE m.type=?1 AND m.raw_id=?2",
+            )?;
+            let entries = q
+                .query_map(params![kind, id], |r| {
+                    Ok(json!({
+                        "video_id": r.get::<_, String>(0)?,
+                        "position_ms": r.get::<_, i64>(1)?,
+                        "duration_ms": r.get::<_, i64>(2)?,
+                        "watched_ms": r.get::<_, i64>(3)?,
+                        "watched": r.get::<_, i64>(4)? != 0,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(json!({ "entries": entries }))
+        })
+    }
     /// Videos of a title marked watched (by hand, or by measured playback), under any addon.
     fn watched_videos(&self, req: &Value) -> Result<Value> {
         let kind = text(req, "type")?.to_owned();
@@ -972,27 +997,42 @@ impl Core {
         let parsed = url::Url::parse(&url).context("Invalid subtitle URL")?;
         let allow_http = boolean(req, "allow_http", false)?;
         addon::validate_transport(&parsed, allow_http)?;
+        let is_ass = |bytes: &[u8]| {
+            let content = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+            let first = content
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(content.len());
+            content[first..].starts_with(b"[Script Info]")
+        };
         // Parse a cache hit once; an unreadable cached file is dropped and refetched.
-        let cached =
-            self.inner.subtitles.read(&url).and_then(|(bytes, path)| {
-                match subtitle::parse(&bytes) {
-                    Ok(cues) if !cues.is_empty() => Some((bytes, path, cues)),
-                    _ => {
-                        self.inner.subtitles.remove(&url);
-                        None
-                    }
+        // ASS/SSA subtitles are passed verbatim to libmpv, so they are cached without cue parsing.
+        let cached = self.inner.subtitles.read(&url).and_then(|(bytes, path)| {
+            if is_ass(&bytes) {
+                return Some((bytes, path, Vec::new(), true));
+            }
+            match subtitle::parse(&bytes) {
+                Ok(cues) if !cues.is_empty() => Some((bytes, path, cues, false)),
+                _ => {
+                    self.inner.subtitles.remove(&url);
+                    None
                 }
-            });
+            }
+        });
         let from_cache = cached.is_some();
-        let (bytes, existing_path, cacheable, expiry, cues) = match cached {
-            Some((bytes, path, cues)) => (bytes, Some(path), true, None, cues),
+        let (bytes, existing_path, cacheable, expiry, cues, ass) = match cached {
+            Some((bytes, path, cues, ass)) => (bytes, Some(path), true, None, cues, ass),
             None => {
                 let (bytes, cacheable, expiry) = self.download_subtitle(&url, allow_http).await?;
-                let cues = subtitle::parse(&bytes)?;
-                (bytes, None, cacheable, expiry, cues)
+                if is_ass(&bytes) {
+                    (bytes, None, cacheable, expiry, Vec::new(), true)
+                } else {
+                    let cues = subtitle::parse(&bytes)?;
+                    (bytes, None, cacheable, expiry, cues, false)
+                }
             }
         };
-        ensure!(!cues.is_empty(), "Subtitle has no readable cues");
+        ensure!(ass || !cues.is_empty(), "Subtitle has no readable cues");
         // On a hit keep its original deadline: reading must not refresh it.
         // no-store never leaves a file; no-cache gets an already-expired
         // marker but its path remains available for the user's export action.

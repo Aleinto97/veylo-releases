@@ -111,6 +111,22 @@ pub struct State {
     pub sub_pos: i32,
     /// Subtle dark pill behind subtitles.
     pub sub_bg: bool,
+    /// Subtitle text color as CSS hex.
+    pub sub_color: String,
+    /// Secondary subtitle track id (dual subtitles), if enabled.
+    pub secondary_sid: Option<i64>,
+    /// Dynamic range compression / dialogue boost audio filter active.
+    pub night_mode: bool,
+    /// Desktop hardware decoding mode ("auto", "copy", "no").
+    pub hwdec_mode: String,
+    /// Video aspect override ("auto", "16:9", "21:9", "4:3").
+    pub aspect_override: String,
+    /// Live video bitrate in bits/sec (0 until known), for Stats HUD.
+    pub video_bitrate: f64,
+    /// Live audio bitrate in bits/sec (0 until known), for Stats HUD.
+    pub audio_bitrate: f64,
+    /// Live A-V sync offset in seconds, for Stats HUD.
+    pub avsync: f64,
     /// Container frame rate (0 until known), used for Android TV/tablet refresh-rate matching.
     pub fps: f64,
 }
@@ -124,8 +140,8 @@ impl State {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Finish { Close, Next, Another, OtherLanguage }
+#[derive(Clone, Debug, PartialEq)]
+pub enum Finish { Close, Next, Prev, Another, OtherLanguage, SwitchSource(usize), SwitchEpisode(String) }
 
 /// A playing session, shared by the engine thread, the video surface and the controls.
 pub struct Live {
@@ -214,6 +230,42 @@ impl Live {
         self.update(|s| { let c = s.sub_bg != on; s.sub_bg = on; c });
         backend::update_settings(|cfg| cfg.sub_bg = on);
     }
+    pub fn set_sub_color(&self, hex: &str) {
+        let color = if hex.starts_with('#') && hex.len() == 7 { hex } else { "#F2EFEA" };
+        let _ = self.mpv.set_property("sub-color", color);
+        self.update(|s| { let c = s.sub_color != color; s.sub_color = color.to_owned(); c });
+        let saved = color.to_owned();
+        backend::update_settings(|cfg| cfg.sub_color = saved);
+    }
+    pub fn set_secondary_sub(&self, id: Option<i64>) {
+        let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
+        let _ = self.mpv.set_property("secondary-sid", value.as_str());
+        self.update(|s| { let c = s.secondary_sid != id; s.secondary_sid = id; c });
+    }
+    pub fn set_night_mode(&self, on: bool) {
+        let filter = if on { "lavfi=[dynaudnorm=f=150:g=15:p=0.9]" } else { "" };
+        let _ = self.mpv.set_property("af", filter);
+        self.update(|s| { let c = s.night_mode != on; s.night_mode = on; c });
+        backend::update_settings(|cfg| cfg.audio_night_mode = on);
+    }
+    pub fn set_hwdec_mode(&self, mode: &str) {
+        if cfg!(target_os = "android") { return; }
+        let norm = match mode { "copy" => "copy", "no" => "no", _ => "auto" };
+        let mpv_val = match norm { "copy" => "auto-copy", "no" => "no", _ => "auto-safe" };
+        let _ = self.mpv.set_property("hwdec", mpv_val);
+        self.update(|s| { let c = s.hwdec_mode != norm; s.hwdec_mode = norm.to_owned(); c });
+        let saved = norm.to_owned();
+        backend::update_settings(|cfg| cfg.hwdec_mode = saved);
+    }
+    pub fn set_aspect_override(&self, aspect: &str) {
+        let norm = match aspect { "16:9" | "21:9" | "4:3" => aspect, _ => "auto" };
+        let mpv_val = if norm == "auto" { "-1" } else { norm };
+        let _ = self.mpv.set_property("video-aspect-override", mpv_val);
+        self.update(|s| { let c = s.aspect_override != norm; s.aspect_override = norm.to_owned(); c });
+    }
+    pub fn frame_step(&self, forward: bool) {
+        let _ = self.mpv.command(if forward { "frame-step" } else { "frame-back-step" }, &[]);
+    }
     pub fn select(&self, audio: bool, id: Option<i64>) {
         let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
         let _ = self.mpv.set_property(if audio { "aid" } else { "sid" }, value.as_str());
@@ -298,6 +350,8 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
     let (state, _) = watch::channel(State {
         speed: 1.0, volume: 100.0, direct,
         sub_scale: cfg.sub_scale, sub_pos: cfg.sub_pos, sub_bg: cfg.sub_bg,
+        sub_color: cfg.sub_color.clone(), night_mode: cfg.audio_night_mode,
+        hwdec_mode: cfg.hwdec_mode.clone(), aspect_override: "auto".into(),
         ..Default::default()
     });
     let live = Arc::new(Live { mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
@@ -347,11 +401,13 @@ fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::R
         // container-default subtitle before that runs.
         o.set_property("sid", "no")?;
         o.set_property("sub-font", "sans-serif")?;
-        o.set_property("sub-color", "#F2EFEA")?;
+        o.set_property("sub-color", cfg.sub_color.as_str())?;
         o.set_property("sub-border-color", "#DD000000")?;
         o.set_property("sub-scale", cfg.sub_scale)?;
         let _ = o.set_property("sub-pos", cfg.sub_pos as i64);
         if cfg.sub_bg { let _ = o.set_property("sub-back-color", "#A8000000"); }
+        if cfg.audio_night_mode { let _ = o.set_property("af", "lavfi=[dynaudnorm=f=150:g=15:p=0.9]"); }
+        if cfg.audio_passthrough { let _ = o.set_property("audio-spdif", "ac3,eac3,dts,dts-hd,truehd"); }
         if req.start_ms > 0 { o.set_property("start", format!("+{}", req.start_ms as f64 / 1000.0).as_str())?; }
         // Certificates are checked everywhere (mpv's default is not to): Android with mpv-android's CA
         // bundle below, Linux with the system's, Windows through Schannel and the Windows store.
@@ -366,7 +422,8 @@ fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::R
             o.set_property("cursor-autohide", "no")?;
             // Clicks and the cursor pass through to the WebView above it (newer mpv; older ones ignore it).
             let _ = o.set_property("cursor-passthrough", true);
-            o.set_property("hwdec", "auto-safe")?;
+            let hw = match cfg.hwdec_mode.as_str() { "copy" => "auto-copy", "no" => "no", _ => "auto-safe" };
+            o.set_property("hwdec", hw)?;
             o.set_property("demuxer-max-bytes", "256MiB")?;
             // HDR to an HDR screen: mpv asks Windows for an HDR10 swapchain when the video and
             // the screen are HDR (Windows "Use HDR" on), and tone-maps to SDR otherwise.
@@ -378,7 +435,8 @@ fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::R
         #[cfg(not(any(target_os = "android", target_os = "windows")))]
         {
             o.set_property("vo", "libmpv")?;
-            o.set_property("hwdec", "auto-safe")?;
+            let hw = match cfg.hwdec_mode.as_str() { "copy" => "auto-copy", "no" => "no", _ => "auto-safe" };
+            o.set_property("hwdec", hw)?;
             o.set_property("demuxer-max-bytes", "256MiB")?;
         }
         #[cfg(target_os = "android")]
@@ -425,6 +483,19 @@ const OBSERVED: [(&str, Format); 21] = [
     ("aid", Format::String), ("sid", Format::String), ("core-idle", Format::Flag),
 ];
 
+fn finish_event(how: Finish, position_ms: i64, duration_ms: i64) -> PlayerEvent {
+    PlayerEvent::Finished {
+        position_ms,
+        duration_ms,
+        next: how == Finish::Next,
+        prev: how == Finish::Prev,
+        another: matches!(how, Finish::Another | Finish::OtherLanguage),
+        language: how == Finish::OtherLanguage,
+        switch_source: match how { Finish::SwitchSource(i) => Some(i), _ => None },
+        switch_episode: match how { Finish::SwitchEpisode(id) => Some(id), _ => None },
+    }
+}
+
 fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle) {
     let mpv = &live.mpv;
     let _ = mpv.disable_deprecated_events();
@@ -432,12 +503,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     if !live.wait_ready(Duration::from_secs(10), &stop) {
         if stop.stopped() || live.finish.lock().is_ok_and(|f| f.is_some()) {
             if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
-            let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
-            let _ = events.send(PlayerEvent::Finished {
-                position_ms: 0, duration_ms: 0,
-                next: how == Finish::Next, another: matches!(how, Finish::Another | Finish::OtherLanguage),
-                language: how == Finish::OtherLanguage,
-            });
+            let how = live.finish.lock().ok().and_then(|f| f.clone()).unwrap_or(Finish::Close);
+            let _ = events.send(finish_event(how, 0, 0));
             return;
         }
         eprintln!("veylo: video surface not ready, opening anyway");
@@ -489,6 +556,16 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
             if follow_target(&live) && announced {
                 let s = live.state();
                 let _ = events.send(PlayerEvent::Started { decoder: hardware(&s), codec: codec_name(&s.codec), facts: facts(&live, &s) });
+            }
+            if played {
+                let vb = mpv.get_property::<f64>("video-bitrate").unwrap_or(0.0).max(0.0);
+                let ab = mpv.get_property::<f64>("audio-bitrate").unwrap_or(0.0).max(0.0);
+                let av = mpv.get_property::<f64>("avsync").unwrap_or(0.0);
+                live.update(|s| {
+                    let c = (s.video_bitrate - vb).abs() > 50_000.0 || (s.audio_bitrate - ab).abs() > 8_000.0 || (s.avsync - av).abs() > 0.005;
+                    s.video_bitrate = vb; s.audio_bitrate = ab; s.avsync = av;
+                    c
+                });
             }
         }
         let Some(event) = mpv.wait_event(0.25) else { continue };
@@ -582,10 +659,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                     live.update(|s| { s.ended = true; true });
                     // If there is no next episode (or auto-next is disabled), close cleanly right away.
                     // With a next episode and auto-next on, the UI runs the short "Up Next" countdown.
-                    if !live.request.has_next {
+                    if !live.request.has_next || !backend::load_settings().auto_next {
                         live.finish(Finish::Close);
-                    } else if !backend::load_settings().auto_next {
-                        live.finish(Finish::Next);
                     }
                 }
                 ("eof-reached", PropertyData::Flag(false)) => live.update(|s| { let c = s.ended; s.ended = false; c }),
@@ -635,12 +710,8 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
     }
     record(position, duration, &mut measured, &mut sent_meta, &mut last_recorded_pos, true);
     if let Ok(mut a) = ACTIVE.lock() { if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, &live)) { *a = None; } }
-    let how = live.finish.lock().ok().and_then(|f| *f).unwrap_or(Finish::Close);
-    let _ = events.send(PlayerEvent::Finished {
-        position_ms: (position * 1000.0) as i64, duration_ms: (duration * 1000.0) as i64,
-        next: how == Finish::Next, another: matches!(how, Finish::Another | Finish::OtherLanguage),
-        language: how == Finish::OtherLanguage,
-    });
+    let how = live.finish.lock().ok().and_then(|f| f.clone()).unwrap_or(Finish::Close);
+    let _ = events.send(finish_event(how, (position * 1000.0) as i64, (duration * 1000.0) as i64));
 }
 
 fn refresh_tracks(live: &Live) {

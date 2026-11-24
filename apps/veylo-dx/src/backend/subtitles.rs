@@ -115,18 +115,34 @@ pub struct OnlineSubtitle {
 }
 
 /// Every subtitle the add-ons offer for one video: the preferred language first, then English,
-/// then the rest by name; the add-on's own order is kept within a language.
-pub async fn online_subtitles(kind: &str, video_id: &str) -> Result<Vec<OnlineSubtitle>> {
-    let v = exec(json!({"op":"subtitles","type":kind,"id":video_id})).await?;
+/// then the rest by name; within a language, releases matching the playing file rank first.
+pub async fn online_subtitles(kind: &str, video_id: &str, filename: Option<&str>, file_size: Option<u64>) -> Result<Vec<OnlineSubtitle>> {
+    let mut extra = serde_json::Map::new();
+    if let Some(f) = filename.map(str::trim).filter(|f| !f.is_empty()) {
+        extra.insert("filename".into(), json!(f));
+    }
+    if let Some(sz) = file_size.filter(|&s| s > 0) {
+        extra.insert("videoSize".into(), json!(sz.to_string()));
+    }
+    let req = if extra.is_empty() {
+        json!({"op":"subtitles","type":kind,"id":video_id})
+    } else {
+        json!({"op":"subtitles","type":kind,"id":video_id,"extra":extra})
+    };
+    let v = exec(req).await?;
     let mut list = v["subtitles"].as_array().cloned().unwrap_or_default();
-    if list.is_empty() && video_id.starts_with("tt") {
-        list = opensubtitles(kind, video_id).await?;
+    if list.len() < 5 && video_id.starts_with("tt") {
+        if let Ok(os_list) = opensubtitles(kind, video_id).await {
+            list.extend(os_list);
+        } else if list.is_empty() {
+            anyhow::bail!("Subtitle providers could not be reached");
+        }
     }
     if list.is_empty() && v["errors"].as_array().is_some_and(|e| !e.is_empty()) {
         anyhow::bail!("Subtitle providers could not be reached");
     }
     let preferred = stream_language().map(|k| subtitle_language_of(&k));
-    Ok(rank_subtitles(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref()))
+    Ok(rank_subtitles_for(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref(), filename))
 }
 
 pub(super) async fn opensubtitles(kind: &str, video_id: &str) -> Result<Vec<Value>> {
@@ -157,11 +173,52 @@ pub(super) fn subtitle_of(v: &Value) -> Option<OnlineSubtitle> {
     Some(OnlineSubtitle { id, url: url.to_owned(), code, language, release })
 }
 
-pub fn rank_subtitles(mut list: Vec<OnlineSubtitle>, preferred: Option<&str>) -> Vec<OnlineSubtitle> {
+#[cfg(test)]
+pub fn rank_subtitles(list: Vec<OnlineSubtitle>, preferred: Option<&str>) -> Vec<OnlineSubtitle> {
+    rank_subtitles_for(list, preferred, None)
+}
+
+fn release_tokens(name: &str) -> Vec<String> {
+    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = stem.rsplit_once('.').map(|(a, _)| a).unwrap_or(stem);
+    stem.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Higher score = stronger release-tag overlap between the playing video filename and subtitle release.
+pub fn release_match_score(sub_release: Option<&str>, playing_filename: Option<&str>) -> u32 {
+    let (Some(sub), Some(play)) = (sub_release, playing_filename) else { return 0 };
+    let pt = release_tokens(play);
+    let st = release_tokens(sub);
+    if pt.is_empty() || st.is_empty() { return 0; }
+    let mut score = 0u32;
+    // Exact release group match (last token) is the strongest indicator of frame-accurate sync.
+    if pt.last() == st.last() { score += 5; }
+    for tok in &st {
+        if pt.contains(tok) {
+            score += match tok.as_str() {
+                "bluray" | "bdrip" | "remux" | "webdl" | "webrip" | "web" | "hdtv" | "imax" | "extended" | "unrated" => 3,
+                _ => 1,
+            };
+        }
+    }
+    score
+}
+
+pub fn rank_subtitles_for(mut list: Vec<OnlineSubtitle>, preferred: Option<&str>, playing_filename: Option<&str>) -> Vec<OnlineSubtitle> {
     let mut seen = HashSet::new();
     list.retain(|s| seen.insert(s.url.clone()));
-    // A stable sort keeps the add-on's order within one language.
-    list.sort_by_key(|s| (Some(s.language.as_str()) != preferred, s.language != "English", s.language == "Unknown", s.language.clone()));
+    // A stable sort keeps the add-on's order for equal language and release-match scores.
+    list.sort_by_key(|s| (
+        Some(s.language.as_str()) != preferred,
+        s.language != "English",
+        s.language == "Unknown",
+        s.language.clone(),
+        std::cmp::Reverse(release_match_score(s.release.as_deref(), playing_filename)),
+    ));
     list
 }
 
@@ -180,5 +237,19 @@ pub async fn fetch_subtitle(url: &str) -> String {
     match exec(json!({"op":"subtitle_file","url":url})).await {
         Ok(v) => v["cache_path"].as_str().map(str::to_owned).unwrap_or_else(|| url.to_owned()),
         Err(_) => url.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod release_sync_tests {
+    use super::*;
+    #[test]
+    fn release_matching_subtitles_rank_first_within_language() {
+        let subs = vec![
+            OnlineSubtitle { id: "1".into(), url: "https://a/1.srt".into(), code: "eng".into(), language: "English".into(), release: Some("Movie.2024.HDTV.x264-OTHER".into()) },
+            OnlineSubtitle { id: "2".into(), url: "https://a/2.srt".into(), code: "eng".into(), language: "English".into(), release: Some("Movie.2024.2160p.WEB-DL.DDP5.1-NTb".into()) },
+        ];
+        let ranked = rank_subtitles_for(subs, Some("English"), Some("Movie.2024.2160p.WEB-DL.H265-NTb.mkv"));
+        assert_eq!(ranked[0].id, "2");
     }
 }

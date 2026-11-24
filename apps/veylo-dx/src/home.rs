@@ -131,6 +131,7 @@ pub fn Home() -> Element {
     });
 
     let continuing: Vec<Media> = library.read().iter().filter(|m| backend::in_progress(m)).cloned().collect();
+    let disliked: std::collections::HashSet<String> = library.read().iter().filter(|m| m.liked < 0).map(|m| m.id.clone()).collect();
     // Tracked shows from the user's library that have a newly aired episode in TVmaze's schedule.
     let mut new_for_you = use_signal(Vec::<Media>::new);
     use_effect(move || {
@@ -200,7 +201,7 @@ pub fn Home() -> Element {
                             Shelf::Ready(items) if items.is_empty() => rsx! { p { class: "meta dim", "Empty" } },
                             Shelf::Ready(items) => rsx! {
                                 div { class: "strip poster-strip",
-                                    for m in items.iter().take(shelf_len()) { PosterCard { key: "{m.key()}", media: m.clone() } }
+                                    for m in items.iter().filter(|m| !disliked.contains(&m.id)).take(shelf_len()) { PosterCard { key: "{m.key()}", media: m.clone() } }
                                 }
                             },
                         }
@@ -237,7 +238,8 @@ fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHa
     // The film's own line when it has one, else the start of its synopsis.
     let blurb = art().and_then(|a| a.tagline).filter(|t| !t.is_empty()).unwrap_or_else(|| media.description.clone());
     let runtime = backend::s(&media.raw, "runtime");
-    let rating = backend::s(&media.raw, "imdbRating");
+    let rating = ["imdbRating", "tmdbRating", "tvmazeRating"].iter()
+        .map(|k| backend::s(&media.raw, k)).find(|r| !r.is_empty()).unwrap_or_default();
     let facts: Vec<String> = [media.year.clone(), media.genres.first().cloned().unwrap_or_default(), runtime]
         .into_iter().filter(|s| !s.is_empty()).collect();
     let (open, open_art, play, pre1, pre2) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
@@ -267,6 +269,16 @@ fn TonightsPick(media: Media, also: Vec<Media>, can_skip: bool, on_skip: EventHa
                     button { class: "pill tonight-play", onclick: move |_| crate::title::resume_now(shell, play.clone()), icons::Play {} span { "Play" } }
                     if can_skip {
                         button { class: "orb glass", aria_label: "Not tonight", title: "Not tonight", onclick: move |_| on_skip.call(()), icons::Refresh {} }
+                    }
+                    button { class: "orb glass", aria_label: "Not for me", title: "Not for me",
+                        onclick: { let m = media.clone(); move |_| {
+                            let m = m.clone();
+                            spawn(async move {
+                                if backend::feedback(&m, -1).await.is_ok() { *shell.picks_dirty.write() += 1; }
+                            });
+                            if can_skip { on_skip.call(()); }
+                        } },
+                        icons::ThumbDown {}
                     }
                     button { class: "orb glass", aria_label: "More picks", title: "More picks", onclick: move |_| { shell.opened.set(None); shell.tab.set(crate::Tab::Picks); }, icons::ArrowRight {} }
                 }

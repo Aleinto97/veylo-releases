@@ -11,7 +11,17 @@ enum Online { Idle, Loading, Ready(Vec<OnlineSubtitle>), Failed }
 
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Sheet { Audio, Subtitles, Chapters, Speed, Picture, Info, Keys }
+enum Sheet { Audio, Subtitles, Chapters, Sources, Episodes, Speed, Sleep, Picture, Info, Keys }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SleepTimer { Off, EndOfEpisode, Mins(u32) }
+
+const SUB_COLORS: [(&str, &str); 4] = [
+    ("Bone", "#F2EFEA"),
+    ("Yellow", "#F7D76E"),
+    ("Cyan", "#8BE9FD"),
+    ("White", "#FFFFFF"),
+];
 
 
 #[component]
@@ -26,11 +36,31 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut scrub = use_signal(|| None::<f64>);
     let mut fullscreen = use_signal(|| false);
     let mut rotation_locked = use_signal(|| false);
+    let mut touch_locked = use_signal(|| false);
+    let mut stats_hud = use_signal(|| false);
+    let mut sleep_mode = use_signal(|| SleepTimer::Off);
+    let mut sleep_rem_secs = use_signal(|| None::<u32>);
+    let mut hover_scrub = use_signal(|| None::<(f64, f64)>); // (percent 0..100, seconds)
+    let mut local_sub_path = use_signal(String::new);
     let mut up_next_dismissed = use_signal(|| false);
     let mut up_next_secs = use_signal(|| None::<u8>);
     let mut up_next_task = use_signal(|| false);
     let auto_next_on = use_hook(|| backend::load_settings().auto_next);
-    // Touch gesture state (Android phone/tablet): double-tap seek, vertical brightness/volume drag, long-press 2×.
+    // Track viewport width for proportional Android touch-gesture hit zones (phones & tablets).
+    #[cfg(target_os = "android")]
+    let mut viewport_w = use_signal(|| 800.0f64);
+    #[cfg(target_os = "android")]
+    use_future(move || async move {
+        let mut eval = document::eval(r#"(() => {
+            const send = () => dioxus.send(window.innerWidth || 800);
+            send();
+            addEventListener('resize', send);
+        })();"#);
+        while let Ok(w) = eval.recv::<f64>().await {
+            if w > 100.0 { viewport_w.set(w); }
+        }
+    });
+    // Touch gesture state (Android phone/tablet): double-tap seek (cumulative), vertical brightness/volume drag, long-press 2×.
     #[cfg(target_os = "android")]
     let mut touch_start = use_signal(|| None::<(f64, f64, std::time::Instant, f32, f32, u64)>);
     #[cfg(target_os = "android")]
@@ -38,7 +68,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     #[cfg(target_os = "android")]
     let mut touch_boost = use_signal(|| None::<f64>); // previous speed while long-pressing 2×
     #[cfg(target_os = "android")]
-    let mut last_tap = use_signal(|| None::<(std::time::Instant, f64)>);
+    let mut last_tap = use_signal(|| None::<(std::time::Instant, f64, i32)>); // (at, x, cumulative_secs)
     #[cfg(target_os = "android")]
     let mut suppress_click = use_signal(|| false);
     let mut online = use_signal(|| Online::Idle);
@@ -50,6 +80,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     // The video whose subtitles can be downloaded: the episode, or the film itself.
     let wanted = live.0.request.record.as_ref().map(|(m, v)| (m.kind.clone(), v.clone().unwrap_or_else(|| m.id.clone())));
     let media_key = live.0.request.record.as_ref().map(|(m, _)| m.key());
+    let req_filename = live.0.request.filename.clone();
+    let req_file_size = live.0.request.file_size;
     use_effect(move || {
         // Reopening the sheet retries a failed lookup, without a retry loop while it stays open.
         if sheet() == Some(Sheet::Subtitles) && *online.peek() == Online::Failed { online.set(Online::Idle); }
@@ -59,9 +91,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         if sheet() != Some(Sheet::Subtitles) && automatic_language().is_none() { return; }
         if *online.peek() != Online::Idle { return; }
         let Some((kind, video)) = target.clone() else { return };
+        let fname = req_filename.clone();
         online.set(Online::Loading);
         spawn(async move {
-            online.set(match backend::online_subtitles(&kind, &video).await { Ok(list) => Online::Ready(list), Err(_) => Online::Failed });
+            online.set(match backend::online_subtitles(&kind, &video, fname.as_deref(), req_file_size).await { Ok(list) => Online::Ready(list), Err(_) => Online::Failed });
         });
     });
 
@@ -152,16 +185,54 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     // Direct output: mpv can't draw into the picture, so text subtitles are drawn here.
     let caption = (s.direct && sub_on && !s.subtitle.trim().is_empty()).then(|| s.subtitle.clone());
     let up_next_active = auto_next_on
+        && sleep_mode() == SleepTimer::Off
         && up_next_due(s.position, s.duration, s.ended, &s.skips(), req.has_next, up_next_dismissed())
         && sheet().is_none() && s.error.is_none() && scrub().is_none();
     let skippable = offer(&s.skips(), s.position, req.has_next)
         .filter(|g| sheet().is_none() && s.error.is_none() && scrub().is_none() && !(up_next_active && g.kind == SegmentKind::Credits));
+
+    // Sleep timer countdown: pauses playback (and suppresses Up Next) when expired or at EOF.
+    let sleep_live = live.clone();
+    let mut sleep_gen = use_signal(|| 0u64);
+    use_effect(move || {
+        match sleep_mode() {
+            SleepTimer::Off => { sleep_rem_secs.set(None); }
+            SleepTimer::EndOfEpisode => {
+                sleep_rem_secs.set(None);
+                if state().ended {
+                    sleep_live.0.set_paused(true);
+                    sleep_mode.set(SleepTimer::Off);
+                }
+            }
+            SleepTimer::Mins(m) => {
+                let g = *sleep_gen.peek() + 1;
+                sleep_gen.set(g);
+                sleep_rem_secs.set(Some(m * 60));
+                let live = sleep_live.0.clone();
+                spawn(async move {
+                    loop {
+                        backend::sleep(1000).await;
+                        if *sleep_gen.peek() != g || *sleep_mode.peek() != SleepTimer::Mins(m) { break; }
+                        let Some(rem) = *sleep_rem_secs.peek() else { break };
+                        if rem <= 1 {
+                            sleep_rem_secs.set(None);
+                            sleep_mode.set(SleepTimer::Off);
+                            live.set_paused(true);
+                            break;
+                        }
+                        sleep_rem_secs.set(Some(rem - 1));
+                    }
+                });
+            }
+        }
+    });
 
     // Up Next auto-play countdown (5s at end of episode, 10s when credits begin).
     let next_live = live.clone();
     use_effect(move || {
         let s = state.read();
         let active = auto_next_on
+            && sleep_mode() == SleepTimer::Off
             && up_next_due(s.position, s.duration, s.ended, &s.skips(), next_live.0.request.has_next, up_next_dismissed())
             && sheet().is_none() && s.error.is_none() && scrub().is_none();
         if !active {
@@ -335,8 +406,14 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "ArrowRight" | "l" | "L" | "MediaFastForward" => { live.seek_by(10.0); say("+10 s".into()); }
             "Home" => { live.seek_to(0.0); say("Start".into()); }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => { let p = (d.as_bytes()[0] - b'0') as f64 * 10.0; live.seek_percent(p); say(format!("{p}%")); }
-            "ArrowUp" | "AudioVolumeUp" => { let v = (now.volume + 5.0).min(130.0); live.set_volume(v); say(format!("Volume {v:.0}")); }
-            "ArrowDown" | "AudioVolumeDown" => { let v = (now.volume - 5.0).max(0.0); live.set_volume(v); say(format!("Volume {v:.0}")); }
+            "ArrowUp" | "AudioVolumeUp" => {
+                if crate::is_tv() && key == "ArrowUp" { poke(); }
+                else { let v = (now.volume + 5.0).min(130.0); live.set_volume(v); say(format!("Volume {v:.0}")); }
+            }
+            "ArrowDown" | "AudioVolumeDown" => {
+                if crate::is_tv() && key == "ArrowDown" { poke(); }
+                else { let v = (now.volume - 5.0).max(0.0); live.set_volume(v); say(format!("Volume {v:.0}")); }
+            }
             "m" | "M" | "AudioVolumeMute" => { live.toggle_mute(); say(if now.muted { "Sound on".into() } else { "Muted".into() }); }
             "f" | "F" if !ANDROID => { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); }
             "a" | "A" => { let t = live.cycle_track(true); say(format!("Audio: {t}")); }
@@ -344,7 +421,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "s" | "S" => sheet.set(Some(Sheet::Subtitles)),
             "," => { let d = now.sub_delay - 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
             "." => { let d = now.sub_delay + 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
+            "<" => { live.frame_step(false); say("−1 frame".into()); }
+            ">" => { live.frame_step(true); say("+1 frame".into()); }
             "b" | "B" if !now.chapters.is_empty() => sheet.set(if sheet() == Some(Sheet::Chapters) { None } else { Some(Sheet::Chapters) }),
+            "e" | "E" if !live.request.episodes.is_empty() => sheet.set(if sheet() == Some(Sheet::Episodes) { None } else { Some(Sheet::Episodes) }),
+            "o" | "O" if !live.request.sources.is_empty() => sheet.set(if sheet() == Some(Sheet::Sources) { None } else { Some(Sheet::Sources) }),
+            "t" | "T" => sheet.set(if sheet() == Some(Sheet::Sleep) { None } else { Some(Sheet::Sleep) }),
             "z" | "Z" => {
                 let next = Fit::ALL[(Fit::ALL.iter().position(|f| *f == now.fit).unwrap_or(0) + 1) % Fit::ALL.len()];
                 live.set_fit(next); say(next.name().into());
@@ -352,6 +434,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "i" | "I" => sheet.set(if sheet() == Some(Sheet::Info) { None } else { Some(Sheet::Info) }),
             "h" | "H" | "?" => sheet.set(if sheet() == Some(Sheet::Keys) { None } else { Some(Sheet::Keys) }),
             "n" | "N" | "MediaTrackNext" if live.request.has_next => live.finish(Finish::Next),
+            "p" | "P" | "MediaTrackPrevious" if live.request.has_prev => live.finish(Finish::Prev),
             "[" => say(speed((now.speed - 0.25).max(0.25))),
             "]" => say(speed((now.speed + 0.25).min(3.0))),
             "\\" => say(speed(1.0)),
@@ -382,6 +465,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 ontouchstart: { let live_ts = lc(); move |e: TouchEvent| {
                     #[cfg(target_os = "android")]
                     {
+                        if *touch_locked.peek() { return; }
                         let touches = e.data.touches();
                         if let Some(t) = touches.first() {
                             let pt = t.client_coordinates();
@@ -395,7 +479,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             spawn(async move {
                                 backend::sleep(450).await;
                                 let still = (*touch_start.peek()).is_some_and(|x| x.5 == seq);
-                                if still && touch_drag.peek().is_none() && sheet.peek().is_none() {
+                                if still && touch_drag.peek().is_none() && sheet.peek().is_none() && !*touch_locked.peek() {
                                     let prev = live_lp.state().speed;
                                     touch_boost.set(Some(prev));
                                     suppress_click.set(true);
@@ -411,6 +495,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 ontouchmove: move |e: TouchEvent| {
                     #[cfg(target_os = "android")]
                     {
+                        if *touch_locked.peek() { return; }
                         let Some((sx, sy, _, sb, sv, _)) = *touch_start.peek() else { return };
                         let touches = e.data.touches();
                         let Some(t) = touches.first() else { return };
@@ -420,8 +505,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         let cur_drag = *touch_drag.peek();
                         if cur_drag.is_none() {
                             if dy.abs() > 22.0 && dy.abs() > dx.abs() * 1.4 && touch_boost.peek().is_none() {
-                                // Rough midpoint: left half controls brightness, right half volume.
-                                let left = sx < 480.0;
+                                let vw = (*viewport_w.peek()).max(320.0);
+                                let left = sx < vw * 0.5;
                                 touch_drag.set(Some(left));
                                 suppress_click.set(true);
                             } else {
@@ -447,6 +532,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 ontouchend: { let live_te = lc(); move |_e: TouchEvent| {
                     #[cfg(target_os = "android")]
                     {
+                        if *touch_locked.peek() { return; }
                         if let Some(prev) = touch_boost.take() {
                             live_te.set_speed(prev);
                             say(if (prev - 1.0).abs() < 0.01 { "Normal speed".into() } else { format!("Speed {prev}×") });
@@ -459,24 +545,29 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         if !dragged {
                             if let Some((sx, _, _, _, _, _)) = start {
                                 let now = std::time::Instant::now();
+                                let vw = (*viewport_w.peek()).max(320.0);
                                 let prev_tap = *last_tap.peek();
-                                if let Some((prev_t, prev_x)) = prev_tap {
-                                    if now.duration_since(prev_t) < std::time::Duration::from_millis(320) && (sx - prev_x).abs() < 120.0 {
-                                        last_tap.set(None);
-                                        if sx < 320.0 {
+                                if let Some((prev_t, prev_x, acc)) = prev_tap {
+                                    let window = if acc != 0 { 750 } else { 320 };
+                                    if now.duration_since(prev_t) < std::time::Duration::from_millis(window) && (sx - prev_x).abs() < vw * 0.25 {
+                                        if sx < vw * 0.36 {
+                                            let next_acc = acc - 10;
+                                            last_tap.set(Some((now, sx, next_acc)));
                                             suppress_click.set(true);
                                             live_te.seek_by(-10.0);
-                                            say("−10 s".into());
+                                            say(format!("−{} s", next_acc.abs()));
                                             return;
-                                        } else if sx > 580.0 {
+                                        } else if sx > vw * 0.64 {
+                                            let next_acc = acc + 10;
+                                            last_tap.set(Some((now, sx, next_acc)));
                                             suppress_click.set(true);
                                             live_te.seek_by(10.0);
-                                            say("+10 s".into());
+                                            say(format!("+{} s", next_acc));
                                             return;
                                         }
                                     }
                                 }
-                                last_tap.set(Some((now, sx)));
+                                last_tap.set(Some((now, sx, 0)));
                             }
                         }
                     }
@@ -494,6 +585,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                     let _ = &live_tc;
                 } },
                 onclick: { let live = lc(); move |_| {
+                    if *touch_locked.peek() { return; }
                     #[cfg(target_os = "android")]
                     if *suppress_click.peek() { suppress_click.set(false); return; }
                     if sheet().is_some() { sheet.set(None); }
@@ -503,13 +595,31 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 } },
                 ondoubleclick: move |_| if !ANDROID { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); },
             }
+            if touch_locked() {
+                button { class: "pill glass player-unlock", aria_label: "Unlock screen",
+                    onclick: move |_| { touch_locked.set(false); poke(); say("Screen unlocked".into()); },
+                    icons::Unlock {} span { "Unlock" }
+                }
+            }
+            if stats_hud() {
+                div { class: "player-stats-hud tnum", aria_live: "off",
+                    span { b { "Video" } "{s.width}×{s.height} · {engine::codec_name(&s.codec)}" }
+                    span { b { "Decode" } "{hw.clone().unwrap_or_else(|| \"Software\".into())}" }
+                    if s.fps > 0.0 { span { b { "FPS" } "{s.fps:.3}" } }
+                    if s.video_bitrate > 0.0 { span { b { "V-Bitrate" } "{s.video_bitrate / 1_000_000.0:.2} Mbps" } }
+                    if s.audio_bitrate > 0.0 { span { b { "A-Bitrate" } "{s.audio_bitrate / 1_000.0:.0} kbps" } }
+                    span { b { "Buffer" } "{s.buffered.max(0.0):.1} s" }
+                    span { b { "Dropped" } "{s.dropped}" }
+                    span { b { "A/V Sync" } "{s.avsync * 1000.0:+.1} ms" }
+                }
+            }
             if let Some(text) = caption {
                 {
                     let sub_bottom = (107 - s.sub_pos).clamp(5, 35);
                     let cls = format!("player-caption{}{}", if visible { " lifted" } else { "" }, if s.sub_bg { " bg" } else { "" });
                     rsx! {
                         div { class: "{cls}", style: "--sub-scale: {s.sub_scale}; --sub-bottom: {sub_bottom}%", aria_live: "polite",
-                            for line in text.lines().map(str::to_owned).collect::<Vec<_>>() { span { "{line}" } }
+                            for line in text.lines().map(str::to_owned).collect::<Vec<_>>() { span { style: "color: {s.sub_color}", "{line}" } }
                         }
                     }
                 }
@@ -518,6 +628,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             // Floating "Up Next" auto-play countdown card during credits or end of episode.
             if up_next_active {
                 div { class: if visible { "player-upnext lifted" } else { "player-upnext" }, role: "region", aria_label: "Up next",
+                    onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                     span { class: "player-upnext-meta",
                         match up_next_secs() {
                             Some(n) => format!("Up next in {n} s"),
@@ -542,6 +653,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             if let Some(error) = s.error.clone() {
                 div { class: "player-center",
                     div { class: "glass panel player-error", role: "alert",
+                        onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                         span { class: "warn-icon big-icon", icons::Alert {} }
                         p { class: "body-strong", "{error}" }
                         p { class: "dim", "Another source may play; this one can also be tried again." }
@@ -556,7 +668,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 div { class: "player-center", aria_label: "Loading", div { class: "player-spinner" } }
             }
 
-            div { class: "player-chrome", inert: (!visible || sheet() == Some(Sheet::Keys)).then_some("true"),
+            div { class: "player-chrome", inert: (!visible || touch_locked() || sheet() == Some(Sheet::Keys)).then_some("true"),
                 onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                 div { class: "player-top",
                     button { class: "bare", aria_label: "Back (Esc)", title: "Back (Esc)", onclick: { let live = lc(); move |_| live.finish(Finish::Close) }, icons::ArrowLeft {} }
@@ -572,10 +684,23 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 span { class: if hw.is_some() { "" } else { "warn" }, title: if hw.is_some() { "Hardware decoding" } else { "Software decoding" },
                                     "{hw.clone().unwrap_or_else(|| \"Software\".into())}" }
                             }
+                            if sleep_mode() != SleepTimer::Off {
+                                span { class: "lit tnum",
+                                    match (sleep_mode(), sleep_rem_secs()) {
+                                        (SleepTimer::EndOfEpisode, _) => "Sleep: end".to_string(),
+                                        (_, Some(rem)) => format!("Sleep: {}m", rem.div_ceil(60)),
+                                        _ => "Sleep".to_string(),
+                                    }
+                                }
+                            }
                         }
                     }
                     span { class: "topbar-spacer" }
                     if ANDROID && !crate::is_tv() {
+                        button { class: "bare", aria_label: "Lock touch controls", title: "Lock touch controls",
+                            onclick: move |_| { touch_locked.set(true); sheet.set(None); shown.set(false); say("Touch locked".into()); },
+                            icons::Lock {}
+                        }
                         button { class: "bare",
                             aria_label: if rotation_locked() { "Unlock orientation" } else { "Lock orientation" },
                             title: if rotation_locked() { "Unlock orientation" } else { "Lock orientation" },
@@ -587,7 +712,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 let _ = crate::android::video_set_rotation_lock(next);
                                 say(if next { "Rotation locked".into() } else { "Rotation unlocked".into() });
                             },
-                            if rotation_locked() { icons::Lock {} } else { icons::Unlock {} }
+                            icons::Resize {}
                         }
                         button { class: "bare", aria_label: "Picture-in-picture", title: "Picture-in-picture",
                             onclick: move |_| {
@@ -601,6 +726,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             icons::Pip {}
                         }
                     }
+                    button { class: "bare", aria_label: "Sleep timer (T)", title: "Sleep timer (T)", aria_pressed: "{sheet() == Some(Sheet::Sleep) || sleep_mode() != SleepTimer::Off}",
+                        onclick: move |_| sheet.set(if sheet() == Some(Sheet::Sleep) { None } else { Some(Sheet::Sleep) }), icons::Moon {} }
                     button { class: "bare", aria_label: "Player shortcuts (H / ?)", title: "Player shortcuts (H / ?)", aria_pressed: "{sheet() == Some(Sheet::Keys)}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Keys) { None } else { Some(Sheet::Keys) }), icons::Keyboard {} }
                     button { class: "bare", aria_label: "Details (I)", title: "Details (I)", aria_pressed: "{sheet() == Some(Sheet::Info)}",
@@ -620,10 +747,35 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 div { class: "player-bottom",
                     span { class: "player-time tnum", "{clock(position)}" }
                     div { class: "scrubber-wrap",
+                        onmousemove: move |e| if !ANDROID && duration > 0.0 {
+                            let coords = e.element_coordinates();
+                            // Estimate ratio via JS width once or use element coordinates smoothly when hovered.
+                            let x = coords.x;
+                            spawn(async move {
+                                if let Ok(w) = document::eval("return (document.querySelector('.scrubber-wrap')?.clientWidth || 0)").await {
+                                    if let Some(width) = w.as_f64().filter(|&v| v > 10.0) {
+                                        let ratio = (x / width).clamp(0.0, 1.0);
+                                        hover_scrub.set(Some((ratio * 100.0, ratio * duration)));
+                                    }
+                                }
+                            });
+                        },
+                        onmouseleave: move |_| hover_scrub.set(None),
                         input { class: "scrubber", r#type: "range", aria_label: "Position", min: "0", max: "{duration.max(1.0)}", step: "0.5",
                             value: "{position}", disabled: duration <= 0.0, style: "--played: {played}%; --buffered: {buffered}%",
                             oninput: move |e| { scrub.set(e.value().parse().ok()); poke(); },
                             onchange: { let live = lc(); move |e: FormEvent| { if let Ok(v) = e.value().parse::<f64>() { live.seek_to(v); } scrub.set(None); } },
+                        }
+                        if let Some((hpct, hsec)) = hover_scrub() {
+                            {
+                                let hch = s.chapters.iter().rev().find(|c| hsec >= c.start).map(|c| c.title.clone());
+                                rsx! {
+                                    div { class: "scrub-tip tnum", style: "left: {hpct.clamp(5.0, 95.0):.1}%",
+                                        span { "{clock(hsec)}" }
+                                        if let Some(ch) = hch { span { class: "scrub-tip-ch", "{ch}" } }
+                                    }
+                                }
+                            }
                         }
                         if duration > 0.0 {
                             for ch in s.chapters.iter().filter(|c| c.start > 1.0 && c.start < duration - 1.0) {
@@ -633,6 +785,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                     }
                     span { class: "player-time tnum dim", if duration > 0.0 { "-{clock(duration - position)}" } }
                     div { class: "player-actions",
+                        if !req.episodes.is_empty() {
+                            button { class: "bare", aria_label: "Episodes (E)", title: "Episodes (E)", aria_pressed: "{sheet() == Some(Sheet::Episodes)}", onclick: move |_| sheet.set(Some(Sheet::Episodes)), icons::Stack {} }
+                        }
+                        if !req.sources.is_empty() {
+                            button { class: "bare", aria_label: "Switch source (O)", title: "Switch source (O)", aria_pressed: "{sheet() == Some(Sheet::Sources)}", onclick: move |_| sheet.set(Some(Sheet::Sources)), icons::Layers {} }
+                        }
                         if !s.chapters.is_empty() {
                             button { class: "bare", aria_label: "Chapters (B)", title: "Chapters (B)", aria_pressed: "{sheet() == Some(Sheet::Chapters)}", onclick: move |_| sheet.set(Some(Sheet::Chapters)), icons::List {} }
                         }
@@ -643,8 +801,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         if !ANDROID {
                             button { class: "bare", aria_label: if s.muted { "Unmute (M)" } else { "Mute (M)" }, title: if s.muted { "Unmute (M)" } else { "Mute (M)" },
                                 onclick: { let live = lc(); move |_| live.toggle_mute() }, if s.muted || s.volume <= 0.0 { icons::Muted {} } else { icons::Audio {} } }
-                            input { class: "scrubber volume", r#type: "range", aria_label: "Volume", min: "0", max: "100", step: "1", value: "{s.volume.min(100.0)}",
-                                style: "--played: {s.volume.min(100.0)}%; --buffered: 0%",
+                            input { class: "scrubber volume", r#type: "range", aria_label: "Volume (up to 130% boost)", min: "0", max: "130", step: "1", value: "{s.volume.min(130.0)}",
+                                style: "--played: {(s.volume / 1.3).min(100.0)}%; --buffered: 0%",
                                 oninput: { let live = lc(); move |e: FormEvent| if let Ok(v) = e.value().parse::<f64>() { live.set_volume(v); } } }
                             button { class: "bare", aria_label: if fullscreen() { "Leave full screen (F)" } else { "Full screen (F)" }, title: if fullscreen() { "Leave full screen (F)" } else { "Full screen (F)" },
                                 onclick: move |_| { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); }, icons::Expand {} }
@@ -680,6 +838,23 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                                 button { class: "player-step-btn", onclick: { let live = lc(); let d = s.audio_delay; move |_| live.set_audio_delay(d + 0.1) }, "+0.1s" }
                                             }
                                         }
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Dialogue boost (Night mode)" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", aria_pressed: "{s.night_mode}",
+                                                    onclick: { let live = lc(); let on = s.night_mode; move |_| live.set_night_mode(!on) },
+                                                    if s.night_mode { "On" } else { "Off" }
+                                                }
+                                            }
+                                        }
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Volume boost" }
+                                            div { class: "player-stepper-controls",
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v - 10.0).max(0.0)) }, "−" }
+                                                button { class: "player-step-btn player-step-val tnum", title: "Reset volume to 100%", onclick: { let live = lc(); move |_| live.set_volume(100.0) }, "{s.volume:.0}%" }
+                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v + 10.0).min(130.0)) }, "+" }
+                                            }
+                                        }
                                     } else {
                                         div { class: "player-stepper",
                                             span { class: "player-stepper-label", "Subtitle sync" }
@@ -705,6 +880,17 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                                 button { class: "player-step-btn", aria_pressed: "{s.sub_bg}", onclick: { let live = lc(); let bg = s.sub_bg; move |_| live.set_sub_bg(!bg) }, if s.sub_bg { "Box on" } else { "Box off" } }
                                             }
                                         }
+                                        div { class: "player-stepper",
+                                            span { class: "player-stepper-label", "Color" }
+                                            div { class: "sub-colors",
+                                                for (cname, chex) in SUB_COLORS {
+                                                    button { key: "{chex}", class: if s.sub_color.eq_ignore_ascii_case(chex) { "sub-swatch on" } else { "sub-swatch" },
+                                                        style: "background: {chex}", aria_label: "{cname}", title: "{cname}",
+                                                        onclick: { let live = lc(); move |_| live.set_sub_color(chex) }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     if !audio && !tracks.is_empty() { p { class: "player-options-head", "In this video" } }
                                     if !audio {
@@ -714,7 +900,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                             sheet.set(None);
                                         } } }
                                     }
-                                    for t in tracks {
+                                    for t in tracks.iter().cloned() {
                                         OptionRow { key: "{t.id}", on: t.selected, label: t.label.clone(),
                                             about: if audio || !s.direct { String::new() } else if t.image { "Image subtitles: drawn by mpv, off the direct path".to_string() }
                                                 else if t.styled { "Styled: full look on SDR, plain text over HDR".to_string() } else { String::new() },
@@ -731,12 +917,106 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                             } } }
                                     }
                                     if audio && s.tracks.iter().all(|t| !t.audio) { p { class: "dim player-empty", "No audio tracks." } }
+                                    if !audio && !s.direct && tracks.len() >= 2 {
+                                        p { class: "player-options-head", "Secondary subtitle (dual)" }
+                                        OptionRow { on: s.secondary_sid.is_none(), label: "Off".to_string(), about: String::new(),
+                                            pick: { let live = lc(); move |_| live.set_secondary_sub(None) } }
+                                        for t in tracks.iter().filter(|t| !t.selected).cloned() {
+                                            OptionRow { key: "sec-{t.id}", on: s.secondary_sid == Some(t.id), label: t.label.clone(), about: "Top track".to_string(),
+                                                pick: { let live = lc(); let id = t.id; move |_| live.set_secondary_sub(Some(id)) } }
+                                        }
+                                    }
+                                    if !audio {
+                                        p { class: "player-options-head", "Load local subtitle file" }
+                                        div { class: "sub-search",
+                                            input { r#type: "text", placeholder: "Path to .srt, .vtt, or .ass…", aria_label: "Local subtitle file path",
+                                                value: "{local_sub_path}", autocomplete: "off", spellcheck: "false",
+                                                oninput: move |e| local_sub_path.set(e.value()),
+                                                onkeydown: move |e: KeyboardEvent| if e.key() != Key::Escape { e.stop_propagation(); },
+                                                onkeyup: move |e: KeyboardEvent| e.stop_propagation(),
+                                            }
+                                            button { class: "player-step-btn", style: "margin-left: 6px", disabled: local_sub_path().trim().is_empty(),
+                                                onclick: { let live = lc(); move |_| {
+                                                    let path = local_sub_path.peek().trim().trim_matches('"').to_owned();
+                                                    if path.is_empty() { return; }
+                                                    let live = live.clone();
+                                                    let mut say = say;
+                                                    spawn(async move {
+                                                        let res = backend::on_runtime(async move {
+                                                            tokio::task::spawn_blocking(move || live.add_subtitle(&path, "Local", "")).await
+                                                        }).await;
+                                                        match res {
+                                                            Ok(Ok(Ok(_))) => { local_sub_path.set(String::new()); sheet.set(None); say("Local subtitles loaded".into()); }
+                                                            _ => say("Couldn't load local subtitle file".into()),
+                                                        }
+                                                    });
+                                                } },
+                                                "Load"
+                                            }
+                                        }
+                                    }
                                     if !audio && wanted.is_some() {
                                         OnlineSubtitles { online: online(), query: sub_query, busy: sub_busy(), added: sub_added(),
                                             selected: s.tracks.iter().find(|t| !t.audio && t.selected).map(|t| t.id), pick: download }
                                     }
                                 }
                             }
+                            Sheet::Sources => rsx! {
+                                for (idx, src) in req.sources.iter().enumerate() {
+                                    {
+                                        let active = src.url == req.url;
+                                        let label = if !src.filename.is_empty() { src.filename.clone() }
+                                            else { src.description.lines().next().unwrap_or(&src.name).to_owned() };
+                                        let about = [
+                                            src.quality.map(str::to_owned),
+                                            src.hdr.map(str::to_owned),
+                                            src.size.clone(),
+                                            Some(src.addon.clone()),
+                                        ].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                                        rsx! {
+                                            OptionRow { key: "src-{idx}", on: active, label, about,
+                                                pick: { let live = lc(); move |_| {
+                                                    sheet.set(None);
+                                                    if !active { live.finish(Finish::SwitchSource(idx)); }
+                                                } } }
+                                        }
+                                    }
+                                }
+                            },
+                            Sheet::Episodes => rsx! {
+                                for ep in req.episodes.iter() {
+                                    {
+                                        let active = req.current_video_id.as_deref() == Some(ep.id.as_str());
+                                        let ep_id = ep.id.clone();
+                                        let label = format!("E{} · {}", ep.number, ep.title);
+                                        let about = if ep.released.is_empty() { ep.overview.clone() } else { backend::date_label(&ep.released) };
+                                        rsx! {
+                                            OptionRow { key: "ep-{ep.id}", on: active, label, about,
+                                                pick: { let live = lc(); move |_| {
+                                                    sheet.set(None);
+                                                    if !active { live.finish(Finish::SwitchEpisode(ep_id.clone())); }
+                                                } } }
+                                        }
+                                    }
+                                }
+                            },
+                            Sheet::Sleep => rsx! {
+                                for (mode, label, about) in [
+                                    (SleepTimer::Off, "Off", "Playback continues normally"),
+                                    (SleepTimer::EndOfEpisode, "End of episode", "Pause when this video ends"),
+                                    (SleepTimer::Mins(15), "15 minutes", "Pause after 15 minutes"),
+                                    (SleepTimer::Mins(30), "30 minutes", "Pause after 30 minutes"),
+                                    (SleepTimer::Mins(45), "45 minutes", "Pause after 45 minutes"),
+                                    (SleepTimer::Mins(60), "60 minutes", "Pause after 1 hour"),
+                                ] {
+                                    OptionRow { key: "{label}", on: sleep_mode() == mode, label: label.to_string(), about: about.to_string(),
+                                        pick: move |_| {
+                                            sleep_mode.set(mode);
+                                            sheet.set(None);
+                                            say(if mode == SleepTimer::Off { "Sleep timer off".into() } else { format!("Sleep timer: {label}") });
+                                        } }
+                                }
+                            },
                             Sheet::Chapters => rsx! {
                                 for (idx, ch) in s.chapters.iter().enumerate() {
                                     {
@@ -761,22 +1041,50 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                     OptionRow { key: "{f.name()}", on: s.fit == f, label: f.name().to_string(), about: f.about().to_string(),
                                         pick: { let live = lc(); move |_| live.set_fit(f) } }
                                 }
+                                p { class: "player-options-head", "Aspect ratio" }
+                                div { class: "sub-langs",
+                                    for ratio in ["auto", "16:9", "21:9", "4:3"] {
+                                        button { key: "ar-{ratio}", class: if s.aspect_override == ratio { "sub-lang on" } else { "sub-lang" },
+                                            onclick: { let live = lc(); move |_| live.set_aspect_override(ratio) },
+                                            if ratio == "auto" { "Auto" } else { "{ratio}" }
+                                        }
+                                    }
+                                }
                                 if ANDROID {
                                     p { class: "player-options-head", "Output" }
                                     OptionRow { on: s.direct, label: "Direct to the display".to_string(), about: "MediaCodec straight to the screen: real HDR10, HLG and HDR10+, lowest power".to_string(),
                                         pick: { let live = lc(); move |_| live.set_direct(true) } }
                                     OptionRow { on: !s.direct, label: "Rendered by mpv".to_string(), about: "Full ASS and image subtitles; HDR is tone-mapped to SDR".to_string(),
                                         pick: { let live = lc(); move |_| live.set_direct(false) } }
+                                } else {
+                                    p { class: "player-options-head", "Hardware decoding" }
+                                    for (mode, label, about) in [
+                                        ("auto", "Automatic (GPU)", "Fastest and lowest power"),
+                                        ("copy", "Hardware copy-back", "Helps if filters or drivers glitch"),
+                                        ("no", "Software (CPU)", "Fallback for problematic drivers"),
+                                    ] {
+                                        OptionRow { key: "hw-{mode}", on: s.hwdec_mode == mode, label: label.to_string(), about: about.to_string(),
+                                            pick: { let live = lc(); move |_| live.set_hwdec_mode(mode) } }
+                                    }
                                 }
                             },
                             Sheet::Keys => rsx! {
                                 div { class: "shortcut-list player-keys",
-                                    for (k, what) in KEYS.into_iter().filter(|(k,_)| !(ANDROID && k == &["F"]) && (req.has_next || k != &["N"])) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
+                                    for (k, what) in KEYS.into_iter().filter(|(k,_)| !(ANDROID && k == &["F"]) && (req.has_next || req.has_prev || k != &["N", "P"])) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
                                 }
                             },
                             Sheet::Info => {
                                 let rows = details(&l, &s, &facts, hw.as_deref());
                                 rsx! {
+                                    div { class: "player-stepper",
+                                        span { class: "player-stepper-label", "Live stats overlay" }
+                                        div { class: "player-stepper-controls",
+                                            button { class: "player-step-btn", aria_pressed: "{stats_hud()}",
+                                                onclick: move |_| stats_hud.set(!stats_hud()),
+                                                if stats_hud() { "On" } else { "Off" }
+                                            }
+                                        }
+                                    }
                                     dl { class: "player-facts",
                                         for (k, v) in rows { div { key: "{k}", dt { "{k}" } dd { "{v}" } } }
                                     }
@@ -792,7 +1100,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
 
 fn sheet_name(s: Sheet) -> &'static str {
-    match s { Sheet::Audio => "Audio", Sheet::Subtitles => "Subtitles", Sheet::Chapters => "Chapters", Sheet::Speed => "Speed", Sheet::Picture => "Picture", Sheet::Info => "Details", Sheet::Keys => "Shortcuts" }
+    match s {
+        Sheet::Audio => "Audio", Sheet::Subtitles => "Subtitles", Sheet::Chapters => "Chapters",
+        Sheet::Sources => "Sources", Sheet::Episodes => "Episodes", Sheet::Speed => "Speed",
+        Sheet::Sleep => "Sleep timer", Sheet::Picture => "Picture", Sheet::Info => "Details",
+        Sheet::Keys => "Shortcuts",
+    }
 }
 
 

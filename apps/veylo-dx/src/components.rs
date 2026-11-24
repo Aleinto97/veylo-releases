@@ -145,8 +145,18 @@ pub fn Scores(media: Media, imdb: String) -> Element {
     let m = media.clone();
     use_hook(move || { spawn(async move { scores.set(backend::review_scores(&m).await); }); });
     let s = scores();
+    let alt_rating = if imdb.is_empty() {
+        let tmdb = backend::s(&media.raw, "tmdbRating");
+        if !tmdb.is_empty() { Some(("TMDB", tmdb)) } else {
+            let tvm = backend::s(&media.raw, "tvmazeRating");
+            (!tvm.is_empty()).then_some(("TVmaze", tvm))
+        }
+    } else {
+        None
+    };
     let mut said = Vec::new();
     if !imdb.is_empty() { said.push(format!("IMDb {imdb}")); }
+    else if let Some((src, ref val)) = alt_rating { said.push(format!("{src} {val}")); }
     if let Some(t) = s.tomatometer { said.push(format!("Rotten Tomatoes {t}%")); }
     if let Some(n) = s.metascore { said.push(format!("Metascore {n}")); }
     if said.is_empty() { return rsx! {}; }
@@ -154,6 +164,7 @@ pub fn Scores(media: Media, imdb: String) -> Element {
     rsx! {
         span { class: "fact scores", title: "{label}", aria_label: "{label}",
             if !imdb.is_empty() { span { class: "score", img { class: "score-logo imdb", src: IMDB_LOGO.as_str(), alt: "" } span { class: "tnum", "{imdb}" } } }
+            else if let Some((src, val)) = alt_rating { span { class: "score", icons::Star {} span { class: "tnum", "{val}" } span { class: "dim", "{src}" } } }
             if let Some(t) = s.tomatometer {
                 span { class: "score", img { class: "score-logo", src: if t >= 60 { FRESH_LOGO.as_str() } else { ROTTEN_LOGO.as_str() }, alt: "" } span { class: "tnum", "{t}%" } }
             }

@@ -733,6 +733,19 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
         "tmdb_key": settings.tmdb_key,
         "stream_language": settings.stream_language,
         "addons": local_addons,
+        "prefs": {
+            "better_posters": settings.better_posters,
+            "picks_hide_watched": settings.picks_hide_watched,
+            "sub_scale": settings.sub_scale,
+            "sub_pos": settings.sub_pos,
+            "sub_bg": settings.sub_bg,
+            "sub_color": settings.sub_color,
+            "audio_night_mode": settings.audio_night_mode,
+            "audio_passthrough": settings.audio_passthrough,
+            "auto_next": settings.auto_next,
+            "max_bitrate_mbps": settings.max_bitrate_mbps,
+        },
+        "track_prefs": export_track_prefs_value(),
     });
     let local_hash = keys_digest(&local);
     let local_has_keys = has_any_key(&local);
@@ -778,6 +791,19 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
                     "tmdb_key": after.tmdb_key,
                     "stream_language": after.stream_language,
                     "addons": crate::addons::for_handoff().await,
+                    "prefs": {
+                        "better_posters": after.better_posters,
+                        "picks_hide_watched": after.picks_hide_watched,
+                        "sub_scale": after.sub_scale,
+                        "sub_pos": after.sub_pos,
+                        "sub_bg": after.sub_bg,
+                        "sub_color": after.sub_color,
+                        "audio_night_mode": after.audio_night_mode,
+                        "audio_passthrough": after.audio_passthrough,
+                        "auto_next": after.auto_next,
+                        "max_bitrate_mbps": after.max_bitrate_mbps,
+                    },
+                    "track_prefs": export_track_prefs_value(),
                 });
                 st.keys_hash = keys_digest(&adopted);
                 st.keys_updated = remote_updated;
@@ -825,7 +851,20 @@ async fn adopt_keys(v: &Value) {
         if tmdb.is_some() { s.tmdb_key = tmdb.clone(); }
         else if v.get("tmdb_key").is_some_and(Value::is_null) { s.tmdb_key = None; }
         if let Some(l) = language.clone().filter(|l| crate::addons::language(l).is_some()) { s.stream_language = Some(l); }
+        if let Some(p) = v.get("prefs") {
+            if let Some(b) = p["better_posters"].as_bool() { s.better_posters = b; }
+            if let Some(b) = p["picks_hide_watched"].as_bool() { s.picks_hide_watched = b; }
+            if let Some(f) = p["sub_scale"].as_f64() { s.sub_scale = f.clamp(0.6, 2.0); }
+            if let Some(n) = p["sub_pos"].as_i64() { s.sub_pos = n.clamp(70, 100) as i32; }
+            if let Some(b) = p["sub_bg"].as_bool() { s.sub_bg = b; }
+            if let Some(c) = p["sub_color"].as_str().filter(|c| c.starts_with('#') && c.len() == 7) { s.sub_color = c.to_owned(); }
+            if let Some(b) = p["audio_night_mode"].as_bool() { s.audio_night_mode = b; }
+            if let Some(b) = p["audio_passthrough"].as_bool() { s.audio_passthrough = b; }
+            if let Some(b) = p["auto_next"].as_bool() { s.auto_next = b; }
+            if p.get("max_bitrate_mbps").is_some() { s.max_bitrate_mbps = parse_max_bitrate(p); }
+        }
     });
+    if let Some(tp) = v.get("track_prefs") { merge_track_prefs_value(tp); }
     crate::addons::adopt(&v["addons"]).await;
 }
 

@@ -201,6 +201,33 @@ pub fn SettingsPage() -> Element {
                     }
                 }
                 div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "Max streaming bitrate" }
+                        span { class: "dim setting-about",
+                            match (settings().max_bitrate_mbps, backend::connection_mbps()) {
+                                (None, Some(mbps)) => format!("Auto: matches your connection (~{mbps:.0} Mbps measured) so playback won't buffer"),
+                                (None, None) => "Auto: measures your connection speed and picks the highest quality that won't buffer".into(),
+                                (Some(0), _) => "Unlimited: always picks the highest quality source regardless of connection speed".into(),
+                                (Some(cap), _) => format!("Prefers sources up to {cap} Mbps average bitrate"),
+                            } } }
+                    select { class: "select-field", aria_label: "Max streaming bitrate",
+                        onkeydown: move |e| { e.stop_propagation(); },
+                        onchange: move |e| {
+                            let val = e.value();
+                            let cap = match val.as_str() {
+                                "auto" => None,
+                                n => n.parse::<u32>().ok(),
+                            };
+                            settings.set(backend::update_settings(|s| s.max_bitrate_mbps = cap));
+                        },
+                        option { value: "auto", selected: settings().max_bitrate_mbps.is_none(), "Auto (match connection)" }
+                        option { value: "0", selected: settings().max_bitrate_mbps == Some(0), "Unlimited (always highest)" }
+                        option { value: "60", selected: settings().max_bitrate_mbps == Some(60), "60 Mbps (4K high)" }
+                        option { value: "30", selected: settings().max_bitrate_mbps == Some(30), "30 Mbps (4K standard)" }
+                        option { value: "15", selected: settings().max_bitrate_mbps == Some(15), "15 Mbps (1080p high / light 4K)" }
+                        option { value: "8", selected: settings().max_bitrate_mbps == Some(8), "8 Mbps (1080p saver)" }
+                    }
+                }
+                div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "Up Next countdown" }
                         span { class: "dim setting-about", "Show a short countdown to the next episode when credits begin or an episode ends" } }
                     div { class: "segmented glass", role: "radiogroup", aria_label: "Up Next countdown",
@@ -208,6 +235,17 @@ pub fn SettingsPage() -> Element {
                         for (on, name) in [(true, "On"), (false, "Off")] {
                             button { class: if settings().auto_next == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().auto_next == on}",
                                 onclick: move |_| settings.set(backend::update_settings(|s| s.auto_next = on)), "{name}" }
+                        }
+                    }
+                }
+                div { class: "setting-row glass",
+                    div { class: "setting-copy", span { class: "setting-name", "HDMI audio passthrough" }
+                        span { class: "dim setting-about", "Send Dolby Digital, DTS, and TrueHD bitstreams directly to an AVR or soundbar (applies from the next video)" } }
+                    div { class: "segmented glass", role: "radiogroup", aria_label: "HDMI audio passthrough",
+                        i { class: "slider", aria_hidden: "true" }
+                        for (on, name) in [(true, "On"), (false, "Off")] {
+                            button { class: if settings().audio_passthrough == on { "seg wide on" } else { "seg wide" }, role: "radio", aria_checked: "{settings().audio_passthrough == on}",
+                                onclick: move |_| settings.set(backend::update_settings(|s| s.audio_passthrough = on)), "{name}" }
                         }
                     }
                 }
@@ -312,6 +350,15 @@ pub fn SettingsPage() -> Element {
                                 }
                             });
                         }, icons::Download {} span { "Export JSON" } }
+                        button { class: "pill glass small", onclick: move |_| {
+                            data_note.set(None);
+                            spawn(async move {
+                                match backend::clear_subtitle_cache().await {
+                                    Ok(()) => data_note.set(Some("Cached subtitle files cleared.".into())),
+                                    Err(e) => data_note.set(Some(format!("Couldn't clear subtitle cache: {e}"))),
+                                }
+                            });
+                        }, icons::Trash {} span { "Clear subtitle cache" } }
                     }
                 }
                 if import_open() {
@@ -516,10 +563,10 @@ fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
                     span { class: "dim setting-about", "{about}" } }
                 button { class: "pill glass", onclick: move |_| screen.set(crate::display::screen()), icons::Refresh {} span { "Check again" } }
             }
-            if cfg!(target_os = "windows") {
+            if cfg!(any(target_os = "windows", target_os = "macos")) {
                 div { class: "setting-row glass",
                     div { class: "setting-copy", span { class: "setting-name", "HDR output" }
-                        span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when Windows HDR is on. Always SDR tone-maps them, for screens whose HDR looks washed out. Applies from the next video." } }
+                        span { class: "dim setting-about", "Automatic sends HDR videos to the screen in HDR when system HDR / EDR is available. Always SDR tone-maps them, for screens whose HDR looks washed out. Applies from the next video." } }
                     div { class: "segmented glass", role: "radiogroup", aria_label: "HDR output",
                         i { class: "slider", aria_hidden: "true" }
                         for (on, name) in [(true, "Automatic"), (false, "Always SDR")] {

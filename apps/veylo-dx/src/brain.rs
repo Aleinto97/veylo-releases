@@ -103,8 +103,10 @@ impl Item {
             year: m.first_year(),
             genres: GENRES.iter().filter(|g| rules::has_genre(m, g)).map(|g| (*g).to_owned()).collect(),
             animated: rules::is_animated(m),
-            rating: m.raw["imdbRating"].as_str().and_then(|r| r.trim().parse::<f64>().ok()).or_else(|| m.raw["imdbRating"].as_f64())
-                .filter(|r| r.is_finite() && *r > 0.0 && *r <= 10.0),
+            rating: ["imdbRating", "tmdbRating", "tvmazeRating"].iter().find_map(|k| {
+                m.raw[*k].as_str().and_then(|r| r.trim().parse::<f64>().ok()).or_else(|| m.raw[*k].as_f64())
+                    .filter(|r| r.is_finite() && *r > 0.0 && *r <= 10.0)
+            }),
             emb: picks_ai::embedding(m).map(Into::into),
             mood: false,
         }

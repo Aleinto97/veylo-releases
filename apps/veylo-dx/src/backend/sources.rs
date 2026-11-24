@@ -33,6 +33,55 @@ pub struct Source {
     /// The picture the file's own header declares, once Play's check has read it: its size and
     /// HDR then outrank what the label claims.
     pub picture: Option<crate::tracks::Picture>,
+    /// Number of main audio tracks read from the container header (used to discount multi-dub bloat).
+    pub audio_tracks_count: Option<u8>,
+    /// Video codec read from the container header ("av1", "hevc", "avc"), when available.
+    pub video_codec: Option<&'static str>,
+    /// Marked nuked on PreDB (corrupt, out-of-sync, bad audio, fake): ranked behind clean releases.
+    pub nuked: bool,
+    /// Release authenticity against srrDB: +1 = verified release with expected size, 0 = neutral,
+    /// -1 = claims a verified scene release name with suspiciously tiny file size.
+    pub scene_trust: i8,
+}
+
+/// Full metadata and playback context passed to Autoplay v2 so it can match localized titles,
+/// pick the right language (including per-title preference & original-language fallback), reject
+/// hidden trailers/extras by runtime, avoid PreDB-nuked releases, and fit the stream bitrate to
+/// the current connection.
+#[derive(Clone, Debug, Default)]
+pub struct AutoplayContext {
+    /// Display title plus original/localized alternate titles (free metadata prioritized).
+    pub titles: Vec<String>,
+    /// Release year for movies (None for series).
+    pub year: Option<i32>,
+    /// Episodes in the season for season-pack size splitting.
+    pub pack_episodes: Option<usize>,
+    /// Expected duration in seconds (free metadata / Cinemeta / TVmaze / TMDB) for pre-probe
+    /// bitrate estimation and hidden trailer/clip rejection.
+    pub expected_seconds: Option<f64>,
+    /// Preferred audio language key (per-title remembered track pref or global `stream_language`).
+    pub preferred_language: Option<String>,
+    /// Film/show's original language key, used as fallback when preferred language isn't present.
+    pub original_language: Option<String>,
+    /// Requested `(season, episode)` for series streams.
+    pub episode_code: Option<(i64, i64)>,
+    /// When true, autoplay never silently plays an off-title source (only exact title matches).
+    pub strict_title: bool,
+    /// Optional release intelligence from free metadata-only srrDB + PreDB.net.
+    pub intel: Option<ReleaseIntel>,
+}
+
+impl AutoplayContext {
+    pub fn simple(title: &str, year: Option<i32>, pack_episodes: Option<usize>) -> Self {
+        Self {
+            titles: if title.trim().is_empty() { Vec::new() } else { vec![title.to_owned()] },
+            year,
+            pack_episodes,
+            preferred_language: stream_language(),
+            strict_title: !title.trim().is_empty(),
+            ..Self::default()
+        }
+    }
 }
 
 pub(super) fn find_quality(text: &str) -> Option<&'static str> {
@@ -67,10 +116,15 @@ static_re!(bluray, r"(?i)\b(?:BLU[ ._-]?RAY|BDRIP|BRRIP|BDREMUX|BD(?:25|50|66|10
 static_re!(web_dl, r"(?i)\bWEB(?:[ ._-]?DL)?\b");
 static_re!(web_rip, r"(?i)\bWEB[ ._-]?RIP\b");
 static_re!(low_source, r"(?i)\b(?:HDTV|PDTV|DVDRIP|DVDSCR|HDCAM|CAM|TS|HDTS|TELESYNC|TC|SCREENER)\b");
-// Filmed or copied in a cinema, or a pre-release screener: never Play's choice, whatever
-// resolution the name claims ("1080p HDTS" is a camera copy at 1080p). A bare "TS" isn't here:
-// it is also MPEG-TS, a container real releases use.
-static_re!(cinema_copy, r"(?i)\b(?:HD[ ._-]?CAM|CAM[ ._-]?RIP|CAM|HD[ ._-]?TS|TELESYNC|HD[ ._-]?TC|TELECINE|DVD[ ._-]?SCR|SCREENER)\b");
+// Filmed or copied in a cinema, pre-release screener, or hardcoded foreign-sub leak: never Play's
+// choice, whatever resolution the name claims ("1080p TS" / "1080p HDTS" is a camera copy).
+// Container extensions (`.ts`, `.mkv`, `.mp4`, ...) are stripped before testing so MPEG-TS
+// `.ts` filenames are never confused with Telesync (`TS`) release tags.
+static_re!(video_ext_suffix, r"(?i)\.(?:mkv|mp4|ts|m2ts|mts|avi|mov|webm|wmv|flv|mpg|mpeg)(?:$|[\s\]\)])");
+static_re!(cinema_copy, r"(?i)\b(?:HD[ ._-]?CAM|CAM[ ._-]?RIP|CAM|HD[ ._-]?TS|TS|TELESYNC|HD[ ._-]?TC|TELECINE|DVD[ ._-]?SCR|SCREENER|WORKPRINT|R5|KORSUB|HARD[ ._-]?SUB(?:S|BED)?|HC[ ._-]?(?:HDRIP|WEBRIP|WEB|1080P|720P|2160P|X264|X265))\b");
+static_re!(extra_clip, r"(?i)\b(?:TRAILER|TEASER|FEATURETTE|DELETED[ ._-]?SCENES?|BEHIND[ ._-]?THE[ ._-]?SCENES|MAKING[ ._-]?OF|BONUS[ ._-]?FEATURES?|NCOP|NCED)\b");
+static_re!(season_ep_tag, r"(?i)\bS(\d{1,2})[ ._-]?E(\d{1,3})(?:[ ._-]?[-–]?E?(\d{1,3}))?\b");
+static_re!(anime_ep_tag, r"(?i)(?:[ _-]-[ _-]|_)(\d{2,3})(?:v\d)?(?:[ _\-\[\(]|$)");
 static_re!(av1, r"(?i)\bAV1\b");
 // Resolution or HDR made up after the fact: AI upscales and SDR regraded to HDR.
 static_re!(upscaled, r"(?i)(?:\b|_)(?:AI[ ._-]?)?UPSCALE(?:D|S)?(?:\b|_)|\bUPSCL\b|\bAI[ ._-]?(?:ENHANCED|REMASTER(?:ED)?)\b|\bREGRADED?\b|\bSDR[ ._-]?TO[ ._-]?HDR\b|\bFAKE[ ._-]?HDR\b");
@@ -97,6 +151,54 @@ pub(super) fn source_tier(text: &str) -> Option<u8> {
     else if web_dl().is_match(text) { Some(3) } else if low_source().is_match(text) { Some(0) } else { Some(1) }
 }
 pub(super) fn codec_tier(text: &str) -> u8 { if av1().is_match(text) { 3 } else if hevc().is_match(text) { 2 } else if avc().is_match(text) { 1 } else { 0 } }
+
+pub(super) fn effective_codec_tier(s: &Source) -> u8 {
+    match s.video_codec {
+        Some("av1") => 3,
+        Some("hevc") => 2,
+        Some("avc") => 1,
+        _ => codec_tier(&s.label),
+    }
+}
+
+pub(super) fn is_cinema_copy(label: &str) -> bool {
+    let stripped = video_ext_suffix().replace_all(label, "");
+    cinema_copy().is_match(&stripped)
+}
+
+/// True when `s` is a non-feature extra (trailer, featurette, making-of, anime NCOP/NCED)
+/// and the requested title itself doesn't contain that word.
+pub(super) fn is_extra_clip(s: &Source, titles: &[String]) -> bool {
+    extra_clip().is_match(&s.label) && !titles.iter().any(|t| extra_clip().is_match(t))
+}
+
+/// True when a non-pack series stream explicitly names a different episode than `(want_s, want_e)`.
+pub(super) fn wrong_episode(s: &Source, want: (i64, i64)) -> bool {
+    if s.pack { return false; }
+    let hay = if !s.filename.is_empty() { s.filename.as_str() } else { s.description.lines().next().unwrap_or("") };
+    let mut found_any = false;
+    for cap in season_ep_tag().captures_iter(hay) {
+        let Ok(season) = cap[1].parse::<i64>() else { continue };
+        let Ok(ep_start) = cap[2].parse::<i64>() else { continue };
+        let ep_end = cap.get(3).and_then(|m| m.as_str().parse::<i64>().ok()).filter(|&e| e >= ep_start).unwrap_or(ep_start);
+        found_any = true;
+        if season == want.0 && (ep_start..=ep_end).contains(&want.1) { return false; }
+    }
+    if found_any { return true; }
+    // Anime bare episode numbers like `[Group] Show - 06 (1080p).mkv` or `Show_06_[2160p].mp4`.
+    if want.0 == 1 {
+        let stripped = video_ext_suffix().replace_all(hay, "");
+        let mut found_ep = false;
+        for cap in anime_ep_tag().captures_iter(&stripped) {
+            let Ok(ep) = cap[1].parse::<i64>() else { continue };
+            if !(1..=500).contains(&ep) || matches!(ep, 10 | 264 | 265 | 480) { continue; }
+            found_ep = true;
+            if ep == want.1 { return false; }
+        }
+        if found_ep { return true; }
+    }
+    false
+}
 
 /// The size in the add-on's label ("💾 45.3 GB" preferred): text as written, and bytes.
 pub(super) fn labelled_size(text: &str) -> Option<(String, u64)> {
@@ -138,6 +240,10 @@ pub(super) fn source_of(addon: &str, v: &Value) -> Source {
         label,
         off_title: false,
         picture: None,
+        audio_tracks_count: None,
+        video_codec: None,
+        nuked: false,
+        scene_trust: 0,
     }
 }
 
@@ -245,6 +351,7 @@ pub(super) fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option
 /// Dolby-Vision-only files (usually profile 5, wrong colours without a DV decoder) come last;
 /// AI upscales and SDR regraded to HDR after every native file.
 /// Torrents, external links and anything under 1080p never.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn play_order(sources: &[Source], pack_episodes: Option<usize>) -> Vec<Source> {
     let language = stream_language();
     play_order_for(sources, pack_episodes, language.as_deref())
@@ -282,6 +389,7 @@ pub fn track_in_language(code: &str, key: &str) -> bool {
 /// when you chose English). English is mostly untagged, so for English the first two are one.
 /// Within a tier: Real-Debrid sources first, then the free web add-ons' (NoTorrent, Absolute
 /// Cinema); a free web link marked as a trial goes last, as it may stop partway.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn play_order_for(sources: &[Source], pack_episodes: Option<usize>, language: Option<&str>) -> Vec<Source> {
     let lang = language.and_then(crate::addons::language);
     let mut out: Vec<Source> = sources.iter().filter(|s| playable(s)).cloned().collect();
@@ -298,15 +406,84 @@ fn non_video_filename(name: &str) -> bool {
 }
 
 /// What Play may choose: a direct 2D video link, not labelled under 1080p (nor an unlabelled DVD rip
-/// or TV capture), never a cinema copy / screener, and never an archive, disc image, or tiny sample clip.
+/// or TV capture), never a cinema copy / telesync / screener, and never an archive, disc image, or tiny sample clip.
 pub(super) fn playable(s: &Source) -> bool {
     let low = match s.quality { Some(q) => quality_rank(Some(q)) > 2, None => low_source().is_match(&s.label) };
     let bad_file = !s.filename.is_empty() && non_video_filename(&s.filename);
     let tiny_sample = sample_clip().is_match(&s.label) && s.size_bytes.is_some_and(|b| b < 200_000_000);
-    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !cinema_copy().is_match(&s.label) && !bad_file && !tiny_sample
+    s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !is_cinema_copy(&s.label) && !bad_file && !tiny_sample
 }
 
 pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u8, u64, i16, u8, u8)>);
+
+/// Connection bitrate ceiling for autoplay: None means unlimited.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct BandwidthBudget {
+    pub max_encode_mbps: Option<f64>,
+    pub max_remux_mbps: Option<f64>,
+}
+
+impl BandwidthBudget {
+    pub(super) fn unlimited() -> Self { Self { max_encode_mbps: None, max_remux_mbps: None } }
+
+    pub(super) fn from_settings(cap: Option<u32>, measured_mbps: Option<f64>) -> Self {
+        match cap {
+            Some(0) => Self::unlimited(),
+            Some(c) => {
+                let c = f64::from(c);
+                Self { max_encode_mbps: Some(c), max_remux_mbps: Some(c) }
+            }
+            None => match measured_mbps {
+                Some(m) if m > 0.0 => Self {
+                    // Leave 15% network headroom and account for VBR scene peaks (1.45x encodes, 1.65x remux).
+                    max_encode_mbps: Some((m * 0.85 / 1.45).max(4.0)),
+                    max_remux_mbps: Some((m * 0.85 / 1.65).max(4.0)),
+                },
+                _ => Self::unlimited(),
+            },
+        }
+    }
+
+    pub(super) fn current() -> Self {
+        Self::from_settings(max_bitrate_mbps(), connection_mbps())
+    }
+}
+
+/// Estimated or verified average bitrate (Mbps) for a source.
+pub(super) fn estimated_avg_mbps(s: &Source, size: u64, expected_seconds: Option<f64>) -> Option<f64> {
+    if size == 0 { return None; }
+    let episode = s.pack || episode_mark().is_match(&s.label);
+    let secs = s.picture.and_then(|p| p.seconds)
+        .or(expected_seconds)
+        .unwrap_or(if episode { 2700.0 } else { 6600.0 });
+    (secs > 0.0).then(|| size as f64 * 8.0 / secs / 1e6)
+}
+
+/// True when the source's average bitrate exceeds the current connection/manual budget.
+pub(super) fn exceeds_budget(s: &Source, size: u64, expected_seconds: Option<f64>, budget: BandwidthBudget) -> bool {
+    let cap = if source_tier(&s.label) == Some(4) { budget.max_remux_mbps } else { budget.max_encode_mbps };
+    let Some(cap) = cap else { return false };
+    estimated_avg_mbps(s, size, expected_seconds).is_some_and(|mbps| mbps > cap)
+}
+
+/// Codec- and multi-dub-adjusted size used to compare visual quality fairly within a resolution tier.
+/// Remuxes keep a lossless-source weight; bloated multi-dub encodes discount extra audio tracks;
+/// HEVC and AV1 encodes get a modest efficiency boost over H.264.
+pub(super) fn effective_size(s: &Source, size: u64) -> u64 {
+    if size == 0 { return 0; }
+    if source_tier(&s.label) == Some(4) {
+        return size.saturating_mul(115) / 100;
+    }
+    let extra_tracks = s.audio_tracks_count.unwrap_or(1).saturating_sub(1) as u64;
+    let audio_bloat = (extra_tracks * 350_000_000).min(size / 2);
+    let video_bytes = size.saturating_sub(audio_bloat);
+    let factor = match effective_codec_tier(s) {
+        3 => 115, // AV1
+        2 => 110, // HEVC
+        _ => 100, // AVC / unknown
+    };
+    video_bytes.saturating_mul(factor) / 100
+}
 
 /// The HDR scale Play ranks a file by: its header's where Play's check read one that says,
 /// else its label's. HDR10+ lives in the frames, so a label's HDR10+ stands over a header's HDR.
@@ -366,7 +543,95 @@ pub(super) fn order_key_for(s: &Source, size: u64, lang: Option<&crate::addons::
     let hdr_rank = match hdr { 1 if dolby_vision_screen => 2, 1 => 0, 0 => 1, t => t };
     // An upscale or regrade goes after every native file: its 4K and HDR are made up, its size padding.
     (s.off_title, tier, provider, dv_penalty, upscaled().is_match(&s.label), s.quality.is_none(), std::cmp::Reverse((is_hdr,
-        picture_class(s, size), size, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, codec_tier(&s.label))))
+        picture_class(s, size), effective_size(s, size), source_tier(&s.label).map_or(-1, i16::from), hdr_rank, effective_codec_tier(s))))
+}
+
+/// Unified quality tie-breaker: sources that fit the connection rank highest-quality first;
+/// if every source exceeds the connection budget, lowest-bitrate goes first (bucketed in 5 Mbps
+/// bands so a 1 Mbps difference never beats primary-language audio) so playback won't stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum QualityOrder {
+    Fit(std::cmp::Reverse<(bool, u8, u64)>, bool, bool, std::cmp::Reverse<(u64, i16, u8, u8)>),
+    OverBudget(u64, bool, u64, std::cmp::Reverse<u8>),
+}
+
+/// One unified total order used for pre-probe optimism, wave early-stop, and final post-probe
+/// selection. `off_title`, connection fit, and PreDB nuke status can never be overridden by size.
+pub(super) type UnifiedKey = (bool, bool, bool, u8, u8, bool, bool, bool, QualityOrder);
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn unified_key(
+    s: &Source,
+    size: u64,
+    audio: AudioVerdict,
+    has_original_lang: bool,
+    lang: Option<&crate::addons::Language>,
+    expected_seconds: Option<f64>,
+    budget: BandwidthBudget,
+    dolby_vision_screen: bool,
+    remux_group_size: Option<u64>,
+) -> UnifiedKey {
+    let over = exceeds_budget(s, size, expected_seconds, budget);
+    let lang_tier = match (lang, audio) {
+        (None, _) => 0,
+        (Some(_), Some((true, _))) => 0,
+        (Some(l), None) => {
+            if l.matches(&s.label) {
+                0
+            } else if other_language_only(&s.label, l.key) {
+                2
+            } else if l.key == "english" {
+                // Untagged English releases (e.g. YTS 4K) stay tier 0 alongside tagged English.
+                0
+            } else {
+                1
+            }
+        }
+        (Some(_), Some((false, _))) => {
+            if has_original_lang { 2 } else { 3 }
+        }
+    };
+    let provider = if !crate::addons::is_free_addon(&s.addon) { 0 } else if s.label.to_uppercase().contains("FREE TRIAL") { 2 } else { 1 };
+    let hdr = verified_hdr_tier(s);
+    let dv_penalty = hdr == 1 && !dolby_vision_screen;
+    let is_hdr = hdr >= 2 || (hdr == 1 && dolby_vision_screen);
+    let hdr_rank = match hdr { 1 if dolby_vision_screen => 2, 1 => 0, 0 => 1, t => t };
+    let eff = effective_size(s, size);
+    let suspicious = s.scene_trust < 0;
+    let verified_bonus = s.scene_trust > 0;
+    let quality = if over {
+        let mbps_bucket = estimated_avg_mbps(s, size, expected_seconds).map_or(u64::MAX, |m| (m / 5.0).floor() as u64);
+        let not_primary_remux = remux_group_size.is_some() && !matches!(audio, Some((true, true)));
+        QualityOrder::OverBudget(mbps_bucket, not_primary_remux, size, std::cmp::Reverse(effective_codec_tier(s)))
+    } else {
+        // Group near-identical encodes (within 50 MB) so a verified MKV (audio + picture read)
+        // or verified srrDB scene release wins cleanly over an unverified twin of virtually identical size.
+        let group_size = remux_group_size.unwrap_or_else(|| if eff >= 50_000_000 { (eff / 50_000_000) * 50_000_000 } else { eff });
+        let not_primary_remux = remux_group_size.is_some() && !matches!(audio, Some((true, true)));
+        let unverified = (s.picture.is_none() && audio.is_none()) || !verified_bonus && s.picture.is_none();
+        QualityOrder::Fit(
+            std::cmp::Reverse((is_hdr, picture_class(s, size), group_size)),
+            not_primary_remux,
+            unverified,
+            std::cmp::Reverse((eff, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, effective_codec_tier(s))),
+        )
+    };
+    (s.off_title, over, s.nuked, lang_tier, provider, dv_penalty, upscaled().is_match(&s.label) || suspicious, s.quality.is_none(), quality)
+}
+
+/// Optimistic lower-bound key for an unprobed source (assuming its audio turns out to match your
+/// language, while respecting its declared size, resolution, HDR, and connection budget).
+pub(super) fn optimistic_key(
+    s: &Source,
+    size: u64,
+    lang: Option<&crate::addons::Language>,
+    expected_seconds: Option<f64>,
+    budget: BandwidthBudget,
+) -> UnifiedKey {
+    let optimistic_audio = lang.and_then(|l| {
+        if other_language_only(&s.label, l.key) { None } else { Some((true, true)) }
+    });
+    unified_key(s, size, optimistic_audio, false, lang, expected_seconds, budget, screen_supports_dv(), None)
 }
 
 /// The source's label names the Audio-language setting's language (flag, name or release tag).
@@ -386,57 +651,151 @@ pub(super) fn other_language_only(label: &str, key: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct Pick { pub best: Option<Source>, pub rest: Vec<Source>, pub debrid: Option<String>, pub audio_known: bool }
 
-/// Probe this many different files at once (the first round), then smaller rounds while an
-/// unprobed one could still beat the best that works: at most `PROBE_MAX` files and about
-/// `PROBE_BUDGET` in all.
-pub(super) const PROBE_FIRST: usize = 12;
-pub(super) const PROBE_NEXT: usize = 6;
-pub(super) const PROBE_MAX: usize = 20;
-pub(super) const PROBE_BUDGET: Duration = Duration::from_millis(2500);
-/// One probe's limit, and how long the others in a round get once one source is known to work.
-pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-pub(super) const PROBE_GRACE: Duration = Duration::from_millis(1200);
+/// Wave probing limits: smaller waves prevent debrid 429 bursts while mirror failover inside each
+/// wave task recovers broken/uncached links without waiting for a second wave.
+pub(super) const PROBE_FIRST: usize = 6;
+pub(super) const PROBE_NEXT: usize = 4;
+pub(super) const PROBE_MAX: usize = 16;
+pub(super) const PROBE_BUDGET: Duration = Duration::from_millis(3000);
+/// Hard wall-clock ceiling when every candidate is failing/rate-limited so Play never hangs.
+pub(super) const PROBE_EMPTY_BUDGET: Duration = Duration::from_secs(7);
+/// One probe's limit, and tier-aware grace windows once a working source is found.
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(7);
+pub(super) const PROBE_GRACE_HIGH: Duration = Duration::from_millis(2000);
+pub(super) const PROBE_GRACE_SAME: Duration = Duration::from_millis(700);
+/// Maximum mirrors tried sequentially inside a single wave task when mirror #1 fails.
+pub(super) const MAX_MIRRORS_PER_GROUP: usize = 3;
+/// Cap for the one-time cold-start CDN throughput burst on the already-open header response.
+pub(super) const SPEED_BURST_BYTES: usize = 1536 * 1024;
+pub(super) const SPEED_BURST_MAX_TIME: Duration = Duration::from_millis(220);
 
-/// Play's automatic choice for one video: every add-on's sources (not waiting for one that is
-/// slow or down), the Play order, then the probe. `title` (and a film's `year`) puts releases
-/// of other titles last.
+/// Play's automatic choice for one video (simple signature kept for compatibility).
 pub async fn autoplay(kind: &str, video_id: &str, pack_episodes: Option<usize>, title: &str, year: Option<i32>) -> Pick {
+    autoplay_for(kind, video_id, AutoplayContext::simple(title, year, pack_episodes)).await
+}
+
+/// Play's automatic choice with full metadata context (localized titles, runtime, original
+/// language, per-title audio preference, episode validation, PreDB/srrDB release intelligence,
+/// and connection-aware bitrate fitting).
+pub async fn autoplay_for(kind: &str, video_id: &str, mut ctx: AutoplayContext) -> Pick {
     let started = std::time::Instant::now();
     dev_log("autoplay: start");
-    // While slower add-ons answer, the first ones' best files are checked already (the checks are
-    // kept by link, so the final round reuses or joins them).
+    // While slower add-ons answer, gently pre-warm only the top 3 exact-title files (never a
+    // full burst) so their probes are already cached when the final list arrives.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Source>>();
-    let (early_title, early_kind) = (title.to_owned(), kind.to_owned());
+    let early_ctx = ctx.clone();
     let early = async move {
+        let mut warmed: HashSet<String> = HashSet::new();
         while let Some(mut batch) = rx.recv().await {
-            for s in &mut batch { s.off_title = !names_title(s, &early_title, year); }
-            let order = play_order(&batch, pack_episodes);
-            dev_log(&format!("autoplay: early round on {} {} sources", order.len(), early_kind));
-            if !order.is_empty() { let _ = pick_source(order, pack_episodes).await; }
+            classify_sources(&mut batch, &early_ctx);
+            let order = play_order_with_ctx(&batch, &early_ctx);
+            let top: Vec<Source> = order.into_iter()
+                .filter(|s| !s.off_title && !s.nuked && warmed.insert(s.url.clone()))
+                .take(3)
+                .collect();
+            if !top.is_empty() {
+                dev_log(&format!("autoplay: pre-warming {} top sources", top.len()));
+                let mut set = tokio::task::JoinSet::new();
+                for s in top { set.spawn(async move { let _ = probe_one(s, false).await; }); }
+                while set.join_next().await.is_some() {}
+            }
         }
     };
-    let fetch = play_sources(kind, video_id, Some(tx));
+    // Run free srrDB/PreDB lookup in parallel with add-on fetching (capped at 700 ms so it adds
+    // 0 ms to Play when add-ons answer faster).
+    let need_intel = ctx.intel.is_none() && kind == "movie" && video_id.starts_with("tt");
+    let title_hint = ctx.titles.first().cloned();
+    let intel_fut = async {
+        if !need_intel { return None; }
+        tokio::time::timeout(Duration::from_millis(700), release_intel(video_id, title_hint.as_deref())).await.ok().flatten()
+    };
+    let fetch = async {
+        let p = play_sources(kind, video_id, Some(tx));
+        tokio::join!(p, intel_fut)
+    };
     tokio::pin!(fetch, early);
-    let mut list = tokio::select! { biased; list = &mut fetch => list, _ = &mut early => fetch.await };
-    for s in &mut list { s.off_title = !names_title(s, title, year); }
-    let order = play_order(&list, pack_episodes);
+    let (mut list, fetched_intel) = tokio::select! { biased; res = &mut fetch => res, _ = &mut early => fetch.await };
+    if ctx.intel.is_none() {
+        if let Some(intel) = fetched_intel {
+            for t in &intel.localized_titles {
+                if !ctx.titles.iter().any(|x| x.eq_ignore_ascii_case(t)) { ctx.titles.push(t.clone()); }
+            }
+            ctx.intel = Some(intel);
+        }
+    }
+    classify_sources(&mut list, &ctx);
+    let order = play_order_with_ctx(&list, &ctx);
     let listed = started.elapsed().as_millis();
-    // Direct links exist but none is 1080p or better: Play won't choose them, and says so.
+    // Direct links exist but none is 1080p or better (or all were cinema copies / extras).
     if order.is_empty() && list.iter().any(|s| s.kind == SourceKind::Direct && !is_3d(&s.label)) {
         dev_log(&format!("autoplay: {} sources, none 1080p or better", list.len()));
         return Pick { debrid: Some(BELOW_1080P.into()), ..Default::default() };
     }
-    let pick = pick_source(order.clone(), pack_episodes).await;
+    let (exact, off_title): (Vec<Source>, Vec<Source>) = if ctx.strict_title && !ctx.titles.is_empty() {
+        order.into_iter().partition(|s| !s.off_title)
+    } else {
+        (order, Vec::new())
+    };
+    if exact.is_empty() && !off_title.is_empty() {
+        dev_log(&format!("autoplay: {} sources, none matched title (refusing {} off-title)", list.len(), off_title.len()));
+        return Pick { best: None, rest: off_title, debrid: Some(NO_MATCHING_TITLE.into()), audio_known: false };
+    }
+    let mut pick = pick_source_with(exact.clone(), &ctx).await;
+    // Keep off-title candidates out of automatic playback, never silently starting the wrong movie.
     let total_ms = started.elapsed().as_millis();
-    dev_log(&format!("autoplay: {} sources, {} playable in {listed} ms; chose {} after {total_ms} ms",
-        list.len(), order.len(), pick.best.as_ref().map(source_summary).unwrap_or_else(|| "nothing".into())));
+    let speed_note = connection_mbps().map(|m| format!(" @{m:.0}Mb/s")).unwrap_or_default();
+    dev_log(&format!("autoplay: {} sources, {} matched in {listed} ms{speed_note}; chose {} after {total_ms} ms",
+        list.len(), exact.len(), pick.best.as_ref().map(source_summary).unwrap_or_else(|| "nothing".into())));
     if total_ms >= 8000 {
         report_issue_bg("performance",
             format!("Slow autoplay resolution ({total_ms} ms)"),
             format!("kind={kind} sources={} playable={} list_ms={listed} total_ms={total_ms} picked={}",
-                list.len(), order.len(), pick.best.is_some()));
+                list.len(), exact.len(), pick.best.is_some()));
+    }
+    if pick.best.is_some() {
+        pick.rest.extend(off_title);
     }
     pick
+}
+
+/// Apply title matching, episode matching, extra-clip filtering, and PreDB/srrDB intel in place.
+pub(super) fn classify_sources(list: &mut Vec<Source>, ctx: &AutoplayContext) {
+    if !ctx.titles.is_empty() {
+        list.retain(|s| !is_extra_clip(s, &ctx.titles));
+    }
+    for s in list.iter_mut() {
+        let title_ok = ctx.titles.is_empty() || names_title_any(s, &ctx.titles, ctx.year);
+        let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
+        s.off_title = !(title_ok && ep_ok);
+        if let Some(intel) = &ctx.intel {
+            s.nuked = is_nuked_source(intel, s);
+            s.scene_trust = match verified_scene_check(intel, s) {
+                Some(true) => 1,
+                Some(false) => -1,
+                None => 0,
+            };
+        }
+    }
+}
+
+/// Classify and rank sources for the `--sources` developer CLI using the exact same rules as autoplay.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+pub fn play_order_for_cli(list: &mut Vec<Source>, ctx: &AutoplayContext) -> Vec<Source> {
+    classify_sources(list, ctx);
+    play_order_with_ctx(list, ctx)
+}
+
+/// Pre-probe ranking using the unified ranker and current connection budget.
+pub(super) fn play_order_with_ctx(sources: &[Source], ctx: &AutoplayContext) -> Vec<Source> {
+    let lang = ctx.preferred_language.as_deref().and_then(crate::addons::language);
+    let budget = BandwidthBudget::current();
+    let dv_screen = screen_supports_dv();
+    let mut out: Vec<Source> = sources.iter().filter(|s| playable(s)).cloned().collect();
+    out.sort_by_cached_key(|s| {
+        let sz = episode_size(s, ctx.pack_episodes).unwrap_or(0);
+        unified_key(s, sz, None, false, lang, ctx.expected_seconds, budget, dv_screen, None)
+    });
+    out
 }
 
 /// Play's source lists, fetched ahead (`prefetch_sources`) or by Play itself, kept for a while:
@@ -506,83 +865,182 @@ pub(crate) fn dev_log(message: &str) {
     eprintln!("{message}");
 }
 
-/// The best candidates are probed together (the relay's one-byte check), one link per file, and
-/// the ones that answer are ranked again by the size their server reports: add-ons often declare
-/// a whole pack's or collection's size as the file's. A round stops waiting once no pending
-/// candidate could outrank a working one, or `PROBE_GRACE` after the first works; another round
-/// runs while the best unprobed candidate (by its declared size) could still win. Debrid status
-/// clips report why nothing worked.
-pub async fn pick_source(candidates: Vec<Source>, pack_episodes: Option<usize>) -> Pick {
-    let size = |s: &Source| episode_size(s, pack_episodes).unwrap_or(0);
-    let lang = stream_language().and_then(|l| crate::addons::language(&l));
-    let started = std::time::Instant::now();
-    // The same file from several scrapers: probe one of its links.
-    let file = |s: &Source| if s.filename.is_empty() { s.url.clone() } else { format!("{}|{:?}", s.filename.to_lowercase(), s.size_bytes) };
-    let mut probed_files: HashSet<String> = HashSet::new();
-    let mut probed_urls: HashSet<String> = HashSet::new();
-    let mut working: Vec<Source> = Vec::new();
-    let mut verdicts: Vec<AudioVerdict> = Vec::new();
-    let mut debrid = None;
-    let mut cursor = 0;
-    loop {
-        let take = if probed_files.is_empty() { PROBE_FIRST } else { PROBE_NEXT }.min(PROBE_MAX - probed_files.len());
-        let mut batch = Vec::new();
-        while cursor < candidates.len() && batch.len() < take {
-            let c = &candidates[cursor];
-            cursor += 1;
-            if probed_files.insert(file(c)) { probed_urls.insert(c.url.clone()); batch.push(c.clone()); }
+/// Mirrors of the same underlying release (same normalized stem + similar size) grouped together
+/// so when mirror #1 fails (e.g. uncached debrid clip), autoplay immediately fails over to mirror #2.
+#[derive(Clone, Debug)]
+pub(super) struct ReleaseGroup {
+    pub mirrors: Vec<Source>,
+}
+
+fn normalized_release_stem(s: &Source) -> String {
+    let raw = if !s.filename.is_empty() {
+        s.filename.rsplit(['/', '\\']).next().unwrap_or(&s.filename)
+    } else {
+        s.description.lines().next().unwrap_or("")
+    };
+    let stripped = video_ext_suffix().replace_all(raw, "");
+    stripped.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+fn similar_size(a: Option<u64>, b: Option<u64>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) if x > 0 && y > 0 => {
+            let (lo, hi) = (x.min(y) as f64, x.max(y) as f64);
+            (hi - lo) / hi <= 0.08
         }
-        if batch.is_empty() { break; }
-        // Later rounds only run while something works: each gets `PROBE_GRACE`, within the budget.
-        let cap = (!working.is_empty()).then(|| tokio::time::Instant::from_std((started + PROBE_BUDGET).min(std::time::Instant::now() + PROBE_GRACE)));
-        let (found, status) = probe_batch(batch, lang, cap, pack_episodes).await;
+        _ => true,
+    }
+}
+
+pub(super) fn group_releases(candidates: &[Source], pack_episodes: Option<usize>) -> Vec<ReleaseGroup> {
+    let mut groups: Vec<(String, Option<u64>, ReleaseGroup)> = Vec::new();
+    let mut seen_urls: HashSet<&str> = HashSet::new();
+    for c in candidates {
+        if !seen_urls.insert(c.url.as_str()) { continue; }
+        let stem = normalized_release_stem(c);
+        let ep_sz = episode_size(c, pack_episodes);
+        if !stem.is_empty() {
+            if let Some((_, _, g)) = groups.iter_mut().find(|(st, sz, _)| *st == stem && (similar_size(*sz, ep_sz) || similar_size(*sz, c.size_bytes))) {
+                g.mirrors.push(c.clone());
+                continue;
+            }
+        }
+        groups.push((stem, ep_sz.or(c.size_bytes), ReleaseGroup { mirrors: vec![c.clone()] }));
+    }
+    groups.into_iter().map(|(_, _, g)| g).collect()
+}
+
+/// Simple wrapper kept for callers/tests without full metadata context.
+pub async fn pick_source(candidates: Vec<Source>, pack_episodes: Option<usize>) -> Pick {
+    let ctx = AutoplayContext { pack_episodes, preferred_language: stream_language(), ..AutoplayContext::default() };
+    pick_source_with(candidates, &ctx).await
+}
+
+/// Verified working source ready for unified final ranking.
+#[derive(Clone, Debug)]
+pub(super) struct VerifiedSource {
+    pub source: Source,
+    pub audio: AudioVerdict,
+    pub has_original_lang: bool,
+}
+
+/// Wave-probing source picker with in-wave mirror failover, live CDN bandwidth measurement,
+/// MP4 tail-moov parsing, duration sanity checks, and unified post-probe ranking.
+pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) -> Pick {
+    let lang = ctx.preferred_language.as_deref().and_then(crate::addons::language);
+    let orig_lang = ctx.original_language.as_deref();
+    let started = std::time::Instant::now();
+    let groups = group_releases(&candidates, ctx.pack_episodes);
+    let mut probed_urls: HashSet<String> = HashSet::new();
+    let mut working: Vec<VerifiedSource> = Vec::new();
+    let mut debrid = None;
+    let mut cursor = 0usize;
+    let mut probed_groups = 0usize;
+    // Allow at most ONE cold-start speed burst per autoplay when Auto bandwidth has no fresh sample.
+    let speed_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        max_bitrate_mbps().is_none() && connection_mbps().is_none(),
+    ));
+    loop {
+        let take = if probed_groups == 0 { PROBE_FIRST } else { PROBE_NEXT }.min(PROBE_MAX.saturating_sub(probed_groups));
+        if take == 0 || cursor >= groups.len() { break; }
+        let end = (cursor + take).min(groups.len());
+        let wave: Vec<ReleaseGroup> = groups[cursor..end].to_vec();
+        cursor = end;
+        probed_groups += wave.len();
+        for g in &wave {
+            for m in g.mirrors.iter().take(MAX_MIRRORS_PER_GROUP) { probed_urls.insert(m.url.clone()); }
+        }
+        let cap = if !working.is_empty() {
+            Some(tokio::time::Instant::from_std((started + PROBE_BUDGET).min(std::time::Instant::now() + PROBE_GRACE_HIGH)))
+        } else {
+            Some(tokio::time::Instant::from_std(started + PROBE_EMPTY_BUDGET))
+        };
+        let (found, status) = probe_wave(wave, lang, orig_lang, ctx, cap, speed_token.clone()).await;
         if status.is_some() { debrid = status; }
-        for (src, verdict) in found { working.push(src); verdicts.push(verdict); }
-        let Some(best) = working.iter().map(|s| order_key(s, size(s), lang)).min() else { continue };
-        // Candidates are in Play order by their declared sizes, which are at least the real ones;
-        // a round is worth it only for a file at least a tenth bigger, or of a better kind.
-        let next = candidates[cursor..].iter().find(|c| !probed_files.contains(&file(c)));
-        let could_win = next.is_some_and(|c| order_key(c, size(c) / 10 * 9, lang) < best)
-            || (started.elapsed() < PROBE_GRACE && rivals_wanted(&working, lang, pack_episodes).is_some_and(|class| candidates[cursor..].iter().take(PROBE_NEXT * 2).any(|c| remux_class(c) == Some(class))));
-        if !could_win || probed_files.len() >= PROBE_MAX || started.elapsed() >= PROBE_BUDGET { break; }
+        working.extend(found);
+        if working.is_empty() {
+            if started.elapsed() >= PROBE_EMPTY_BUDGET { break; }
+            continue;
+        }
+        let budget = BandwidthBudget::current();
+        let dv_screen = screen_supports_dv();
+        let best_key = working.iter()
+            .map(|w| unified_key(&w.source, episode_size(&w.source, ctx.pack_episodes).unwrap_or(0), w.audio, w.has_original_lang, lang, ctx.expected_seconds, budget, dv_screen, None))
+            .min()
+            .expect("non-empty");
+        // Stop immediately if no remaining unprobed group can optimistically beat our best working
+        // file (and no remux rival is still wanted).
+        let remaining_best = groups.get(cursor).and_then(|g| g.mirrors.first());
+        let could_win = remaining_best.is_some_and(|c| {
+            let sz = episode_size(c, ctx.pack_episodes).unwrap_or(0);
+            optimistic_key(c, sz / 10 * 9, lang, ctx.expected_seconds, budget) < best_key
+        }) || (started.elapsed() < PROBE_GRACE_HIGH
+            && rivals_wanted_verified(&working, lang, ctx.pack_episodes).is_some_and(|class| {
+                groups[cursor..].iter().take(PROBE_NEXT * 2)
+                    .any(|g| g.mirrors.first().is_some_and(|c| remux_class(c) == Some(class)))
+            }));
+        if !could_win || probed_groups >= PROBE_MAX || started.elapsed() >= PROBE_BUDGET { break; }
     }
     if working.is_empty() { return Pick { best: None, rest: Vec::new(), debrid, audio_known: false }; }
-    let mut paired: Vec<(Source, AudioVerdict)> = working.into_iter().zip(verdicts).collect();
-    paired.sort_by_cached_key(|(s, _)| order_key(s, size(s), lang));
-    dev_log(&format!("checked {} working files in {} ms, audio: {}; pictures: {}", paired.len(), started.elapsed().as_millis(),
-        paired.iter().map(|(_, v)| match v { Some((true, true)) => "main", Some((true, false)) => "yes", Some((false, _)) => "no", None => "?" }).collect::<Vec<_>>().join(" "),
-        paired.iter().map(|(s, _)| picture_summary(s)).collect::<Vec<_>>().join(" | ")));
-    // The files' own audio tracks: one in your language first, then those that can't tell, then
-    // the rest, each in the Play order.
-    let (working, verdicts): (Vec<Source>, Vec<AudioVerdict>) = paired.into_iter().unzip();
-    let ranked = rank_by_audio(working, verdicts);
-    let audio_known = ranked[0].0.is_some();
-    let mut working: Vec<Source> = ranked.into_iter().map(|(_, s)| s).collect();
-    let mut rest = working.split_off(1);
+    let budget = BandwidthBudget::current();
+    let ranked = rank_verified(working, lang, ctx.pack_episodes, ctx.expected_seconds, budget, screen_supports_dv());
+    dev_log(&format!("checked {} working files in {} ms, audio: {}; pictures: {}", ranked.len(), started.elapsed().as_millis(),
+        ranked.iter().map(|w| match w.audio { Some((true, true)) => "main", Some((true, false)) => "yes", Some((false, _)) => "no", None => "?" }).collect::<Vec<_>>().join(" "),
+        ranked.iter().map(|w| picture_summary(&w.source)).collect::<Vec<_>>().join(" | ")));
+    let audio_known = ranked[0].audio.is_some();
+    let mut ordered: Vec<Source> = ranked.into_iter().map(|w| w.source).collect();
+    let mut rest = ordered.split_off(1);
     rest.extend(candidates.into_iter().filter(|c| !probed_urls.contains(&c.url)));
-    Pick { best: working.pop(), rest, debrid: None, audio_known }
+    Pick { best: ordered.pop(), rest, debrid: None, audio_known }
 }
 
 /// What a file's tracks say about the Audio-language setting: (it has that language, its main
 /// track is in it); None when unread or unclear.
 pub(super) type AudioVerdict = Option<(bool, bool)>;
 
-/// Working sources (in the Play order) ranked again by their own audio: files with your language,
-/// then those that can't tell, then the rest. Among remuxes of the same resolution and HDR (the
-/// same picture: their sizes differ by the dubs they carry) the one whose main track is in your
-/// language, the original release, goes first.
-pub(super) fn rank_by_audio(working: Vec<Source>, verdicts: Vec<AudioVerdict>) -> Vec<(AudioVerdict, Source)> {
-    let mut groups: Vec<usize> = Vec::new();
-    for (i, s) in working.iter().enumerate() {
-        let same = remux_class(s).and_then(|c| working[..i].iter().position(|o| remux_class(o) == Some(c)));
-        groups.push(same.unwrap_or(i));
+/// Single unified post-probe ranker: preserves `off_title`, connection `BandwidthBudget`,
+/// verified audio language (keeping untagged English in tier 0, with original-language fallback),
+/// verified HDR/resolution/bitrate, and remux primary-language tiebreaking.
+pub(super) fn rank_verified(
+    mut working: Vec<VerifiedSource>,
+    lang: Option<&crate::addons::Language>,
+    pack_episodes: Option<usize>,
+    expected_seconds: Option<f64>,
+    budget: BandwidthBudget,
+    dolby_vision_screen: bool,
+) -> Vec<VerifiedSource> {
+    // Compute max effective size per same-class remux group (among fitting sources with same
+    // off_title & language tier) so an original-language remux beats a larger multi-dub remux.
+    let mut remux_max: HashMap<(bool, bool, RemuxClass), u64> = HashMap::new();
+    for w in &working {
+        if let Some(class) = remux_class(&w.source) {
+            let sz = episode_size(&w.source, pack_episodes).unwrap_or(0);
+            let over = exceeds_budget(&w.source, sz, expected_seconds, budget);
+            let eff = effective_size(&w.source, sz);
+            let entry = remux_max.entry((w.source.off_title, over, class)).or_insert(0);
+            if eff > *entry { *entry = eff; }
+        }
     }
-    let mut ranked: Vec<(usize, AudioVerdict, Source)> = groups.into_iter().zip(verdicts).zip(working).map(|((g, v), s)| (g, v, s)).collect();
-    ranked.sort_by_key(|(group, v, _)| {
-        let tier = match v { Some((true, _)) => 0, None => 1, Some((false, _)) => 2 };
-        (tier, *group, !matches!(v, Some((_, true))))
+    working.sort_by_cached_key(|w| {
+        let sz = episode_size(&w.source, pack_episodes).unwrap_or(0);
+        let over = exceeds_budget(&w.source, sz, expected_seconds, budget);
+        let group_sz = remux_class(&w.source).and_then(|c| remux_max.get(&(w.source.off_title, over, c)).copied());
+        unified_key(&w.source, sz, w.audio, w.has_original_lang, lang, expected_seconds, budget, dolby_vision_screen, group_sz)
     });
-    ranked.into_iter().map(|(_, v, s)| (v, s)).collect()
+    working
+}
+
+/// Backwards-compatible wrapper used by existing unit tests.
+#[cfg(test)]
+pub(super) fn rank_by_audio(working: Vec<Source>, verdicts: Vec<AudioVerdict>) -> Vec<(AudioVerdict, Source)> {
+    let items: Vec<VerifiedSource> = working.into_iter().zip(verdicts)
+        .map(|(source, audio)| VerifiedSource { source, audio, has_original_lang: false })
+        .collect();
+    let lang = crate::addons::language("english");
+    rank_verified(items, lang, None, None, BandwidthBudget::unlimited(), false)
+        .into_iter()
+        .map(|w| (w.audio, w.source))
+        .collect()
 }
 
 /// A remux's picture class (resolution, HDR, Dolby Vision only, upscaled): remuxes of one class
@@ -603,37 +1061,56 @@ pub(super) fn rivals_wanted(working: &[Source], lang: Option<&crate::addons::Lan
     (working.iter().filter(|s| remux_class(s) == Some(class)).count() < REMUX_RIVALS).then_some(class)
 }
 
+fn rivals_wanted_verified(working: &[VerifiedSource], lang: Option<&crate::addons::Language>, pack_episodes: Option<usize>) -> Option<RemuxClass> {
+    let sources: Vec<Source> = working.iter().map(|w| w.source.clone()).collect();
+    rivals_wanted(&sources, lang, pack_episodes)
+}
+
 /// How long a working file's header may take to read.
-pub(super) const AUDIO_TIMEOUT: Duration = Duration::from_millis(1500);
+pub(super) const AUDIO_TIMEOUT: Duration = Duration::from_millis(1400);
 
-/// What checking one link found: it works (and its real size, debrid status clip, audio tracks
-/// and the link its redirects end at).
+/// What checking one link found: it works (and its real size, debrid status clip, audio tracks,
+/// picture, video codec, and final resolved CDN URL).
 #[derive(Clone, Debug)]
-pub(super) struct ProbeOutcome { ok: bool, status: u64, bytes: Option<u64>, debrid: Option<String>, tracks: Option<Vec<crate::tracks::AudioTrack>>,
-    picture: Option<crate::tracks::Picture>, resolved: Option<String> }
+pub(super) struct ProbeOutcome {
+    ok: bool,
+    status: u64,
+    bytes: Option<u64>,
+    debrid: Option<String>,
+    tracks: Option<Vec<crate::tracks::AudioTrack>>,
+    picture: Option<crate::tracks::Picture>,
+    video_codec: Option<&'static str>,
+    resolved: Option<String>,
+}
 
-/// Checks by link, for a while: a check under way is joined, not repeated (Play's early round
-/// on the first add-on's sources, the final one, "Another source"). Only links that work are
-/// kept: a status clip (often a passing refusal: a burst of requests, the debrid service busy),
-/// a timeout or a network error is tried again next time.
+/// Checks by link, for a while: working links stay cached for 5 min; hard failures (debrid status
+/// clips, 404/410, non-video files) stay cached for 45 s so waves never re-hit dead clips;
+/// transient timeouts and 429s stay retryable.
 pub(super) type Probed = std::sync::Arc<tokio::sync::OnceCell<ProbeOutcome>>;
 pub(super) static PROBED: OnceLock<Mutex<HashMap<String, (std::time::Instant, Probed)>>> = OnceLock::new();
 pub(super) const PROBED_TTL: Duration = Duration::from_secs(5 * 60);
-/// Checks under way at once for one add-on's links.
-pub(super) const PROBES_PER_ADDON: usize = 12;
+pub(super) const NEG_PROBED_TTL: Duration = Duration::from_secs(45);
+/// Checks under way at once for one add-on's links (bounded to prevent debrid 429 storms).
+pub(super) const PROBES_PER_ADDON: usize = 6;
 /// The pause before checking a link again that answered "too many requests".
-pub(super) const RETRY_AFTER_429: Duration = Duration::from_millis(1200);
+pub(super) const RETRY_AFTER_429: Duration = Duration::from_millis(600);
 pub(super) static PROBE_GATES: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
 
-/// The relay's one-byte check of a link, then (when it works) its header for the audio tracks.
-pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
+/// The relay's one-byte check of a link, then (when it works) its header for audio tracks,
+/// picture, video codec, and optional zero-extra-request CDN speed burst.
+pub(super) async fn probe_one(src: Source, allow_speed_burst: bool) -> Option<ProbeOutcome> {
     let cell = {
         let mut map = PROBED.get_or_init(Default::default).lock().ok()?;
-        map.retain(|_, (at, _)| at.elapsed() < PROBED_TTL);
+        map.retain(|_, (at, cell)| {
+            let ttl = match cell.get() {
+                Some(o) if !o.ok => NEG_PROBED_TTL,
+                _ => PROBED_TTL,
+            };
+            at.elapsed() < ttl
+        });
         map.entry(src.url.clone()).or_insert_with(|| (std::time::Instant::now(), Probed::default())).1.clone()
     };
     match cell.get_or_try_init(|| async move {
-        // A few at a time per add-on: a burst of resolves is what debrid services refuse.
         let gate = {
             let mut gates = PROBE_GATES.get_or_init(Default::default).lock().map_err(|_| None)?;
             gates.entry(src.addon.clone()).or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(PROBES_PER_ADDON))).clone()
@@ -642,23 +1119,25 @@ pub(super) async fn probe_one(src: Source) -> Option<ProbeOutcome> {
         let headers = Value::Object(src.headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
         let check = || tokio::time::timeout(PROBE_TIMEOUT, backend().proxy.probe(&src.url, &headers, false));
         let mut probe = check().await.map_err(|_| None)?.map_err(|_| None)?;
-        // "Too many requests": once more after a pause, as such a refusal passes.
         if probe["status"] == 429 {
             tokio::time::sleep(RETRY_AFTER_429).await;
             probe = check().await.map_err(|_| None)?.map_err(|_| None)?;
         }
         let ok = probe["ok"] == true;
+        let status = probe["status"].as_u64().unwrap_or(0);
+        let bytes = probe["bytes"].as_u64();
+        let debrid = probe["debrid_status"].as_str().map(str::to_owned);
         let playlist = probe["playlist"] == true;
         let probe_resolved = probe["resolved_url"].as_str().filter(|u| u.starts_with("https://")).map(str::to_owned);
-        let (tracks, picture, header_resolved) = if ok && !playlist {
-            tokio::time::timeout(AUDIO_TIMEOUT, file_header(src, probe_resolved.clone())).await.unwrap_or_default()
+        let (tracks, picture, video_codec, header_resolved) = if ok && !playlist {
+            tokio::time::timeout(AUDIO_TIMEOUT, file_header(src, probe_resolved.clone(), bytes, allow_speed_burst)).await.unwrap_or_default()
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         let resolved = header_resolved.or(probe_resolved);
-        let outcome = ProbeOutcome { ok, status: probe["status"].as_u64().unwrap_or(0), bytes: probe["bytes"].as_u64(), debrid: probe["debrid_status"].as_str().map(str::to_owned),
-            tracks, picture, resolved };
-        if ok { Ok(outcome) } else { Err(Some(outcome)) }
+        let hard_fail = !ok && (debrid.is_some() || matches!(status, 404 | 410 | 403 | 200 | 206));
+        let outcome = ProbeOutcome { ok, status, bytes, debrid, tracks, picture, video_codec, resolved };
+        if ok || hard_fail { Ok(outcome) } else { Err(Some(outcome)) }
     }).await {
         Ok(found) => Some(found.clone()),
         Err(answer) => answer,
@@ -670,36 +1149,144 @@ fn same_origin(a: &str, b: &str) -> bool {
     ua.scheme() == ub.scheme() && ua.host_str() == ub.host_str() && ua.port_or_known_default() == ub.port_or_known_default()
 }
 
-/// The audio tracks and the picture a file's header declares, read from its first bytes
-/// (stopping as soon as the tracks are known: the picture is in the same part of the header),
-/// and the https link the source's redirects end at. When `probe_resolved` is already known from
-/// the one-byte check, fetch directly from it to avoid a second debrid redirect/resolve.
-pub(super) async fn file_header(src: Source, probe_resolved: Option<String>) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
-    file_header_with_client(&backend_http(), src, probe_resolved).await
+/// Read container header (MKV/MP4 head, plus fast MP4 tail-moov fallback for non-fast-start files),
+/// optionally continuing on the exact same open HTTP stream for up to 220 ms / 1.5 MiB to seed
+/// the live CDN bandwidth estimator with zero extra round-trips.
+pub(super) async fn file_header(
+    src: Source,
+    probe_resolved: Option<String>,
+    total_bytes: Option<u64>,
+    measure_speed: bool,
+) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<&'static str>, Option<String>) {
+    let (tracks, pic, codec, resolved, speed_sample) =
+        file_header_with_client_full(&backend_http(), src, probe_resolved, total_bytes, measure_speed).await;
+    if let Some((bytes, elapsed)) = speed_sample {
+        backend().proxy.record_bandwidth_sample(bytes, elapsed);
+    }
+    (tracks, pic, codec, resolved)
 }
 
-pub(super) async fn file_header_with_client(http: &reqwest::Client, src: Source, probe_resolved: Option<String>) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
+#[cfg(test)]
+pub(super) async fn file_header_with_client(
+    http: &reqwest::Client,
+    src: Source,
+    probe_resolved: Option<String>,
+) -> (Option<Vec<crate::tracks::AudioTrack>>, Option<crate::tracks::Picture>, Option<String>) {
+    let (tracks, pic, _, resolved, _) = file_header_with_client_full(http, src, probe_resolved, None, false).await;
+    (tracks, pic, resolved)
+}
+
+pub(super) async fn file_header_with_client_full(
+    http: &reqwest::Client,
+    src: Source,
+    probe_resolved: Option<String>,
+    total_bytes: Option<u64>,
+    measure_speed: bool,
+) -> (
+    Option<Vec<crate::tracks::AudioTrack>>,
+    Option<crate::tracks::Picture>,
+    Option<&'static str>,
+    Option<String>,
+    Option<(u64, Duration)>,
+) {
     let target = probe_resolved.as_deref().unwrap_or(&src.url);
-    let mut req = http.get(target).header("range", format!("bytes=0-{}", crate::tracks::HEAD_BYTES - 1));
+    let range_end = if measure_speed { SPEED_BURST_BYTES - 1 } else { crate::tracks::HEAD_BYTES - 1 };
+    let mut req = http.get(target).header("range", format!("bytes=0-{range_end}"));
     // Forward origin-scoped headers only when fetching the original origin (never leak to redirected CDNs).
     if same_origin(&src.url, target) {
         for (k, v) in &src.headers { req = req.header(k.as_str(), v.as_str()); }
     }
-    let Ok(mut response) = req.send().await else { return (None, None, probe_resolved) };
-    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None, probe_resolved); }
+    let Ok(mut response) = req.send().await else { return (None, None, None, probe_resolved, None) };
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return (None, None, None, probe_resolved, None); }
     let resolved = Some(response.url().to_string()).filter(|u| u.starts_with("https://") && *u != src.url).or(probe_resolved);
+    let read_started = std::time::Instant::now();
+    // Skip the first 128 KiB (TCP slow-start ramp) when timing throughput so fast connections
+    // aren't underestimated by 2-3x on a fresh TLS socket.
+    let mut post_warmup_at: Option<std::time::Instant> = None;
+    let mut post_warmup_bytes = 0u64;
     let mut head = Vec::with_capacity(65536);
-    // Avoid re-parsing the EBML/MP4 header on every ~16 KiB TCP chunk; parse at geometric milestones.
+    let mut total_read = 0u64;
     let mut next_parse = 16 * 1024;
+    let mut parsed: Option<(Vec<crate::tracks::AudioTrack>, Option<crate::tracks::Picture>, Option<&'static str>)> = None;
+
+    fn account_chunk(n: u64, total_read: &mut u64, post_warmup_at: &mut Option<std::time::Instant>, post_warmup_bytes: &mut u64) {
+        *total_read += n;
+        if post_warmup_at.is_some() {
+            *post_warmup_bytes += n;
+        } else if *total_read >= 128 * 1024 {
+            *post_warmup_at = Some(std::time::Instant::now());
+        }
+    }
+
     while head.len() < crate::tracks::HEAD_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else { break };
+        account_chunk(chunk.len() as u64, &mut total_read, &mut post_warmup_at, &mut post_warmup_bytes);
         head.extend_from_slice(&chunk);
         if head.len() >= next_parse {
-            if let Some(tracks) = crate::tracks::audio_tracks(&head) { return (Some(tracks), crate::tracks::picture(&head), resolved); }
+            if let Some(tracks) = crate::tracks::audio_tracks(&head) {
+                parsed = Some((tracks, crate::tracks::picture(&head), crate::tracks::video_codec(&head)));
+                break;
+            }
+            // Non-fast-start MP4 (`ftyp` + `mdat` with no `moov` in head): don't waste bandwidth reading 1 MiB of video data!
+            if crate::tracks::mp4_moov_at_end(&head) { break; }
             next_parse = (next_parse * 2).min(crate::tracks::HEAD_BYTES);
         }
     }
-    (crate::tracks::audio_tracks(&head), crate::tracks::picture(&head), resolved)
+
+    // Zero-extra-request CDN speed burst: if requested (cold start) and we haven't read enough yet,
+    // keep draining the same open response up to 1.5 MiB or 220 ms max.
+    let mut speed_sample = None;
+    if measure_speed {
+        while (total_read as usize) < SPEED_BURST_BYTES && read_started.elapsed() < SPEED_BURST_MAX_TIME {
+            let remain = SPEED_BURST_MAX_TIME.saturating_sub(read_started.elapsed());
+            match tokio::time::timeout(remain, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => account_chunk(chunk.len() as u64, &mut total_read, &mut post_warmup_at, &mut post_warmup_bytes),
+                _ => break,
+            }
+        }
+    }
+    if let Some(since) = post_warmup_at {
+        let elapsed = since.elapsed();
+        if post_warmup_bytes >= 256 * 1024 && elapsed >= Duration::from_millis(5) {
+            speed_sample = Some((post_warmup_bytes, elapsed));
+        }
+    } else if total_read >= 256 * 1024 {
+        let elapsed = read_started.elapsed();
+        if elapsed >= Duration::from_millis(5) {
+            speed_sample = Some((total_read, elapsed));
+        }
+    }
+    drop(response);
+
+    if let Some((tracks, pic, codec)) = parsed {
+        return (Some(tracks), pic, codec, resolved, speed_sample);
+    }
+    let tracks = crate::tracks::audio_tracks(&head);
+    let pic = crate::tracks::picture(&head);
+    let codec = crate::tracks::video_codec(&head);
+    if tracks.is_some() || pic.is_some() {
+        return (tracks, pic, codec, resolved, speed_sample);
+    }
+
+    // Non-fast-start MP4 fallback: read the last 512 KiB from the resolved URL to parse tail `moov`.
+    if crate::tracks::mp4_moov_at_end(&head) && total_bytes.is_some_and(|b| b > 524_288) {
+        let tail_target = resolved.as_deref().unwrap_or(&src.url);
+        let mut treq = http.get(tail_target).header("range", "bytes=-524288");
+        if same_origin(&src.url, tail_target) {
+            for (k, v) in &src.headers { treq = treq.header(k.as_str(), v.as_str()); }
+        }
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_millis(500), treq.send()).await {
+            if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_millis(500), resp.bytes()).await {
+                    let (t_tracks, t_pic) = crate::tracks::parse_mp4_tail(&tail);
+                    let t_codec = crate::tracks::video_codec(&tail);
+                    return (t_tracks, t_pic, t_codec, resolved, speed_sample);
+                }
+            }
+        }
+    }
+
+    (None, None, codec, resolved, speed_sample)
 }
 
 /// A working file as its header declares it: its resolution and HDR replace the label's (the
@@ -721,73 +1308,157 @@ pub(super) fn picture_summary(s: &Source) -> String {
     format!("{}x{}{transfer}{dv}{rate}", p.width, p.height)
 }
 
-/// The batch's working sources, each with the size its server reports, and a debrid status seen.
-pub(super) async fn probe_batch(batch: Vec<Source>, lang: Option<&'static crate::addons::Language>, cap: Option<tokio::time::Instant>, pack_episodes: Option<usize>) -> (Vec<(Source, AudioVerdict)>, Option<String>) {
-    // Season packs count by their share per episode, as in the Play order.
-    let size = move |s: &Source| episode_size(s, pack_episodes).unwrap_or(0);
+/// Reject hidden trailers, bumpers, or broken short clips when the container reports a real duration.
+pub(super) fn duration_plausible(pic: &crate::tracks::Picture, expected_seconds: Option<f64>, is_episode: bool) -> bool {
+    let Some(secs) = pic.seconds else { return true };
+    if secs < 120.0 { return false; }
+    if let Some(exp) = expected_seconds.filter(|e| *e >= 1200.0) {
+        let min_secs = if is_episode { (exp * 0.35).max(120.0) } else { (exp * 0.45).max(300.0) };
+        if secs < min_secs { return false; }
+    }
+    true
+}
+
+/// Probe a wave of `ReleaseGroup`s concurrently. Within each group task, if mirror #1 fails
+/// (e.g. uncached debrid status clip), immediately fail over to mirror #2/#3. Stops as soon as no
+/// pending group's optimistic key can beat the best verified working candidate, or on a tier-aware
+/// grace deadline.
+pub(super) async fn probe_wave(
+    wave: Vec<ReleaseGroup>,
+    lang: Option<&'static crate::addons::Language>,
+    orig_lang: Option<&str>,
+    ctx: &AutoplayContext,
+    cap: Option<tokio::time::Instant>,
+    speed_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (Vec<VerifiedSource>, Option<String>) {
+    let pack_episodes = ctx.pack_episodes;
+    let expected_seconds = ctx.expected_seconds;
+    let is_episode = ctx.episode_code.is_some() || pack_episodes.is_some();
+    let orig_key = orig_lang.map(str::to_owned);
     on_runtime(async move {
         let mut jobs = tokio::task::JoinSet::new();
-        for (i, src) in batch.iter().enumerate() {
-            let src = src.clone();
+        for (i, group) in wave.iter().enumerate() {
+            let mirrors: Vec<Source> = group.mirrors.iter().take(MAX_MIRRORS_PER_GROUP).cloned().collect();
+            let orig_key = orig_key.clone();
+            let speed_token = speed_token.clone();
             jobs.spawn(async move {
-                let outcome = probe_one(src).await;
-                let audio = lang.zip(outcome.as_ref().and_then(|o| o.tracks.clone()))
-                    .and_then(|(l, t)| crate::tracks::in_language(&t, l.key).map(|has| (has, crate::tracks::primary_in_language(&t, l.key))));
-                (i, outcome, audio)
+                let mut last_status: Option<String> = None;
+                let mut last_http_429 = false;
+                for mirror in mirrors {
+                    let wants_burst = mirror.size_bytes.is_none_or(|b| b >= 3_000_000_000)
+                        && speed_token.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    let outcome = probe_one(mirror.clone(), wants_burst).await;
+                    let Some(result) = outcome else {
+                        if wants_burst { speed_token.store(true, std::sync::atomic::Ordering::Relaxed); }
+                        continue;
+                    };
+                    if !result.ok {
+                        if wants_burst { speed_token.store(true, std::sync::atomic::Ordering::Relaxed); }
+                        if result.debrid.is_some() { last_status = result.debrid; }
+                        else if result.status == 429 { last_http_429 = true; }
+                        continue;
+                    }
+                    if let Some(pic) = &result.picture {
+                        if !duration_plausible(pic, expected_seconds, is_episode) {
+                            continue;
+                        }
+                    }
+                    let audio = lang.zip(result.tracks.as_ref())
+                        .and_then(|(l, t)| crate::tracks::in_language(t, l.key).map(|has| (has, crate::tracks::primary_in_language(t, l.key))));
+                    let has_original_lang = orig_key.as_deref().zip(result.tracks.as_ref())
+                        .is_some_and(|(o, t)| crate::tracks::in_language(t, o) == Some(true));
+                    let mut src = mirror;
+                    if let Some(picture) = result.picture { src = with_picture(src, picture); }
+                    if let Some(tracks) = &result.tracks {
+                        let main_count = tracks.iter().filter(|t| !t.extra()).count().min(u8::MAX as usize) as u8;
+                        if main_count > 0 { src.audio_tracks_count = Some(main_count); }
+                    }
+                    if result.video_codec.is_some() { src.video_codec = result.video_codec; }
+                    if let Some(url) = result.resolved { src.url = url; }
+                    if let Some(bytes) = result.bytes.filter(|b| *b > 0) {
+                        src.size_bytes = Some(bytes);
+                        src.size = Some(binary_size(bytes as f64));
+                        src.declared_size = true;
+                        src.labelled_bytes = None;
+                        src.pack = false;
+                    }
+                    return (i, Some(VerifiedSource { source: src, audio, has_original_lang }), None, false);
+                }
+                (i, None, last_status, last_http_429)
             });
         }
-        let estimated: Vec<OrderKey> = batch.iter().map(|s| order_key(s, size(s), lang)).collect();
-        let mut pending: HashSet<usize> = (0..batch.len()).collect();
-        let mut working: Vec<Source> = Vec::new();
-        let mut verdicts: Vec<AudioVerdict> = Vec::new();
+        let mut pending: HashSet<usize> = (0..wave.len()).collect();
+        let mut working: Vec<VerifiedSource> = Vec::new();
         let mut debrid = None;
         let mut deadline: Option<tokio::time::Instant> = cap;
+        let mut first_working_at: Option<tokio::time::Instant> = None;
         let started = std::time::Instant::now();
+        let dv_screen = screen_supports_dv();
         while !pending.is_empty() {
             let next = match deadline {
                 Some(at) => match tokio::time::timeout_at(at, jobs.join_next()).await { Ok(n) => n, Err(_) => break },
                 None => jobs.join_next().await,
             };
-            let Some(Ok((i, outcome, audio))) = next else { if next.is_none() { break } else { continue } };
+            let Some(Ok((i, found, status, hit_429))) = next else { if next.is_none() { break } else { continue } };
             pending.remove(&i);
             if std::env::var_os("VEYLO_PROBE_TRACE").is_some() {
-                let what = outcome.as_ref().map(|o| format!("ok={} status={} bytes={:?}", o.ok, o.status, o.bytes)).unwrap_or_else(|| "error or timeout".into());
-                dev_log(&format!("  probe #{i} {} {:.60} est {} -> {what} at {} ms", batch[i].hdr.unwrap_or("SDR"), batch[i].filename, batch[i].size.as_deref().unwrap_or("?"), started.elapsed().as_millis()));
+                let rep = &wave[i].mirrors[0];
+                let what = match &found {
+                    Some(v) => format!("OK bytes={:?} {}", v.source.size_bytes, picture_summary(&v.source)),
+                    None => format!("FAIL debrid={status:?} 429={hit_429}"),
+                };
+                dev_log(&format!("  wave #{i} ({} mirrors) {} {:.55} -> {what} at {} ms",
+                    wave[i].mirrors.len(), rep.hdr.unwrap_or("SDR"), rep.filename, started.elapsed().as_millis()));
             }
-            let Some(result) = outcome else { continue };
-            if !result.ok {
-                if let Some(status) = result.debrid { debrid = Some(status); }
-                else if result.status == 429 && debrid.is_none() { debrid = Some("busy".into()); }
-                continue;
+            match found {
+                Some(verified) => working.push(verified),
+                None => {
+                    if status.is_some() { debrid = status; }
+                    else if hit_429 && debrid.is_none() { debrid = Some("busy".into()); }
+                    continue;
+                }
             }
-            let mut src = batch[i].clone();
-            if let Some(picture) = result.picture { src = with_picture(src, picture); }
-            // The player opens the link the add-on's resolve led to: no second resolve on Play.
-            if let Some(url) = result.resolved { src.url = url; }
-            if let Some(bytes) = result.bytes.filter(|b| *b > 0) {
-                // The server's size is the file's own: no pack share, no label.
-                src.size_bytes = Some(bytes);
-                src.size = Some(binary_size(bytes as f64));
-                src.declared_size = true;
-                src.labelled_bytes = None;
-                src.pack = false;
+            let now = tokio::time::Instant::now();
+            let first = *first_working_at.get_or_insert(now);
+            let budget = BandwidthBudget::current();
+            let best_key = working.iter()
+                .map(|w| unified_key(&w.source, episode_size(&w.source, pack_episodes).unwrap_or(0), w.audio, w.has_original_lang, lang, expected_seconds, budget, dv_screen, None))
+                .min()
+                .expect("one works");
+            let wanted = rivals_wanted_verified(&working, lang, pack_episodes);
+            // Check if any still-pending group can optimistically beat our best verified source.
+            let mut better_tier_pending = false;
+            let mut any_can_beat = false;
+            for &p in &pending {
+                let rep = &wave[p].mirrors[0];
+                let sz = episode_size(rep, pack_episodes).unwrap_or(0);
+                let opt = optimistic_key(rep, sz, lang, expected_seconds, budget);
+                if opt < best_key || (wanted.is_some() && remux_class(rep) == wanted) {
+                    any_can_beat = true;
+                    // Strictly higher tier (better budget fit, non-nuked, better language, or better HDR/resolution class).
+                    let higher_quality = match (opt.8, best_key.8) {
+                        (QualityOrder::Fit(a, _, _, _), QualityOrder::Fit(b, _, _, _)) => (a.0 .0, a.0 .1) > (b.0 .0, b.0 .1),
+                        (QualityOrder::Fit(..), QualityOrder::OverBudget(..)) => true,
+                        _ => false,
+                    };
+                    if (opt.0, opt.1, opt.2, opt.3) < (best_key.0, best_key.1, best_key.2, best_key.3) || higher_quality {
+                        better_tier_pending = true;
+                    }
+                }
             }
-            working.push(src);
-            verdicts.push(audio);
-            let grace = tokio::time::Instant::now() + PROBE_GRACE;
-            if working.len() == 1 { deadline = Some(deadline.map_or(grace, |d| d.min(grace))); }
-            // A pending source's real size is at most its declared one: if none could beat the
-            // best working source even at that size, the answer is known.
-            let best = working.iter().map(|s| order_key(s, size(s), lang)).min().expect("one works");
-            let wanted = rivals_wanted(&working, lang, pack_episodes);
-            if pending.iter().all(|p| estimated[*p] >= best && (wanted.is_none() || remux_class(&batch[*p]) != wanted)) { break; }
+            if !any_can_beat { break; }
+            let grace = if better_tier_pending { PROBE_GRACE_HIGH } else { PROBE_GRACE_SAME };
+            let target = first + grace;
+            deadline = Some(cap.map_or(target, |c| c.min(target)));
         }
-        (working.into_iter().zip(verdicts).collect(), debrid)
+        (working, debrid)
     }).await.unwrap_or_default()
 }
 
 /// `Pick::debrid` when the only direct links are under 1080p (Play never chooses those).
 pub(super) const BELOW_1080P: &str = "below-1080p";
+/// `Pick::debrid` when no playable source matched the requested title (strict title safety).
+pub(super) const NO_MATCHING_TITLE: &str = "no-matching-title";
 
 /// What to say when no checked source worked (the Android app's wording).
 pub fn no_source_message(debrid: Option<&str>) -> &'static str {
@@ -796,6 +1467,7 @@ pub fn no_source_message(debrid: Option<&str>) -> &'static str {
         Some("failed") => "Your debrid service could not provide this file. Choose another source.",
         Some("busy") => "Your sources are refusing requests for a moment (too many at once). Try again in a minute.",
         Some(BELOW_1080P) => "No source is 1080p or better, so Play didn't choose one. Pick one from the list.",
+        Some(NO_MATCHING_TITLE) => "No source matched this title, so Play didn't start the wrong one. Pick one from the list.",
         _ => "No source responded. Try again or choose another source.",
     }
 }
@@ -911,6 +1583,214 @@ mod unit_tests {
             assert!(reqs[0].contains("authorization: bearer secret-token"), "same-origin must send header");
             assert!(!reqs[1].contains("secret-token"), "cross-origin resolved URL must never receive origin secret headers");
         });
+    }
+
+    #[test]
+    fn digger_rejects_telesync_and_off_title_never_beats_on_title() {
+        let mk = |name: &str, bytes: u64| source_of("AIOStreams", &json!({
+            "title": name, "url": format!("https://x.invalid/{}", name.len() + (bytes as usize % 997)),
+            "behaviorHints": {"filename": name, "videoSize": bytes}
+        }));
+        // Bare TS / D.TS.1O8Op camrips are rejected, while MPEG-TS `.ts` container stays playable.
+        assert!(!playable(&mk("Digger.2026.TS.1080p.MULTi.mkv", 4_600_000_000)));
+        assert!(!playable(&mk("Digger.2026.D.TS.1O8Op.mkv", 4_400_000_000)));
+        assert!(!playable(&mk("Digger.2026.TS.1080p.Dragon.Money.Studio", 4_400_000_000)));
+        assert!(playable(&mk("Digger.2026.1080p.WEB.H264-POKE.mkv", 1_700_000_000)));
+        assert!(playable(&mk("Film.2025.2160p.UHD.BluRay.REMUX.HEVC.ts", 55_000_000_000)));
+
+        // Off-title Judy (with English audio) MUST NEVER beat on-title Digger even when Digger audio is unread/other.
+        let mut digger = mk("Digger.2026.1080p.WEB.H264-POKE.mkv", 1_700_000_000);
+        let mut judy = mk("Judy.BDRemux.1080p.pk.mkv", 18_400_000_000);
+        digger.off_title = !names_title(&digger, "Digger", Some(2026));
+        judy.off_title = !names_title(&judy, "Digger", Some(2026));
+        assert!(!digger.off_title && judy.off_title);
+
+        let ranked = rank_verified(
+            vec![
+                VerifiedSource { source: judy.clone(), audio: Some((true, true)), has_original_lang: true },
+                VerifiedSource { source: digger.clone(), audio: Some((false, false)), has_original_lang: false },
+            ],
+            crate::addons::language("english"),
+            None,
+            Some(6600.0),
+            BandwidthBudget::unlimited(),
+            false,
+        );
+        assert_eq!(ranked[0].source.filename, digger.filename);
+    }
+
+    #[test]
+    fn untagged_english_4k_beats_tagged_1080p_while_italian_prefers_italian() {
+        let mk = |name: &str, url: &str, bytes: u64| source_of("AIOStreams", &json!({
+            "title": name, "url": url,
+            "behaviorHints": {"filename": name, "videoSize": bytes}
+        }));
+        let yts_4k = mk("Clashing.Through.The.Snow.2026.2160p.4K.WEB.x265.10bit.AAC5.1-YTS.mkv", "https://x.invalid/yts", 4_900_000_000);
+        let mircrew = mk("Clashing Through the Snow (2026) 1080p H264 iTA EnG AC3-MIRCrew.mkv", "https://x.invalid/mir", 2_500_000_000);
+        let amen_vf = mk("Clashing.Through.The.Snow.2026.MULTI.VF2.2160p.WEB.DV.HDR10+.H265-Amen.mkv", "https://x.invalid/amen", 10_200_000_000);
+
+        // English user: untagged 4K YTS (audio: None) beats tagged 1080p MIRCrew (audio: Some((true, false))).
+        let eng = rank_verified(
+            vec![
+                VerifiedSource { source: mircrew.clone(), audio: Some((true, false)), has_original_lang: true },
+                VerifiedSource { source: yts_4k.clone(), audio: None, has_original_lang: false },
+            ],
+            crate::addons::language("english"),
+            None,
+            Some(6600.0),
+            BandwidthBudget::unlimited(),
+            false,
+        );
+        assert_eq!(eng[0].source.url, yts_4k.url);
+
+        // Italian user: MIRCrew (verified Italian) beats Amen (French+English only) and untagged YTS.
+        let ita = rank_verified(
+            vec![
+                VerifiedSource { source: amen_vf, audio: Some((false, false)), has_original_lang: true },
+                VerifiedSource { source: yts_4k, audio: None, has_original_lang: false },
+                VerifiedSource { source: mircrew.clone(), audio: Some((true, true)), has_original_lang: true },
+            ],
+            crate::addons::language("italian"),
+            None,
+            Some(6600.0),
+            BandwidthBudget::unlimited(),
+            false,
+        );
+        assert_eq!(ita[0].source.url, mircrew.url);
+    }
+
+    #[test]
+    fn release_groups_preserve_mirrors_for_failover_and_dedup_across_scrapers() {
+        let mk = |addon: &str, name: &str, url: &str, bytes: u64| source_of(addon, &json!({
+            "title": name, "url": url,
+            "behaviorHints": {"filename": name, "videoSize": bytes}
+        }));
+        let amen1 = mk("AIOStreams", "Clashing.Through.The.Snow.2026.2160p.HDR10+-Amen.mkv", "https://x.invalid/a1", 10_950_000_000);
+        let amen2 = mk("AIOStreams", "Clashing.Through.The.Snow.2026.2160p.HDR10+-Amen.mkv", "https://x.invalid/a2", 10_950_000_000);
+        let yts1 = mk("AIOStreams", "Clashing.Through.The.Snow.2026.2160p.WEB.x265-YTS.mkv", "https://x.invalid/y1", 5_260_000_000);
+        let yts2 = mk("Torrentio RD", "Clashing.Through.The.Snow.2026.2160p.WEB.x265-YTS.mkv", "https://x.invalid/y2", 4_880_000_000);
+        let groups = group_releases(&[amen1, amen2, yts1, yts2], None);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].mirrors.len(), 2, "both Amen mirrors kept for failover");
+        assert_eq!(groups[1].mirrors.len(), 2, "AIOStreams & Torrentio YTS merged into one group");
+    }
+
+    #[test]
+    fn bandwidth_budget_fits_connection_and_degrades_gracefully() {
+        let mk = |title: &str, url: &str, bytes: u64| source_of("Torrentio", &json!({
+            "title": title, "url": url, "behaviorHints": {"videoSize": bytes}
+        }));
+        // 2-hour movie (7200 s):
+        // remux = 54 GB ≈ 60 Mbps; web4k = 11.7 GB ≈ 13 Mbps; web1080 = 3.6 GB ≈ 4 Mbps.
+        let remux = mk("Film 2026 2160p HDR REMUX", "https://x.invalid/remux", 54_000_000_000);
+        let web4k = mk("Film 2026 2160p HDR10+ WEB-DL H265", "https://x.invalid/web4k", 11_700_000_000);
+        let web1080 = mk("Film 2026 1080p WEB-DL H265", "https://x.invalid/web1080", 3_600_000_000);
+        let all = || vec![
+            VerifiedSource { source: remux.clone(), audio: Some((true, true)), has_original_lang: true },
+            VerifiedSource { source: web4k.clone(), audio: Some((true, true)), has_original_lang: true },
+            VerifiedSource { source: web1080.clone(), audio: Some((true, true)), has_original_lang: true },
+        ];
+        let eng = crate::addons::language("english");
+
+        // Fast 150 Mbps fiber (Auto): 60 Mbps 4K Remux fits and wins.
+        let fast = rank_verified(all(), eng, None, Some(7200.0), BandwidthBudget::from_settings(None, Some(150.0)), false);
+        assert_eq!(fast[0].source.url, remux.url);
+
+        // 30 Mbps tablet Wi-Fi (Auto -> ~17.6 Mbps encode / ~15.5 Mbps remux safe cap): 13 Mbps 4K HDR10+ wins!
+        let wifi = rank_verified(all(), eng, None, Some(7200.0), BandwidthBudget::from_settings(None, Some(30.0)), false);
+        assert_eq!(wifi[0].source.url, web4k.url);
+
+        // Slow 5 Mbps hotel Wi-Fi (Auto -> 4.0 Mbps floor; only 4 Mbps 1080p fits, or if all over, smallest wins).
+        let slow = rank_verified(all(), eng, None, Some(7200.0), BandwidthBudget::from_settings(None, Some(5.0)), false);
+        assert_eq!(slow[0].source.url, web1080.url);
+
+        // Manual Unlimited (Some(0)): Remux wins even on 15 Mbps measured speed.
+        let unlim = rank_verified(all(), eng, None, Some(7200.0), BandwidthBudget::from_settings(Some(0), Some(15.0)), false);
+        assert_eq!(unlim[0].source.url, remux.url);
+    }
+
+    #[test]
+    fn original_language_fallback_duration_extras_and_wrong_episode() {
+        use crate::tracks::{Picture, Transfer};
+        let mk = |title: &str, url: &str, bytes: u64| source_of("A", &json!({
+            "title": title, "url": url, "behaviorHints": {"filename": title, "videoSize": bytes}
+        }));
+        // Foreign-original Korean film when no English dub exists: original Korean beats French dub.
+        let kor = mk("Parasite.2019.2160p.HDR.WEB-DL.KOR.mkv", "https://x.invalid/kor", 12_000_000_000);
+        let fre = mk("Parasite.2019.2160p.HDR.REMUX.FRE.mkv", "https://x.invalid/fre", 55_000_000_000);
+        let ranked = rank_verified(
+            vec![
+                VerifiedSource { source: fre, audio: Some((false, false)), has_original_lang: false },
+                VerifiedSource { source: kor.clone(), audio: Some((false, false)), has_original_lang: true },
+            ],
+            crate::addons::language("english"),
+            None,
+            Some(7920.0),
+            BandwidthBudget::unlimited(),
+            false,
+        );
+        assert_eq!(ranked[0].source.url, kor.url);
+
+        // Localized title matching via `names_title_any`.
+        let ita_release = mk("Scontrarsi a Natale (2026) iTA-ENG.WEBDL.1080p.x264.mkv", "https://x.invalid/it", 2_700_000_000);
+        assert!(names_title_any(&ita_release, &["Clashing Through the Snow".into(), "Scontrarsi a Natale".into()], Some(2026)));
+
+        // Duration sanity rejects trailers/clips while accepting real cuts.
+        let trailer_pic = Picture { width: 1920, height: 1080, transfer: Transfer::Sdr, dolby_vision: None, seconds: Some(150.0) };
+        let feature_pic = Picture { width: 3840, height: 2160, transfer: Transfer::Pq, dolby_vision: None, seconds: Some(6200.0) };
+        assert!(!duration_plausible(&trailer_pic, Some(6600.0), false));
+        assert!(duration_plausible(&feature_pic, Some(6600.0), false));
+
+        // Extra clips rejected unless the title itself contains the word.
+        let making = mk("Digger.2026.Making.Of.1080p.WEB.mkv", "https://x.invalid/m", 800_000_000);
+        assert!(is_extra_clip(&making, &["Digger".into()]));
+        let tpb = mk("Trailer.Park.Boys.S01E01.1080p.WEB.mkv", "https://x.invalid/tpb", 900_000_000);
+        assert!(!is_extra_clip(&tpb, &["Trailer Park Boys".into()]));
+
+        // Wrong episode rejected (both SxxEyy and anime bare numbers); matching & multi-episode allowed.
+        let ep2 = mk("Show.S01E02.1080p.WEB.mkv", "https://x.invalid/e2", 1_500_000_000);
+        let ep12 = mk("Show.S01E01-E02.1080p.WEB.mkv", "https://x.invalid/e12", 3_000_000_000);
+        let anime_ep6 = mk("[SickeClipse]_Solo_Leveling_06_[2160p][x265].mp4", "https://x.invalid/a6", 1_400_000_000);
+        let anime_ep1 = mk("[Salieri] Solo Leveling - 01 (1080p) (HDR) [Dual Audio].mkv", "https://x.invalid/a1", 1_400_000_000);
+        assert!(wrong_episode(&ep2, (1, 1)));
+        assert!(!wrong_episode(&ep12, (1, 1)));
+        assert!(!wrong_episode(&ep12, (1, 2)));
+        assert!(wrong_episode(&anime_ep6, (1, 1)));
+        assert!(!wrong_episode(&anime_ep1, (1, 1)));
+    }
+
+    #[test]
+    fn predb_nuked_and_fake_sized_scene_releases_rank_behind_clean_ones() {
+        let mk = |name: &str, url: &str, bytes: u64| source_of("A", &json!({
+            "title": name, "url": url, "behaviorHints": {"filename": name, "videoSize": bytes}
+        }));
+        let srr = json!({"results": [
+            {"release": "The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE", "date": "2026-11-24", "isForeign": "no", "imdbId": "21285562", "size": 29_900_000_000u64}
+        ]});
+        let pre = json!({"data": [
+            {"release": "The.Dog.Stars.2026.2160p.UHD.BluRay.x265-NUKEDGRP", "status": 1, "reason": "out.of.sync"}
+        ]});
+        let intel = parse_release_intel(&srr, Some(&pre));
+        let mut list = vec![
+            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-NUKEDGRP.mkv", "https://x.invalid/nuked", 32_000_000_000),
+            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE.mkv", "https://x.invalid/fake", 2_000_000_000),
+            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE.mkv", "https://x.invalid/clean", 29_900_000_000),
+        ];
+        let ctx = AutoplayContext {
+            titles: vec!["The Dog Stars".into()],
+            year: Some(2026),
+            preferred_language: Some("english".into()),
+            strict_title: true,
+            intel: Some(intel),
+            ..AutoplayContext::default()
+        };
+        classify_sources(&mut list, &ctx);
+        assert!(list[0].nuked);
+        assert_eq!(list[1].scene_trust, -1);
+        assert_eq!(list[2].scene_trust, 1);
+        let ordered = play_order_with_ctx(&list, &ctx);
+        assert_eq!(ordered[0].url, "https://x.invalid/clean");
+        assert_eq!(ordered[2].url, "https://x.invalid/nuked");
     }
 }
 

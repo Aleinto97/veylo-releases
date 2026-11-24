@@ -13,7 +13,15 @@ impl AudioTrack {
     /// Commentary or audio description: not the film's own sound (as `engine::extra_audio`).
     pub fn extra(&self) -> bool {
         let n = self.name.to_lowercase();
-        n.contains("commentary") || n.contains("description") || n.contains("descriptive")
+        n.contains("commentary")
+            || n.contains("description")
+            || n.contains("descriptive")
+            || n.contains("visually impaired")
+            || n.contains("visual impaired")
+            || n.contains("(ad)")
+            || n.contains("[ad]")
+            || n.contains("(vi)")
+            || n.contains("[vi]")
     }
 }
 
@@ -87,6 +95,117 @@ pub const HEAD_BYTES: usize = 1 << 20;
 /// at the end, Matroska with large attachments first) or the format is another (m2ts, AVI).
 pub fn audio_tracks(head: &[u8]) -> Option<Vec<AudioTrack>> {
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) { matroska(head) } else if head.get(4..8) == Some(b"ftyp") { mp4(head) } else { None }
+}
+
+/// True when `head` begins like an MP4 whose `moov` index is placed after `mdat` (not fast-start),
+/// so a single tail range request can recover its audio tracks, resolution, HDR, and duration.
+pub fn mp4_moov_at_end(head: &[u8]) -> bool {
+    if head.get(4..8) != Some(b"ftyp") { return false; }
+    let top = boxes(head);
+    let has_moov = top.iter().any(|b| &b.0 == b"moov");
+    let has_mdat = top.iter().any(|b| &b.0 == b"mdat");
+    !has_moov && has_mdat
+}
+
+/// Parse audio tracks and picture from the tail bytes of a non-fast-start MP4 file.
+pub fn parse_mp4_tail(tail: &[u8]) -> (Option<Vec<AudioTrack>>, Option<Picture>) {
+    // Scan for a plausible top-level `moov` box header (`[size: u32 BE] "moov"`) whose declared
+    // size fits inside the remainder of `tail`.
+    for i in 4..tail.len().saturating_sub(4) {
+        if &tail[i..i + 4] != b"moov" { continue; }
+        let start = i - 4;
+        let size = u32::from_be_bytes(tail[start..i].try_into().unwrap()) as usize;
+        let valid = if size == 1 && start + 16 <= tail.len() {
+            let sz64 = u64::from_be_bytes(tail[start + 8..start + 16].try_into().unwrap()) as usize;
+            sz64 >= 24 && start + sz64 <= tail.len()
+        } else {
+            size >= 16 && start + size <= tail.len()
+        };
+        if valid {
+            let slice = &tail[start..];
+            let tracks = mp4(slice);
+            let pic = mp4_picture(slice);
+            if tracks.is_some() || pic.is_some() {
+                return (tracks, pic);
+            }
+        }
+    }
+    (None, None)
+}
+
+/// Video codec declared in the container header ("av1", "hevc", "avc"), when readable.
+pub fn video_codec(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        matroska_video_codec(head)
+    } else if head.get(4..8) == Some(b"ftyp") || head.get(4..8) == Some(b"moov") {
+        mp4_video_codec(head)
+    } else {
+        None
+    }
+}
+
+fn matroska_video_codec(head: &[u8]) -> Option<&'static str> {
+    const SEGMENT: u64 = 0x1853_8067;
+    const TRACKS: u64 = 0x1654_AE6B;
+    const CLUSTER: u64 = 0x1F43_B675;
+    let (_, seg_start, seg_end, _) = elements(head).into_iter().find(|e| e.0 == SEGMENT)?;
+    let segment = &head[seg_start..seg_end];
+    for (id, start, end, whole) in elements(segment) {
+        if id == CLUSTER { return None; }
+        if id != TRACKS { continue; }
+        if !whole { return None; }
+        let tracks = &segment[start..end];
+        for (_, s, e, _) in elements(tracks).into_iter().filter(|e| e.0 == 0xAE && e.3) {
+            let entry = &tracks[s..e];
+            let mut video = false;
+            let mut codec_id = None;
+            for (id, s, e, _) in elements(entry) {
+                match id {
+                    0x83 => video = uint(&entry[s..e]) == 1,
+                    0x86 => codec_id = Some(text(&entry[s..e])),
+                    _ => {}
+                }
+            }
+            if video {
+                return match codec_id.as_deref() {
+                    Some(c) if c.contains("AV1") => Some("av1"),
+                    Some(c) if c.contains("HEVC") => Some("hevc"),
+                    Some(c) if c.contains("AVC") => Some("avc"),
+                    _ => None,
+                };
+            }
+        }
+        return None;
+    }
+    None
+}
+
+fn mp4_video_codec(head: &[u8]) -> Option<&'static str> {
+    let top = boxes(head);
+    let (_, ms, me, whole) = *top.iter().find(|b| &b.0 == b"moov")?;
+    if !whole { return None; }
+    let moov = &head[ms..me];
+    let child = |b: &[u8], kind: &[u8; 4]| boxes(b).into_iter().find(|x| &x.0 == kind).map(|(_, s, e, _)| (s, e));
+    boxes(moov).into_iter().filter(|b| &b.0 == b"trak").find_map(|(_, ts, te, _)| {
+        let trak = &moov[ts..te];
+        let (ds, de) = child(trak, b"mdia")?;
+        let mdia = &trak[ds..de];
+        let (hs, he) = child(mdia, b"hdlr")?;
+        if mdia[hs..he].get(8..12) != Some(b"vide") { return None; }
+        let (ns, ne) = child(mdia, b"minf")?;
+        let minf = &mdia[ns..ne];
+        let (ls, le) = child(minf, b"stbl")?;
+        let stbl = &minf[ls..le];
+        let (ss, se) = child(stbl, b"stsd")?;
+        let entries = stbl[ss..se].get(8..)?;
+        let (fourcc, _, _, _) = *boxes(entries).first()?;
+        match &fourcc {
+            b"av01" => Some("av1"),
+            b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Some("hevc"),
+            b"avc1" | b"avc3" => Some("avc"),
+            _ => None,
+        }
+    })
 }
 
 // ---------------------------------------------------------------- Matroska
@@ -491,5 +610,24 @@ mod tests {
         assert_eq!((p_hdr.width, p_hdr.height), (320, 240));
         // selftest-hdr.mp4 is a video-only clip (no audio track).
         assert_eq!(audio_tracks(hdr_clip).unwrap().len(), 0);
+        assert_eq!(video_codec(sdr_clip), Some("avc"));
+    }
+
+    #[test]
+    fn mp4_tail_moov_and_extra_audio_tags() {
+        let mut moov = trak(b"vide", "und", "Video");
+        moov.extend(trak(b"soun", "ita", ""));
+        moov.extend(trak(b"soun", "eng", "English (AD)"));
+        let tail_moov = bx(b"moov", &moov);
+        let head = [bx(b"ftyp", b"isomiso2"), bx(b"mdat", &[0; 64])].concat();
+        assert!(mp4_moov_at_end(&head));
+        let mut tail = vec![0xAAu8; 32];
+        tail.extend_from_slice(&tail_moov);
+        let (tracks, _pic) = parse_mp4_tail(&tail);
+        let tracks = tracks.expect("tail moov parsed");
+        assert_eq!(tracks.len(), 2);
+        assert!(tracks[1].extra(), "(AD) audio description must be marked extra");
+        assert_eq!(in_language(&tracks, "english"), Some(false));
+        assert_eq!(in_language(&tracks, "italian"), Some(true));
     }
 }
