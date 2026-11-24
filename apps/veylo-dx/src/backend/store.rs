@@ -514,7 +514,7 @@ pub(super) fn duel_state_path() -> PathBuf { backend().data_dir.join("picks-duel
 /// cards on screen and what you kept and starred.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DuelState {
-    pub kind: Option<String>, pub style: String, pub genre: Option<String>, pub from: String, pub to: String,
+    pub kind: Option<String>, pub style: String, pub genres: Vec<String>, pub from: String, pub to: String,
     /// The night (the brain's session) and when it was last played.
     pub night: u64, pub last: i64,
     pub round: u32, pub streak: u32, pub shown: Vec<String>,
@@ -553,7 +553,7 @@ pub fn flush_writes() {
 pub fn save_duel(d: &DuelState) {
     let m = |x: &Option<Media>| x.as_ref().map(media_json).unwrap_or(Value::Null);
     let list = |l: &[Media]| l.iter().map(media_json).collect::<Vec<_>>();
-    write_soon(duel_state_path(), json!({"version": 3, "kind": d.kind, "style": d.style, "genre": d.genre, "from": d.from, "to": d.to,
+    write_soon(duel_state_path(), json!({"version": 3, "kind": d.kind, "style": d.style, "genres": d.genres, "genre": d.genres.first(), "from": d.from, "to": d.to,
         "night": d.night.to_string(), "last": d.last, "round": d.round, "streak": d.streak, "shown": d.shown,
         "left": m(&d.left), "right": m(&d.right), "kept": list(&d.kept), "starred": list(&d.starred)}).to_string());
 }
@@ -565,11 +565,16 @@ pub fn load_duel() -> Option<DuelState> {
     let list = |k: &str| v[k].as_array().into_iter().flatten().filter_map(|x| Media::from_json(x, "")).collect::<Vec<_>>();
     // An earlier duel's suggested pick carries on as the card you kept.
     let winner = m("winner");
+    let genres: Vec<String> = v["genres"].as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        .filter(|g| !g.is_empty())
+        .or_else(|| v["genre"].as_str().map(|g| vec![g.to_owned()]))
+        .unwrap_or_default();
     Some(DuelState {
         // "anime" was a type before Style existed: it is the Animation style now.
         kind: v["kind"].as_str().filter(|k| *k != "anime").map(str::to_owned),
         style: if v["kind"] == "anime" { "animation".into() } else { v["style"].as_str().unwrap_or("live").to_owned() },
-        genre: v["genre"].as_str().map(str::to_owned),
+        genres,
         from: s(&v, "from"), to: s(&v, "to"),
         night: v["night"].as_str().and_then(|n| n.parse().ok()).unwrap_or(0), last: v["last"].as_i64().unwrap_or(0),
         round: v["round"].as_u64().unwrap_or(0) as u32, streak: v["streak"].as_u64().unwrap_or(0) as u32,

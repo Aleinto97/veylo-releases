@@ -18,6 +18,8 @@ fn Glyph(d: &'static str) -> Element {
 #[component] pub fn ThumbUp() -> Element { rsx! { Glyph { d: "M7 10v10H4V10h3Zm0 0 4-7c1.4 0 2.3 1 2 2.4L12.4 9H18a2 2 0 0 1 2 2.3l-1.2 7A2 2 0 0 1 16.8 20H7" } } }
 #[component] pub fn ThumbDown() -> Element { rsx! { Glyph { d: "M17 14V4h3v10h-3Zm0 0-4 7c-1.4 0-2.3-1-2-2.4l.6-3.6H6a2 2 0 0 1-2-2.3l1.2-7A2 2 0 0 1 7.2 4H17" } } }
 #[component] pub fn Chevron() -> Element { rsx! { Glyph { d: "m7 10 5 5 5-5" } } }
+#[component] pub fn ChevronLeft() -> Element { rsx! { Glyph { d: "m15 6-6 6 6 6" } } }
+#[component] pub fn ChevronRight() -> Element { rsx! { Glyph { d: "m9 6 6 6-6 6" } } }
 #[component] pub fn Play() -> Element { rsx! { Glyph { d: "M8 5.5v13l10.5-6.5L8 5.5Z" } } }
 #[component] pub fn Check() -> Element { rsx! { Glyph { d: "m5 12.5 4.5 4.5L19 7.5" } } }
 #[component] pub fn PlayCircle() -> Element { rsx! { Glyph { d: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Zm-2-12.5v7l5.5-3.5L10 8.5Z" } } }

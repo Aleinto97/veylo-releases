@@ -799,7 +799,7 @@ pub async fn collection_parts(m: &Media) -> Option<CollectionShelf> {
                     .cloned().collect();
                 parts.sort_by_key(|p| p["release_date"].as_str().unwrap_or_default().to_owned());
                 if parts.len() >= 2 {
-                    let resolved = tmdb_titles("movie", parts, None).await;
+                    let resolved = tmdb_titles("movie", parts, &[]).await;
                     if resolved.len() >= 2 {
                         return Some(CollectionShelf { name: cname, parts: resolved });
                     }

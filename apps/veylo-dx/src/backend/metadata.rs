@@ -554,10 +554,10 @@ pub(super) async fn tmdb_genre_list(kind: &str) -> Vec<(i64, String)> {
 /// like any other. Titles without an IMDb id are skipped. Formats (reality, talk, news, soap)
 /// never come back, kids' series only when asked for, and a series carries the years it aired.
 /// Without a key, Cinemeta's lists answer instead.
-pub async fn discover_candidates(genre: Option<String>, kind: Option<String>, style: Style, from: Option<i32>, to: Option<i32>, pages: Vec<u32>) -> Vec<Media> {
-    if !tmdb_ready() { return cinemeta_candidates(genre, kind, style, from, to, pages).await; }
+pub async fn discover_candidates(selected_genres: Vec<String>, kind: Option<String>, style: Style, from: Option<i32>, to: Option<i32>, pages: Vec<u32>) -> Vec<Media> {
+    if !tmdb_ready() { return cinemeta_candidates(selected_genres, kind, style, from, to, pages).await; }
     let kinds: Vec<&str> = match kind.as_deref() { Some("movie") => vec!["movie"], Some("series") => vec!["tv"], _ => vec!["movie", "tv"] };
-    let wants_kids = genre.as_deref().is_some_and(|g| crate::picks_rules::canonical_genre(g) == "Kids");
+    let wants_kids = selected_genres.iter().any(|g| crate::picks_rules::canonical_genre(g) == "Kids");
     let mut out = Vec::new();
     for tk in kinds {
         let genres = tmdb_genre_list(tk).await;
@@ -568,20 +568,28 @@ pub async fn discover_candidates(genre: Option<String>, kind: Option<String>, st
         match style { Style::Animation => with_genres.push(16), Style::Live => without.push(16), Style::Both => {} }
         // Reality, News, Soap, Talk; Kids unless asked for.
         if tk == "tv" { without.extend([10764, 10763, 10766, 10767]); if !wants_kids { without.push(10762); } }
-        if let Some(g) = &genre {
+        let mut unmatched = false;
+        for g in &selected_genres {
             let wanted = match crate::picks_rules::canonical_genre(g).to_lowercase().as_str() {
                 "sci-fi" => if tk == "tv" { "sci-fi & fantasy".into() } else { "science fiction".into() },
                 "kids" => if tk == "tv" { "kids".into() } else { "family".into() },
                 other => other.to_owned(),
             };
             match genres.iter().find(|(_, n)| n.to_lowercase() == wanted || n.to_lowercase().split(" & ").any(|p| p == wanted)) {
-                Some((id, _)) => { with_genres.push(*id); without.retain(|w| w != id); }
+                Some((id, _)) => {
+                    if !with_genres.contains(id) { with_genres.push(*id); }
+                    without.retain(|w| w != id);
+                }
                 None => {
                     let found = tmdb("search/keyword".into(), vec![("query", g.clone())]).await;
-                    match found.and_then(|v| v["results"][0]["id"].as_i64()) { Some(id) => with_keywords.push(id), None => continue }
+                    match found.and_then(|v| v["results"][0]["id"].as_i64()) {
+                        Some(id) => if !with_keywords.contains(&id) { with_keywords.push(id); },
+                        None => { unmatched = true; break; }
+                    }
                 }
             }
         }
+        if unmatched { continue; }
         let join = |v: &[i64]| v.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         if !with_genres.is_empty() { query.push(("with_genres", join(&with_genres))); }
         if !with_keywords.is_empty() { query.push(("with_keywords", join(&with_keywords))); }
@@ -600,15 +608,15 @@ pub async fn discover_candidates(genre: Option<String>, kind: Option<String>, st
             let Some(v) = tmdb(format!("discover/{tk}"), q).await else { break };
             results.extend(v["results"].as_array().cloned().unwrap_or_default());
         }
-        out.extend(tmdb_titles(tk, results, genre.as_deref()).await);
+        out.extend(tmdb_titles(tk, results, &selected_genres).await);
     }
     out
 }
 
 /// TMDB results (Discover, recommendations) as Cinemeta titles, so they open and play like any
-/// other: IMDb ids looked up together, a series with the years it aired. `genre` is added to a
-/// title that lacks it (a keyword match). Titles without an IMDb id are skipped.
-pub(super) async fn tmdb_titles(tk: &str, results: Vec<Value>, genre: Option<&str>) -> Vec<Media> {
+/// other: IMDb ids looked up together, a series with the years it aired. `ensure_genres` are added
+/// to a title that lacks them (keyword matches). Titles without an IMDb id are skipped.
+pub(super) async fn tmdb_titles(tk: &str, results: Vec<Value>, ensure_genres: &[String]) -> Vec<Media> {
     let genres = tmdb_genre_list(tk).await;
     let names = |ids: &[i64]| ids.iter().filter_map(|id| genres.iter().find(|(g, _)| g == id).map(|(_, n)| n.clone())).collect::<Vec<_>>();
     let mut out = Vec::new();
@@ -649,7 +657,7 @@ pub(super) async fn tmdb_titles(tk: &str, results: Vec<Value>, genre: Option<&st
         let Some((imdb, years)) = r["id"].as_i64().and_then(|id| found.get(&id).cloned()) else { continue };
         let ids: Vec<i64> = r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
         let mut genre_names: Vec<String> = names(&ids);
-        if let Some(g) = genre { if !genre_names.iter().any(|n| crate::picks_rules::has_genre_name(n, g)) { genre_names.push(g.to_owned()); } }
+        for g in ensure_genres { if !genre_names.iter().any(|n| crate::picks_rules::has_genre_name(n, g)) { genre_names.push(g.clone()); } }
         // Japanese animation is anime.
         if ids.contains(&16) && r["original_language"] == "ja" { genre_names.push("Anime".into()); }
         let date = r[if tk == "movie" { "release_date" } else { "first_air_date" }].as_str().unwrap_or_default();
@@ -680,7 +688,7 @@ pub async fn related(m: &Media) -> Vec<Media> {
         .filter(|r| !r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).any(|g| [10764, 10763, 10766, 10767, 10762].contains(&g)))
         .filter(|r| r["vote_count"].as_i64().unwrap_or(0) >= 50)
         .take(12).cloned().collect();
-    tmdb_titles(&kind, results, None).await
+    tmdb_titles(&kind, results, &[]).await
 }
 
 pub(super) fn tvmaze_genres(s: &Value) -> Vec<String> {
@@ -696,7 +704,7 @@ pub(super) static TVMAZE: OnceLock<tokio::sync::OnceCell<Vec<Value>>> = OnceLock
 
 /// Series from TVmaze (free, no key): popular, well-rated shows with IMDb ids, sampled across
 /// its index once per session, as Cinemeta titles so they open and play like any other.
-pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option<i32>, to: Option<i32>) -> Vec<Media> {
+pub async fn tvmaze_candidates(selected_genres: Vec<String>, style: Style, from: Option<i32>, to: Option<i32>) -> Vec<Media> {
     let cell = TVMAZE.get_or_init(tokio::sync::OnceCell::new);
     // An empty answer (offline, TVmaze down) is not kept: the next visit asks again.
     let shows = cell.get_or_try_init(|| async {
@@ -724,13 +732,13 @@ pub async fn tvmaze_candidates(genre: Option<String>, style: Style, from: Option
         if all.is_empty() { Err(()) } else { Ok(all) }
     }).await;
     let Ok(shows) = shows else { return Vec::new() };
-    let wanted = genre.as_deref().map(|g| match g.to_lowercase().as_str() { "sci-fi" | "science fiction" => "science-fiction".to_owned(), x => x.to_owned() });
+    let wanted: Vec<String> = selected_genres.iter().map(|g| match g.to_lowercase().as_str() { "sci-fi" | "science fiction" => "science-fiction".to_owned(), x => x.to_owned() }).collect();
     let mut out: Vec<(f64, Media)> = shows.iter().filter_map(|s| {
         let genres = tvmaze_genres(s);
         let lower: Vec<String> = genres.iter().map(|g| g.to_lowercase().replace("sci-fi", "science-fiction")).collect();
         let animated = lower.iter().any(|g| g == "anime" || g == "animation");
         match style { Style::Animation if !animated => return None, Style::Live if animated => return None, _ => {} }
-        if let Some(w) = &wanted { if !lower.iter().any(|g| g == w) { return None; } }
+        if !wanted.iter().all(|w| lower.iter().any(|g| g == w)) { return None; }
         // The years it aired: from its premiere to its end (or still running).
         let year: i32 = s["premiered"].as_str().and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()).unwrap_or(0);
         let ended: Option<i32> = s["ended"].as_str().and_then(|d| d.get(..4)).and_then(|y| y.parse().ok());

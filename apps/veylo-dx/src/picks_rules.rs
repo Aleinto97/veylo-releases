@@ -138,16 +138,18 @@ pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
 }
 
 /// Narrow the pool without reordering it. Formats never pass; kids' titles only when Kids is
-/// the genre; unknown years never match a bound; a series matches if it aired in the range.
-pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genre: Option<&str>, from: Option<i32>, to: Option<i32>, this_year: i32) -> Vec<Media> {
-    let wants_kids = genre.is_some_and(|g| canonical_genre(g) == "Kids");
+/// among the chosen genres; unknown years never match a bound; a series matches if it aired in
+/// the range; multiple genres combine with AND (a title must carry every chosen genre).
+pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genres: &[String], from: Option<i32>, to: Option<i32>, this_year: i32) -> Vec<Media> {
+    let wants_kids = genres.iter().any(|g| canonical_genre(g) == "Kids");
     items.iter().filter(|m| {
         let kind_ok = kind.is_none_or(|k| if k == "series" { m.kind == "series" || m.kind == "anime" } else { m.kind == k });
-        let style_ok = style_matches(m,style);
+        let style_ok = style_matches(m, style);
         let years_ok = if from.is_none() && to.is_none() { true } else {
             year_range(m, this_year).is_some_and(|(a, b)| from.is_none_or(|f| b >= f) && to.is_none_or(|t| a <= t))
         };
-        kind_ok && style_ok && years_ok && !is_format(m) && (wants_kids || !is_kids(m)) && genre.is_none_or(|g| has_genre(m, g))
+        let genres_ok = genres.iter().all(|g| has_genre(m, g));
+        kind_ok && style_ok && years_ok && !is_format(m) && (wants_kids || !is_kids(m)) && genres_ok
     }).cloned().collect()
 }
 
@@ -202,7 +204,7 @@ mod tests {
         assert!(is_animated(&viking));
         settle_style(&mut viking, false);
         assert!(!is_animated(&viking) && viking.genres == ["Comedy", "Crime"]);
-        assert!(filter_picks(std::slice::from_ref(&viking), Some("movie"), Style::Animation, None, None, None, 2026).is_empty());
+        assert!(filter_picks(std::slice::from_ref(&viking), Some("movie"), Style::Animation, &[], None, None, 2026).is_empty());
         // The same title from the catalogue again cannot bring the style back.
         let mut pool = vec![viking.clone()];
         merge(&mut pool, vec![media("tt27817389", "movie", "2025", &["Animation", "Comedy"])]);
@@ -267,8 +269,8 @@ mod tests {
         let mut detailed=sparse.clone();detailed.genres.push("Animation".into());
         let mut pool=vec![sparse];merge(&mut pool,vec![detailed]);
         assert_eq!(pool.len(),1);assert!(is_animated(&pool[0]));
-        assert!(filter_picks(&pool,None,Style::Live,None,None,None,2026).is_empty());
-        assert_eq!(filter_picks(&pool,None,Style::Animation,None,None,None,2026).len(),1);
+        assert!(filter_picks(&pool, None, Style::Live, &[], None, None, 2026).is_empty());
+        assert_eq!(filter_picks(&pool, None, Style::Animation, &[], None, None, 2026).len(), 1);
         let mut raw=media("raw","series","2020",&["Comedy"]);
         raw.raw["tmdb_id"]=serde_json::json!(1);raw.raw["genre_ids"]=serde_json::json!([16,35]);assert!(is_animated(&raw));
         raw.raw["genre_ids"]=serde_json::Value::Null;raw.raw["show_type"]=serde_json::json!("Animation");assert!(is_animated(&raw));
@@ -278,21 +280,33 @@ mod tests {
         let c = [media("film", "movie", "2000", &["Drama"]), media("toon", "movie", "2010", &["Animation"]),
             media("show", "series", "2015", &["Drama"]), media("anime", "anime", "2020", &[]),
             media("reality", "series", "2018", &["Reality-TV"]), media("kids", "series", "2016", &["Children"])];
-        assert_eq!(ids(filter_picks(&c, None, Style::Live, None, None, None, 2026)), ["film", "show"]);
-        assert_eq!(ids(filter_picks(&c, Some("movie"), Style::Animation, None, None, None, 2026)), ["toon"]);
-        assert_eq!(ids(filter_picks(&c, Some("series"), Style::Animation, None, None, None, 2026)), ["anime"]);
-        assert_eq!(ids(filter_picks(&c, None, Style::Both, None, None, None, 2026)), ["film", "toon", "show", "anime"]);
-        assert_eq!(ids(filter_picks(&c, None, Style::Both, Some("Kids"), None, None, 2026)), ["kids"]);
+        assert_eq!(ids(filter_picks(&c, None, Style::Live, &[], None, None, 2026)), ["film", "show"]);
+        assert_eq!(ids(filter_picks(&c, Some("movie"), Style::Animation, &[], None, None, 2026)), ["toon"]);
+        assert_eq!(ids(filter_picks(&c, Some("series"), Style::Animation, &[], None, None, 2026)), ["anime"]);
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &[], None, None, 2026)), ["film", "toon", "show", "anime"]);
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &["Kids".into()], None, None, 2026)), ["kids"]);
+    }
+
+    #[test]
+    fn multiple_genres_combine_with_and() {
+        let c = [
+            media("both", "movie", "2020", &["Sci-Fi", "Thriller"]),
+            media("only-scifi", "movie", "2020", &["Sci-Fi", "Drama"]),
+            media("pair", "series", "2021", &["Sci-Fi & Fantasy", "Thriller"]),
+            media("kids-comedy", "series", "2022", &["Kids", "Comedy"]),
+        ];
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &["Sci-Fi".into(), "Thriller".into()], None, None, 2026)), ["both", "pair"]);
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &["Kids".into(), "Comedy".into()], None, None, 2026)), ["kids-comedy"]);
     }
 
     #[test]
     fn series_match_any_year_they_aired_and_unknown_years_never_match_a_bound() {
         let c = [media("a", "movie", "2000", &["Drama"]), media("b", "series", "2010–2017", &["Drama"]),
             media("c", "series", "2016–", &["Drama"]), media("d", "movie", "", &["Drama"])];
-        assert_eq!(ids(filter_picks(&c, None, Style::Both, Some("drama"), Some(2000), Some(2010), 2026)), ["a", "b"]);
-        assert_eq!(ids(filter_picks(&c, None, Style::Both, None, Some(2020), None, 2026)), ["c"]);
-        assert_eq!(ids(filter_picks(&c, Some("movie"), Style::Both, None, None, None, 2026)), ["a", "d"]);
-        assert!(filter_picks(&c, None, Style::Both, None, Some(2021), Some(2000), 2026).is_empty());
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &["drama".into()], Some(2000), Some(2010), 2026)), ["a", "b"]);
+        assert_eq!(ids(filter_picks(&c, None, Style::Both, &[], Some(2020), None, 2026)), ["c"]);
+        assert_eq!(ids(filter_picks(&c, Some("movie"), Style::Both, &[], None, None, 2026)), ["a", "d"]);
+        assert!(filter_picks(&c, None, Style::Both, &[], Some(2021), Some(2000), 2026).is_empty());
     }
 
     #[test]

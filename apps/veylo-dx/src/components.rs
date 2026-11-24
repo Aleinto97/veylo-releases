@@ -192,6 +192,33 @@ pub fn StartOver(on_reset: EventHandler<()>, #[props(default)] labelled: bool) -
     }
 }
 
+/// A horizontal shelf strip wrapped with subtle edge fades and hover scroll chevrons on desktop.
+/// The shell's motion script manages `data-left` / `data-right` overflow state and smooth paging.
+#[component]
+pub fn ShelfStrip(#[props(default = "strip poster-strip".to_string())] class: String, children: Element) -> Element {
+    rsx! {
+        div { class: "strip-wrap",
+            button {
+                class: "strip-arrow prev glass",
+                r#type: "button",
+                tabindex: "-1",
+                aria_label: "Scroll left",
+                "data-dir": "-1",
+                icons::ChevronLeft {}
+            }
+            div { class: "{class}", {children} }
+            button {
+                class: "strip-arrow next glass",
+                r#type: "button",
+                tabindex: "-1",
+                aria_label: "Scroll right",
+                "data-dir": "1",
+                icons::ChevronRight {}
+            }
+        }
+    }
+}
+
 /// A poster with the name under it; used by Search.
 #[component]
 pub fn PosterButton(media: Media, on_press: EventHandler<Media>) -> Element {

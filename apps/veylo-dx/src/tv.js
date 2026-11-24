@@ -176,7 +176,7 @@
         const play = button && !button.disabled ? button : null;
         // A new place starts on its first artwork on screen, else its first control on screen, else the tabs.
         const onScreen = sel => [...scope().querySelectorAll(sel)].find(el => usable(el) && el.getBoundingClientRect().top < innerHeight);
-        const first = () => onScreen('.page .card, .page .card-art') || onScreen('.page ' + FOCUSABLE.split(', ').join(', .page '))
+        const first = () => onScreen('.page .home-hero .play-big, .page .card, .page .card-art, .page .cw-open') || onScreen('.page ' + FOCUSABLE.split(', ').join(', .page '))
             || document.querySelector('.dock-tab.on');
         const back = restore();
         // Still arriving: the poster to return to, the rows, or the title's Play (busy finding sources).
@@ -206,7 +206,7 @@
     const seed = document.createElement('canvas'); seed.width = 12; seed.height = 7;
     function light() {
         const a = document.activeElement;
-        const own = a && a.closest && a.closest('.card, .card-art, .lib-item, .week-card, .poster, .duel-card, .person');
+        const own = a && a.closest && a.closest('.card, .card-art, .cw-card, .hero-thumb, .lib-item, .week-card, .poster, .duel-card, .person');
         const img = (own && own.querySelector('img')) || document.querySelector('.ambient img');
         if (!img || !img.currentSrc || img.currentSrc === lit) return;
         if (!img.complete || !img.naturalWidth) { img.addEventListener('load', light, { once: true }); return; }
@@ -222,7 +222,7 @@
         shown = 1 - shown;
     }
     // The opened title's backdrop lights the room when nothing with artwork has focus.
-    new MutationObserver(() => { if (!document.activeElement || !document.activeElement.closest('.card, .card-art, .duel-card, .person')) light(); })
+    new MutationObserver(() => { if (!document.activeElement || !document.activeElement.closest('.card, .card-art, .cw-card, .hero-thumb, .duel-card, .person')) light(); })
         .observe(document.querySelector('.ambient') || document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
     light();
 })();

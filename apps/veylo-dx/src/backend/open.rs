@@ -710,7 +710,7 @@ pub async fn person_filmography(person: &Person) -> Filmography {
                 let resolve_group = |raw: Vec<(String, Value)>| async move {
                     let movies: Vec<Value> = raw.iter().filter(|(k, _)| k == "movie").map(|(_, v)| v.clone()).collect();
                     let series: Vec<Value> = raw.iter().filter(|(k, _)| k == "tv").map(|(_, v)| v.clone()).collect();
-                    let (mut m, s) = tokio::join!(tmdb_titles("movie", movies, None), tmdb_titles("tv", series, None));
+                    let (mut m, s) = tokio::join!(tmdb_titles("movie", movies, &[]), tmdb_titles("tv", series, &[]));
                     m.extend(s);
                     m
                 };
@@ -774,21 +774,28 @@ const CINEMETA_GENRES: [&str; 19] = ["Action", "Adventure", "Animation", "Biogra
 /// Picks' wider catalogue without a TMDB key: Cinemeta's popular and top-rated lists (for the
 /// genre, when Cinemeta has it), at the pages' depths, narrowed to the style and years here.
 /// Genres only other add-ons know are theirs to answer (genre_candidates).
-pub(super) async fn cinemeta_candidates(genre: Option<String>, kind: Option<String>, style: Style, from: Option<i32>, to: Option<i32>, pages: Vec<u32>) -> Vec<Media> {
-    let wanted = match &genre {
-        Some(g) => {
+pub(super) async fn cinemeta_candidates(selected_genres: Vec<String>, kind: Option<String>, style: Style, from: Option<i32>, to: Option<i32>, pages: Vec<u32>) -> Vec<Media> {
+    let mut wanted_lists: Vec<Option<&str>> = Vec::new();
+    if selected_genres.is_empty() {
+        wanted_lists.push((style == Style::Animation).then_some("Animation"));
+    } else {
+        for g in &selected_genres {
             let g = match crate::picks_rules::canonical_genre(g).as_str() { "Kids" => "Family".to_owned(), other => other.to_owned() };
-            match CINEMETA_GENRES.iter().find(|c| crate::picks_rules::canonical_genre(c) == g) { Some(c) => Some(*c), None => return Vec::new() }
+            match CINEMETA_GENRES.iter().find(|c| crate::picks_rules::canonical_genre(c) == g) {
+                Some(c) => if !wanted_lists.contains(&Some(*c)) { wanted_lists.push(Some(*c)); },
+                None => return Vec::new(),
+            }
         }
-        None => (style == Style::Animation).then_some("Animation"),
-    };
+    }
     let kinds: &[&str] = match kind.as_deref() { Some("movie") => &["movie"], Some("series") => &["series"], _ => &["movie", "series"] };
     let mut requests = Vec::new();
-    for k in kinds {
-        for (i, page) in pages.iter().enumerate() {
-            let mut extra = json!({ "skip": (page.saturating_sub(1) % 20 * 50).to_string() });
-            if let Some(g) = wanted { extra["genre"] = json!(g); }
-            requests.push(json!({"op":"catalog","addon_url":CINEMETA,"type":k,"id":if i % 2 == 0 { "top" } else { "imdbRating" },"extra":extra}));
+    for wanted in wanted_lists.into_iter().take(2) {
+        for k in kinds {
+            for (i, page) in pages.iter().enumerate() {
+                let mut extra = json!({ "skip": (page.saturating_sub(1) % 20 * 50).to_string() });
+                if let Some(g) = wanted { extra["genre"] = json!(g); }
+                requests.push(json!({"op":"catalog","addon_url":CINEMETA,"type":k,"id":if i % 2 == 0 { "top" } else { "imdbRating" },"extra":extra}));
+            }
         }
     }
     let answers = on_runtime(async move {
@@ -806,7 +813,8 @@ pub(super) async fn cinemeta_candidates(genre: Option<String>, kind: Option<Stri
         let first = m.first_year().unwrap_or(0);
         let last = if m.kind == "movie" { first } else { m.year.split('–').nth(1).and_then(|y| y.trim().parse().ok()).unwrap_or(9999) };
         let years_ok = !(from.is_some_and(|f| first == 0 || last < f) || to.is_some_and(|t| first == 0 || first > t));
-        style_ok && years_ok && !m.genres.iter().any(|g| formats.contains(&g.as_str()))
+        let genres_ok = selected_genres.iter().all(|g| crate::picks_rules::has_genre(m, g));
+        style_ok && years_ok && genres_ok && !m.genres.iter().any(|g| formats.contains(&g.as_str()))
     }).collect()
 }
 
@@ -819,7 +827,7 @@ pub(super) async fn cinemeta_related(m: &Media) -> Vec<Media> {
     let mut out = Vec::new();
     for g in m.genres.iter().filter(|g| !(animated && *g == "Animation")).take(2) {
         let page = 1 + (rand_u64() % 6) as u32;
-        out.extend(cinemeta_candidates(Some(g.clone()), Some(kind.into()), style, None, None, vec![page]).await.into_iter().take(12));
+        out.extend(cinemeta_candidates(vec![g.clone()], Some(kind.into()), style, None, None, vec![page]).await.into_iter().take(12));
     }
     out
 }
@@ -1025,9 +1033,9 @@ mod tests {
             let t = std::time::Instant::now();
             let n = new_episodes().await;
             println!("new episodes ({:?}): {:?}", t.elapsed(), n.iter().map(|m| &m.name).collect::<Vec<_>>());
-            let c = discover_candidates(Some("Sci-Fi".into()), None, Style::Live, Some(2000), Some(2015), vec![1, 3]).await;
+            let c = discover_candidates(vec!["Sci-Fi".into()], None, Style::Live, Some(2000), Some(2015), vec![1, 3]).await;
             println!("candidates sci-fi 2000-2015 live: {} {:?}", c.len(), c.iter().take(5).map(|m| (&m.name, &m.year)).collect::<Vec<_>>());
-            let a = discover_candidates(None, Some("series".into()), Style::Animation, None, None, vec![2]).await;
+            let a = discover_candidates(Vec::new(), Some("series".into()), Style::Animation, None, None, vec![2]).await;
             println!("candidates animated series: {} {:?}", a.len(), a.iter().take(4).map(|m| &m.name).collect::<Vec<_>>());
             let r = related(&film).await;
             println!("related: {} {:?}", r.len(), r.iter().take(5).map(|m| &m.name).collect::<Vec<_>>());

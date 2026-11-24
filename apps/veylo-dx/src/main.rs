@@ -78,7 +78,7 @@ pub struct Accent(pub Signal<String>);
 
 /// Keyboard commands routed from the window to the Picks screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PickCommand { Left, Right, Skip, Neither }
+pub enum PickCommand { Left, Right, Skip, Neither, ClosePopover }
 
 /// Shared shell state, provided once at the root.
 #[derive(Clone, Copy)]
@@ -461,6 +461,9 @@ fn Shell_() -> Element {
             }
             Key::Escape if search_open() => close_search(shell),
             Key::Escape if opened.read().is_some() => opened.set(None),
+            Key::Escape if !is_tv() && tab() == Tab::Picks && shell.trailer.read().is_none() => {
+                pick_command.set(Some(PickCommand::ClosePopover));
+            }
             // A TV's Back on another tab goes to Home (it never leaves the app).
             Key::Escape if is_tv() && tab() != Tab::Home => go(tab, opened, Tab::Home),
             _ if search_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
@@ -543,13 +546,38 @@ fn Shell_() -> Element {
             const p = document.querySelector('.page');
             const y = p ? p.scrollTop : 0;
             document.documentElement.classList.toggle('scrolled', y > 4);
-            // Smooth GPU hero parallax on TitlePage: drives a single clamped CSS var with zero reflow.
-            const tp = p && p.querySelector('.title-page');
-            if (tp) tp.style.setProperty('--hero-y', Math.min(320, Math.max(0, y)) + 'px');
+            // Smooth GPU hero parallax on TitlePage and Home: drives a single clamped CSS var with zero reflow.
+            const heroHost = p && p.querySelector('.title-page, .home');
+            if (heroHost) heroHost.style.setProperty('--hero-y', Math.min(320, Math.max(0, y)) + 'px');
             const s = screenOf(p);
             if (s && p) savedScroll[s] = y;
         };
         document.addEventListener('scroll', e => { if (e.target.classList && e.target.classList.contains('page')) sync(); }, true);
+        // Horizontal shelf edge-fades and desktop scroll chevrons.
+        const syncStrip = wrap => {
+            const st = wrap.querySelector(':scope > .strip');
+            if (!st) return;
+            const left = st.scrollLeft > 4;
+            const right = st.scrollLeft + st.clientWidth < st.scrollWidth - 4;
+            wrap.toggleAttribute('data-left', left);
+            wrap.toggleAttribute('data-right', right);
+        };
+        const syncStrips = () => document.querySelectorAll('.strip-wrap').forEach(syncStrip);
+        document.addEventListener('scroll', e => {
+            const st = e.target;
+            if (st && st.classList && st.classList.contains('strip') && st.parentElement && st.parentElement.classList.contains('strip-wrap')) {
+                syncStrip(st.parentElement);
+            }
+        }, true);
+        document.addEventListener('click', e => {
+            const btn = e.target.closest && e.target.closest('.strip-arrow');
+            if (!btn) return;
+            const wrap = btn.closest('.strip-wrap');
+            const st = wrap && wrap.querySelector(':scope > .strip');
+            if (!st) return;
+            const dir = Number(btn.dataset.dir || '1');
+            st.scrollBy({ left: dir * Math.max(240, st.clientWidth * 0.78), behavior: 'smooth' });
+        }, true);
         const restoreScroll = () => {
             const p = document.querySelector('.page');
             if (!p) return;
@@ -586,7 +614,7 @@ fn Shell_() -> Element {
             g.dataset.sliding = '';
             if (first) requestAnimationFrame(() => requestAnimationFrame(() => { s.style.transition = ''; }));
         });
-        addEventListener('resize', () => requestAnimationFrame(slide));
+        addEventListener('resize', () => requestAnimationFrame(() => { slide(); syncStrips(); }));
         // A new tab slides in from the side you moved toward.
         document.addEventListener('click', e => {
             const t = e.target.closest && e.target.closest('.dock-tab');
@@ -604,12 +632,12 @@ fn Shell_() -> Element {
             art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%');
         };
         document.addEventListener('pointermove', glare, { passive: true });
-        // Single rAF-throttled observer for scroll shadow, title scroll-reset, and pill sliders.
+        // Single rAF-throttled observer for scroll shadow, title scroll-reset, pill sliders, and shelf fades.
         let framed = false;
         new MutationObserver(() => {
             if (framed) return;
             framed = true;
-            requestAnimationFrame(() => { framed = false; restoreScroll(); sync(); slide(); });
+            requestAnimationFrame(() => { framed = false; restoreScroll(); sync(); slide(); syncStrips(); });
         }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
     })();"#); });
 
@@ -618,7 +646,10 @@ fn Shell_() -> Element {
     let mut lamp_layers = use_signal(Vec::<String>::new);
     use_effect(move || {
         let raw = lamp_source();
-        if raw.is_empty() { return; }
+        if raw.is_empty() {
+            if !lamp_layers.peek().is_empty() { lamp_layers.set(Vec::new()); }
+            return;
+        }
         let now = backend::ambient_url(&raw);
         let mut layers = lamp_layers.peek().clone();
         if layers.last() == Some(&now) { return; }

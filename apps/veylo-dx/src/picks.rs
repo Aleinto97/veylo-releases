@@ -16,7 +16,14 @@ const MAX_GROWTH: u32 = 6;
 #[derive(Clone, Copy, PartialEq)]
 enum Slot { Filters, Mood }
 
-fn year_span(from: &str, to: &str) -> Option<String> { (!from.is_empty() || !to.is_empty()).then(|| format!("{from}–{to}")) }
+fn year_span(from: Option<i32>, to: Option<i32>) -> Option<String> {
+    match (from, to) {
+        (Some(a), Some(b)) => Some(format!("{a}–{b}")),
+        (Some(a), None) => Some(format!("{a}–")),
+        (None, Some(b)) => Some(format!("–{b}")),
+        (None, None) => None,
+    }
+}
 fn new_night_id() -> u64 { backend::rand_u64() | 1 }
 fn has(list: &[Media], m: &Media) -> bool { list.iter().any(|x| x.key() == m.key()) }
 /// A title you finished, under any of its ids (`backend::watched_ids`).
@@ -36,7 +43,7 @@ pub fn Picks() -> Element {
         let saved = backend::load_duel().unwrap_or_default();
         let same = saved.night != 0 && backend::now_secs() - saved.last < NIGHT_GAP;
         let start = if same { saved } else {
-            backend::DuelState { kind: saved.kind, style: saved.style, genre: saved.genre, from: saved.from, to: saved.to, night: new_night_id(), ..Default::default() }
+            backend::DuelState { kind: saved.kind, style: saved.style, genres: saved.genres, from: saved.from, to: saved.to, night: new_night_id(), ..Default::default() }
         };
         (start, same)
     });
@@ -53,7 +60,7 @@ pub fn Picks() -> Element {
     let mut starred = use_signal(|| start.starred.clone());
     let mut kind = use_signal(|| start.kind.clone());
     let mut style = use_signal(|| Style::parse(&start.style));
-    let mut genre = use_signal(|| start.genre.clone());
+    let mut selected_genres = use_signal(|| start.genres.clone());
     let mut from_text = use_signal(|| start.from.clone());
     let mut to_text = use_signal(|| start.to.clone());
     let mut hide_watched = use_signal(|| backend::load_settings().picks_hide_watched);
@@ -80,12 +87,16 @@ pub fn Picks() -> Element {
         }
     });
 
-    // The room takes its light from tonight's favourite while it is on screen.
+    // The room takes its light from tonight's champion while it is on screen, else the leading
+    // card in front of you so Picks never freezes Home's old backdrop or drops to flat black.
     let mut lamp = shell.lamp_source;
     use_effect(move || {
         let champion = kept.read().first().cloned().filter(|_| *streak.read() > 0);
         let (l, r) = pair();
-        let on_screen = champion.filter(|c| [l, r].iter().flatten().any(|m| m.key() == c.key()));
+        let on_screen = champion
+            .filter(|c| [l.as_ref(), r.as_ref()].into_iter().flatten().any(|m| m.key() == c.key()))
+            .or(l)
+            .or(r);
         let Some(c) = on_screen else { if !lamp.peek().is_empty() { lamp.set(String::new()); } return };
         let key = c.key();
         if let Some(src) = backend::cached_artwork(&c).and_then(|a| a.backdrop) {
@@ -118,8 +129,8 @@ pub fn Picks() -> Element {
         loading.set(false);
         let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 25) as u32).collect();
         let (mut more, tvmaze) = tokio::join!(
-            backend::discover_candidates(None, None, Style::Both, None, None, pages),
-            backend::tvmaze_candidates(None, Style::Both, None, None),
+            backend::discover_candidates(Vec::new(), None, Style::Both, None, None, pages),
+            backend::tvmaze_candidates(Vec::new(), Style::Both, None, None),
         );
         more.extend(tvmaze);
         pool.with_mut(|p| rules::merge(p, more));
@@ -153,8 +164,11 @@ pub fn Picks() -> Element {
     let disliked = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked < 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
     let liked_ids = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked > 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
 
-    let from = use_memo(move || from_text().parse::<i32>().ok().filter(|_| from_text().len() == 4));
-    let to = use_memo(move || to_text().parse::<i32>().ok().filter(|_| to_text().len() == 4));
+    let from_raw = use_memo(move || from_text().parse::<i32>().ok().filter(|_| from_text().len() == 4));
+    let to_raw = use_memo(move || to_text().parse::<i32>().ok().filter(|_| to_text().len() == 4));
+    let years_invalid = use_memo(move || from_raw().zip(to_raw()).is_some_and(|(a, b)| a > b));
+    let from = use_memo(move || if years_invalid() { None } else { from_raw() });
+    let to = use_memo(move || if years_invalid() { None } else { to_raw() });
     // Titles checked for a poster and a trailer: only ready ones are drawn when enough are, and a
     // title found lacking either is set aside for the session.
     let mut verified = use_signal(HashSet::<String>::new);
@@ -172,7 +186,7 @@ pub fn Picks() -> Element {
                 .collect::<Vec<_>>();
         }
         let this_year = backend::civil(backend::now_secs()).0 as i32;
-        let out = rules::filter_picks(&pool.read(), kind().as_deref(), style(), genre().as_deref(), from(), to(), this_year);
+        let out = rules::filter_picks(&pool.read(), kind().as_deref(), style(), &selected_genres(), from(), to(), this_year);
         let gone = rejected.read();
         let not_for_me = disliked.read();
         let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
@@ -254,19 +268,22 @@ pub fn Picks() -> Element {
     let mut fetched = use_signal(HashSet::<String>::new);
     let catalog_genres = use_resource(|| async { backend::catalog_genres().await });
     let mut enriching = use_signal(|| false);
-    // Few candidates for these filters: ask the catalogs that declare the genre, then TMDB
-    // Discover (any genre, type and years; Cinemeta's lists without a key), each once per filter combination.
+    // Few candidates for these filters: ask the catalogs that declare each chosen genre, then TMDB
+    // Discover (any genre combo, type and years; Cinemeta's lists without a key), each once per filter combination.
     use_effect(move || {
-        let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
-        if g.is_none() && k.is_none() && st == Style::Both && f.is_none() && t.is_none() { return; }
-        let combo = format!("{g:?}|{k:?}|{st:?}|{f:?}|{t:?}");
+        let (gs, k, st, f, t) = (selected_genres(), kind(), style(), from(), to());
+        if gs.is_empty() && k.is_none() && st == Style::Both && f.is_none() && t.is_none() { return; }
+        let mut sorted = gs.clone();
+        sorted.sort();
+        let combo = format!("{sorted:?}|{k:?}|{st:?}|{f:?}|{t:?}");
         if filtered.read().len() >= 8 || fetched.peek().contains(&combo) { return; }
         fetched.write().insert(combo);
         enriching.set(true);
         spawn(async move {
-            let mut more = match &g { Some(g) => backend::genre_candidates(g).await, None => Vec::new() };
-            more.extend(backend::discover_candidates(g.clone(), k.clone(), st, f, t, vec![1, 2]).await);
-            if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(g, st, f, t).await); }
+            let mut more = Vec::new();
+            for g in &gs { more.extend(backend::genre_candidates(g).await); }
+            more.extend(backend::discover_candidates(gs.clone(), k.clone(), st, f, t, vec![1, 2]).await);
+            if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(gs, st, f, t).await); }
             pool.with_mut(|p| rules::merge(p, more));
             enriching.set(false);
         });
@@ -281,11 +298,11 @@ pub fn Picks() -> Element {
         if loading() || !pool_complete() || enriching() || unseen >= 8 || *growth.peek() >= MAX_GROWTH { return; }
         *growth.write() += 1;
         enriching.set(true);
-        let (g, k, st, f, t) = (genre(), kind(), style(), from(), to());
+        let (gs, k, st, f, t) = (selected_genres(), kind(), style(), from(), to());
         spawn(async move {
             let pages: Vec<u32> = (0..2).map(|_| 1 + (backend::rand_u64() % 30) as u32).collect();
-            let mut more = backend::discover_candidates(g.clone(), k.clone(), st, f, t, pages).await;
-            if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(g, st, f, t).await); }
+            let mut more = backend::discover_candidates(gs.clone(), k.clone(), st, f, t, pages).await;
+            if k.as_deref() != Some("movie") { more.extend(backend::tvmaze_candidates(gs, st, f, t).await); }
             pool.with_mut(|p| rules::merge(p, more));
             enriching.set(false);
         });
@@ -340,11 +357,17 @@ pub fn Picks() -> Element {
         streak.set(0);
         pair.set(next);
     };
-    // A new duel when a filter changes; a restored one is kept until then.
+    // A new duel when a filter or Saved-only mode changes; a restored catalog duel is kept only
+    // when entering normal mode.
     use_effect(move || {
-        let _ = (kind(), style(), genre(), from(), to(), hide_watched());
+        let saved_only = (shell.picks_saved_only)();
+        let _ = (kind(), style(), selected_genres(), from(), to(), hide_watched(), saved_only);
+        if saved_only && *slot.peek() == Some(Slot::Filters) { slot.set(None); }
         if loading() || !brain_ready() { return; }
-        if *restored.peek() { restored.set(false); return; }
+        if *restored.peek() {
+            restored.set(false);
+            if !saved_only { return; }
+        }
         start_duel();
     });
     // Progress can change while the player or title page is open. Cards on screen must obey
@@ -355,10 +378,11 @@ pub fn Picks() -> Element {
         let (left, right) = pair.peek().clone();
         if left.iter().chain(right.iter()).any(|m| finished(&seen, m)) { start_duel(); }
     });
-    // Remember tonight as it goes.
+    // Remember tonight as it goes (never overwrite the catalog duel while in Saved-only mode).
     use_effect(move || {
+        if (shell.picks_saved_only)() { return; }
         let (left, right) = pair();
-        backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genre: genre(), from: from_text(), to: to_text(),
+        backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genres: selected_genres(), from: from_text(), to: to_text(),
             night: night(), last: backend::now_secs(), round: round(), streak: streak(), shown: shown(), left, right, kept: kept(), starred: starred() });
     });
     // The first pair, once there is something to choose from.
@@ -367,8 +391,9 @@ pub fn Picks() -> Element {
         let (l, r) = pair.peek().clone();
         if !loading() && brain_ready() && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
     });
-    // Style is an invariant of visible cards, including restored cards enriched later.
+    // Style is an invariant of visible catalog cards, including restored cards enriched later.
     use_effect(move || {
+        if (shell.picks_saved_only)() { return; }
         let (l, r) = resolved_pair();
         let st = style();
         if !brain_ready() || !l.iter().chain(r.iter()).any(|m| !rules::style_matches(m, st)) { return; }
@@ -392,8 +417,9 @@ pub fn Picks() -> Element {
     let mut keep = move |left: bool| {
         let (l, r) = resolved_pair.peek().clone();
         let (Some(won), Some(lost)) = (if left { (l.clone(), r.clone()) } else { (r.clone(), l.clone()) }) else { return };
+        let saved_only = *shell.picks_saved_only.peek();
         if !verified.peek().contains(&won.key()) || !verified.peek().contains(&lost.key())
-            || !rules::style_matches(&won, *style.peek()) || !rules::style_matches(&lost, *style.peek()) { return; }
+            || (!saved_only && (!rules::style_matches(&won, *style.peek()) || !rules::style_matches(&lost, *style.peek()))) { return; }
         { let mut b = brain.write(); let e = b.keep(&won, &lost); brain::persist(&mut b, Some(&e)); }
         *round.write() += 1;
         let wins = if kept.peek().first().is_some_and(|k| k.key() == won.key()) { *streak.peek() + 1 } else { 1 };
@@ -418,8 +444,11 @@ pub fn Picks() -> Element {
     let mut leaving = use_signal(|| None::<bool>);
     let mut choose = move |left: bool| {
         if leaving.peek().is_some() { return; }
+        let saved_only = *shell.picks_saved_only.peek();
+        let st = *style.peek();
         let ready = { let (l, r) = resolved_pair.peek().clone();
-            l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())) };
+            l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())
+                && (saved_only || (rules::style_matches(&l, st) && rules::style_matches(&r, st)))) };
         if !ready { return; }
         leaving.set(Some(left));
         spawn(async move { backend::sleep(190).await; keep(left); leaving.set(None); });
@@ -505,6 +534,9 @@ pub fn Picks() -> Element {
                 starred.with_mut(|s| if !has(s, &m) { s.insert(0, m.clone()); });
                 notify(format!("Liked {}: more like it from now on", m.name));
                 expand(m.clone());
+            } else if value == 0 {
+                starred.with_mut(|s| s.retain(|x| x.key() != m.key()));
+                notify(format!("Removed like from {}", m.name));
             }
             if value < 0 {
                 kept.with_mut(|k| k.retain(|x| x.key() != m.key()));
@@ -582,12 +614,17 @@ pub fn Picks() -> Element {
     use_effect(move || {
         let Some(command) = (shell.pick_command)() else { return };
         shell.pick_command.set(None);
+        if command == PickCommand::ClosePopover {
+            slot.set(None);
+            return;
+        }
         if slot.peek().is_some() { return; }
         match command {
             PickCommand::Left => choose(true),
             PickCommand::Right => choose(false),
             PickCommand::Skip => change_pair(false),
             PickCommand::Neither => change_pair(true),
+            PickCommand::ClosePopover => {}
         }
     });
 
@@ -602,20 +639,33 @@ pub fn Picks() -> Element {
         counts.into_iter().map(|(g, n)| { let more = tmdb || fetchable.contains(&g.to_lowercase()); (g, n, more) })
             .filter(|(_, n, more)| *n >= 2 || *more).collect()
     };
-    let years = year_span(&from_text(), &to_text());
+    let years = year_span(from(), to());
+    let year_incomplete = (!from_text().is_empty() && from_raw().is_none()) || (!to_text().is_empty() && to_raw().is_none());
+    let saved_only = (shell.picks_saved_only)();
     let type_options: [(Option<&'static str>, &'static str); 3] = [(None, "Everything"), (Some("movie"), "Films"), (Some("series"), "Series")];
     let style_options: [(Style, &'static str); 3] = [(Style::Live, "Live action"), (Style::Animation, "Animation"), (Style::Both, "Live action and animation")];
     // The chip always says what is on screen, the style included (Live action is the default,
     // not "no filter"); it lights up only when something differs from the defaults.
+    let chosen_genres = selected_genres();
+    let genres_label = (!chosen_genres.is_empty()).then(|| chosen_genres.join(" + "));
     let summary: Vec<String> = [
         kind().map(|k| if k == "movie" { "Films".to_owned() } else { "Series".to_owned() }),
         Some(match style() { Style::Live => "Live action", Style::Animation => "Animation", Style::Both => "Live action and animation" }.to_owned()),
-        genre(), years.clone(),
+        genres_label, years.clone(),
     ].into_iter().flatten().collect();
-    let customised = kind().is_some() || style() != Style::Live || genre().is_some() || years.is_some();
+    let customised = kind().is_some() || style() != Style::Live || !chosen_genres.is_empty() || years.is_some();
     // Back to the defaults (Live action is the default style); the filters panel and the empty state alike.
-    let mut clear_filters = move || { kind.set(None); style.set(Style::Live); genre.set(None); from_text.set(String::new()); to_text.set(String::new()); };
-    let pair_ready = { let (l, r) = pair(); l.as_ref().zip(r.as_ref()).is_some_and(|(l, r)| verified.read().contains(&l.key()) && verified.read().contains(&r.key())) };
+    let mut clear_filters = move || { kind.set(None); style.set(Style::Live); selected_genres.set(Vec::new()); from_text.set(String::new()); to_text.set(String::new()); };
+    let pair_ready = {
+        let (l, r) = resolved_pair();
+        let st = style();
+        leaving().is_none()
+            && l.as_ref().zip(r.as_ref()).is_some_and(|(l, r)| {
+                verified.read().contains(&l.key())
+                    && verified.read().contains(&r.key())
+                    && (saved_only || (rules::style_matches(l, st) && rules::style_matches(r, st)))
+            })
+    };
     let ai_failed = !verified.read().is_empty() && crate::picks_ai::failed();
 
     // What the brain says (each title's features cost a hash and a projection) is worked out
@@ -662,6 +712,9 @@ pub fn Picks() -> Element {
 
     rsx! {
         div { class: "duel",
+            if slot().is_some() {
+                div { class: "pop-backdrop", aria_hidden: "true", onclick: move |_| slot.set(None) }
+            }
             div { class: "duel-bar",
                 div { class: "night",
                     div { class: "night-head",
@@ -687,124 +740,168 @@ pub fn Picks() -> Element {
                     }
                 }
                 div { class: "chips",
-                    if (shell.picks_saved_only)() {
-                        button { class: "chip-btn glass on", title: "Dueling your Saved watchlist — tap to return to full catalog",
-                            onclick: move |_| { shell.picks_saved_only.set(false); start_duel(); },
+                    if saved_only {
+                        button { class: "chip-btn glass on saved-chip", title: "Dueling your Saved watchlist — tap to return to full catalog",
+                            onclick: move |_| { shell.picks_saved_only.set(false); },
                             icons::Bookmark {} span { "Saved only" } icons::Close {} }
                     }
                     button { class: if slot() == Some(Slot::Mood) || !moods.is_empty() { "chip-btn glass on" } else { "chip-btn glass" },
                         disabled: ai_failed, title: if ai_failed { "Moods need the local AI" } else { "Set tonight's mood" },
                         onclick: move |_| slot.set(if slot() == Some(Slot::Mood) { None } else { Some(Slot::Mood) }), icons::Sparkles {} span { "Mood" } }
-                    button { class: if slot() == Some(Slot::Filters) || customised { "chip-btn glass on" } else { "chip-btn glass" }, title: "Filters: {summary.join(\", \")}",
-                        onclick: move |_| slot.set(if slot() == Some(Slot::Filters) { None } else { Some(Slot::Filters) }),
-                        icons::Sliders {}
-                        span { class: "filter-summary", {summary.join(" · ")} }
+                    if !saved_only {
+                        button { class: if slot() == Some(Slot::Filters) || customised { "chip-btn glass on" } else { "chip-btn glass" }, title: "Filters: {summary.join(\", \")}",
+                            onclick: move |_| slot.set(if slot() == Some(Slot::Filters) { None } else { Some(Slot::Filters) }),
+                            icons::Sliders {}
+                            span { class: "filter-summary", {summary.join(" · ")} }
+                        }
                     }
                     button { class: "chip-btn glass", title: "New night: forget tonight's votes and moods (lasting taste stays)", onclick: move |_| new_night(),
                         icons::Moon {} span { "New night" } }
                 }
-            }
-            match slot() {
-                Some(Slot::Mood) => rsx! {
-                    div { class: "popover glass mood-pop", role: "group", aria_label: "Tonight's mood",
-                        p { class: "pop-note", "Pick a mood or describe one. Picks leans toward it all night; tap again to drop it." }
-                        div { class: "pop-options",
-                            for (label, phrase) in brain::MOODS {
-                                button { class: if moods.iter().any(|m| m == label) { "option on" } else { "option" }, disabled: mood_busy(),
-                                    onclick: move |_| toggle_mood(label.to_owned(), Some(phrase.to_owned())), "{label}" }
+                match slot() {
+                    Some(Slot::Mood) => rsx! {
+                        div { class: "popover glass mood-pop", role: "group", aria_label: "Tonight's mood",
+                            p { class: "pop-note", "Pick a mood or describe one. Picks leans toward it all night; tap again to drop it." }
+                            div { class: "pop-options",
+                                for (label, phrase) in brain::MOODS {
+                                    button { class: if moods.iter().any(|m| m == label) { "option on" } else { "option" }, disabled: mood_busy(),
+                                        onclick: move |_| toggle_mood(label.to_owned(), Some(phrase.to_owned())), "{label}" }
+                                }
+                            }
+                            div { class: "mood-input",
+                                input { class: "mood-text", r#type: "text", maxlength: "80", placeholder: "Describe a mood: “slow-burn heist in the snow”", aria_label: "Describe a mood", value: "{mood_text}",
+                                    onkeydown: move |e| {
+                                        e.stop_propagation();
+                                        if e.key() == Key::Enter { add_mood(); }
+                                        else if e.key() == Key::Escape { slot.set(None); }
+                                    },
+                                    oninput: move |e| mood_text.set(e.value()) }
+                                button { class: "pill accent", disabled: mood_busy() || mood_text().trim().is_empty(), onclick: move |_| add_mood(), icons::Sparkles {} span { "Add" } }
+                            }
+                            div { class: "pop-row end",
+                                if !moods.is_empty() {
+                                    button { class: "pill glass", disabled: mood_busy(), onclick: move |_| clear_moods(), icons::Undo {} span { "Clear moods" } }
+                                }
+                                button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
                             }
                         }
-                        div { class: "mood-input",
-                            input { class: "mood-text", r#type: "text", maxlength: "80", placeholder: "Describe a mood: “slow-burn heist in the snow”", aria_label: "Describe a mood", value: "{mood_text}",
-                                onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Enter { add_mood(); } },
-                                oninput: move |e| mood_text.set(e.value()) }
-                            button { class: "pill accent", disabled: mood_busy() || mood_text().trim().is_empty(), onclick: move |_| add_mood(), icons::Sparkles {} span { "Add" } }
-                        }
-                        div { class: "pop-row end",
-                            if !moods.is_empty() {
-                                button { class: "pill glass", disabled: mood_busy(), onclick: move |_| clear_moods(), icons::Undo {} span { "Clear moods" } }
+                    },
+                    Some(Slot::Filters) => rsx! {
+                        div { class: "popover glass filters-pop", role: "group", aria_label: "Filters",
+                            div { class: "pop-row",
+                                div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
+                                    i { class: "slider", aria_hidden: "true" }
+                                    for (value, label) in type_options {
+                                        button { class: if kind().as_deref() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{kind().as_deref() == value}",
+                                            aria_label: "{label}", title: "{label}", onclick: move |_| kind.set(value.map(str::to_owned)),
+                                            match value { None => rsx! { icons::Grid {} }, Some("movie") => rsx! { icons::Film {} }, _ => rsx! { icons::Tv {} } }
+                                        }
+                                    }
+                                }
+                                // Style beside type: animated films and series are still films and series.
+                                div { class: "segmented glass", role: "radiogroup", aria_label: "Style",
+                                    i { class: "slider", aria_hidden: "true" }
+                                    for (value, label) in style_options {
+                                        button { class: if style() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{style() == value}",
+                                            aria_label: "{label}", title: "{label}", onclick: move |_| style.set(value),
+                                            match value { Style::Live => rsx! { icons::Camera {} }, Style::Animation => rsx! { icons::Blossom {} }, Style::Both => rsx! { icons::Layers {} } }
+                                        }
+                                    }
+                                }
+                                button { class: if hide_watched() { "chip-btn glass on" } else { "chip-btn glass" }, role: "switch", aria_checked: "{hide_watched()}",
+                                    title: if hide_watched() { "Hiding completed titles; unfinished series stay available" } else { "Showing completed titles too" },
+                                    onclick: move |_| {
+                                        let on = !hide_watched();
+                                        backend::update_settings(|s| s.picks_hide_watched = on);
+                                        hide_watched.set(on);
+                                    },
+                                    icons::EyeOff {} span { "Hide watched" } }
                             }
-                            button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
-                        }
-                    }
-                },
-                Some(Slot::Filters) => rsx! {
-                    div { class: "popover glass filters-pop", role: "group", aria_label: "Filters",
-                        div { class: "pop-row",
-                            div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
-                                i { class: "slider", aria_hidden: "true" }
-                                for (value, label) in type_options {
-                                    button { class: if kind().as_deref() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{kind().as_deref() == value}",
-                                        aria_label: "{label}", title: "{label}", onclick: move |_| kind.set(value.map(str::to_owned)),
-                                        match value { None => rsx! { icons::Grid {} }, Some("movie") => rsx! { icons::Film {} }, _ => rsx! { icons::Tv {} } }
+                            div { class: "pop-row years",
+                                span { class: "pop-label", icons::Calendar {} "Years" }
+                                input { class: if years_invalid() { "year invalid" } else { "year" }, r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "From", aria_label: "From year", value: "{from_text}",
+                                    onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Escape { slot.set(None); } },
+                                    oninput: move |e| from_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
+                                span { class: "dim", "–" }
+                                input { class: if years_invalid() { "year invalid" } else { "year" }, r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "To", aria_label: "To year", value: "{to_text}",
+                                    onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Escape { slot.set(None); } },
+                                    oninput: move |e| to_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
+                                if years_invalid() {
+                                    span { class: "year-hint warn", "From must be ≤ To" }
+                                } else if year_incomplete {
+                                    span { class: "year-hint dim", "Enter 4 digits" }
+                                }
+                            }
+                            div { class: "pop-options", role: "group", aria_label: "Genres (combine multiple)",
+                                button { class: if chosen_genres.is_empty() { "option on" } else { "option" }, aria_pressed: "{chosen_genres.is_empty()}", onclick: move |_| selected_genres.set(Vec::new()), "Any genre" }
+                                for (g, _n, more) in genres {
+                                    {
+                                        let is_on = chosen_genres.iter().any(|x| x.eq_ignore_ascii_case(&g));
+                                        let g_click = g.clone();
+                                        rsx! {
+                                            button { class: if is_on { "option on" } else { "option" },
+                                                aria_pressed: "{is_on}",
+                                                title: if more { "More from your catalogs" } else { "" },
+                                                onclick: move |_| {
+                                                    selected_genres.with_mut(|list| {
+                                                        if let Some(pos) = list.iter().position(|x| x.eq_ignore_ascii_case(&g_click)) {
+                                                            list.remove(pos);
+                                                        } else {
+                                                            list.push(g_click.clone());
+                                                        }
+                                                    });
+                                                },
+                                                "{g}"
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            // Style beside type: animated films and series are still films and series.
-                            div { class: "segmented glass", role: "radiogroup", aria_label: "Style",
-                                i { class: "slider", aria_hidden: "true" }
-                                for (value, label) in style_options {
-                                    button { class: if style() == value { "seg on" } else { "seg" }, role: "radio", aria_checked: "{style() == value}",
-                                        aria_label: "{label}", title: "{label}", onclick: move |_| style.set(value),
-                                        match value { Style::Live => rsx! { icons::Camera {} }, Style::Animation => rsx! { icons::Blossom {} }, Style::Both => rsx! { icons::Layers {} } }
-                                    }
+                            div { class: "pop-row end",
+                                if customised {
+                                    button { class: "pill glass", onclick: move |_| clear_filters(),
+                                        icons::Undo {} span { "Clear filters" } }
                                 }
-                            }
-                            button { class: if hide_watched() { "chip-btn glass on" } else { "chip-btn glass" }, role: "switch", aria_checked: "{hide_watched()}",
-                                title: if hide_watched() { "Hiding completed titles; unfinished series stay available" } else { "Showing completed titles too" },
-                                onclick: move |_| {
-                                    let on = !hide_watched();
-                                    backend::update_settings(|s| s.picks_hide_watched = on);
-                                    hide_watched.set(on);
-                                },
-                                icons::EyeOff {} span { "Hide watched" } }
-                        }
-                        div { class: "pop-row years",
-                            span { class: "pop-label", icons::Calendar {} "Years" }
-                            input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "From", aria_label: "From year", value: "{from_text}",
-                                onkeydown: move |e| e.stop_propagation(), oninput: move |e| from_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
-                            span { class: "dim", "–" }
-                            input { class: "year", r#type: "text", inputmode: "numeric", maxlength: "4", placeholder: "To", aria_label: "To year", value: "{to_text}",
-                                onkeydown: move |e| e.stop_propagation(), oninput: move |e| to_text.set(e.value().chars().filter(char::is_ascii_digit).take(4).collect()) }
-                        }
-                        div { class: "pop-options", role: "radiogroup", aria_label: "Genre",
-                            button { class: if genre().is_none() { "option on" } else { "option" }, onclick: move |_| genre.set(None), "Any genre" }
-                            for (g, _n, more) in genres {
-                                button { class: if genre().as_deref() == Some(g.as_str()) { "option on" } else { "option" },
-                                    title: if more { "More from your catalogs" } else { "" },
-                                    onclick: { let g = g.clone(); move |_| genre.set(Some(g.clone())) },
-                                    "{g}" }
+                                button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
                             }
                         }
-                        div { class: "pop-row end",
-                            if customised {
-                                button { class: "pill glass", onclick: move |_| clear_filters(),
-                                    icons::Undo {} span { "Clear filters" } }
-                            }
-                            button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
-                        }
-                    }
-                },
-                None => rsx! {},
+                    },
+                    None => rsx! {},
+                }
             }
 
             if ai_failed {
                 p { class: "picks-ai-status", role: "status", "Local AI unavailable. Picks is using genres, years and ratings only." }
             }
 
-            if waiting || (rl.is_none() && rr.is_none() && growing) {
+            if waiting || (rl.is_none() && rr.is_none() && growing && !saved_only) {
                 div { class: "duel-cards", div { class: "duel-card skeleton-card" } span { class: "versus display", aria_hidden: "true", "vs" } div { class: "duel-card skeleton-card" } }
             } else if rl.is_none() && rr.is_none() {
-                div { class: "center-note", div { class: "glass panel", span { class: "big-icon dim", icons::Search {} } p { "Nothing matches these filters" }
-                    button { class: "pill glass", onclick: move |_| clear_filters(), icons::Undo {} span { "Clear filters" } } } }
+                div { class: "center-note",
+                    div { class: "glass panel",
+                        span { class: "big-icon dim", if saved_only { icons::Bookmark {} } else { icons::Search {} } }
+                        p {
+                            if saved_only {
+                                if hide_watched() { "No unwatched saved titles to duel" } else { "No saved titles to duel" }
+                            } else {
+                                "Nothing matches these filters"
+                            }
+                        }
+                        if saved_only {
+                            button { class: "pill accent", onclick: move |_| shell.picks_saved_only.set(false), icons::Undo {} span { "Return to full catalog" } }
+                        } else {
+                            button { class: "pill glass", onclick: move |_| clear_filters(), icons::Undo {} span { "Clear filters" } }
+                        }
+                    }
+                }
             } else {
                 div { class: match leaving() { Some(true) => "duel-cards keep-left", Some(false) => "duel-cards keep-right", None => "duel-cards" },
                     // A key only renews a component inside a list: a new title must get a new card.
                     // A card shows once its poster and trailer are confirmed.
-                    {side(rl.clone(), infos.0.clone(), "left", &verified.read(), style(), growing,
+                    {side(rl.clone(), infos.0.clone(), "left", &verified.read(), style(), saved_only, growing,
                         EventHandler::new(move |_| choose(true)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
                     span { class: "versus display", aria_hidden: "true", "vs" }
-                    {side(rr.clone(), infos.1.clone(), "right", &verified.read(), style(), growing,
+                    {side(rr.clone(), infos.1.clone(), "right", &verified.read(), style(), saved_only, growing,
                         EventHandler::new(move |_| choose(false)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
                 }
             }
@@ -841,14 +938,19 @@ struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>,
 /// One side of the duel: the card once checked, else a placeholder (or a note when nothing else
 /// matches these filters).
 #[allow(clippy::too_many_arguments)]
-fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: &HashSet<String>, style: Style, growing: bool,
+fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: &HashSet<String>, style: Style, saved_only: bool, growing: bool,
     on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
     match m {
-        Some(m) if verified.contains(&m.key()) && rules::style_matches(&m, style) => rsx! {
+        Some(m) if verified.contains(&m.key()) && (saved_only || rules::style_matches(&m, style)) => rsx! {
             for m in [m] { DuelCard { key: "{m.key()}", media: m.clone(), side, info: info.clone().unwrap_or_default(), on_keep, on_play, on_rate } }
         },
-        None if !growing => rsx! {
-            div { class: "duel-card lone-note glass", p { class: "dim", "No other title matches these filters. Widen them for a duel." } }
+        None if saved_only || !growing => rsx! {
+            div { class: "duel-card lone-note glass",
+                p { class: "dim",
+                    if saved_only { "Only one saved title is available. Save more or return to the full catalog." }
+                    else { "No other title matches these filters. Widen them for a duel." }
+                }
+            }
         },
         _ => rsx! { div { class: "duel-card skeleton-card" } },
     }
@@ -865,13 +967,16 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     use_hook(move || { if need_meta { spawn(async move { if let Ok(t) = backend::title_meta(&m).await { meta.set(Some(t)); } }); } });
     let facts = meta();
     let art = crate::components::use_artwork(&media);
-    let logo = art().and_then(|a| a.logo).or_else(|| facts.as_ref().map(|f| f.logo.clone()).filter(|l| !l.is_empty()));
+    let mut failed_logos = use_signal(HashSet::<String>::new);
+    let logo = art().and_then(|a| a.logo)
+        .or_else(|| facts.as_ref().map(|f| f.logo.clone()).filter(|l| !l.is_empty()))
+        .or_else(|| media.raw["logo"].as_str().map(str::to_owned).filter(|l| !l.is_empty()))
+        .filter(|l| !failed_logos.read().contains(l));
     let mut bg_sources = Vec::new();
     if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
     let fb = media.backdrop().to_owned();
     if !fb.is_empty() && !bg_sources.contains(&fb) { bg_sources.push(fb); }
     if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
-    let mut logo_failed = use_signal(|| false);
     // Each card lends its own accent: its Keep button takes the colour of its artwork.
     let accent_src = bg_sources.first().cloned().unwrap_or_default();
     let accent = use_resource(use_reactive!(|accent_src| async move { backend::accent(accent_src).await }));
@@ -883,8 +988,12 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     let videos = art().map(|a| a.videos).unwrap_or_default();
     let about = crate::theatre::About::of(&media, facts.as_ref(), art().as_ref());
     let director = facts.as_ref().and_then(|f| f.directors.first().cloned());
+    let imdb = facts.as_ref().map(|f| f.rating.clone()).filter(|r| !r.is_empty())
+        .unwrap_or_else(|| backend::s(&media.raw, "imdbRating"));
+    let runtime = facts.as_ref().map(|f| f.runtime.clone()).filter(|r| !r.is_empty())
+        .or_else(|| Some(backend::s(&media.raw, "runtime")).filter(|r| !r.is_empty()));
     let arrow = if side == "left" { "←" } else { "→" };
-    let (open, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone());
+    let (open, pre_open, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
     let liked = info.liked;
     rsx! {
         article { class: "duel-card {side}", style: "{card_style}", aria_label: "{media.name}",
@@ -898,26 +1007,33 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
                         span { class: "match-num tnum", for v in [p] { span { key: "{v}", class: "roll", "{v}%" } } }
                         span { class: "match-word", "match" }
                         i { class: "match-meter", aria_hidden: "true" } } }
-                    if info.wins > 0 { span { class: "streak glass", key: "{info.wins}", title: "Wins in a row tonight", icons::Trophy {} span { class: "tnum", "{info.wins}" } } }
+                    if info.wins > 0 {
+                        for w in [info.wins] {
+                            span { class: "streak", key: "{w}", title: "Wins in a row tonight", icons::Trophy {} span { class: "tnum", "{w}" } }
+                        }
+                    }
                 }
                 div { class: "card-rate",
                     icons::IconButton { label: if liked { "Liked: tap to undo" } else { "Like" }, class: if liked { "glass small on" } else { "glass small" }, pressed: liked,
-                        onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((like.clone(), if liked { 0 } else { 1 })) }, icons::Heart {} }
+                        onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((like.clone(), if liked { 0 } else { 1 })) }, icons::ThumbUp {} }
                     icons::IconButton { label: "Not for me: never show it again", class: "glass small",
                         onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((dislike.clone(), -1)) }, icons::ThumbDown {} }
                 }
             }
             div { class: "duel-copy",
                 if let Some(why) = info.why.clone() { p { class: "card-why", span { class: "lamp", icons::Sparkles {} } span { "{why}" } } }
-                match logo.filter(|_| !logo_failed()) {
-                    Some(src) => rsx! { img { class: "duel-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
+                match logo {
+                    Some(src) => rsx! {
+                        img { class: "duel-logo", src: "{src}", alt: "{media.name}",
+                            onerror: { let u = src.clone(); move |_| { failed_logos.write().insert(u.clone()); } } }
+                    },
                     None => rsx! { h2 { class: "display duel-title", "{media.name}" } },
                 }
                 div { class: "facts",
-                    crate::components::Scores { media: media.clone(), imdb: facts.as_ref().map(|f| f.rating.clone()).unwrap_or_default() }
-                    if let Some(r) = facts.as_ref().map(|f| f.runtime.clone()).filter(|r| !r.is_empty()) { span { class: "fact", icons::Clock {} span { "{r}" } } }
+                    crate::components::Scores { media: media.clone(), imdb }
+                    if let Some(r) = runtime { span { class: "fact", icons::Clock {} span { "{r}" } } }
                     if !media.year.is_empty() { span { class: "fact", icons::Calendar {} span { class: "tnum", "{media.year}" } } }
-                    if !media.genres.is_empty() { span { class: "fact", icons::Tag {} span { {media.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ")} } } }
+                    if !media.genres.is_empty() { span { class: "fact genres", icons::Tag {} span { {media.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ")} } } }
                 }
                 if !info.feels.is_empty() { p { class: "feels", span { class: "dim", "Feels" } for f in info.feels.iter() { span { class: "feel", "{f}" } } } }
                 if let Some(d) = director { p { class: "duel-credit", span { class: "dim", icons::Clapper {} } span { "{d}" } } }
@@ -926,7 +1042,11 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
                     CardPlayButton { media: media.clone(), episodes: facts.as_ref().map(|f| f.episodes.clone()).unwrap_or_default(), on_play: move |_| on_play.call(play.clone()) }
                     if let Some(t) = trailer { icons::IconButton { label: "Trailer and videos", class: "glass",
                         onclick: move |_| crate::theatre::watch_videos(shell, about.clone(), videos.clone(), t.clone(), None), icons::Clapper {} } }
-                    icons::IconButton { label: "Details", class: "glass", onclick: move |_| { let mut s = shell; s.opened.set(Some(open.clone())) }, icons::Info {} }
+                    button { class: "orb glass", aria_label: "Details", title: "Details",
+                        onpointerdown: move |_| backend::prefetch_title(&pre_open),
+                        onclick: move |_| { let mut s = shell; s.opened.set(Some(open.clone())) },
+                        icons::Info {}
+                    }
                 }
             }
         }
@@ -943,10 +1063,12 @@ fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on
     let fb = media.backdrop().to_owned();
     if !fb.is_empty() && !bg_sources.contains(&fb) { bg_sources.push(fb); }
     if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
-    let (open, remove, play) = (media.clone(), media.clone(), media.clone());
+    let (open, pre_open, remove, play) = (media.clone(), media.clone(), media.clone(), media.clone());
     rsx! {
         div { class: "short-item glass", role: "listitem",
-            button { class: "short-open", aria_label: "Open {media.name}", onclick: move |_| shell.opened.set(Some(open.clone())),
+            button { class: "short-open", aria_label: "Open {media.name}",
+                onpointerdown: move |_| backend::prefetch_title(&pre_open),
+                onclick: move |_| shell.opened.set(Some(open.clone())),
                 crate::components::FallbackImg { sources: bg_sources, lazy: true }
                 span { class: "short-name", if star { span { class: "lamp", icons::Star {} } } span { "{media.name}" } }
                 span { class: "short-bar", style: "--fill: {pct}%", aria_label: "{pct}% match" }
@@ -986,6 +1108,7 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
         if t.1.is_empty() { return; }
         spawn(async move { backend::sleep(PREFETCH_AFTER_MS).await; backend::prefetch_sources(&t.0, &t.1); });
     }));
+    let ready = target.is_some();
     let label = target.as_ref().map(|t| t.label.clone()).unwrap_or_else(|| "Play".into());
     let media = progress.read().as_ref().map(|(m, _)| m.clone()).unwrap_or(media);
     let go = move |e: MouseEvent| {
@@ -997,9 +1120,9 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
     };
     rsx! {
         if compact {
-            icons::IconButton { label: "{label}", class: "glass small", onclick: go, icons::Play {} }
+            icons::IconButton { label: "{label}", class: "glass small", disabled: !ready, onclick: go, icons::Play {} }
         } else {
-            button { class: "pill glass", title: "Play or resume this title", onclick: go, icons::Play {} span { "{label}" } }
+            button { class: "pill glass", title: "Play or resume this title", disabled: !ready, onclick: go, icons::Play {} span { "{label}" } }
         }
     }
 }

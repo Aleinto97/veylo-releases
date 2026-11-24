@@ -39,8 +39,8 @@
 .orb:active:not(:disabled), .pill:active:not(:disabled), .seg:active, .chip-btn:active, .dock-tab:active, .option:active, .name-chip:active {
   transform: scale(.92); filter: brightness(1.25); transition-duration: .06s;
 }
-.card, .ep-main, .week-open, .duel-hit, .source-main, .demo-row { transition: transform .18s cubic-bezier(.22, 1, .36, 1); }
-.card:active, .ep-main:active:not(:disabled), .week-open:active, .source-main:active, .demo-row:active { transform: scale(.975); transition-duration: .06s; }
+.card, .ep-main, .week-open, .cw-open, .duel-hit, .source-main, .demo-row { transition: transform .18s cubic-bezier(.22, 1, .36, 1); }
+.card:active, .ep-main:active:not(:disabled), .week-open:active, .cw-open:active, .source-main:active, .demo-row:active { transform: scale(.975); transition-duration: .06s; }
 
 /* Library: remove a title (and its history). Quiet until wanted. */
 .lib-item { position: relative; min-width: 0; }
@@ -62,7 +62,7 @@
 /* Posters: top left (the watched tick owns top right); asking covers the poster. */
 .lib-item .forget { top: 6px; left: 6px; }
 .lib-item .forget.armed { top: 0; left: 0; right: 0; aspect-ratio: 2 / 3; flex-direction: column; justify-content: center;
-  border-radius: 8px; background: rgba(0,0,0,.66); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+  border-radius: 12px; background: rgba(0,0,0,.66); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 @media (hover: hover) {
   .forget:not(.armed) { opacity: 0; }
   .week-card:hover .forget, .lib-item:hover .forget, .forget:focus-within { opacity: 1; }
