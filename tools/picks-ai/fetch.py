@@ -47,7 +47,8 @@ def download(url, digest):
         print('Fetching', url, flush=True)
         # Direct writes avoid this host's broken atomic-new-file links; retry transient 5xx/network errors.
         last_err = None
-        for attempt in range(4):
+        attempts = 7
+        for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(url, timeout=120) as response, open(cache, 'wb') as out:
                     shutil.copyfileobj(response, out)
@@ -55,8 +56,10 @@ def download(url, digest):
                 break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_err = exc
-                if attempt < 3:
-                    wait = 2 ** (attempt + 1)
+                if attempt < attempts - 1:
+                    # Rate limits (429) need longer than a blip: honour Retry-After, else back off to ~1 min.
+                    retry_after = getattr(exc, 'headers', None) and exc.headers.get('Retry-After')
+                    wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** (attempt + 1), 60)
                     print(f'Fetch attempt {attempt + 1} failed ({exc}); retrying in {wait}s...', flush=True)
                     time.sleep(wait)
         if last_err is not None:

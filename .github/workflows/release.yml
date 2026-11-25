@@ -98,6 +98,12 @@ jobs:
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-v1
+      # Pinned Picks AI downloads (checksummed by fetch.py): reuse them so a Maven/NuGet rate limit
+      # (HTTP 429) can't fail a release.
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/fetch.py') }}
       - uses: cargo-bins/cargo-binstall@main
       - name: Tools
         run: |
