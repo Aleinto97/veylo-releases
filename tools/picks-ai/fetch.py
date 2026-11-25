@@ -40,6 +40,9 @@ ASSETS = {
 ROOT = Path(__file__).resolve().parents[2]
 DEST = ROOT / 'apps/veylo-dx/picks-ai'
 
+MAVEN_CENTRAL = 'https://repo.maven.apache.org/maven2/'
+MAVEN_MIRROR = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
 def download(url, digest):
     cache = DEST / 'downloads' / digest
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -49,8 +52,13 @@ def download(url, digest):
         last_err = None
         attempts = 7
         for attempt in range(attempts):
+            # Maven Central rate-limits GitHub's shared runner IPs (HTTP 429): every other attempt uses
+            # Google's official Maven Central mirror. The SHA-256 check below covers either source.
+            source = url
+            if attempt % 2 == 1 and url.startswith(MAVEN_CENTRAL):
+                source = MAVEN_MIRROR + url[len(MAVEN_CENTRAL):]
             try:
-                with urllib.request.urlopen(url, timeout=120) as response, open(cache, 'wb') as out:
+                with urllib.request.urlopen(source, timeout=120) as response, open(cache, 'wb') as out:
                     shutil.copyfileobj(response, out)
                 last_err = None
                 break
