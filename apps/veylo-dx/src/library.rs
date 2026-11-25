@@ -71,9 +71,10 @@ pub fn Library() -> Element {
     let snap = LIB_SNAPSHOT.get().and_then(|m| m.lock().ok()).map(|s| s.clone()).unwrap_or_default();
     let mut history = use_signal(move || snap.history.map(Ok::<Vec<Seen>, String>));
     let mut saved = use_signal(move || snap.saved);
-    // Refresh from SQLite silently in the background so returning to Library paints on Frame 0
-    // with zero skeleton flash while still reflecting newly saved or watched titles.
-    use_hook(move || {
+    // Refresh from SQLite silently on mount and whenever playback or saves update (`picks_dirty`),
+    // keeping cached Frame-0 paint while reflecting newly watched/saved/progressed titles live.
+    use_effect(move || {
+        let _ = (shell.picks_dirty)();
         spawn(async move {
             let (hist_res, lib_res) = tokio::join!(backend::viewing_history(), backend::library());
             match hist_res {

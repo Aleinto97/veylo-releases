@@ -737,7 +737,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
                 if s.loaded && s.error.is_none() {
                     div { class: "player-mid",
-                        button { class: "bare", aria_label: "Back 10 seconds (←)", title: "Back 10 seconds (←)", onclick: { let live = lc(); move |_| { live.seek_by(-10.0); poke(); } }, icons::Rewind10 {} }
+                        button { class: "bare", aria_label: "Back 10 seconds (←)", title: "Back 10 seconds (←)", onclick: { let live = lc(); move |_| { live.seek_by(-10.0); say("−10 s".into()); poke(); } }, icons::Rewind10 {} }
                         button { class: "bare player-big", aria_label: if s.paused { "Play (Space)" } else { "Pause (Space)" }, title: if s.paused { "Play (Space)" } else { "Pause (Space)" },
                             onclick: { let live = lc(); move |_| { live.toggle_pause(); poke(); } },
                             for k in [if s.paused { "play" } else { "pause" }] {
@@ -746,7 +746,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 }
                             }
                         }
-                        button { class: "bare", aria_label: "Forward 10 seconds (→)", title: "Forward 10 seconds (→)", onclick: { let live = lc(); move |_| { live.seek_by(10.0); poke(); } }, icons::Forward10 {} }
+                        button { class: "bare", aria_label: "Forward 10 seconds (→)", title: "Forward 10 seconds (→)", onclick: { let live = lc(); move |_| { live.seek_by(10.0); say("+10 s".into()); poke(); } }, icons::Forward10 {} }
                     }
                 }
 
@@ -824,7 +824,8 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             }
 
             if let Some(which) = sheet() {
-                section { class: "player-sheet glass", role: "dialog", aria_label: sheet_name(which), aria_modal: (which == Sheet::Keys).then_some("true"),
+                for sheet_key in [sheet_name(which)] {
+                section { key: "{sheet_key}", class: "player-sheet glass", role: "dialog", aria_label: sheet_name(which), aria_modal: (which == Sheet::Keys).then_some("true"),
                     tabindex: (which == Sheet::Keys).then_some("-1"), onmounted: move |e| async move { if which == Sheet::Keys { let _ = e.set_focus(true).await; } },
                     onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                     div { class: "sheet-head",
@@ -944,7 +945,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                                 onkeydown: move |e: KeyboardEvent| if e.key() != Key::Escape { e.stop_propagation(); },
                                                 onkeyup: move |e: KeyboardEvent| e.stop_propagation(),
                                             }
-                                            button { class: "player-step-btn", style: "margin-left: 6px", disabled: local_sub_path().trim().is_empty(),
+                                            button { class: "player-step-btn sub-load-btn", disabled: local_sub_path().trim().is_empty(),
                                                 onclick: { let live = lc(); move |_| {
                                                     let path = local_sub_path.peek().trim().trim_matches('"').to_owned();
                                                     if path.is_empty() { return; }
@@ -1107,6 +1108,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             }
                         }
                     }
+                }
                 }
             }
         }

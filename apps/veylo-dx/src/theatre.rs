@@ -130,12 +130,19 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
     let mut failed_logos = use_signal(std::collections::HashSet::<String>::new);
     let mut pressed_backdrop = use_signal(|| false);
     use_hook(theatre_listen);
+    // Reset tracked YouTube state/time when switching to a different clip so J/L don't use the previous clip's timestamp.
+    let clip_id = clip.youtube.clone();
+    use_effect(use_reactive!(|clip_id| {
+        let _ = clip_id;
+        document::eval("window.__veyloYt = {};");
+    }));
     rsx! {
         div { class: "scrim theatre-scrim",
             onpointerdown: move |_| pressed_backdrop.set(true),
             onclick: move |_| { if pressed_backdrop() { shell.trailer.set(None); } pressed_backdrop.set(false); },
             if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{backend::ambient_url(&about.backdrop)}", alt: "", decoding: "async" } }
-            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}",
+            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}", tabindex: "-1",
+                onmounted: move |e| async move { let _ = e.set_focus(true).await; },
                 onpointerdown: move |e| e.stop_propagation(), onclick: move |e| e.stop_propagation(),
                 // The video is the main actor: it takes all the room the side column leaves.
                 div { class: "theatre-stage",

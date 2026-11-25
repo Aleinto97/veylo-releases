@@ -31,7 +31,9 @@ html:has(.app.playing) .tv-light { display: none; }
 .tv .card-art { transition: transform .32s cubic-bezier(.16, 1, .3, 1), box-shadow .32s cubic-bezier(.16, 1, .3, 1); }
 .tv .card:focus .card-art, .tv .card-art:focus, .tv .hero-thumb:focus {
   transform: scale(1.1); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 22px 44px -10px rgba(0,0,0,.8); outline: none; opacity: 1; }
-.tv .cw-card:has(.cw-open:focus) { transform: scale(1.04); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 22px 44px -10px rgba(0,0,0,.8); }
+.tv .cw-card:has(.cw-open:focus), .tv .cw-card:has(.forget:focus-within), .tv .week-card:has(.forget:focus-within) {
+  transform: scale(1.04); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 22px 44px -10px rgba(0,0,0,.8); }
+.tv .forget:focus-within { opacity: 1; }
 .tv .cw-open:focus { outline: none; }
 .tv .home-hero { min-height: clamp(340px, 64vh, 430px); padding-top: 84px; padding-bottom: 22px; }
 .tv .strip-arrow { display: none !important; }

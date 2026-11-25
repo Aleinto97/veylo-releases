@@ -135,7 +135,7 @@
         if (e.key !== 'Escape') return;
         // A Picks menu (mood, filters) closes with its own Done, and Back stops there.
         const menu = document.querySelector('.popover');
-        const done = menu && menu.querySelector('.pill.accent');
+        const done = menu && (menu.querySelector('.pop-done') || menu.querySelector('.pill.accent:not(:disabled)'));
         if (done && !document.querySelector('.app.playing')) {
             e.preventDefault(); e.stopPropagation(); done.click();
             const opener = document.querySelector('.chip-btn.on') || document.querySelector('.duel-bar .chip-btn');

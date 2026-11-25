@@ -595,6 +595,7 @@ fn LinkButton(url: &'static str, label: &'static str) -> Element {
 #[component]
 fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
     let mut screen = use_signal(crate::display::screen);
+    let mut checked_flash = use_signal(|| false);
     let (title, about) = crate::display::summary(screen(), settings().hdr_output);
     rsx! {
         section { class: "settings-block",
@@ -602,7 +603,11 @@ fn ScreenBlock(settings: Signal<backend::Settings>) -> Element {
             div { class: "setting-row glass",
                 div { class: "setting-copy", span { class: "setting-name", "This screen: {title}" }
                     span { class: "dim setting-about", "{about}" } }
-                button { class: "pill glass", onclick: move |_| screen.set(crate::display::screen()), icons::Refresh {} span { "Check again" } }
+                button { class: "pill glass", onclick: move |_| {
+                    screen.set(crate::display::screen());
+                    checked_flash.set(true);
+                    spawn(async move { backend::sleep(1800).await; checked_flash.set(false); });
+                }, if checked_flash() { icons::Check {} } else { icons::Refresh {} } span { if checked_flash() { "Checked" } else { "Check again" } } }
             }
             if cfg!(any(target_os = "windows", target_os = "macos")) {
                 div { class: "setting-row glass",

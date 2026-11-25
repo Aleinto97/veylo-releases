@@ -67,6 +67,7 @@ pub fn Picks() -> Element {
     let watched = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::watched_ids().await } });
     let library = use_resource(move || { let _ = (shell.picks_dirty)(); async { backend::library().await.unwrap_or_default() } });
     let mut slot = use_signal(|| None::<Slot>);
+    let mut arm_night = use_signal(|| false);
     let mut toast = use_signal(|| None::<(u64, String)>);
     let mut mood_text = use_signal(String::new);
     let mut mood_busy = use_signal(|| false);
@@ -163,6 +164,7 @@ pub fn Picks() -> Element {
     });
     let disliked = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked < 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
     let liked_ids = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked > 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
+    let saved_ids = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.saved).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
 
     let from_raw = use_memo(move || from_text().parse::<i32>().ok().filter(|_| from_text().len() == 4));
     let to_raw = use_memo(move || to_text().parse::<i32>().ok().filter(|_| to_text().len() == 4));
@@ -242,7 +244,26 @@ pub fn Picks() -> Element {
     };
     // Check the candidates ahead of the duel, at most a dozen at a time: a finished check frees a
     // place (the effect follows `checking`), it doesn't add a dozen more.
+    // In Saved-only mode, saved titles are always eligible without requiring a trailer or swapping sequels.
     use_effect(move || {
+        let saved_only = (shell.picks_saved_only)();
+        if saved_only {
+            let list = filtered.read().clone();
+            let missing: Vec<Media> = {
+                let ok = verified.peek();
+                list.into_iter().filter(|m| !ok.contains(&m.key())).collect()
+            };
+            if !missing.is_empty() {
+                verified.with_mut(|v| for m in &missing { v.insert(m.key()); });
+                spawn(async move {
+                    for m in missing.into_iter().take(24) {
+                        if crate::picks_ai::failed() { break; }
+                        let _ = crate::picks_ai::embed(&m).await;
+                    }
+                });
+            }
+            return;
+        }
         let in_flight = checking.read().len();
         let room = CHECKS_AT_ONCE.saturating_sub(in_flight);
         if room == 0 { return; }
@@ -479,9 +500,15 @@ pub fn Picks() -> Element {
     });
 
     // A card on screen that turns out to lack a poster or trailer gives its place to another
-    // (not a round).
+    // (not a round). Saved-only cards stay eligible regardless of trailer availability.
     use_effect(move || {
         let (l, r) = pair();
+        if (shell.picks_saved_only)() {
+            for m in [l, r].into_iter().flatten() {
+                if !verified.peek().contains(&m.key()) { verified.write().insert(m.key()); }
+            }
+            return;
+        }
         for (left, m) in [(true, l), (false, r)] {
             let Some(m) = m else { continue };
             if verified.peek().contains(&m.key()) { continue; }
@@ -598,7 +625,16 @@ pub fn Picks() -> Element {
         mood_text.set(String::new());
         toggle_mood(words, None);
     };
+    let save_toggle = move |m: Media, next: bool| {
+        spawn(async move {
+            if backend::set_saved(&m, next).await.is_err() { notify("Couldn't update Saved. Try again.".into()); return; }
+            if !next { crate::library::unsave_from_snapshot(&m.key()); }
+            *shell.picks_dirty.write() += 1;
+            notify(if next { format!("Saved {} to Library", m.name) } else { format!("Removed {} from Saved", m.name) });
+        });
+    };
     let mut new_night = move || {
+        arm_night.set(false);
         let id = new_night_id();
         night.set(id);
         brain.write().set_session(id);
@@ -687,6 +723,7 @@ pub fn Picks() -> Element {
             feels: b.feels(m),
             wins: if champion.as_deref() == Some(&m.key()) { streak() } else { 0 },
             liked: liked_ids.read().contains(&brain::id(m)),
+            saved: saved_ids.read().contains(&brain::id(m)),
         };
         let (l, r) = resolved_pair();
         (l.as_ref().map(card), r.as_ref().map(card))
@@ -707,6 +744,7 @@ pub fn Picks() -> Element {
     let (rl, rr) = resolved_pair();
     let infos = infos();
     let shortlist = shortlist();
+    let night_has_state = votes > 0 || !moods.is_empty() || !shortlist.is_empty();
     let waiting = loading() || !brain_ready() || (hide_watched() && watched.read().is_none());
     let growing = !pool_complete() || enriching();
 
@@ -755,8 +793,19 @@ pub fn Picks() -> Element {
                             span { class: "filter-summary", {summary.join(" · ")} }
                         }
                     }
-                    button { class: "chip-btn glass", title: "New night: forget tonight's votes and moods (lasting taste stays)", onclick: move |_| new_night(),
-                        icons::Moon {} span { "New night" } }
+                    if arm_night() {
+                        span { class: "confirm", role: "group", aria_label: "Start a new night?",
+                            button { class: "pill forget-confirm", onclick: move |_| new_night(), icons::Moon {} span { "Reset tonight" } }
+                            icons::IconButton { label: "Keep tonight", class: "glass small", onclick: move |_| arm_night.set(false), icons::Close {} }
+                        }
+                    } else {
+                        button { class: "chip-btn glass", title: "New night: forget tonight's votes and moods (lasting taste stays)",
+                            onclick: move |_| {
+                                if !night_has_state { new_night(); }
+                                else { slot.set(None); arm_night.set(true); }
+                            },
+                            icons::Moon {} span { "New night" } }
+                    }
                 }
                 match slot() {
                     Some(Slot::Mood) => rsx! {
@@ -782,7 +831,7 @@ pub fn Picks() -> Element {
                                 if !moods.is_empty() {
                                     button { class: "pill glass", disabled: mood_busy(), onclick: move |_| clear_moods(), icons::Undo {} span { "Clear moods" } }
                                 }
-                                button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
+                                button { class: "pill accent pop-done", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
                             }
                         }
                     },
@@ -862,7 +911,7 @@ pub fn Picks() -> Element {
                                     button { class: "pill glass", onclick: move |_| clear_filters(),
                                         icons::Undo {} span { "Clear filters" } }
                                 }
-                                button { class: "pill accent", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
+                                button { class: "pill accent pop-done", onclick: move |_| slot.set(None), icons::Check {} span { "Done" } }
                             }
                         }
                     },
@@ -899,10 +948,10 @@ pub fn Picks() -> Element {
                     // A key only renews a component inside a list: a new title must get a new card.
                     // A card shows once its poster and trailer are confirmed.
                     {side(rl.clone(), infos.0.clone(), "left", &verified.read(), style(), saved_only, growing,
-                        EventHandler::new(move |_| choose(true)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
+                        EventHandler::new(move |_| choose(true)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)), EventHandler::new(move |(m, s)| save_toggle(m, s)))}
                     span { class: "versus display", aria_hidden: "true", "vs" }
                     {side(rr.clone(), infos.1.clone(), "right", &verified.read(), style(), saved_only, growing,
-                        EventHandler::new(move |_| choose(false)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)))}
+                        EventHandler::new(move |_| choose(false)), EventHandler::new(played), EventHandler::new(move |(m, v)| rate(m, v)), EventHandler::new(move |(m, s)| save_toggle(m, s)))}
                 }
             }
 
@@ -933,16 +982,16 @@ pub fn Picks() -> Element {
 
 /// What the brain says about a card.
 #[derive(Clone, Debug, PartialEq, Default)]
-struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>, wins: u32, liked: bool }
+struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>, wins: u32, liked: bool, saved: bool }
 
 /// One side of the duel: the card once checked, else a placeholder (or a note when nothing else
 /// matches these filters).
 #[allow(clippy::too_many_arguments)]
 fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: &HashSet<String>, style: Style, saved_only: bool, growing: bool,
-    on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
+    on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>, on_save: EventHandler<(Media, bool)>) -> Element {
     match m {
         Some(m) if verified.contains(&m.key()) && (saved_only || rules::style_matches(&m, style)) => rsx! {
-            for m in [m] { DuelCard { key: "{m.key()}", media: m.clone(), side, info: info.clone().unwrap_or_default(), on_keep, on_play, on_rate } }
+            for m in [m] { DuelCard { key: "{m.key()}", media: m.clone(), side, info: info.clone().unwrap_or_default(), on_keep, on_play, on_rate, on_save } }
         },
         None if saved_only || !growing => rsx! {
             div { class: "duel-card lone-note glass",
@@ -958,7 +1007,7 @@ fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: 
 
 /// One side of the duel: artwork, the brain's read on it, facts, synopsis and the ways on.
 #[component]
-fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>) -> Element {
+fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>, on_save: EventHandler<(Media, bool)>) -> Element {
     let shell = use_context::<Shell>();
     let init_meta = backend::cached_title_meta(&media);
     let need_meta = init_meta.is_none();
@@ -993,8 +1042,9 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
     let runtime = facts.as_ref().map(|f| f.runtime.clone()).filter(|r| !r.is_empty())
         .or_else(|| Some(backend::s(&media.raw, "runtime")).filter(|r| !r.is_empty()));
     let arrow = if side == "left" { "←" } else { "→" };
-    let (open, pre_open, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
+    let (open, pre_open, save_m, like, dislike, play) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
     let liked = info.liked;
+    let saved = info.saved;
     rsx! {
         article { class: "duel-card {side}", style: "{card_style}", aria_label: "{media.name}",
             div { class: "duel-art", crate::components::FallbackImg { sources: bg_sources } }
@@ -1014,6 +1064,8 @@ fn DuelCard(media: Media, side: &'static str, info: CardInfo, on_keep: EventHand
                     }
                 }
                 div { class: "card-rate",
+                    icons::IconButton { label: if saved { "Saved to Library: tap to remove" } else { "Save to Library" }, class: if saved { "glass small on" } else { "glass small" }, pressed: saved,
+                        onclick: move |e: MouseEvent| { e.stop_propagation(); on_save.call((save_m.clone(), !saved)) }, icons::Bookmark {} }
                     icons::IconButton { label: if liked { "Liked: tap to undo" } else { "Like" }, class: if liked { "glass small on" } else { "glass small" }, pressed: liked,
                         onclick: move |e: MouseEvent| { e.stop_propagation(); on_rate.call((like.clone(), if liked { 0 } else { 1 })) }, icons::ThumbUp {} }
                     icons::IconButton { label: "Not for me: never show it again", class: "glass small",
@@ -1115,7 +1167,7 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
         e.stop_propagation();
         let Some(target) = &target else { return };
         if let Some(h) = &on_play { h.call(()); }
-        if target.video.is_empty() { let mut s = shell; s.opened.set(Some(media.clone())); }
+        if target.video.is_empty() { crate::title::play_or_resume(shell, media.clone()); }
         else { crate::title::play_from_card(shell, media.clone(), target.video.clone()); }
     };
     rsx! {

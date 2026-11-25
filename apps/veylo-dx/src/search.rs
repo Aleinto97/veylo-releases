@@ -16,6 +16,7 @@ pub fn SearchOverlay() -> Element {
     let mut searching = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut generation = use_signal(|| 0u64);
+    let mut arm_clear_history = use_signal(|| false);
     let ideas = use_resource(|| async {
         let items = backend::picks().await.map(|p| p.items).unwrap_or_default();
         if items.len() <= 1 { return items; }
@@ -77,8 +78,17 @@ pub fn SearchOverlay() -> Element {
     use_hook(move || if let Ok(q) = std::env::var("VEYLO_DX_SEARCH") {
         if !q.trim().is_empty() { spawn(async move { query.set(q.clone()); run(q, 0, false); }); }
     });
-    // A name tapped on a title page arrives as a query.
-    use_hook(move || if let Some(q) = shell.search_query.take() { spawn(async move { query.set(q.clone()); run(q, 0, false); }); });
+    // A name tapped on a title page arrives as a query; otherwise, reopening with a remembered draft runs it.
+    use_hook(move || {
+        if let Some(q) = shell.search_query.take() {
+            spawn(async move { query.set(q.clone()); run(q, 0, false); });
+        } else {
+            let existing = query.peek().clone();
+            if !existing.trim().is_empty() {
+                spawn(async move { run(existing, 0, false); });
+            }
+        }
+    });
     let q = query();
     let results = outcome.read().as_ref().map(|o| o.results.clone()).unwrap_or_default();
     let several_addons = results.first().is_some_and(|(first, _)| results.iter().any(|(a, _)| a != first));
@@ -97,7 +107,12 @@ pub fn SearchOverlay() -> Element {
     let history = shell.history.read().clone();
     // Spoken only: the field's sweeping rule shows searching, the groups show counts.
     let status = if searching() { "Searching".to_string() }
-        else if outcome.read().is_some() { match results.len() { 0 => String::new(), 1 => "1 title".into(), n => format!("{n} titles") } }
+        else if vibe_mode() {
+            match vibe_results.read().as_ref() {
+                Some(list) => match list.len() { 0 => "No matching vibes".into(), 1 => "1 vibe match".into(), n => format!("{n} vibe matches") },
+                None => String::new(),
+            }
+        } else if outcome.read().is_some() { match results.len() { 0 => String::new(), 1 => "1 title".into(), n => format!("{n} titles") } }
         else { String::new() };
 
     rsx! {
@@ -152,7 +167,15 @@ pub fn SearchOverlay() -> Element {
                             for past in history.queries.iter().take(8).cloned() {
                                 button { key: "{past}", class: "token glass", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }
                             }
-                            icons::IconButton { label: "Clear history", class: "small", onclick: move |_| backend::clear_history(&mut shell.history.write()), icons::Trash {} }
+                            if arm_clear_history() {
+                                span { class: "confirm", role: "group", aria_label: "Clear search history?",
+                                    button { class: "pill forget-confirm", onclick: move |_| { arm_clear_history.set(false); backend::clear_history(&mut shell.history.write()); },
+                                        icons::Trash {} span { "Clear" } }
+                                    icons::IconButton { label: "Keep history", class: "glass small", onclick: move |_| arm_clear_history.set(false), icons::Close {} }
+                                }
+                            } else {
+                                icons::IconButton { label: "Clear history", class: "small", onclick: move |_| arm_clear_history.set(true), icons::Trash {} }
+                            }
                         }
                     }
                     if !history.items.is_empty() {

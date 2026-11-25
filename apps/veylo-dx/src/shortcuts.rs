@@ -23,8 +23,8 @@ pub fn AppShortcuts() -> Element {
     } else if (shell.search_open)() {
         rows.extend([(&["Enter"][..], "Search"), (&["Esc"][..], "Close search")]); "Search"
     } else if let Some(media) = shell.opened.read().as_ref() {
-        rows.extend([(&["P"][..], "Play or resume"), (&["L"][..], "Like"), (&["D"][..], "Not for me"), (&["S"][..], "Save"), (&["T"][..], "Trailer")]);
-        if media.kind == "movie" { rows.extend([(&["W"][..], "Watched"), (&["O"][..], "Choose source")]); }
+        rows.extend([(&["P"][..], "Play or resume"), (&["L"][..], "Like"), (&["D"][..], "Not for me"), (&["S"][..], "Save"), (&["W"][..], "Watched"), (&["T"][..], "Trailer")]);
+        if media.kind == "movie" { rows.push((&["O"], "Choose source")); }
         rows.push((&["Esc"], "Back")); "Title"
     } else {
         if (shell.tab)() == Tab::Picks {
