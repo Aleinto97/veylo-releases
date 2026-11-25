@@ -22,6 +22,8 @@ pub fn SettingsPage() -> Element {
     let mut check_note = use_signal(|| None::<String>);
     let mut tmdb_checking = use_signal(|| false);
     let mut tmdb_problem = use_signal(|| None::<String>);
+    let mut tmdb_draft = use_signal(String::new);
+    let mut rd_draft = use_signal(String::new);
     let mut custom_url = use_signal(String::new);
     let mut import_open = use_signal(|| false);
     let mut import_text = use_signal(String::new);
@@ -60,6 +62,7 @@ pub fn SettingsPage() -> Element {
             match addons::check_rd_key(key.clone()).await {
                 Ok(account) => {
                     settings.set(backend::update_settings(|s| { s.rd_key = Some(key); s.rd_key_removed = false; }));
+                    rd_draft.set(String::new());
                     rd_account.set(Some(account));
                     if let Err(e) = addons::reconfigure().await { problem.set(Some(format!("{e:#}"))); }
                 }
@@ -67,6 +70,23 @@ pub fn SettingsPage() -> Element {
             }
             busy.set(None);
             overview.restart();
+        });
+    };
+    let mut save_tmdb_key = move |key: String| {
+        let key = key.trim().to_owned();
+        if key.is_empty() || *tmdb_checking.peek() { return; }
+        tmdb_checking.set(true);
+        tmdb_problem.set(None);
+        spawn(async move {
+            match backend::check_tmdb_key(key.clone()).await {
+                Ok(()) => {
+                    settings.set(backend::update_settings(|s| s.tmdb_key = Some(key)));
+                    tmdb_draft.set(String::new());
+                    backend::clear_artwork_caches();
+                }
+                Err(e) => tmdb_problem.set(Some(format!("{e:#}"))),
+            }
+            tmdb_checking.set(false);
         });
     };
     let mut choose_language = move |key: String| {
@@ -117,27 +137,24 @@ pub fn SettingsPage() -> Element {
                             backend::clear_artwork_caches();
                         }, icons::Trash {} span { "Remove key" } }
                     } else {
-                        LinkButton { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
-                        // Masked while typing; checked with TMDB, then saved, on Enter.
-                        input { class: "key-field", r#type: "password", placeholder: "TMDB API key", aria_label: "TMDB API key", autocomplete: "off",
-                            disabled: tmdb_checking(),
-                            onkeydown: move |e| { e.stop_propagation(); },
-                            onchange: move |e| {
-                                let key = e.value().trim().to_owned();
-                                if key.is_empty() || tmdb_checking() { return; }
-                                tmdb_checking.set(true);
-                                tmdb_problem.set(None);
-                                spawn(async move {
-                                    match backend::check_tmdb_key(key.clone()).await {
-                                        Ok(()) => {
-                                            settings.set(backend::update_settings(|s| s.tmdb_key = Some(key)));
-                                            backend::clear_artwork_caches();
-                                        }
-                                        Err(e) => tmdb_problem.set(Some(format!("{e:#}"))),
-                                    }
-                                    tmdb_checking.set(false);
-                                });
-                            } }
+                        div { class: "setting-input-group",
+                            LinkButton { url: addons::TMDB_KEY_PAGE, label: "Get a TMDB key (API Key, not the Read Access Token)" }
+                            // Masked while typing; checked with TMDB, then saved, on Enter or Save.
+                            input { class: "key-field", r#type: "password", placeholder: "TMDB API key", aria_label: "TMDB API key", autocomplete: "off",
+                                value: "{tmdb_draft}",
+                                disabled: tmdb_checking(),
+                                oninput: move |e| tmdb_draft.set(e.value()),
+                                onkeydown: move |e| {
+                                    e.stop_propagation();
+                                    if e.key() == Key::Enter { save_tmdb_key(tmdb_draft.peek().clone()); }
+                                },
+                            }
+                            button { class: "pill accent small",
+                                disabled: tmdb_checking() || tmdb_draft().trim().is_empty(),
+                                onclick: move |_| save_tmdb_key(tmdb_draft.peek().clone()),
+                                icons::Check {} span { if tmdb_checking() { "Checking…" } else { "Save" } }
+                            }
+                        }
                     }
                 }
                 if let Some(p) = tmdb_problem() { p { class: "addon-problem", role: "alert", icons::Alert {} span { "{p}" } } }
@@ -180,11 +197,29 @@ pub fn SettingsPage() -> Element {
                                 let done = addons::remove_rd_key().await; settings.set(backend::load_settings()); done })); },
                             icons::Trash {} span { "Remove key" } }
                     } else {
-                        LinkButton { url: addons::RD_KEY_PAGE, label: "Get your Real-Debrid key" }
-                        input { class: "key-field", r#type: "password", placeholder: "Real-Debrid API token", aria_label: "Real-Debrid API token", autocomplete: "off",
-                            disabled: busy().is_some(),
-                            onkeydown: move |e| { e.stop_propagation(); },
-                            onchange: move |e| { let v = e.value().trim().to_owned(); if !v.is_empty() { save_rd_key(v); } } }
+                        div { class: "setting-input-group",
+                            LinkButton { url: addons::RD_KEY_PAGE, label: "Get your Real-Debrid key" }
+                            input { class: "key-field", r#type: "password", placeholder: "Real-Debrid API token", aria_label: "Real-Debrid API token", autocomplete: "off",
+                                value: "{rd_draft}",
+                                disabled: busy().is_some(),
+                                oninput: move |e| rd_draft.set(e.value()),
+                                onkeydown: move |e| {
+                                    e.stop_propagation();
+                                    if e.key() == Key::Enter {
+                                        let v = rd_draft.peek().trim().to_owned();
+                                        if !v.is_empty() { save_rd_key(v); }
+                                    }
+                                },
+                            }
+                            button { class: "pill accent small",
+                                disabled: busy().is_some() || rd_draft().trim().is_empty(),
+                                onclick: move |_| {
+                                    let v = rd_draft.peek().trim().to_owned();
+                                    if !v.is_empty() { save_rd_key(v); }
+                                },
+                                icons::Check {} span { if busy().as_deref() == Some("key") { "Checking…" } else { "Save" } }
+                            }
+                        }
                     }
                 }
                 div { class: "setting-row glass",
@@ -305,25 +340,27 @@ pub fn SettingsPage() -> Element {
                                 }
                             }
                         }
-                        div { class: "setting-row glass", style: "margin-top: 12px",
+                        div { class: "setting-row glass custom-addon-row",
                             div { class: "setting-copy", span { class: "setting-name", "Custom Stremio add-on" }
                                 span { class: "dim setting-about", "Install any Stremio manifest URL (TorBox, AllDebrid, Premiumize, self-hosted AIOStreams, or community add-ons). Links stay masked and are never logged." } }
-                            input { class: "key-field", r#type: "password", placeholder: "https://…/manifest.json", aria_label: "Custom Stremio add-on URL", autocomplete: "off",
-                                value: "{custom_url}", disabled: busy().is_some(),
-                                oninput: move |e| custom_url.set(e.value()),
-                                onkeydown: move |e| { e.stop_propagation(); },
-                            }
-                            button { class: "pill accent small", disabled: busy().is_some() || custom_url().trim().is_empty(),
-                                onclick: move |_| {
-                                    let url = custom_url.peek().trim().to_owned();
-                                    custom_url.set(String::new());
-                                    run("custom".into(), Box::pin(async move {
-                                        let name = addons::install_custom(url).await?;
-                                        check_note.set(Some(format!("Installed {name}.")));
-                                        Ok(())
-                                    }));
-                                },
-                                icons::Plus {} span { "Install" }
+                            div { class: "setting-input-group",
+                                input { class: "key-field", r#type: "password", placeholder: "https://…/manifest.json", aria_label: "Custom Stremio add-on URL", autocomplete: "off",
+                                    value: "{custom_url}", disabled: busy().is_some(),
+                                    oninput: move |e| custom_url.set(e.value()),
+                                    onkeydown: move |e| { e.stop_propagation(); },
+                                }
+                                button { class: "pill accent small", disabled: busy().is_some() || custom_url().trim().is_empty(),
+                                    onclick: move |_| {
+                                        let url = custom_url.peek().trim().to_owned();
+                                        custom_url.set(String::new());
+                                        run("custom".into(), Box::pin(async move {
+                                            let name = addons::install_custom(url).await?;
+                                            check_note.set(Some(format!("Installed {name}.")));
+                                            Ok(())
+                                        }));
+                                    },
+                                    icons::Plus {} span { "Install" }
+                                }
                             }
                         }
                     },
@@ -524,6 +561,10 @@ pub fn SettingsPage() -> Element {
                             let js = format!("navigator.clipboard?.writeText({}).catch(()=>{{}})", serde_json::to_string(&report).unwrap_or_default());
                             let _ = document::eval(&js);
                             diag_copied.set(true);
+                            spawn(async move {
+                                backend::sleep(2200).await;
+                                diag_copied.set(false);
+                            });
                         }, icons::Copy {} span { if diag_copied() { "Copied" } else { "Copy log" } } }
                         button { class: "pill glass small", onclick: move |_| {
                             if !diag_open() { diag_text.set(backend::diagnostic_report()); }

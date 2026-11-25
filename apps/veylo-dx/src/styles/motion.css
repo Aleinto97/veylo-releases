@@ -52,31 +52,34 @@
 .ambient img { animation: arrive .55s ease-out; }
 
 /* ---------------------------------------------------------------- the player
-   Controls drift in from their edges and back out when they rest; the picture never moves. */
+   Controls drift in from their edges and back out when they rest; the picture never moves.
+   Use `backwards` (not `both`) so the entrance animation releases `transform` after finishing
+   and `.player.calm` glides the bars smoothly instead of snapping. */
 @keyframes from-top { from { opacity: 0; transform: translateY(-10px); } }
 @keyframes from-bottom { from { opacity: 0; transform: translateY(10px); } }
 @keyframes from-center { from { opacity: 0; transform: translate(-50%, -50%) scale(.94); } }
-.player-top { animation: from-top .24s var(--out) both; transition: transform .24s var(--out); }
-.player-bottom { animation: from-bottom .24s var(--out) both; transition: transform .24s var(--out); }
-.player-mid { animation: from-center .26s var(--out) both; transition: transform .24s var(--out); }
+.player-top { animation: from-top .26s var(--out) backwards; transition: transform .28s var(--out); }
+.player-bottom { animation: from-bottom .26s var(--out) backwards; transition: transform .28s var(--out); }
+.player-mid { animation: from-center .26s var(--out) backwards; transition: transform .28s var(--out); }
 .player.calm .player-top { transform: translateY(-12px); }
 /* While a source is found the status bar is still showing: sit below it. */
 .player.pending .player-top { top: calc(20px + var(--top-inset)); }
 .player.calm .player-bottom { transform: translateY(12px); }
 .player.calm .player-mid { transform: translate(-50%, -50%) scale(.95); }
-/* Play and pause turn into each other. */
-@keyframes icon-turn { from { opacity: 0; transform: scale(.7) rotate(-25deg); } }
-.player .player-big .icon { animation: icon-turn .22s var(--out); }
+/* Play and pause turn into each other on every keyed toggle. */
+@keyframes icon-turn { from { opacity: 0; transform: scale(.72) rotate(-22deg); } }
+.player .player-big-glyph .icon { animation: icon-turn .22s var(--out); }
 /* Seeking: the arrows spin a little the way they seek. */
 .player-mid .bare .icon { transition: transform .22s var(--out); }
 .player-mid .bare:first-child:active .icon { transform: rotate(-40deg); transition-duration: .08s; }
 .player-mid .bare:last-child:active .icon { transform: rotate(40deg); transition-duration: .08s; }
 @keyframes osd-in { from { opacity: 0; transform: translateX(-50%) scale(.92); } }
-.player-osd { animation: osd-in .18s var(--out); }
+.player-osd { animation: osd-in .18s var(--out) backwards; }
 @keyframes sheet-side { from { opacity: 0; transform: translateX(14px); } }
-.player-sheet { animation: sheet-side .22s var(--out); }
+.player-sheet { animation: sheet-side .22s var(--out) backwards; }
+@media (max-width: 760px) { .player-sheet { animation: rise-sheet .22s var(--out) backwards; } }
 @keyframes skip-in { from { opacity: 0; transform: translateX(18px); } }
-.player .player-skip { animation: skip-in .26s var(--out); }
+.player .player-skip, .player .player-upnext { animation: skip-in .26s var(--out) backwards; }
 /* Finding a source: the film's light breathes while you wait. */
 @keyframes breathe { 50% { opacity: .55; } }
 .player.pending::before { content: ''; position: absolute; inset: 0; pointer-events: none;

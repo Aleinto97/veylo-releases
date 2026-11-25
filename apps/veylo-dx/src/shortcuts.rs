@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 #[component]
 pub fn ShortcutButton() -> Element {
     let mut shell = use_context::<Shell>();
-    rsx! { icons::IconButton { label: "Page shortcuts (?)", class: "glass", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} } }
+    rsx! { icons::IconButton { label: "Page shortcuts (?)", class: "glass desktop-only", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} } }
 }
 
 /// Only commands that apply here, followed by shared app navigation.

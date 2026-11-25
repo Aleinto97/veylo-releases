@@ -127,12 +127,16 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
     let mut go = move |to: usize| shell.trailer.with_mut(|t| if let Some(t) = t { t.at = to; });
     let link = format!("https://www.youtube.com/watch?v={}", clip.youtube);
     let about = theatre.about.clone();
-    let mut logo_failed = use_signal(|| false);
+    let mut failed_logos = use_signal(std::collections::HashSet::<String>::new);
+    let mut pressed_backdrop = use_signal(|| false);
     use_hook(theatre_listen);
     rsx! {
-        div { class: "scrim theatre-scrim", onclick: move |_| shell.trailer.set(None),
+        div { class: "scrim theatre-scrim",
+            onpointerdown: move |_| pressed_backdrop.set(true),
+            onclick: move |_| { if pressed_backdrop() { shell.trailer.set(None); } pressed_backdrop.set(false); },
             if !about.backdrop.is_empty() { img { class: "theatre-glow", src: "{backend::ambient_url(&about.backdrop)}", alt: "", decoding: "async" } }
-            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}", onclick: move |e| e.stop_propagation(),
+            section { class: "theatre glass", role: "dialog", aria_modal: "true", aria_label: "Videos: {about.title}",
+                onpointerdown: move |e| e.stop_propagation(), onclick: move |e| e.stop_propagation(),
                 // The video is the main actor: it takes all the room the side column leaves.
                 div { class: "theatre-stage",
                     div { class: "trailer-frame",
@@ -155,8 +159,11 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
                         icons::IconButton { label: "Close (Esc)", class: "glass small", onclick: move |_| shell.trailer.set(None), icons::Close {} }
                     }
                     div { class: "theatre-titles",
-                        match about.logo.clone().filter(|_| !logo_failed()) {
-                            Some(src) => rsx! { img { class: "theatre-logo", src: "{src}", alt: "{about.title}", onerror: move |_| logo_failed.set(true) } },
+                        match about.logo.clone().filter(|u| !failed_logos.read().contains(u)) {
+                            Some(src) => rsx! {
+                                img { class: "theatre-logo", src: "{src}", alt: "{about.title}",
+                                    onerror: { let u = src.clone(); move |_| { failed_logos.write().insert(u.clone()); } } }
+                            },
                             None => rsx! { h2 { class: "display theatre-title", "{about.title}" } },
                         }
                         div { class: "theatre-facts",

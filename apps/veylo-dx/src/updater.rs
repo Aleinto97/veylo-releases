@@ -272,7 +272,8 @@ pub fn UpdateNotice() -> Element {
                             }
                         });
                     },
-                    "{action}"
+                    if working { span { class: "spinner", aria_hidden: "true" } }
+                    span { "{action}" }
                 }
                 if !working { icons::IconButton { label: "Later", onclick: move |_| step.set(Step::Later), icons::Close {} } }
             }

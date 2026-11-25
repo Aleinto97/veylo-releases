@@ -76,6 +76,10 @@
 .top-match { position: relative; display: flex; gap: 20px; width: 100%; padding: 16px; border-radius: 24px; text-align: left; overflow: hidden; isolation: isolate; }
 .top-art { position: absolute; inset: 0 0 0 35%; z-index: -1; -webkit-mask-image: linear-gradient(90deg, transparent, #000 45%); mask-image: linear-gradient(90deg, transparent, #000 45%); }
 .top-art img { width: 100%; height: 100%; object-fit: cover; opacity: .7; }
+@media (max-width: 760px) {
+  .top-art { -webkit-mask-image: none; mask-image: none; }
+  .top-art::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.45) 0%, rgba(0,0,0,.78) 55%, rgba(0,0,0,.92) 100%); }
+}
 .top-poster { width: 96px; flex: none; }
 .top-copy { display: flex; flex-direction: column; gap: 4px; justify-content: center; min-width: 0; max-width: 620px; }
 .best .icon { width: 20px; height: 20px; fill: currentColor; }
@@ -163,6 +167,7 @@
 .sheet-head { display: flex; align-items: center; gap: 12px; padding: 16px 16px 10px 20px; }
 .sheet-head .group-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sheet-scroll { overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 0 16px 20px; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.sheet-notice { margin: 0 0 12px; width: 100%; }
 
 /* ---------------------------------------------------------------- episodes and sources */
 
@@ -293,6 +298,9 @@
 .theatre-clip-name { font-size: 13px; font-weight: 650; line-height: 1.25; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 .theatre-clip-kind { font-size: 12px; color: var(--dust); }
 .theatre-clip-kind.official, .video-kind.official { color: var(--bone); font-weight: 650; }
+@media (hover: none), (pointer: coarse) {
+  .theatre-keys, .clip-key { display: none; }
+}
 @media (max-width: 900px), (orientation: portrait) {
   .theatre { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: auto; max-height: calc(100dvh - var(--top-inset) - var(--bottom-inset) - 24px); overflow-y: auto; }
   .theatre .trailer-frame { max-width: none; }
@@ -503,13 +511,16 @@
   .week-strip .week-card { width: auto; }
   .week-strip .week-title { font-size: 26px; }
 }
-.week-card { position: relative; flex: none; width: min(460px, 78vw); aspect-ratio: 16 / 9; border-radius: 22px; overflow: hidden; background: rgba(255,255,255,.06);
-  box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1px var(--edge), 0 18px 40px rgba(0,0,0,.35); }
+.week-card { position: relative; flex: none; width: min(460px, 78vw); aspect-ratio: 16 / 9; border-radius: 18px; overflow: hidden; background: rgba(255,255,255,.06);
+  box-shadow: 0 14px 32px rgba(0,0,0,.42); transition: transform .26s cubic-bezier(.22, 1, .36, 1), box-shadow .26s cubic-bezier(.22, 1, .36, 1); }
+.week-card::before { content: ''; position: absolute; inset: 0; z-index: 3; pointer-events: none; border-radius: inherit;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.22), inset 0 0 0 1px rgba(255,255,255,.1); }
+.week-card:hover { transform: translateY(-4px) scale(1.02); box-shadow: 0 24px 48px -12px rgba(0,0,0,.78), 0 0 0 1px rgba(255,255,255,.22); }
 .week-open { position: absolute; inset: 0; display: block; text-align: left; }
-.week-open img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: transform .25s ease-out; }
-.week-open:hover img, .week-open:focus-visible img { transform: scale(1.04); }
+.week-open img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: transform .35s cubic-bezier(.22, 1, .36, 1); }
+.week-card:hover .week-open img, .week-open:focus-visible img { transform: scale(1.04); }
 .week-open::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,0) 28%, rgba(0,0,0,.55) 58%, rgba(0,0,0,.9) 100%); }
-.week-open:focus-visible { outline: 2px solid var(--bone); outline-offset: -2px; border-radius: 22px; }
+.week-open:focus-visible { outline: 2px solid var(--bone); outline-offset: -2px; border-radius: 18px; }
 .week-copy { position: absolute; left: 20px; right: 84px; bottom: 18px; z-index: 1; display: flex; flex-direction: column; gap: 4px; text-shadow: 0 1px 12px rgba(0,0,0,.6); }
 .week-when { font-size: 13px; font-weight: 700; color: rgba(242,239,234,.75); letter-spacing: .02em; }
 .week-title { font-size: 30px; line-height: 1; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -68,8 +68,14 @@ pub fn TitlePage(media: Media) -> Element {
         }
     }); });
     let mut chooser = use_signal(|| None::<Chooser>);
-    let mut logo_failed = use_signal(|| false);
+    let mut failed_logos = use_signal(std::collections::HashSet::<String>::new);
     let mut failed_frames = use_signal(std::collections::HashSet::<String>::new);
+    // Keep Shell aware of open bottom sheets so Esc/Back closes the sheet before leaving TitlePage.
+    use_effect(move || {
+        let open = chooser().is_some() || person_sheet().is_some();
+        if *shell.title_sheet_open.peek() != open { shell.title_sheet_open.set(open); }
+    });
+    use_drop(move || { shell.title_sheet_open.set(false); });
     // Two-slot hero crossfade state:
     // - `shown`:    currently displayed (fully decoded) backdrop URL on top.
     // - `under`:    previous backdrop held solid underneath during a 1.4s crossfade.
@@ -245,6 +251,7 @@ pub fn TitlePage(media: Media) -> Element {
         shell.title_command.set(None);
         let film = !episodic(&k_media);
         match key {
+            '\x1b' => { chooser.set(None); person_sheet.set(None); }
             'p' => if film { autoplay.call((k_media.id.clone(), None)) }
                    else if let Some(id) = up_next(&episodes(), &k_media, &seen.peek()).filter(|_| *seen_ready.peek()) { autoplay.call((id.clone(), backend::episode_label(&id))) },
             'l' => rate.call(1),
@@ -267,7 +274,8 @@ pub fn TitlePage(media: Media) -> Element {
     let film = !episodic(&media);
     let logo = art().and_then(|a| a.logo)
         .or_else(|| facts.as_ref().map(|m| m.logo.clone()).filter(|l| !l.is_empty()))
-        .or_else(|| media.raw["logo"].as_str().map(str::to_owned).filter(|l| !l.is_empty()));
+        .or_else(|| media.raw["logo"].as_str().map(str::to_owned).filter(|l| !l.is_empty()))
+        .filter(|l| !failed_logos.read().contains(l));
     let backdrop = art().and_then(|a| a.backdrop).unwrap_or_else(|| media.backdrop().to_owned());
     let production = art().unwrap_or_default();
     // Combine add-on trailers with free/TMDB artwork trailers without blocking `title_meta`.
@@ -339,10 +347,11 @@ pub fn TitlePage(media: Media) -> Element {
     let cur_ready = top_ready();
     let is_initial = cur_under.is_empty();
     let logo_pending = art().is_none() && facts.is_none() && !allow_fallback();
+    let sheet_open = chooser().is_some() || person_sheet().is_some();
 
     rsx! {
         article { class: "title-page", aria_label: "{media.name}",
-            section { class: "title-hero",
+            section { class: "title-hero", inert: sheet_open.then_some("true"),
                 div { class: "title-art-stack",
                     if !cur_under.is_empty() {
                         for k in [format!("u-{cur_under}")] {
@@ -400,8 +409,11 @@ pub fn TitlePage(media: Media) -> Element {
                     }
                 }
                 div { class: "title-copy",
-                    match logo.filter(|_| !logo_failed()) {
-                        Some(src) => rsx! { img { class: "title-logo", src: "{src}", alt: "{media.name}", onerror: move |_| logo_failed.set(true) } },
+                    match logo {
+                        Some(src) => rsx! {
+                            img { class: "title-logo", src: "{src}", alt: "{media.name}",
+                                onerror: { let u = src.clone(); move |_| { failed_logos.write().insert(u.clone()); } } }
+                        },
                         None if logo_pending => rsx! { div { class: "title-logo", style: "height: 76px" } },
                         None => rsx! { h1 { class: "display title-name", "{media.name}" } },
                     }
@@ -444,6 +456,10 @@ pub fn TitlePage(media: Media) -> Element {
                                         let verb = if media.last_video_id.as_deref() == Some(next.as_str()) && backend::in_progress(&media) { "Resume" } else { "Play" };
                                         match backend::episode_label(&next) { Some(l) => format!("{verb} {l}"), None => verb.into() }
                                     } } }
+                                }
+                            } else if !seen_ready() || matches!(meta(), Load::Loading) {
+                                button { class: "pill accent play-big", disabled: true,
+                                    icons::Play {} span { "Play" }
                                 }
                             }
                         }
@@ -511,7 +527,7 @@ pub fn TitlePage(media: Media) -> Element {
                 }
             }
 
-            div { class: "title-body",
+            div { class: "title-body", inert: sheet_open.then_some("true"),
                 if !media.description.is_empty() { p { class: "title-synopsis", "{media.description}" } }
                 else if let Some(d) = facts.as_ref().map(|m| m.description.clone()).filter(|d| !d.is_empty()) { p { class: "title-synopsis", "{d}" } }
                 // The studios and networks behind it, as quiet idents.
@@ -528,6 +544,7 @@ pub fn TitlePage(media: Media) -> Element {
                     Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
                     Load::Ready(m) => rsx! {
                         if !film { Episodes { list: m.episodes.clone(), media: media.clone(), season: season, last: media.last_video_id.clone(), busy: busy(), seen: seen,
+                            watched: watched,
                             progress: ep_progress,
                             posters: production.season_posters.clone(),
                             on_play: move |(id, label): (String, String)| autoplay.call((id, Some(label))),
@@ -536,18 +553,18 @@ pub fn TitlePage(media: Media) -> Element {
                         Videos { videos: production.videos.clone(), about: crate::theatre::About::of(&media, Some(&m), Some(&production)), trailers: m.trailers.clone() }
                         Credits { meta: m.clone(), production: production.clone(), on_person: move |p: backend::Person| person_sheet.set(Some(p)) }
                         if let Some(col) = collection() {
-                            section { class: "shelf", style: "margin-top: 28px",
+                            section { class: "shelf title-shelf",
                                 div { class: "group-head", span { class: "group-icon", icons::Stack {} } span { class: "group-name", "{col.name}" }
                                     span { class: "tnum dim", "{col.parts.len()}" } }
-                                div { class: "strip poster-strip",
+                                crate::components::ShelfStrip {
                                     for item in col.parts { crate::components::PosterCard { key: "col-{item.key()}", media: item } }
                                 }
                             }
                         }
                         if !similar.read().is_empty() {
-                            section { class: "shelf", style: "margin-top: 24px",
+                            section { class: "shelf title-shelf",
                                 div { class: "group-head", span { class: "group-icon lamp", icons::Sparkles {} } span { class: "group-name", "More like this" } }
-                                div { class: "strip poster-strip",
+                                crate::components::ShelfStrip {
                                     for item in similar.read().iter().cloned() { crate::components::PosterCard { key: "sim-{item.key()}", media: item } }
                                 }
                             }
@@ -720,6 +737,33 @@ pub fn prefetch_resume(media: &Media) {
     if let Some(id) = id { backend::prefetch_sources(&media.kind, &id); }
 }
 
+/// Play a title directly from Home Hero: resumes if started, or resolves the first unwatched
+/// regular episode for unstarted series so Play actually starts playback instead of opening Details.
+pub fn play_or_resume(mut shell: Shell, media: Media) {
+    if media.kind == "movie" || media.last_video_id.is_some() {
+        resume_now(shell, media);
+        return;
+    }
+    let ticket = crate::finding(shell, media.name.clone());
+    spawn(async move {
+        let (meta_res, seen) = tokio::join!(backend::title_meta(&media), backend::watched_episodes(&media));
+        if !crate::still_wanted(shell, ticket) { return; }
+        let list = meta_res.map(|m| m.episodes).unwrap_or_default();
+        let next = up_next(&list, &media, &seen)
+            .or_else(|| crate::picks_rules::regular_episodes(&list, backend::now_secs()).first().map(|e| e.id.clone()));
+        match next {
+            Some(video) => {
+                let label = backend::episode_label(&video);
+                play_next(shell, media, video, label);
+            }
+            None => {
+                shell.player_status.set(None);
+                shell.opened.set(Some(media));
+            }
+        }
+    });
+}
+
 /// Resume from Home or Continue watching: the film, or the series' last episode, starts at once
 /// with the automatic choice. Without a known episode the title page opens instead.
 pub fn resume_now(mut shell: Shell, media: Media) {
@@ -862,6 +906,7 @@ const EPISODE_PAGE: usize = 24;
 #[component]
 fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last: Option<String>, busy: Option<String>,
             seen: Signal<std::collections::HashSet<String>>,
+            watched: Signal<bool>,
             progress: Signal<std::collections::HashMap<String, (i64, i64, bool)>>,
             on_play: EventHandler<(String, String)>,
             on_download: EventHandler<(String, String)>,
@@ -888,12 +933,11 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, last:
     seasons.sort_by_key(|s| if *s == 0 { i64::MAX } else { *s });
     seasons.dedup();
     let shown: Vec<Episode> = list.iter().filter(|e| Some(e.season) == season()).cloned().collect();
-    // Marking an episode watched marks the ones before it in its season ("season 1 up to
-    // episode 3"); unmarking clears it and the ones after. The series counts as watched once
-    // every episode is.
+    // Marking an episode updates watched state; Shift+click marks up to that episode in its season.
+    // The series counts as watched once every released regular episode is watched.
     let mut seen = seen;
+    let mut series_done = watched;
     let (for_mark, all) = (media.clone(), list.clone());
-    let mut series_done = use_signal(|| media.watched);
     let mark = use_callback(move |(ids, on): (Vec<String>, bool)| {
         if ids.is_empty() { return; }
         let before = seen.peek().clone();
@@ -1247,7 +1291,7 @@ fn SourceSheet(
                 }
                 div { class: "sheet-scroll",
                     if let Some(note) = dl_note() {
-                        div { class: "notice glass", role: "status", span { class: "group-icon", icons::Download {} } span { "{note}" } }
+                        div { class: "notice glass sheet-notice", role: "status", span { class: "group-icon", icons::Download {} } span { "{note}" } }
                     }
                     match sources() {
                         Load::Loading => rsx! { div { class: "rows", for i in 0..4 { div { key: "{i}", class: "row skeleton-row" } } } },
@@ -1343,7 +1387,8 @@ fn PersonSheet(person: backend::Person, on_close: EventHandler<()>) -> Element {
                     span { class: "group-icon", icons::Users {} }
                     span { class: "group-name", "{f.person.name}" }
                     span { class: "topbar-spacer" }
-                    button { class: "pill glass small",
+                    button { class: "pill glass small person-search-btn",
+                        aria_label: "Search catalogs for {search_name}",
                         onclick: move |_| {
                             shell.search_query.set(Some(search_name.clone()));
                             shell.search_open.set(true);

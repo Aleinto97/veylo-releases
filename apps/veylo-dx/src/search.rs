@@ -129,7 +129,7 @@ pub fn SearchOverlay() -> Element {
                 }
                 if !crate::picks_ai::failed() {
                     button {
-                        class: if vibe_mode() { "pill accent small" } else { "pill glass small" },
+                        class: if vibe_mode() { "pill accent" } else { "pill glass" },
                         title: "On-device semantic search by mood, plot or vibe",
                         aria_pressed: "{vibe_mode()}",
                         onclick: move |_| {
@@ -156,7 +156,7 @@ pub fn SearchOverlay() -> Element {
                         }
                     }
                     if !history.items.is_empty() {
-                        div { class: "group-head", title: "Opened from search", span { class: "group-icon", icons::History {} } }
+                        div { class: "group-head", title: "Opened from search", span { class: "group-icon", icons::History {} } span { class: "group-name", "Recent" } }
                         div { class: "strip",
                             for m in history.items.iter().take(10).cloned() {
                                 PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }
@@ -164,7 +164,7 @@ pub fn SearchOverlay() -> Element {
                         }
                     }
                     if let Some(list) = ideas().map(|l| l.into_iter().filter(|m| !history.items.iter().any(|h| h.key() == m.key())).collect::<Vec<_>>()).filter(|l| !l.is_empty()) {
-                        div { class: "group-head", title: "From your picks", span { class: "group-icon lamp", icons::Sparkles {} } }
+                        div { class: "group-head", title: "From your picks", span { class: "group-icon lamp", icons::Sparkles {} } span { class: "group-name", "From your picks" } }
                         div { class: "strip",
                             for m in list.into_iter().take(10) {
                                 PosterButton { key: "{m.key()}", media: m.clone(), on_press: open }

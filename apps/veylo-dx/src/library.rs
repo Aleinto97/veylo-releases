@@ -43,6 +43,25 @@ struct LibSnapshot {
 
 static LIB_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<LibSnapshot>> = std::sync::OnceLock::new();
 
+/// Remove a forgotten title from Library's cached snapshot immediately.
+pub fn forget_from_snapshot(key: &str) {
+    if let Some(m) = LIB_SNAPSHOT.get() {
+        if let Ok(mut s) = m.lock() {
+            if let Some(h) = s.history.as_mut() { h.retain(|x| x.media.key() != key); }
+            if let Some(sv) = s.saved.as_mut() { sv.retain(|x| x.key() != key); }
+        }
+    }
+}
+
+/// Remove an unsaved title from Library's cached Saved list immediately.
+pub fn unsave_from_snapshot(key: &str) {
+    if let Some(m) = LIB_SNAPSHOT.get() {
+        if let Ok(mut s) = m.lock() {
+            if let Some(sv) = s.saved.as_mut() { sv.retain(|x| x.key() != key); }
+        }
+    }
+}
+
 #[component]
 pub fn Library() -> Element {
     // No title in front here: the accent goes back to neutral.
@@ -73,7 +92,9 @@ pub fn Library() -> Element {
     });
     // Titles removed this visit vanish at once; the store already forgot them.
     let gone = use_signal(std::collections::HashSet::<String>::new);
+    let unsaved = use_signal(std::collections::HashSet::<String>::new);
     use_context_provider(|| Gone(gone));
+    use_context_provider(|| Unsaved(unsaved));
     let mut filter = use_signal(|| LibFilter::All);
     let mut query = use_signal(String::new);
     let mut downloads = use_signal(backend::list_downloads);
@@ -98,13 +119,16 @@ pub fn Library() -> Element {
     let show_saved = matches!(f, LibFilter::All | LibFilter::Saved | LibFilter::Movies | LibFilter::Series);
     let show_history = f != LibFilter::Downloads && f != LibFilter::Saved;
     let stats_line = {
+        let gone_set = gone.read();
+        let unsaved_set = unsaved.read();
         let hist_count = history.read().as_ref().and_then(|r| r.as_ref().ok()).map(|l| {
-            let watched_movies = l.iter().filter(|s| s.media.kind == "movie" && s.media.watched).count();
-            let watched_series = l.iter().filter(|s| s.media.kind != "movie" && s.media.watched).count();
-            let in_prog = l.iter().filter(|s| backend::in_progress(&s.media)).count();
+            let live = l.iter().filter(|s| !gone_set.contains(&s.media.key()));
+            let watched_movies = live.clone().filter(|s| s.media.kind == "movie" && s.media.watched).count();
+            let watched_series = live.clone().filter(|s| s.media.kind != "movie" && s.media.watched).count();
+            let in_prog = live.filter(|s| backend::in_progress(&s.media)).count();
             (watched_movies, watched_series, in_prog)
         });
-        let saved_n = saved().map(|s| s.len()).unwrap_or(0);
+        let saved_n = saved().map(|s| s.iter().filter(|m| !gone_set.contains(&m.key()) && !unsaved_set.contains(&m.key())).count()).unwrap_or(0);
         let dl_bytes: u64 = downloads.read().iter().map(|d| d.bytes).sum();
         let mut parts = Vec::new();
         if let Some((wm, ws, ip)) = hist_count {
@@ -119,7 +143,7 @@ pub fn Library() -> Element {
     rsx! {
         div { class: "library",
             h1 { class: "display title", "Library" }
-            if !stats_line.is_empty() { p { class: "dim tnum", style: "margin: -8px 0 14px; font-size: 13px", "{stats_line}" } }
+            if !stats_line.is_empty() { p { class: "dim tnum lib-stats", "{stats_line}" } }
             div { class: "lib-toolbar",
                 div { class: "lib-filters", role: "tablist", aria_label: "Filter library",
                     for opt in LibFilter::ALL {
@@ -163,7 +187,7 @@ pub fn Library() -> Element {
                                 let retry_key = job.key.clone();
                                 let failed = matches!(job.state, DownloadState::Failed(_));
                                 rsx! {
-                                    div { key: "dl-act-{job.key}", class: "addon-row glass",
+                                    div { key: "dl-act-{job.key}", class: "addon-row glass dl-active",
                                         span { class: "addon-name", "{job.title}" }
                                         span { class: "dim tnum addon-offers", "{status}" }
                                         span { class: "topbar-spacer" }
@@ -171,6 +195,9 @@ pub fn Library() -> Element {
                                             button { class: "pill accent small", onclick: move |_| { let _ = backend::retry_download(&retry_key); active_dl.set(backend::active_downloads()); }, icons::Refresh {} span { "Retry" } }
                                         }
                                         button { class: "pill glass small", onclick: move |_| { backend::cancel_download(&key); active_dl.set(backend::active_downloads()); }, icons::Close {} span { if failed { "Dismiss" } else { "Cancel" } } }
+                                        if let Some(p) = pct {
+                                            div { class: "dl-progress", div { style: "width: {p:.1}%" } }
+                                        }
                                     }
                                 }
                             }
@@ -196,7 +223,7 @@ pub fn Library() -> Element {
             if show_saved {
                 if let Some(list) = saved() {
                     {
-                        let list: Vec<Media> = list.into_iter().filter(|m| !gone.read().contains(&m.key()) && f.matches(m) && text_match(&m.name)).collect();
+                        let list: Vec<Media> = list.into_iter().filter(|m| !gone.read().contains(&m.key()) && !unsaved.read().contains(&m.key()) && f.matches(m) && text_match(&m.name)).collect();
                         rsx! {
                             if !list.is_empty() {
                                 section { class: "lib-section",
@@ -214,7 +241,7 @@ pub fn Library() -> Element {
                                         }
                                     }
                                     div { class: "lib-grid",
-                                        for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } } }
+                                        for m in list { div { key: "saved-{m.key()}", class: "lib-item", PosterCard { media: m.clone() } Unsave { media: m.clone() } } }
                                     }
                                 }
                             } else if f == LibFilter::Saved {
@@ -327,33 +354,81 @@ fn WeekCard(seen: Seen, now: i64, ahead: bool) -> Element {
 #[derive(Clone, Copy)]
 struct Gone(Signal<std::collections::HashSet<String>>);
 
+#[derive(Clone, Copy)]
+struct Unsaved(Signal<std::collections::HashSet<String>>);
+
 /// Remove from the Library: a first press asks, a second deletes the title's history.
 #[component]
 fn Forget(media: Media) -> Element {
+    let mut shell = use_context::<Shell>();
     let Gone(mut gone) = use_context::<Gone>();
     let mut armed = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let name = media.name.clone();
     rsx! {
         div { class: if armed() { "forget armed" } else { "forget" },
-            onmouseleave: move |_| armed.set(false),
             if armed() {
                 button { class: "pill forget-confirm", disabled: busy(), aria_label: "Remove {name} and its history",
-                    onclick: move |e| {
+                    onclick: move |e: Event<MouseData>| {
                         e.stop_propagation();
                         let m = media.clone();
                         busy.set(true);
                         spawn(async move {
-                            if backend::forget(&m).await.is_ok() { gone.write().insert(m.key()); }
+                            let res = backend::forget(&m).await;
                             busy.set(false);
                             armed.set(false);
+                            if res.is_ok() {
+                                let key = m.key();
+                                gone.write().insert(key.clone());
+                                forget_from_snapshot(&key);
+                                crate::home::forget_from_snapshot(&key);
+                                *shell.picks_dirty.write() += 1;
+                            }
                         });
                     },
                     icons::Trash {} span { "Remove" }
                 }
                 icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
             } else {
-                icons::IconButton { label: "Remove from Library", class: "glass small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
+                icons::IconButton { label: "Remove {name} from Library", class: "glass small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
+            }
+        }
+    }
+}
+
+/// Remove a title from the Saved shelf (keeps any watch history intact).
+#[component]
+fn Unsave(media: Media) -> Element {
+    let mut shell = use_context::<Shell>();
+    let Unsaved(mut unsaved) = use_context::<Unsaved>();
+    let mut armed = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let name = media.name.clone();
+    rsx! {
+        div { class: if armed() { "forget armed" } else { "forget" },
+            if armed() {
+                button { class: "pill forget-confirm", disabled: busy(), aria_label: "Remove {name} from Saved",
+                    onclick: move |e: Event<MouseData>| {
+                        e.stop_propagation();
+                        let m = media.clone();
+                        busy.set(true);
+                        spawn(async move {
+                            let res = backend::set_saved(&m, false).await;
+                            busy.set(false);
+                            armed.set(false);
+                            if res.is_ok() {
+                                let key = m.key();
+                                unsaved.write().insert(key.clone());
+                                unsave_from_snapshot(&key);
+                                *shell.picks_dirty.write() += 1;
+                            }
+                        });
+                    },
+                    icons::Trash {} span { "Unsave" }
+                }
+                icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
+            } else {
+                icons::IconButton { label: "Remove {name} from Saved", class: "glass small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
             }
         }
     }

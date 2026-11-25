@@ -41,6 +41,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut sleep_mode = use_signal(|| SleepTimer::Off);
     let mut sleep_rem_secs = use_signal(|| None::<u32>);
     let mut hover_scrub = use_signal(|| None::<(f64, f64)>); // (percent 0..100, seconds)
+    let mut scrub_width = use_signal(|| 0.0f64);
     let mut local_sub_path = use_signal(String::new);
     let mut up_next_dismissed = use_signal(|| false);
     let mut up_next_secs = use_signal(|| None::<u8>);
@@ -418,7 +419,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "f" | "F" if !ANDROID => { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); }
             "a" | "A" => { let t = live.cycle_track(true); say(format!("Audio: {t}")); }
             "c" | "C" => { let t = live.cycle_track(false); say(format!("Subtitles: {t}")); }
-            "s" | "S" => sheet.set(Some(Sheet::Subtitles)),
+            "s" | "S" => sheet.set(if sheet() == Some(Sheet::Subtitles) { None } else { Some(Sheet::Subtitles) }),
             "," => { let d = now.sub_delay - 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
             "." => { let d = now.sub_delay + 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
             "<" => { live.frame_step(false); say("−1 frame".into()); }
@@ -712,7 +713,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 let _ = crate::android::video_set_rotation_lock(next);
                                 say(if next { "Rotation locked".into() } else { "Rotation unlocked".into() });
                             },
-                            icons::Resize {}
+                            icons::RotateScreen {}
                         }
                         button { class: "bare", aria_label: "Picture-in-picture", title: "Picture-in-picture",
                             onclick: move |_| {
@@ -728,7 +729,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                     }
                     button { class: "bare", aria_label: "Sleep timer (T)", title: "Sleep timer (T)", aria_pressed: "{sheet() == Some(Sheet::Sleep) || sleep_mode() != SleepTimer::Off}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Sleep) { None } else { Some(Sheet::Sleep) }), icons::Moon {} }
-                    button { class: "bare", aria_label: "Player shortcuts (H / ?)", title: "Player shortcuts (H / ?)", aria_pressed: "{sheet() == Some(Sheet::Keys)}",
+                    button { class: "bare desktop-only", aria_label: "Player shortcuts (H / ?)", title: "Player shortcuts (H / ?)", aria_pressed: "{sheet() == Some(Sheet::Keys)}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Keys) { None } else { Some(Sheet::Keys) }), icons::Keyboard {} }
                     button { class: "bare", aria_label: "Details (I)", title: "Details (I)", aria_pressed: "{sheet() == Some(Sheet::Info)}",
                         onclick: move |_| sheet.set(if sheet() == Some(Sheet::Info) { None } else { Some(Sheet::Info) }), icons::Info {} }
@@ -739,7 +740,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         button { class: "bare", aria_label: "Back 10 seconds (←)", title: "Back 10 seconds (←)", onclick: { let live = lc(); move |_| { live.seek_by(-10.0); poke(); } }, icons::Rewind10 {} }
                         button { class: "bare player-big", aria_label: if s.paused { "Play (Space)" } else { "Pause (Space)" }, title: if s.paused { "Play (Space)" } else { "Pause (Space)" },
                             onclick: { let live = lc(); move |_| { live.toggle_pause(); poke(); } },
-                            if s.paused { icons::Play {} } else { icons::Pause {} } }
+                            for k in [if s.paused { "play" } else { "pause" }] {
+                                span { key: "{k}", class: "player-big-glyph",
+                                    if s.paused { icons::Play {} } else { icons::Pause {} }
+                                }
+                            }
+                        }
                         button { class: "bare", aria_label: "Forward 10 seconds (→)", title: "Forward 10 seconds (→)", onclick: { let live = lc(); move |_| { live.seek_by(10.0); poke(); } }, icons::Forward10 {} }
                     }
                 }
@@ -747,18 +753,21 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 div { class: "player-bottom",
                     span { class: "player-time tnum", "{clock(position)}" }
                     div { class: "scrubber-wrap",
-                        onmousemove: move |e| if !ANDROID && duration > 0.0 {
-                            let coords = e.element_coordinates();
-                            // Estimate ratio via JS width once or use element coordinates smoothly when hovered.
-                            let x = coords.x;
+                        onmouseenter: move |_| if !ANDROID {
                             spawn(async move {
                                 if let Ok(w) = document::eval("return (document.querySelector('.scrubber-wrap')?.clientWidth || 0)").await {
                                     if let Some(width) = w.as_f64().filter(|&v| v > 10.0) {
-                                        let ratio = (x / width).clamp(0.0, 1.0);
-                                        hover_scrub.set(Some((ratio * 100.0, ratio * duration)));
+                                        scrub_width.set(width);
                                     }
                                 }
                             });
+                        },
+                        onmousemove: move |e| if !ANDROID && duration > 0.0 {
+                            let width = *scrub_width.peek();
+                            if width > 10.0 {
+                                let ratio = (e.element_coordinates().x / width).clamp(0.0, 1.0);
+                                hover_scrub.set(Some((ratio * 100.0, ratio * duration)));
+                            }
                         },
                         onmouseleave: move |_| hover_scrub.set(None),
                         input { class: "scrubber", r#type: "range", aria_label: "Position", min: "0", max: "{duration.max(1.0)}", step: "0.5",
@@ -786,18 +795,18 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                     span { class: "player-time tnum dim", if duration > 0.0 { "-{clock(duration - position)}" } }
                     div { class: "player-actions",
                         if !req.episodes.is_empty() {
-                            button { class: "bare", aria_label: "Episodes (E)", title: "Episodes (E)", aria_pressed: "{sheet() == Some(Sheet::Episodes)}", onclick: move |_| sheet.set(Some(Sheet::Episodes)), icons::Stack {} }
+                            button { class: "bare", aria_label: "Episodes (E)", title: "Episodes (E)", aria_pressed: "{sheet() == Some(Sheet::Episodes)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Episodes) { None } else { Some(Sheet::Episodes) }), icons::Stack {} }
                         }
                         if !req.sources.is_empty() {
-                            button { class: "bare", aria_label: "Switch source (O)", title: "Switch source (O)", aria_pressed: "{sheet() == Some(Sheet::Sources)}", onclick: move |_| sheet.set(Some(Sheet::Sources)), icons::Layers {} }
+                            button { class: "bare", aria_label: "Switch source (O)", title: "Switch source (O)", aria_pressed: "{sheet() == Some(Sheet::Sources)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Sources) { None } else { Some(Sheet::Sources) }), icons::Layers {} }
                         }
                         if !s.chapters.is_empty() {
-                            button { class: "bare", aria_label: "Chapters (B)", title: "Chapters (B)", aria_pressed: "{sheet() == Some(Sheet::Chapters)}", onclick: move |_| sheet.set(Some(Sheet::Chapters)), icons::List {} }
+                            button { class: "bare", aria_label: "Chapters (B)", title: "Chapters (B)", aria_pressed: "{sheet() == Some(Sheet::Chapters)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Chapters) { None } else { Some(Sheet::Chapters) }), icons::List {} }
                         }
-                        button { class: "bare", aria_label: "Audio tracks (A cycles them)", title: "Audio tracks (A cycles them)", aria_pressed: "{sheet() == Some(Sheet::Audio)}", onclick: move |_| sheet.set(Some(Sheet::Audio)), icons::Audio {} }
-                        button { class: "bare", aria_label: "Subtitles (S)", title: "Subtitles (S)", disabled: !has_subs, aria_pressed: "{sheet() == Some(Sheet::Subtitles)}", onclick: move |_| sheet.set(Some(Sheet::Subtitles)), icons::Subtitles {} }
-                        button { class: "bare", aria_label: "Speed ([ ])", title: "Speed ([ ])", aria_pressed: "{sheet() == Some(Sheet::Speed)}", onclick: move |_| sheet.set(Some(Sheet::Speed)), icons::Gauge {} }
-                        button { class: "bare", aria_label: "Picture (Z)", title: "Picture (Z)", aria_pressed: "{sheet() == Some(Sheet::Picture)}", onclick: move |_| sheet.set(Some(Sheet::Picture)), icons::Resize {} }
+                        button { class: "bare", aria_label: "Audio tracks (A cycles them)", title: "Audio tracks (A cycles them)", aria_pressed: "{sheet() == Some(Sheet::Audio)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Audio) { None } else { Some(Sheet::Audio) }), icons::Headphones {} }
+                        button { class: "bare", aria_label: "Subtitles (S)", title: "Subtitles (S)", disabled: !has_subs, aria_pressed: "{sheet() == Some(Sheet::Subtitles)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Subtitles) { None } else { Some(Sheet::Subtitles) }), icons::Subtitles {} }
+                        button { class: "bare", aria_label: "Speed ([ ])", title: "Speed ([ ])", aria_pressed: "{sheet() == Some(Sheet::Speed)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Speed) { None } else { Some(Sheet::Speed) }), icons::Gauge {} }
+                        button { class: "bare", aria_label: "Picture (Z)", title: "Picture (Z)", aria_pressed: "{sheet() == Some(Sheet::Picture)}", onclick: move |_| sheet.set(if sheet() == Some(Sheet::Picture) { None } else { Some(Sheet::Picture) }), icons::Resize {} }
                         if !ANDROID {
                             button { class: "bare", aria_label: if s.muted { "Unmute (M)" } else { "Mute (M)" }, title: if s.muted { "Unmute (M)" } else { "Mute (M)" },
                                 onclick: { let live = lc(); move |_| live.toggle_mute() }, if s.muted || s.volume <= 0.0 { icons::Muted {} } else { icons::Audio {} } }
@@ -850,9 +859,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                         div { class: "player-stepper",
                                             span { class: "player-stepper-label", "Volume boost" }
                                             div { class: "player-stepper-controls",
-                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v - 10.0).max(0.0)) }, "−" }
+                                                button { class: "player-step-btn", aria_label: "Decrease volume", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v - 10.0).max(0.0)) }, "−" }
                                                 button { class: "player-step-btn player-step-val tnum", title: "Reset volume to 100%", onclick: { let live = lc(); move |_| live.set_volume(100.0) }, "{s.volume:.0}%" }
-                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v + 10.0).min(130.0)) }, "+" }
+                                                button { class: "player-step-btn", aria_label: "Increase volume", onclick: { let live = lc(); let v = s.volume; move |_| live.set_volume((v + 10.0).min(130.0)) }, "+" }
                                             }
                                         }
                                     } else {
@@ -867,9 +876,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                         div { class: "player-stepper",
                                             span { class: "player-stepper-label", "Size" }
                                             div { class: "player-stepper-controls",
-                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v - 0.1) }, "−" }
+                                                button { class: "player-step-btn", aria_label: "Smaller subtitles", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v - 0.1) }, "−" }
                                                 button { class: "player-step-btn player-step-val tnum", title: "Reset size", onclick: { let live = lc(); move |_| live.set_sub_scale(1.05) }, "{s.sub_scale * 100.0:.0}%" }
-                                                button { class: "player-step-btn", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v + 0.1) }, "+" }
+                                                button { class: "player-step-btn", aria_label: "Larger subtitles", onclick: { let live = lc(); let v = s.sub_scale; move |_| live.set_sub_scale(v + 0.1) }, "+" }
                                             }
                                         }
                                         div { class: "player-stepper",
@@ -926,7 +935,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                                 pick: { let live = lc(); let id = t.id; move |_| live.set_secondary_sub(Some(id)) } }
                                         }
                                     }
-                                    if !audio {
+                                    if !audio && !ANDROID {
                                         p { class: "player-options-head", "Load local subtitle file" }
                                         div { class: "sub-search",
                                             input { r#type: "text", placeholder: "Path to .srt, .vtt, or .ass…", aria_label: "Local subtitle file path",
@@ -1070,7 +1079,13 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             },
                             Sheet::Keys => rsx! {
                                 div { class: "shortcut-list player-keys",
-                                    for (k, what) in KEYS.into_iter().filter(|(k,_)| !(ANDROID && k == &["F"]) && (req.has_next || req.has_prev || k != &["N", "P"])) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
+                                    for (k, what) in KEYS.into_iter().filter(|(k, _)| {
+                                        !(ANDROID && k == &["F"])
+                                            && (req.has_next || req.has_prev || k != &["N", "P"])
+                                            && (!s.chapters.is_empty() || k != &["B"])
+                                            && (!req.episodes.is_empty() || k != &["E"])
+                                            && (req.sources.len() > 1 || k != &["O"])
+                                    }) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
                                 }
                             },
                             Sheet::Info => {
@@ -1191,7 +1206,7 @@ pub fn PendingPlayer(title: String, step: String) -> Element {
                     span { class: "player-facts-line", span { "{step}" } }
                 }
                 span { class: "topbar-spacer" }
-                button { class: "bare", aria_label: "Page shortcuts (?)", title: "Page shortcuts (?)", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} }
+                button { class: "bare desktop-only", aria_label: "Page shortcuts (?)", title: "Page shortcuts (?)", onclick: move |_| shell.shortcuts_open.set(true), icons::Keyboard {} }
             }
             div { class: "player-center", role: "status", aria_label: "{step}",
                 div { class: "player-pending-note", div { class: "player-spinner" } span { class: "dim", "{step}" } }

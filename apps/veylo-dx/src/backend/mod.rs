@@ -527,6 +527,8 @@ pub async fn set_episodes_watched(media: &Media, video_ids: Vec<String>, watched
 
 /// Stop tracking a title: its history, progress, marks and rating are deleted from the store.
 pub async fn forget(media: &Media) -> Result<()> {
+    // Wait for any in-flight playback progress write so it cannot recreate the row right after DELETE.
+    flush_progress().await;
     exec(json!({"op":"forget","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await?;
     sync_forgotten(media);
     Ok(())

@@ -115,6 +115,8 @@ pub struct Shell {
     pub play_ticket: Signal<u64>,
     /// When true, Picks duels exclusively over titles saved in the user's Library ("Pick from Saved").
     pub picks_saved_only: Signal<bool>,
+    /// True while a bottom sheet (`SourceSheet` / `PersonSheet`) is open on top of the Title Page.
+    pub title_sheet_open: Signal<bool>,
 }
 
 impl Shell {
@@ -333,6 +335,7 @@ fn Shell_() -> Element {
         player_key: Signal::new(None),
         play_ticket: Signal::new(0),
         picks_saved_only: Signal::new(false),
+        title_sheet_open: Signal::new(false),
     });
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
@@ -460,18 +463,26 @@ fn Shell_() -> Element {
                 }
             }
             Key::Escape if search_open() => close_search(shell),
-            Key::Escape if opened.read().is_some() => opened.set(None),
+            Key::Escape if opened.read().is_some() => {
+                if *shell.title_sheet_open.peek() { title_command.set(Some('\x1b')); }
+                else { opened.set(None); }
+            }
             Key::Escape if !is_tv() && tab() == Tab::Picks && shell.trailer.read().is_none() => {
                 pick_command.set(Some(PickCommand::ClosePopover));
             }
             // A TV's Back on another tab goes to Home (it never leaves the app).
             Key::Escape if is_tv() && tab() != Tab::Home => go(tab, opened, Tab::Home),
             _ if search_open() || shell.trailer.read().is_some() || ctrl || e.modifiers().alt() => {}
-            Key::Backspace if opened.read().is_some() => opened.set(None),
+            Key::Backspace if opened.read().is_some() => {
+                if *shell.title_sheet_open.peek() { title_command.set(Some('\x1b')); }
+                else { opened.set(None); }
+            }
             Key::Character(c) if c == "?" => shortcuts_open.set(!shortcuts_open()),
             Key::Character(c) if c == "/" => { e.prevent_default(); search_open.set(true); }
             // Title page: P play, L like, D not for me, S save, W watched, T trailer, O sources.
-            Key::Character(c) if opened.read().is_some() => title_command.set(c.to_lowercase().chars().next()),
+            Key::Character(c) if opened.read().is_some() => {
+                if !*shell.title_sheet_open.peek() { title_command.set(c.to_lowercase().chars().next()); }
+            }
             _ if tab() != Tab::Picks || e.is_auto_repeating() || e.is_composing() => {}
             Key::ArrowLeft => { e.prevent_default(); pick_command.set(Some(PickCommand::Left)); }
             Key::ArrowRight => { e.prevent_default(); pick_command.set(Some(PickCommand::Right)); }
@@ -590,7 +601,7 @@ fn Shell_() -> Element {
             const el = s && p.querySelector('.' + s);
             if (el && !el.dataset.restored) {
                 el.dataset.restored = '1';
-                if (savedScroll[s]) p.scrollTop = savedScroll[s];
+                p.scrollTop = savedScroll[s] || 0;
                 sync();
             }
         };
@@ -686,7 +697,8 @@ fn Shell_() -> Element {
             div { class: "status-guard", aria_hidden: "true" }
             TopBar {}
             // `inert` is a boolean attribute: present means on, even as inert="false". Omit it when unused.
-            main { class: "page", key: "{opened.read().as_ref().map(|m| m.key()).unwrap_or_default()}", inert: (search_open() || shortcuts_open()).then_some("true"),
+            main { class: "page", key: "{opened.read().as_ref().map(|m| m.key()).unwrap_or_default()}",
+                inert: (search_open() || shortcuts_open() || shell.trailer.read().is_some()).then_some("true"),
                 if let Some(media) = opened() { for media in [media] { title::TitlePage { key: "{media.key()}", media } } }
                 else { match tab() {
                     Tab::Home => rsx! { home::Home {} },
@@ -708,7 +720,9 @@ fn Shell_() -> Element {
             if search_open() { search::SearchOverlay {} }
             if shortcuts_open() { shortcuts::AppShortcuts {} }
             // Windows, macOS and Android install releases; Linux builds from source.
-            if updater::ASSET.is_some() { updater::UpdateNotice {} }
+            if updater::ASSET.is_some() && (shell.player)().is_none() && shell.pending().is_none() && !search_open() && shell.trailer.read().is_none() {
+                updater::UpdateNotice {}
+            }
             if let Some(theatre) = (shell.trailer)() { theatre::TheatreSheet { theatre } }
         }
     }
@@ -719,8 +733,9 @@ fn Shell_() -> Element {
 #[component]
 fn TopBar() -> Element {
     let mut shell = use_context::<Shell>();
+    let bar_inert = (shell.shortcuts_open)() || (shell.search_open)() || shell.trailer.read().is_some() || (shell.title_sheet_open)();
     rsx! {
-        header { class: "topbar", inert: (shell.shortcuts_open)().then_some("true"),
+        header { class: "topbar", inert: bar_inert.then_some("true"),
             if shell.opened.read().is_some() {
                 icons::IconButton { label: "Back", class: "glass", onclick: move |_| shell.opened.set(None), icons::ArrowLeft {} }
             } else {
@@ -933,7 +948,7 @@ mod playback_lifetime_tests {
                 title_command: Signal::new(None), search_query: Signal::new(None), opened: Signal::new(None),
                 lamp_source: Signal::new(String::new()), pick_command: Signal::new(None),
                 history: Signal::new(backend::History::default()), picks_dirty: Signal::new(0), addon_updates: Signal::new(0),
-                player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0), picks_saved_only: Signal::new(false),
+                player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0), picks_saved_only: Signal::new(false), title_sheet_open: Signal::new(false),
             }
         });
         rsx! { if show() { TestSourceChooser {} } }

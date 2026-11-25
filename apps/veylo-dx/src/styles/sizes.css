@@ -14,10 +14,15 @@
   .top-match { flex-direction: column; }
   .top-art { inset: 0; }
   .search-field { height: 60px; padding-left: 18px; }
-  .ep-still { width: 128px; }
-  .ep-overview { display: none; }
   .title-hero { min-height: 520px; }
   .source-details { padding-left: 14px; }
+}
+@media (max-width: 520px) {
+  .topbar { gap: 6px; }
+  .dock-tab { min-width: 42px; height: 42px; padding: 0 10px; }
+  .last-played { height: 48px; }
+  .lp-orb { width: 40px; height: 40px; }
+  .person-search-btn span { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -46,18 +51,18 @@
 .lib-item { position: relative; min-width: 0; }
 /* A button inside a plain div shrinks to its content: the card must fill its grid cell. */
 .lib-item .card { width: 100%; }
-.forget { position: absolute; z-index: 3; display: flex; gap: 8px; align-items: center; transition: opacity .18s ease; }
+.forget { position: absolute; z-index: 5; display: flex; gap: 8px; align-items: center; transition: opacity .18s ease; }
 .forget .orb { width: 36px; height: 36px; }
-.forget .orb.glass { --glass-tint: rgba(8,8,10,.62); }
+.forget .orb.glass { --glass-tint: rgba(8,8,10,.66); }
 .forget .orb .icon { width: 17px; height: 17px; }
-.forget-confirm { min-height: 36px; height: 36px; padding: 0 14px; gap: 6px; color: #fff; background: rgba(200,48,48,.92);
+.forget-confirm { min-height: 36px; height: 36px; padding: 0 14px; gap: 6px; color: #fff; background: rgba(200,48,48,.94);
   box-shadow: 0 6px 20px rgba(0,0,0,.35); font-size: 14px; }
 .forget-confirm .icon { width: 16px; height: 16px; }
 /* Asking before Picks forgets: the same red as removing a title, at the size of its row. */
 .confirm { display: inline-flex; align-items: center; gap: 8px; animation: arrive .14s ease-out; }
 .confirm .forget-confirm { height: 48px; min-height: 48px; padding: 0 18px; font-size: 15px; }
 .chips .confirm .forget-confirm { height: 56px; min-height: 56px; border-radius: 28px; }
-/* Week cards: top right corner is free. */
+/* Week cards & Continue watching: top right corner is free. */
 .week-card .forget { top: 12px; right: 12px; }
 /* Posters: top left (the watched tick owns top right); asking covers the poster. */
 .lib-item .forget { top: 6px; left: 6px; }
@@ -65,6 +70,10 @@
   border-radius: 12px; background: rgba(0,0,0,.66); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 @media (hover: hover) {
   .forget:not(.armed) { opacity: 0; }
-  .week-card:hover .forget, .lib-item:hover .forget, .forget:focus-within { opacity: 1; }
+  .week-card:hover .forget, .cw-card:hover .forget, .lib-item:hover .forget, .forget:focus-within { opacity: 1; }
 }
-@media (hover: none) { .forget:not(.armed) { opacity: .9; } }
+@media (hover: none) {
+  .forget:not(.armed) { opacity: .62; }
+  .lib-item .forget:not(.armed) .orb { width: 32px; height: 32px; }
+  .forget.armed, .forget:focus-within { opacity: 1; }
+}

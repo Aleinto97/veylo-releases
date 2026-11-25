@@ -31,8 +31,17 @@
 .addon-row.glass { border-radius: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,.09); }
 .addon-row.glass:first-child { border-radius: 16px 16px 0 0; box-shadow: inset 0 1px 0 var(--sheen); }
 .addon-row.glass:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+.addon-row.dl-active { position: relative; overflow: hidden; }
+.dl-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.08); }
+.dl-progress > div { height: 100%; background: var(--lamp); transition: width .3s ease-out; }
+.setting-input-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.custom-addon-row { margin-top: 12px; }
+@media (max-width: 900px) {
+  .setting-row:has(.setting-input-group) { flex-wrap: wrap; }
+}
 @media (max-width: 640px) {
   .setting-row { flex-wrap: wrap; }
+  .setting-input-group { width: 100%; }
   .key-field, .select-field { width: 100%; }
 }
 .check-note { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; padding: 12px 18px; border-radius: 16px; background: rgba(255,255,255,.06); color: var(--bone); font-size: 14.5px; }
@@ -51,6 +60,7 @@
 @media (max-width: 699px) { .link-panel { flex-direction: column; align-items: flex-start; } }
 
 /* Library filters, in-library search, history import and diagnostic log viewer. */
+.lib-stats { margin: -8px 0 14px; font-size: 13px; }
 .lib-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 20px; }
 .lib-filters { display: flex; flex-wrap: wrap; gap: 8px; }
 .lib-search { position: relative; display: flex; align-items: center; min-width: 220px; flex: 0 1 300px; }

@@ -25,6 +25,13 @@ pub fn invalidate_cache() {
     }
 }
 
+/// Remove a forgotten title from Home's cached library list so Continue watching never flashes stale rows.
+pub fn forget_from_snapshot(key: &str) {
+    if let Some(m) = HOME_SNAPSHOT.get() {
+        if let Ok(mut s) = m.lock() { s.library.retain(|x| x.key() != key); }
+    }
+}
+
 fn read_home_snapshot() -> Option<HomeSnapshot> {
     let snap = HOME_SNAPSHOT.get()?.lock().ok()?.clone();
     (!snap.rows.is_empty()).then_some(snap)
@@ -174,7 +181,18 @@ pub fn Home() -> Element {
                         SectionHeader { title: "Continue watching" }
                         ShelfStrip { class: "strip cw-strip".to_string(),
                             for (i, m) in continuing.iter().enumerate() {
-                                ContinueCard { key: "cw-{m.key()}", media: m.clone(), ahead: i < 2 }
+                                ContinueCard {
+                                    key: "cw-{m.key()}",
+                                    media: m.clone(),
+                                    ahead: i < 2,
+                                    on_forget: move |gone: Media| {
+                                        let key = gone.key();
+                                        library.with_mut(|list| list.retain(|x| x.key() != key));
+                                        forget_from_snapshot(&key);
+                                        crate::library::forget_from_snapshot(&key);
+                                        *shell.picks_dirty.write() += 1;
+                                    },
+                                }
                             }
                         }
                     }
@@ -293,6 +311,14 @@ fn HomeHero(
     let mut top_ready = use_signal(|| false);
     let mut failed_urls = use_signal(HashSet::<String>::new);
     let mut failed_logos = use_signal(HashSet::<String>::new);
+    // Brief grace window on cold start so a clean logo fades in once instead of flashing <h1> text first.
+    let mut allow_text = use_signal(|| false);
+    use_hook(move || {
+        spawn(async move {
+            backend::sleep(320).await;
+            allow_text.set(true);
+        });
+    });
 
     let cur_art = art_map.read().get(&media.key()).cloned();
     let desired = pick_backdrop(&media, &art_map.read(), &failed_urls.read());
@@ -407,6 +433,7 @@ fn HomeHero(
                                             onerror: { let u = src.clone(); move |_| { failed_logos.write().insert(u.clone()); } },
                                         }
                                     },
+                                    None if cur_art.is_none() && !allow_text() => rsx! { div { class: "hero-logo", style: "height: 68px" } },
                                     None => rsx! { h1 { class: "display hero-name", "{media.name}" } },
                                 }
                             }
@@ -419,7 +446,7 @@ fn HomeHero(
                             if !blurb.is_empty() { p { class: "hero-blurb", "{blurb}" } }
                             div { class: "hero-actions",
                                 button { class: "pill accent play-big",
-                                    onclick: move |_| crate::title::resume_now(shell, play.clone()),
+                                    onclick: move |_| crate::title::play_or_resume(shell, play.clone()),
                                     icons::Play {} span { "Play" }
                                 }
                                 button { class: "pill glass",
@@ -478,10 +505,12 @@ fn HomeHero(
 }
 
 /// Widescreen 16:9 Continue Watching card: backdrop, episode badge, remaining time, progress bar,
-/// and a direct Resume orb.
+/// a remove control, and a direct Resume orb.
 #[component]
-fn ContinueCard(media: Media, ahead: bool) -> Element {
+fn ContinueCard(media: Media, ahead: bool, on_forget: EventHandler<Media>) -> Element {
     let mut shell = use_context::<Shell>();
+    let mut armed = use_signal(|| false);
+    let mut busy = use_signal(|| false);
     let art = use_artwork(&media);
     let mut bg_sources = Vec::new();
     if let Some(b) = art().and_then(|a| a.backdrop) { if !b.is_empty() { bg_sources.push(b); } }
@@ -495,7 +524,7 @@ fn ContinueCard(media: Media, ahead: bool) -> Element {
         Some(tag) => context.strip_prefix(tag.as_str()).map(|r| r.trim_start_matches(", ").to_owned()).unwrap_or(context),
         None => context,
     };
-    let (open, resume, pre, for_ahead) = (media.clone(), media.clone(), media.clone(), media.clone());
+    let (open, resume, pre, for_ahead, for_forget) = (media.clone(), media.clone(), media.clone(), media.clone(), media.clone());
     use_hook(move || if ahead { crate::title::prefetch_resume(&for_ahead) });
     rsx! {
         div { class: "cw-card",
@@ -511,6 +540,33 @@ fn ContinueCard(media: Media, ahead: bool) -> Element {
                     if !remaining.is_empty() { span { class: "cw-meta tnum", "{remaining}" } }
                 }
                 if fraction > 0.0 { div { class: "card-progress cw-progress", div { style: "width: {fraction * 100.0}%" } } }
+            }
+            div { class: if armed() { "forget armed" } else { "forget" },
+                if armed() {
+                    button { class: "pill forget-confirm", disabled: busy(), aria_label: "Remove {media.name} from Continue watching",
+                        onclick: move |e: Event<MouseData>| {
+                            e.stop_propagation();
+                            let m = for_forget.clone();
+                            busy.set(true);
+                            spawn(async move {
+                                let ok = backend::forget(&m).await.is_ok();
+                                busy.set(false);
+                                armed.set(false);
+                                if ok { on_forget.call(m); }
+                            });
+                        },
+                        icons::Trash {} span { "Remove" }
+                    }
+                    icons::IconButton { label: "Keep", class: "glass small",
+                        onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false); },
+                        icons::Close {}
+                    }
+                } else {
+                    icons::IconButton { label: "Remove {media.name} from Continue watching", class: "glass small forget-btn",
+                        onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true); },
+                        icons::Trash {}
+                    }
+                }
             }
             icons::IconButton {
                 label: "Resume {media.name}",

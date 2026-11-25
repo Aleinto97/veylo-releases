@@ -33,7 +33,12 @@ pub fn AccountBlock() -> Element {
         });
     };
     let working = busy();
-    let field = |e: KeyboardEvent| e.stop_propagation();
+    let creds_empty = email().trim().is_empty() || password().is_empty();
+    let mut submit_sign_in = move || {
+        let (e, p) = (email.peek().clone(), password.peek().clone());
+        if e.trim().is_empty() || p.is_empty() { return; }
+        run("in", Box::pin(async move { backend::sign_in(e, p).await?; Ok(None) }));
+    };
 
     rsx! {
         section { class: "settings-block account-block",
@@ -109,14 +114,18 @@ pub fn AccountBlock() -> Element {
                     if panel() == Panel::Email {
                         div { class: "account-form glass",
                             input { class: "key-field", r#type: "email", placeholder: "Email", aria_label: "Email", autocomplete: "email",
-                                value: "{email}", onkeydown: field, oninput: move |e| email.set(e.value()) }
+                                value: "{email}",
+                                onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
+                                oninput: move |e| email.set(e.value()) }
                             input { class: "key-field", r#type: "password", placeholder: "Password", aria_label: "Password", autocomplete: "current-password",
-                                value: "{password}", onkeydown: field, oninput: move |e| password.set(e.value()) }
+                                value: "{password}",
+                                onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
+                                oninput: move |e| password.set(e.value()) }
                             div { class: "account-actions",
-                                button { class: "pill accent", disabled: working.is_some(),
-                                    onclick: move |_| { let (e, p) = (email(), password()); run("in", Box::pin(async move { backend::sign_in(e, p).await?; Ok(None) })); },
+                                button { class: "pill accent", disabled: working.is_some() || creds_empty,
+                                    onclick: move |_| submit_sign_in(),
                                     span { if working == Some("in") { "Signing in…" } else { "Sign in" } } }
-                                button { class: "pill glass", disabled: working.is_some(),
+                                button { class: "pill glass", disabled: working.is_some() || creds_empty,
                                     onclick: move |_| { let (e, p) = (email(), password()); run("up", Box::pin(async move { backend::sign_up(e, p).await?; Ok(None) })); },
                                     span { if working == Some("up") { "Creating…" } else { "Create account" } } }
                                 button { class: "link-btn", disabled: working.is_some(),

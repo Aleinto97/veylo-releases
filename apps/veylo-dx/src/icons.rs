@@ -100,3 +100,5 @@ pub fn IconButton(
 #[component] pub fn Copy() -> Element { rsx! { Glyph { d: "M9 9h10v11H9zM5 15H4.5A1.5 1.5 0 0 1 3 13.5v-8A1.5 1.5 0 0 1 4.5 4h8A1.5 1.5 0 0 1 14 5.5V6" } } }
 #[component] pub fn Upload() -> Element { rsx! { Glyph { d: "M12 15V4m-5 5 5-5 5 5M5 20h14" } } }
 #[component] pub fn Plus() -> Element { rsx! { Glyph { d: "M12 5v14M5 12h14" } } }
+#[component] pub fn Headphones() -> Element { rsx! { Glyph { d: "M4 13a8 8 0 0 1 16 0v5a2 2 0 0 1-2 2h-1.5a1.5 1.5 0 0 1-1.5-1.5v-4a1.5 1.5 0 0 1 1.5-1.5H20M4 13v5a2 2 0 0 0 2 2h1.5A1.5 1.5 0 0 0 9 18.5v-4A1.5 1.5 0 0 0 7.5 13H4" } } }
+#[component] pub fn RotateScreen() -> Element { rsx! { Glyph { d: "M7.5 19.5 4.5 16.5a2 2 0 0 1 0-2.8l9.2-9.2a2 2 0 0 1 2.8 0l3 3a2 2 0 0 1 0 2.8l-9.2 9.2a2 2 0 0 1-2.8 0ZM16.5 3.5A8.5 8.5 0 0 1 21 9.5M7.5 20.5A8.5 8.5 0 0 1 3 14.5" } } }
