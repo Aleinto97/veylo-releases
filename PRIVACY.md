@@ -22,7 +22,7 @@ If you choose to sign in (Email/Password, Google Sign-In, or QR device linking)
 using Firebase Authentication & Firestore:
 
 - **Zero-Knowledge Encryption (E2EE)**: Your synced watch history, episode
-  progress, saved titles, likes, preferences, TMDB key, and add-on URLs are
+  progress, saved titles, likes, preferences, and add-on URLs are
   encrypted on your device with AES-256-GCM using a randomly generated 256-bit
   Sync Key that never leaves your devices in plaintext. Neither Firebase nor the
   project operator can decrypt your synced library, keys, or add-ons.
@@ -46,7 +46,7 @@ using Firebase Authentication & Firestore:
 
 Veylo connects directly from your device to:
 - **Metadata & artwork providers** you enable (Cinemeta, BetterPosters, TVmaze,
-  Wikidata/Wikimedia, AniList, optional TMDB with your own key, OpenSubtitles /
+  Wikidata/Wikimedia/Wikipedia, AniList, ElfHosted, OpenSubtitles /
   IntroDB / AniSkip during playback).
 - **User-installed add-ons**: Veylo ships with no third-party streaming add-ons.
   Any add-on URL you install is contacted directly by your device according to

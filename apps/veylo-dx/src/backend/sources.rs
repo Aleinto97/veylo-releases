@@ -501,6 +501,7 @@ fn screen_supports_dv() -> bool {
 }
 
 /// The Play-order sort key of one source whose file is `size` bytes: smaller plays first.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Language>) -> OrderKey {
     order_key_for(s, size, lang, screen_supports_dv())
 }
@@ -602,11 +603,12 @@ pub(super) fn optimistic_key(
     lang: Option<&crate::addons::Language>,
     expected_seconds: Option<f64>,
     budget: BandwidthBudget,
+    dolby_vision_screen: bool,
 ) -> UnifiedKey {
     let optimistic_audio = lang.and_then(|l| {
         if other_language_only(&s.label, l.key) { None } else { Some((true, true)) }
     });
-    unified_key(s, size, optimistic_audio, false, lang, expected_seconds, budget, screen_supports_dv(), None)
+    unified_key(s, size, optimistic_audio, false, lang, expected_seconds, budget, dolby_vision_screen, None)
 }
 
 /// The source's label names the Audio-language setting's language (flag, name or release tag).
@@ -707,7 +709,9 @@ pub async fn autoplay_for(kind: &str, video_id: &str, ctx: AutoplayContext) -> P
             format!("kind={kind} sources={} playable={} list_ms={listed} total_ms={total_ms} picked={}",
                 list.len(), exact.len(), pick.best.is_some()));
     }
-    if pick.best.is_some() {
+    // Never append `off_title` to `pick.rest` when strict title matching is enabled:
+    // otherwise runtime fallback / language retries could silently play the wrong film.
+    if pick.best.is_some() && !ctx.strict_title {
         pick.rest.extend(off_title);
     }
     pick
@@ -723,6 +727,24 @@ pub(super) fn classify_sources(list: &mut Vec<Source>, ctx: &AutoplayContext) {
         let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
         s.off_title = !(title_ok && ep_ok);
     }
+}
+
+/// Classify and sort sources for the manual Source Chooser using `ctx`: on-title direct sources
+/// always come first, while loose add-on matches for another film (e.g. "Judy" returned under
+/// "Digger") are flagged `off_title` and pushed to the bottom.
+pub(super) fn classify_manual_sources_with(list: &mut [Source], ctx: &AutoplayContext) {
+    for s in list.iter_mut() {
+        let title_ok = ctx.titles.is_empty() || names_title_any(s, &ctx.titles, ctx.year);
+        let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
+        s.off_title = !(title_ok && ep_ok);
+    }
+    list.sort_by_key(|x| (x.off_title, x.kind != SourceKind::Direct, quality_rank(x.quality)));
+}
+
+/// Classify and sort sources for the manual Source Chooser.
+pub fn classify_manual_sources(list: &mut [Source], media: &Media, video_id: &str) {
+    let ctx = autoplay_context_for_media(media, video_id, None);
+    classify_manual_sources_with(list, &ctx);
 }
 
 /// Classify and rank sources for the `--sources` developer CLI using the exact same rules as autoplay.
@@ -884,6 +906,7 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
     let mut debrid = None;
     let mut cursor = 0usize;
     let mut probed_groups = 0usize;
+    let dv_screen = screen_supports_dv();
     // Allow at most ONE cold-start speed burst per autoplay when Auto bandwidth has no fresh sample.
     let speed_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         max_bitrate_mbps().is_none() && connection_mbps().is_none(),
@@ -903,7 +926,7 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
         } else {
             Some(tokio::time::Instant::from_std(started + PROBE_EMPTY_BUDGET))
         };
-        let (found, status) = probe_wave(wave, lang, orig_lang, ctx, cap, speed_token.clone()).await;
+        let (found, status) = probe_wave(wave, lang, orig_lang, ctx, cap, speed_token.clone(), dv_screen).await;
         if status.is_some() { debrid = status; }
         working.extend(found);
         if working.is_empty() {
@@ -911,7 +934,6 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
             continue;
         }
         let budget = BandwidthBudget::current();
-        let dv_screen = screen_supports_dv();
         let best_key = working.iter()
             .map(|w| unified_key(&w.source, episode_size(&w.source, ctx.pack_episodes).unwrap_or(0), w.audio, w.has_original_lang, lang, ctx.expected_seconds, budget, dv_screen, None))
             .min()
@@ -921,9 +943,9 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
         let remaining_best = groups.get(cursor).and_then(|g| g.mirrors.first());
         let could_win = remaining_best.is_some_and(|c| {
             let sz = episode_size(c, ctx.pack_episodes).unwrap_or(0);
-            optimistic_key(c, sz / 10 * 9, lang, ctx.expected_seconds, budget) < best_key
+            optimistic_key(c, sz / 10 * 9, lang, ctx.expected_seconds, budget, dv_screen) < best_key
         }) || (started.elapsed() < PROBE_GRACE_HIGH
-            && rivals_wanted_verified(&working, lang, ctx.pack_episodes).is_some_and(|class| {
+            && rivals_wanted_verified(&working, lang, ctx.pack_episodes, dv_screen).is_some_and(|class| {
                 groups[cursor..].iter().take(PROBE_NEXT * 2)
                     .any(|g| g.mirrors.first().is_some_and(|c| remux_class(c) == Some(class)))
             }));
@@ -931,7 +953,7 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
     }
     if working.is_empty() { return Pick { best: None, rest: Vec::new(), debrid, audio_known: false }; }
     let budget = BandwidthBudget::current();
-    let ranked = rank_verified(working, lang, ctx.pack_episodes, ctx.expected_seconds, budget, screen_supports_dv());
+    let ranked = rank_verified(working, lang, ctx.pack_episodes, ctx.expected_seconds, budget, dv_screen);
     dev_log(&format!("checked {} working files in {} ms, audio: {}; pictures: {}", ranked.len(), started.elapsed().as_millis(),
         ranked.iter().map(|w| match w.audio { Some((true, true)) => "main", Some((true, false)) => "yes", Some((false, _)) => "no", None => "?" }).collect::<Vec<_>>().join(" "),
         ranked.iter().map(|w| picture_summary(&w.source)).collect::<Vec<_>>().join(" | ")));
@@ -1003,15 +1025,20 @@ pub(super) fn remux_class(s: &Source) -> Option<RemuxClass> {
 pub(super) const REMUX_RIVALS: usize = 3;
 
 /// The best working source's remux class while fewer than `REMUX_RIVALS` of it work.
+#[cfg(test)]
 pub(super) fn rivals_wanted(working: &[Source], lang: Option<&crate::addons::Language>, pack_episodes: Option<usize>) -> Option<RemuxClass> {
-    let best = working.iter().min_by_key(|s| order_key(s, episode_size(s, pack_episodes).unwrap_or(0), lang))?;
+    rivals_wanted_for(working, lang, pack_episodes, screen_supports_dv())
+}
+
+pub(super) fn rivals_wanted_for(working: &[Source], lang: Option<&crate::addons::Language>, pack_episodes: Option<usize>, dolby_vision_screen: bool) -> Option<RemuxClass> {
+    let best = working.iter().min_by_key(|s| order_key_for(s, episode_size(s, pack_episodes).unwrap_or(0), lang, dolby_vision_screen))?;
     let class = remux_class(best)?;
     (working.iter().filter(|s| remux_class(s) == Some(class)).count() < REMUX_RIVALS).then_some(class)
 }
 
-fn rivals_wanted_verified(working: &[VerifiedSource], lang: Option<&crate::addons::Language>, pack_episodes: Option<usize>) -> Option<RemuxClass> {
+fn rivals_wanted_verified(working: &[VerifiedSource], lang: Option<&crate::addons::Language>, pack_episodes: Option<usize>, dolby_vision_screen: bool) -> Option<RemuxClass> {
     let sources: Vec<Source> = working.iter().map(|w| w.source.clone()).collect();
-    rivals_wanted(&sources, lang, pack_episodes)
+    rivals_wanted_for(&sources, lang, pack_episodes, dolby_vision_screen)
 }
 
 /// How long a working file's header may take to read.
@@ -1278,6 +1305,7 @@ pub(super) async fn probe_wave(
     ctx: &AutoplayContext,
     cap: Option<tokio::time::Instant>,
     speed_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dv_screen: bool,
 ) -> (Vec<VerifiedSource>, Option<String>) {
     let pack_episodes = ctx.pack_episodes;
     let expected_seconds = ctx.expected_seconds;
@@ -1341,7 +1369,6 @@ pub(super) async fn probe_wave(
         let mut deadline: Option<tokio::time::Instant> = cap;
         let mut first_working_at: Option<tokio::time::Instant> = None;
         let started = std::time::Instant::now();
-        let dv_screen = screen_supports_dv();
         while !pending.is_empty() {
             let next = match deadline {
                 Some(at) => match tokio::time::timeout_at(at, jobs.join_next()).await { Ok(n) => n, Err(_) => break },
@@ -1374,14 +1401,14 @@ pub(super) async fn probe_wave(
                 .map(|w| unified_key(&w.source, episode_size(&w.source, pack_episodes).unwrap_or(0), w.audio, w.has_original_lang, lang, expected_seconds, budget, dv_screen, None))
                 .min()
                 .expect("one works");
-            let wanted = rivals_wanted_verified(&working, lang, pack_episodes);
+            let wanted = rivals_wanted_verified(&working, lang, pack_episodes, dv_screen);
             // Check if any still-pending group can optimistically beat our best verified source.
             let mut better_tier_pending = false;
             let mut any_can_beat = false;
             for &p in &pending {
                 let rep = &wave[p].mirrors[0];
                 let sz = episode_size(rep, pack_episodes).unwrap_or(0);
-                let opt = optimistic_key(rep, sz, lang, expected_seconds, budget);
+                let opt = optimistic_key(rep, sz, lang, expected_seconds, budget, dv_screen);
                 if opt < best_key || (wanted.is_some() && remux_class(rep) == wanted) {
                     any_can_beat = true;
                     // Strictly higher tier (better budget fit, better language, or better HDR/resolution class).
@@ -1566,6 +1593,14 @@ mod unit_tests {
             false,
         );
         assert_eq!(ranked[0].source.filename, digger.filename);
+
+        // Manual Source Chooser also flags Judy as off-title and sorts Digger ahead of it.
+        let ctx = AutoplayContext::simple("Digger", Some(2026), None);
+        let mut manual = vec![judy.clone(), digger.clone()];
+        classify_manual_sources_with(&mut manual, &ctx);
+        assert_eq!(manual[0].filename, digger.filename);
+        assert!(!manual[0].off_title);
+        assert!(manual[1].off_title);
     }
 
     #[test]

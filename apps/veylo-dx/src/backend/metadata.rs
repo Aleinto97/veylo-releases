@@ -1,6 +1,6 @@
 //! Artwork and metadata from outside the add-ons: posters, BetterPosters (charts, tagged posters,
-//! fuller details), TMDB (artwork, cast, videos, Picks candidates) and TVmaze. Without a TMDB key
-//! the keyless sources in open.rs stand in.
+//! fuller details), keyless ElfHosted metadata (cast portraits, logos, trailers, episode stills),
+//! TVmaze, AniList/ani.zip and Wikidata/Wikipedia (open.rs). No API keys required.
 use super::*;
 
 // ---------------------------------------------------------------- posters
@@ -12,15 +12,15 @@ pub(super) static HDR_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic:
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn hdr_output() -> bool { HDR_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) }
 
-/// Poster images in order of preference: BetterPosters (by IMDb id, rating and genre tags),
-/// then the add-on's own poster (Cinemeta for most titles), then the backdrop. A failing
-/// image moves on to the next one.
+/// Poster images in order of preference: BetterPosters (by IMDb id, rating, genre and
+/// 4K/1080p/Dolby quality badges), then the add-on's own poster (Cinemeta for most titles),
+/// then the backdrop. A failing image moves on to the next one.
 pub fn posters(m: &Media) -> Vec<String> {
     let imdb = Some(m.id.as_str()).filter(|id| id.starts_with("tt"))
         .or_else(|| m.raw["imdb_id"].as_str().filter(|id| id.starts_with("tt")));
     let mut out = Vec::new();
     if BETTER_POSTERS.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Some(id) = imdb { out.push(format!("https://btttr.cc/poster/imdb/poster-default/{id}.jpg")); }
+        if let Some(id) = imdb { out.push(format!("https://btttr.cc/poster-q/imdb/poster-default/{id}.jpg")); }
     }
     out.push(m.poster.clone());
     // Cinemeta's image service has a poster for nearly every IMDb title; try high-res first.
@@ -213,28 +213,21 @@ pub(super) async fn bp_artwork(m: &Media) -> Option<Artwork> {
     (art.backdrop.is_some() || art.logo.is_some()).then_some(art)
 }
 
-// ---------------------------------------------------------------- TMDB artwork
+// ---------------------------------------------------------------- keyless ElfHosted metadata
 
-/// Wide artwork from TMDB: a text-free backdrop and an English logo. Empty fields fall back
-/// to the add-on's (Metahub) images.
+/// Wide artwork and production details merged across BetterPosters, ElfHosted, TVmaze, AniList
+/// and Wikidata. Empty fields fall back to the add-on's (Metahub) images.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Artwork {
     pub genres: Vec<String>,
     pub backdrop: Option<String>,
-    /// True only when `backdrop` comes from a verified textless / ad-free tier (e.g. TMDB
-    /// `iso_639_1: null`, which bans streaming-service watermarks like Netflix/Prime Video).
+    /// True only when `backdrop` comes from a verified clean / ad-free source.
     pub backdrop_clean: bool,
     pub logo: Option<String>, pub poster: Option<String>,
-    /// TMDB's YouTube trailers and teasers (video keys), best first: alternatives for regions
-    /// where one is blocked.
+    /// YouTube trailers and teasers (video keys), best first.
     pub trailers: Vec<String>,
-    pub tmdb: Option<(String, i64)>,
-    /// The TMDB collection a film belongs to (a series of films), for "watch part 1 first".
-    pub collection: Option<i64>,
-    /// The title page's own material from the real production, all from the same TMDB answer:
-    /// more official frames (textless), its tagline, cast with photos and parts, key crew,
-    /// studio and network logos, the certificate, the original language, each season's
-    /// poster and the videos (trailers, featurettes, behind the scenes).
+    /// Additional official frames, tagline, cast with photos and parts, key crew, studio and
+    /// network logos, certificate, original language, season posters and videos.
     pub stills: Vec<String>,
     pub tagline: Option<String>,
     pub cast: Vec<Person>,
@@ -259,7 +252,6 @@ pub struct Person {
     pub name: String,
     pub role: String,
     pub photo: Option<String>,
-    pub tmdb_id: Option<i64>,
     pub tvmaze_id: Option<i64>,
     pub wikidata_id: Option<String>,
 }
@@ -268,108 +260,11 @@ pub struct Studio { pub name: String, pub logo: String }
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Video { pub youtube: String, pub name: String, pub kind: String, pub official: bool }
 
-pub(super) const TMDB_IMG: &str = "https://image.tmdb.org/t/p";
-
-/// Bayesian quality score for a TMDB image: prefers high-resolution (>= 1280px wide) community-
-/// verified art over 1-vote uploads (which often have misleadingly high raw vote_average).
-fn tmdb_image_score(i: &Value) -> (bool, i64) {
-    let w = i["width"].as_i64().unwrap_or(0);
-    let votes = i["vote_count"].as_f64().unwrap_or(0.0).max(0.0);
-    let avg = i["vote_average"].as_f64().unwrap_or(0.0).clamp(0.0, 10.0);
-    // Prior of 3 votes at 5.0 prevents a single 10/10 upload from beating a 30-vote 8.5 still.
-    let bayesian = (avg * votes + 15.0) / (votes + 3.0);
-    (w >= 1280, (bayesian * 1000.0) as i64)
-}
-
-/// The production's own material from one TMDB details answer (see Artwork).
-pub(super) fn production(details: &Value, kind: &str, backdrop: Option<&str>) -> Artwork {
-    let img = |size: &str, v: &Value| v.as_str().filter(|p| !p.is_empty()).map(|p| format!("{TMDB_IMG}/{size}{p}"));
-    let mut frames: Vec<&Value> = details["images"]["backdrops"].as_array().into_iter().flatten().filter(|i| i["iso_639_1"].is_null()).collect();
-    frames.sort_by_key(|i| std::cmp::Reverse(tmdb_image_score(i)));
-    let stills: Vec<String> = frames.iter().filter_map(|i| img("w1280", &i["file_path"])).filter(|u| Some(u.as_str()) != backdrop).take(4).collect();
-    let tv = kind == "tv";
-    let credits = if tv { &details["aggregate_credits"] } else { &details["credits"] };
-    let cast = credits["cast"].as_array().into_iter().flatten().take(15).map(|c| Person {
-        name: s(c, "name"),
-        role: if tv { c["roles"][0]["character"].as_str().unwrap_or_default().to_owned() } else { s(c, "character") },
-        photo: img("h632", &c["profile_path"]),
-        tmdb_id: c["id"].as_i64(),
-        ..Default::default()
-    }).filter(|p| !p.name.is_empty()).collect();
-    let mut crew: Vec<(String, Vec<Person>)> = Vec::new();
-    let mut credit = |label: &str, c: &Value| {
-        let person = Person { name: s(c, "name"), role: String::new(), photo: img("h632", &c["profile_path"]), tmdb_id: c["id"].as_i64(), ..Default::default() };
-        if person.name.is_empty() { return; }
-        match crew.iter_mut().find(|(l, _)| l == label) {
-            Some((_, people)) => if !people.iter().any(|p| p.name == person.name) && people.len() < 3 { people.push(person) },
-            None => crew.push((label.to_owned(), vec![person])),
-        }
-    };
-    for c in details["created_by"].as_array().into_iter().flatten() { credit("Created by", c); }
-    for c in credits["crew"].as_array().into_iter().flatten() {
-        let jobs: Vec<String> = if tv { c["jobs"].as_array().into_iter().flatten().map(|j| s(j, "job")).collect() } else { vec![s(c, "job")] };
-        for job in jobs {
-            let label = match job.as_str() { "Director" if !tv => "Directed by", "Screenplay" | "Writer" if !tv => "Written by",
-                "Original Music Composer" => "Music by", "Director of Photography" if !tv => "Cinematography by", _ => continue };
-            credit(label, c);
-        }
-    }
-    let order = ["Created by", "Directed by", "Written by", "Music by", "Cinematography by"];
-    crew.sort_by_key(|(l, _)| order.iter().position(|o| o == l));
-    let mut studios: Vec<Studio> = Vec::new();
-    for c in details["networks"].as_array().into_iter().flatten().chain(details["production_companies"].as_array().into_iter().flatten()) {
-        if let Some(logo) = img("w300", &c["logo_path"]) {
-            if studios.len() < 4 && !studios.iter().any(|x| x.name == s(c, "name")) { studios.push(Studio { name: s(c, "name"), logo }); }
-        }
-    }
-    let rated = |list: &Value, field: &dyn Fn(&Value) -> Option<String>| {
-        let all: Vec<&Value> = list["results"].as_array().into_iter().flatten().collect();
-        all.iter().find(|r| r["iso_3166_1"] == "US").and_then(|r| field(r)).or_else(|| all.iter().find_map(|r| field(r)))
-    };
-    let certificate = if tv { rated(&details["content_ratings"], &|r| Some(s(r, "rating")).filter(|x| !x.is_empty())) }
-        else { rated(&details["release_dates"], &|r| r["release_dates"].as_array().into_iter().flatten().map(|d| s(d, "certification")).find(|x| !x.is_empty())) };
-    let original = s(details, "original_language");
-    let language = details["spoken_languages"].as_array().into_iter().flatten().find(|l| l["iso_639_1"] == original.as_str())
-        .map(|l| s(l, "english_name")).filter(|x| !x.is_empty());
-    let mut alt_titles: Vec<String> = Vec::new();
-    for field in ["original_title", "original_name"] {
-        let t = s(details, field);
-        if !t.is_empty() && !alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&t)) { alt_titles.push(t); }
-    }
-    let alts = details["alternative_titles"]["titles"].as_array()
-        .or_else(|| details["alternative_titles"]["results"].as_array());
-    for entry in alts.into_iter().flatten() {
-        let t = s(entry, "title");
-        if !t.is_empty() && !alt_titles.iter().any(|x| x.eq_ignore_ascii_case(&t)) && alt_titles.len() < 40 {
-            alt_titles.push(t);
-        }
-    }
-    let runtime_mins = details["runtime"].as_u64()
-        .or_else(|| details["episode_run_time"].as_array().and_then(|a| a.first()).and_then(Value::as_u64))
-        .filter(|m| *m > 0 && *m <= 600);
-    let runtime_secs = runtime_mins.map(|m| (m * 60) as f64);
-    let season_posters = details["seasons"].as_array().into_iter().flatten()
-        .filter_map(|x| Some((x["season_number"].as_i64()?, img("w500", &x["poster_path"])?))).collect();
-    // The production's own videos first: official trailers, teasers, clips, then the rest.
-    let rank = |kind: &str| match kind { "Trailer" => 4, "Teaser" => 3, "Clip" => 2, "Featurette" => 1, _ => 0 };
-    let mut videos: Vec<Video> = details["videos"]["results"].as_array().into_iter().flatten()
-        .filter(|v| v["site"] == "YouTube" && matches!(v["type"].as_str(), Some("Trailer" | "Teaser" | "Featurette" | "Behind the Scenes" | "Clip")))
-        .map(|v| Video { youtube: s(v, "key"), name: s(v, "name"), kind: s(v, "type"), official: v["official"].as_bool().unwrap_or(false) })
-        .filter(|v| !v.youtube.is_empty()).collect();
-    videos.sort_by_key(|v| std::cmp::Reverse((v.official, rank(&v.kind))));
-    videos.truncate(12);
-    Artwork {
-        stills,
-        tagline: Some(s(details, "tagline")).filter(|t| !t.is_empty()),
-        cast, crew, studios, certificate, language,
-        original_language: (!original.is_empty()).then_some(original),
-        alt_titles,
-        runtime_secs,
-        season_posters, videos,
-        ..Artwork::default()
-    }
-}
-
+const ELFHOSTED_BASE: &str = "https://tmdb.elfhosted.com";
+const JUSTWATCH_GRAPHQL: &str = "https://apis.justwatch.com/graphql";
+const JUSTWATCH_IMAGES: &str = "https://images.justwatch.com";
+pub(super) static ELF_CACHE: OnceLock<Mutex<Answers>> = OnceLock::new();
+pub(super) static JW_STILLS_CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 pub(super) static ARTWORK: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
 
 pub(super) fn imdb_of(m: &Media) -> Option<String> {
@@ -378,88 +273,133 @@ pub(super) fn imdb_of(m: &Media) -> Option<String> {
         .map(|id| id.split(':').next().unwrap_or(id).to_owned())
 }
 
-pub(super) static TMDB_KEY: Mutex<Option<String>> = Mutex::new(None);
-pub(super) fn set_tmdb_key(key: Option<String>) { if let Ok(mut k) = TMDB_KEY.lock() { *k = key; } }
-pub(super) fn tmdb_key() -> Option<String> { TMDB_KEY.lock().ok().and_then(|k| k.clone()) }
-
-/// GET a TMDB v3 endpoint. The key travels as a query parameter and is never logged.
-pub(super) async fn tmdb(path: String, query: Vec<(&'static str, String)>) -> Option<Value> {
-    let key = tmdb_key()?;
-    on_runtime(async move {
-        let response = backend().http.get(format!("https://api.themoviedb.org/3/{path}"))
-            .query(&[("api_key", key)]).query(&query).send().await.ok()?.error_for_status().ok()?;
-        response.json::<Value>().await.ok()
-    }).await.ok().flatten()
+/// Downscale oversized `/original/` TMDB image URLs to a crisp WebView-friendly size.
+fn sized_tmdb_img(url: &str, size: &str) -> String {
+    if url.contains("image.tmdb.org/t/p/original/") {
+        url.replacen("/original/", &format!("/{size}/"), 1)
+    } else {
+        url.to_owned()
+    }
 }
 
-pub(super) fn best_image(list: &Value, languages: &[Option<&str>]) -> Option<String> {
-    let images: Vec<&Value> = list.as_array().into_iter().flatten().collect();
-    languages.iter().find_map(|lang| {
-        images.iter().filter(|i| i["iso_639_1"].as_str() == *lang)
-            .max_by_key(|i| tmdb_image_score(i))
-            .and_then(|i| i["file_path"].as_str().map(str::to_owned))
-    })
+/// Parse runtime strings like `"2h47min"`, `"166 min"`, `"45min"`, or `"1h 32m"` into seconds.
+pub(super) fn parse_runtime_secs(raw: &str) -> Option<f64> {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() { return None; }
+    let mut mins: u64 = 0;
+    let mut cur: u64 = 0;
+    let mut saw_digit = false;
+    let mut saw_unit = false;
+    for ch in lower.chars() {
+        if let Some(d) = ch.to_digit(10) {
+            cur = cur.saturating_mul(10).saturating_add(u64::from(d));
+            saw_digit = true;
+        } else if ch == 'h' && saw_digit {
+            mins = mins.saturating_add(cur.saturating_mul(60));
+            cur = 0;
+            saw_digit = false;
+            saw_unit = true;
+        } else if ch == 'm' && saw_digit {
+            mins = mins.saturating_add(cur);
+            cur = 0;
+            saw_digit = false;
+            saw_unit = true;
+        }
+    }
+    if saw_digit && !saw_unit { mins = mins.saturating_add(cur); }
+    (mins > 0 && mins <= 600).then(|| (mins * 60) as f64)
 }
 
-/// TMDB artwork and production details for a title; cached for the session. Returns None when no
-/// TMDB API key is configured. Used strictly as fallback / gap-filler behind free keyless sources,
-/// except for guaranteed textless (`iso_639_1: null`) backdrops which prevent streaming-service
-/// ("Netflix" / "Prime Video") promotional banners.
-pub async fn tmdb_artwork(m: &Media) -> Option<Artwork> {
-    if !tmdb_ready() { return None; }
-    let imdb = imdb_of(m);
-    let cache_key = imdb.clone().unwrap_or_else(|| format!("{}|{}", m.name.to_lowercase(), m.first_year().unwrap_or(0)));
-    let cache = ARTWORK.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().ok()?.get(&cache_key).cloned() { return Some(hit); }
-    let by_imdb = match &imdb {
-        Some(id) => tmdb(format!("find/{id}"), vec![("external_source", "imdb_id".into())]).await.and_then(|f| {
-            f["movie_results"][0]["id"].as_i64().map(|i| ("movie", i)).or_else(|| f["tv_results"][0]["id"].as_i64().map(|i| ("tv", i)))
-        }),
-        None => None,
+/// Fetch keyless Stremio-protocol metadata from ElfHosted (`tmdb.elfhosted.com`), cached 15 min.
+pub(super) async fn elfhosted_meta(kind: &str, imdb: &str) -> Option<Value> {
+    if !matches!(kind, "movie" | "series") || !imdb.starts_with("tt") { return None; }
+    let path = format!("meta/{kind}/{imdb}.json");
+    let cache = ELF_CACHE.get_or_init(Default::default);
+    let now = now_secs();
+    if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
+        if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
+    }
+    let url = format!("{ELFHOSTED_BASE}/{path}");
+    let got = on_runtime(async move {
+        let response = backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?;
+        let v = response.json::<Value>().await.ok()?;
+        v.get("meta").filter(|m| m.is_object()).cloned()
+    }).await.ok().flatten();
+    if let Ok(mut c) = cache.lock() {
+        c.retain(|_, (at, hit)| now - *at < if hit.is_some() { 900 } else { 120 });
+        cache_insert(&mut c, 400, path, (now, got.clone()));
+    }
+    got
+}
+
+/// Parse an ElfHosted `/meta/{kind}/{imdb}.json` object into Veylo's `Artwork` model.
+pub(super) fn parse_elfhosted_artwork(meta: &Value) -> Artwork {
+    let url_of = |key: &str, size: &str| {
+        Some(s(meta, key))
+            .filter(|u| u.starts_with("https://"))
+            .map(|u| sized_tmdb_img(&u, size))
     };
-    // No IMDb id (Kitsu anime, for one) or unknown to TMDB: search by name, accepting only a
-    // result whose year agrees within one year, so another title's art is never borrowed.
-    let found = match by_imdb { Some(x) => Some(x), None => tmdb_by_name(m).await };
-    let (kind, id) = found?;
-    // Images, videos, credits and localized alternate titles in one request.
-    let extra = if kind == "tv" { "images,videos,aggregate_credits,content_ratings,alternative_titles" } else { "images,videos,credits,release_dates,alternative_titles" };
-    let details = tmdb(format!("{kind}/{id}"), vec![("append_to_response", extra.into()), ("include_image_language", "en,null".into())]).await.unwrap_or_default();
-    let images = &details["images"];
-    let mut videos: Vec<&Value> = details["videos"]["results"].as_array().into_iter().flatten()
-        .filter(|v| v["site"] == "YouTube" && (v["type"] == "Trailer" || v["type"] == "Teaser")).collect();
-    // The production's own videos first: official trailers, then official teasers, then the rest.
-    videos.sort_by_key(|v| std::cmp::Reverse((v["official"].as_bool().unwrap_or(false), v["type"] == "Trailer", v["iso_639_1"] == "en", v["size"].as_i64().unwrap_or(0))));
-    let trailers: Vec<String> = videos.iter().filter_map(|v| v["key"].as_str().map(str::to_owned)).collect();
-    // Strict textless (`iso_639_1: null`) backdrop first — guaranteed free of Netflix/Prime banners.
-    // Use w1280 (7x smaller than 4K original, 9x less GPU texture memory) for fast cold starts and
-    // 120fps WebView hero animations while staying razor-sharp on tablets and desktops.
-    let textless = best_image(&images["backdrops"], &[None]);
-    let backdrop_clean = textless.is_some();
-    let backdrop_path = textless.or_else(|| best_image(&images["backdrops"], &[Some("en")]));
-    let backdrop = backdrop_path.as_ref().map(|p| format!("https://image.tmdb.org/t/p/w1280{p}"));
-    let art = Artwork {
-        genres: details["genres"].as_array().into_iter().flatten().filter_map(|g| g["name"].as_str()).map(crate::picks_rules::canonical_genre).collect(),
-        // Text-free backdrops first (no language), then English ones.
-        backdrop: backdrop.clone(),
-        backdrop_clean,
-        logo: best_image(&images["logos"], &[Some("en"), None]).map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
-        poster: best_image(&images["posters"], &[Some("en"), None]).or_else(|| details["poster_path"].as_str().map(str::to_owned))
-            .map(|p| format!("https://image.tmdb.org/t/p/w780{p}")),
+    let genres: Vec<String> = meta["genres"].as_array().or_else(|| meta["genre"].as_array())
+        .into_iter().flatten().filter_map(Value::as_str).map(crate::picks_rules::canonical_genre).collect();
+    let trailers: Vec<String> = meta["trailers"].as_array().into_iter().flatten()
+        .map(|t| s(t, "source")).filter(|k| !k.is_empty()).collect();
+    let videos: Vec<Video> = meta["trailers"].as_array().into_iter().flatten()
+        .filter_map(|t| {
+            let youtube = s(t, "source");
+            if youtube.is_empty() { return None; }
+            let kind = Some(s(t, "type")).filter(|k| !k.is_empty()).unwrap_or_else(|| "Trailer".into());
+            let name = Some(s(t, "name")).filter(|n| !n.is_empty()).unwrap_or_else(|| kind.clone());
+            Some(Video { youtube, name, kind, official: true })
+        }).take(12).collect();
+    let cast: Vec<Person> = meta["app_extras"]["cast"].as_array().into_iter().flatten().take(15).filter_map(|c| {
+        let name = s(c, "name");
+        if name.is_empty() { return None; }
+        let role = s(c, "character");
+        let photo = Some(s(c, "photo")).filter(|u| u.starts_with("https://"));
+        Some(Person { name, role, photo, ..Default::default() })
+    }).collect();
+    let mut crew: Vec<(String, Vec<Person>)> = Vec::new();
+    for (field_name, label) in [("director", "Directed by"), ("writer", "Written by")] {
+        let people: Vec<Person> = meta[field_name].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).take(3)
+            .map(|name| Person { name: name.to_owned(), ..Default::default() }).collect();
+        if !people.is_empty() { crew.push((label.to_owned(), people)); }
+    }
+    let certificate = Some(s(meta, "ageRating")).filter(|c| !c.is_empty() && c.len() <= 10);
+    let runtime_secs = parse_runtime_secs(&s(meta, "runtime"));
+    Artwork {
+        genres,
+        backdrop: url_of("background", "w1280"),
+        logo: url_of("logo", "w500"),
+        poster: url_of("poster", "w780"),
         trailers,
-        tmdb: Some((kind.to_owned(), id)),
-        collection: details["belongs_to_collection"]["id"].as_i64(),
-        ..production(&details, kind, backdrop.as_deref())
-    };
-    if let Ok(mut c) = cache.lock() { cache_insert(&mut c, 800, cache_key, art.clone()); }
+        cast,
+        crew,
+        certificate,
+        runtime_secs,
+        videos,
+        ..Artwork::default()
+    }
+}
+
+/// Keyless ElfHosted artwork & production metadata (backdrop, logo, cast portraits, trailers,
+/// age rating, runtime); cached for the session.
+pub async fn elfhosted_artwork(m: &Media) -> Option<Artwork> {
+    let imdb = imdb_of(m)?;
+    let kind = if m.kind == "movie" { "movie" } else if m.kind == "series" { "series" } else { return None };
+    let cache = ARTWORK.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().ok()?.get(&imdb).cloned() { return Some(hit); }
+    let meta = elfhosted_meta(kind, &imdb).await?;
+    let art = parse_elfhosted_artwork(&meta);
+    if let Ok(mut c) = cache.lock() { cache_insert(&mut c, 800, imdb, art.clone()); }
     Some(art)
 }
 
-/// Free-first artwork for a title across the whole app (Home, Library, Picks, Related):
-/// BetterPosters (and TVmaze untouched originals for series) come first; when a TMDB API key is
-/// configured, TMDB runs in parallel and fills ONLY what free sources lack — plus guaranteed
-/// textless (`iso_639_1: null`) backdrops that eliminate Netflix/Prime Video promotional banners.
+/// Free keyless artwork for a title across the whole app (Home, Library, Picks, Related):
+/// BetterPosters (and TVmaze untouched originals for series) come first; keyless ElfHosted runs
+/// in parallel and fills any gaps (cast portraits, logos, backdrops, trailers, runtime).
 pub async fn artwork(m: &Media) -> Option<Artwork> {
-    let (bp, tmdb) = tokio::join!(bp_artwork(m), tmdb_artwork(m));
+    let (bp, elf) = tokio::join!(bp_artwork(m), elfhosted_artwork(m));
     let free = match bp {
         Some(art) if art.backdrop.is_some() => Some(art),
         other => match tvmaze_backdrop_artwork(m).await {
@@ -467,10 +407,10 @@ pub async fn artwork(m: &Media) -> Option<Artwork> {
             None => other,
         },
     };
-    match (free, tmdb) {
-        (Some(f), Some(t)) => Some(with_extras(f, t)),
+    match (free, elf) {
+        (Some(f), Some(e)) => Some(with_extras(f, e)),
         (Some(f), None) => Some(f),
-        (None, Some(t)) => Some(t),
+        (None, Some(e)) => Some(e),
         (None, None) => None,
     }
 }
@@ -489,11 +429,84 @@ pub fn ambient_url(url: &str) -> String {
 
 static TITLE_ART_CACHE: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
 
-/// Clear session artwork caches (called when the user toggles BetterPosters or updates TMDB key).
+/// Parse a JustWatch GraphQL response into crisp, textless 1440px widescreen backdrops for the
+/// exact matching IMDb ID (never matching on title alone).
+pub(super) fn parse_justwatch_stills(v: &Value, imdb: &str) -> Vec<String> {
+    let edges = v["data"]["popularTitles"]["edges"].as_array();
+    let Some(content) = edges.into_iter().flatten().find_map(|e| {
+        let c = &e["node"]["content"];
+        (c["externalIds"]["imdbId"].as_str() == Some(imdb)).then_some(c)
+    }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for b in content["backdrops"].as_array().into_iter().flatten() {
+        let Some(path) = b["backdropUrl"].as_str() else { continue };
+        if !path.starts_with("/backdrop/") { continue; }
+        let url = format!("{JUSTWATCH_IMAGES}{path}");
+        if !out.contains(&url) { out.push(url); }
+        if out.len() >= 5 { break; }
+    }
+    out
+}
+
+/// Keyless multi-frame widescreen backdrops (~60-90ms) from JustWatch's public GraphQL endpoint,
+/// matched strictly by IMDb ID and cached for the session.
+pub(super) async fn justwatch_stills(m: &Media) -> Vec<String> {
+    let Some(imdb) = imdb_of(m) else { return Vec::new() };
+    let obj_type = if m.kind == "movie" { "MOVIE" } else if m.kind == "series" { "SHOW" } else { return Vec::new() };
+    if m.name.trim().is_empty() { return Vec::new(); }
+    let cache = JW_STILLS_CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&imdb).cloned()) {
+        return hit;
+    }
+    let query = r#"query GetBackdrops($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter) {
+  popularTitles(country: $country, first: $first, filter: $filter) {
+    edges {
+      node {
+        content(country: $country, language: $language) {
+          externalIds { imdbId }
+          backdrops(profile: S1440, format: JPG) { backdropUrl }
+        }
+      }
+    }
+  }
+}"#;
+    let body = json!({
+        "query": query,
+        "variables": {
+            "country": "US",
+            "language": "en",
+            "first": 8,
+            "filter": { "searchQuery": m.name, "objectTypes": [obj_type] }
+        }
+    });
+    let imdb_match = imdb.clone();
+    let got = on_runtime(async move {
+        let resp = backend().http
+            .post(JUSTWATCH_GRAPHQL)
+            .json(&body)
+            .timeout(Duration::from_secs(4))
+            .send().await.ok()?.error_for_status().ok()?;
+        let v = resp.json::<Value>().await.ok()?;
+        Some(parse_justwatch_stills(&v, &imdb_match))
+    }).await.ok().flatten();
+    if let Some(stills) = got {
+        if let Ok(mut c) = cache.lock() { cache_insert(&mut c, 600, imdb, stills.clone()); }
+        stills
+    } else {
+        Vec::new()
+    }
+}
+
+/// Clear session artwork caches (called when the user toggles BetterPosters).
 pub fn clear_artwork_caches() {
     if let Some(c) = TITLE_ART_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
     if let Some(c) = ARTWORK.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
     if let Some(c) = BP_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
+    if let Some(c) = ELF_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
+    if let Some(c) = JW_STILLS_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
+    clear_quality_cache();
 }
 
 /// Synchronously read cached title hero artwork from this session so re-opening a title paints
@@ -506,24 +519,49 @@ pub fn cached_title_artwork(m: &Media) -> Option<Artwork> {
 /// from session caches so returning to a screen paints artwork on Frame 0.
 pub fn cached_artwork(m: &Media) -> Option<Artwork> {
     if let Some(hit) = cached_title_artwork(m) { return Some(hit); }
-    let cache_key = imdb_of(m).unwrap_or_else(|| format!("{}|{}", m.name.to_lowercase(), m.first_year().unwrap_or(0)));
-    ARTWORK.get()?.lock().ok()?.get(&cache_key).cloned()
+    let imdb = imdb_of(m)?;
+    ARTWORK.get()?.lock().ok()?.get(&imdb).cloned()
 }
 
-/// Fast title hero artwork (~150-250ms): runs ONLY BetterPosters + optional TMDB gap-filler
-/// (never blocked by slower TVmaze/AniList/Wikidata series calls, which stream in below the fold
-/// via `open_series_free` and `open_wikidata` with free-first priority).
+/// Fast title hero artwork (~90-200ms): runs BetterPosters + keyless ElfHosted + keyless JustWatch
+/// multi-frame backdrops in parallel (never blocked by slower TVmaze/AniList/Wikidata calls).
 pub async fn title_artwork_fast(m: &Media) -> Option<Artwork> {
     if let Some(hit) = cached_title_artwork(m) {
         return Some(hit);
     }
-    let (bp, tmdb) = tokio::join!(bp_artwork(m), tmdb_artwork(m));
-    let out = match (bp, tmdb) {
-        (Some(f), Some(t)) => Some(with_extras(f, t)),
+    let (bp, elf, jw_stills) = tokio::join!(bp_artwork(m), elfhosted_artwork(m), justwatch_stills(m));
+    let mut out = match (bp, elf) {
+        (Some(f), Some(e)) => Some(with_extras(f, e)),
         (Some(f), None) => Some(f),
-        (None, Some(t)) => Some(t),
+        (None, Some(e)) => Some(e),
         (None, None) => None,
     };
+    if !jw_stills.is_empty() {
+        let mut art = out.unwrap_or_default();
+        let mut iter = jw_stills.into_iter();
+        if art.backdrop.is_none() {
+            art.backdrop = iter.next();
+        }
+        for s in iter {
+            if art.stills.len() >= 4 { break; }
+            if Some(s.as_str()) != art.backdrop.as_deref() && !art.stills.contains(&s) {
+                art.stills.push(s);
+            }
+        }
+        out = Some(art);
+    }
+    // Fallback second frame via Metahub (usually a distinct textless backdrop from BetterPosters)
+    // when JustWatch had no stills for this IMDb title.
+    if let Some(ref mut art) = out {
+        if art.stills.is_empty() && art.backdrop.is_some() {
+            if let Some(imdb) = imdb_of(m) {
+                let metahub = format!("https://images.metahub.space/background/medium/{imdb}/img");
+                if art.backdrop.as_deref() != Some(metahub.as_str()) {
+                    art.stills.push(metahub);
+                }
+            }
+        }
+    }
     if let Some(ref art) = out {
         if let Ok(mut c) = TITLE_ART_CACHE.get_or_init(Default::default).lock() {
             cache_insert(&mut c, 400, m.key(), art.clone());
@@ -532,163 +570,16 @@ pub async fn title_artwork_fast(m: &Media) -> Option<Artwork> {
     out
 }
 
-/// Whether TMDB can be asked (a key is set).
-pub fn tmdb_ready() -> bool { tmdb_key().is_some() }
-
-/// TMDB genre ids and names, per "movie" or "tv".
-pub(super) type GenreLists = HashMap<String, Vec<(i64, String)>>;
-pub(super) static TMDB_GENRES: OnceLock<Mutex<GenreLists>> = OnceLock::new();
-
-/// TMDB's genre list for "movie" or "tv", cached.
-pub(super) async fn tmdb_genre_list(kind: &str) -> Vec<(i64, String)> {
-    let cache = TMDB_GENRES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(kind).cloned()) { return hit; }
-    let list: Vec<(i64, String)> = tmdb(format!("genre/{kind}/list"), vec![]).await.map(|v| v["genres"].as_array().into_iter().flatten()
-        .filter_map(|g| Some((g["id"].as_i64()?, g["name"].as_str()?.to_owned()))).collect()).unwrap_or_default();
-    if let Ok(mut c) = cache.lock() { c.insert(kind.to_owned(), list.clone()); }
-    list
-}
-
-/// Popular, well-rated titles from TMDB Discover for a genre (TMDB genre, else a keyword such as
-/// "martial arts"), type, style and years, as Cinemeta titles (IMDb ids) so they open and play
-/// like any other. Titles without an IMDb id are skipped. Formats (reality, talk, news, soap)
-/// never come back, kids' series only when asked for, and a series carries the years it aired.
-/// Without a key, Cinemeta's lists answer instead.
+/// Popular, well-rated titles for a genre, type, style and years, as Cinemeta titles (IMDb ids)
+/// so they open and play like any other. Fully keyless via Cinemeta's ranked catalogs.
 pub async fn discover_candidates(selected_genres: Vec<String>, kind: Option<String>, style: Style, from: Option<i32>, to: Option<i32>, pages: Vec<u32>) -> Vec<Media> {
-    if !tmdb_ready() { return cinemeta_candidates(selected_genres, kind, style, from, to, pages).await; }
-    let kinds: Vec<&str> = match kind.as_deref() { Some("movie") => vec!["movie"], Some("series") => vec!["tv"], _ => vec!["movie", "tv"] };
-    let wants_kids = selected_genres.iter().any(|g| crate::picks_rules::canonical_genre(g) == "Kids");
-    let mut out = Vec::new();
-    for tk in kinds {
-        let genres = tmdb_genre_list(tk).await;
-        let mut query: Vec<(&'static str, String)> = vec![("sort_by", "popularity.desc".into()), ("vote_count.gte", "80".into()), ("include_adult", "false".into())];
-        let mut with_genres: Vec<i64> = Vec::new();
-        let mut with_keywords: Vec<i64> = Vec::new();
-        let mut without: Vec<i64> = Vec::new();
-        match style { Style::Animation => with_genres.push(16), Style::Live => without.push(16), Style::Both => {} }
-        // Reality, News, Soap, Talk; Kids unless asked for.
-        if tk == "tv" { without.extend([10764, 10763, 10766, 10767]); if !wants_kids { without.push(10762); } }
-        let mut unmatched = false;
-        for g in &selected_genres {
-            let wanted = match crate::picks_rules::canonical_genre(g).to_lowercase().as_str() {
-                "sci-fi" => if tk == "tv" { "sci-fi & fantasy".into() } else { "science fiction".into() },
-                "kids" => if tk == "tv" { "kids".into() } else { "family".into() },
-                other => other.to_owned(),
-            };
-            match genres.iter().find(|(_, n)| n.to_lowercase() == wanted || n.to_lowercase().split(" & ").any(|p| p == wanted)) {
-                Some((id, _)) => {
-                    if !with_genres.contains(id) { with_genres.push(*id); }
-                    without.retain(|w| w != id);
-                }
-                None => {
-                    let found = tmdb("search/keyword".into(), vec![("query", g.clone())]).await;
-                    match found.and_then(|v| v["results"][0]["id"].as_i64()) {
-                        Some(id) => if !with_keywords.contains(&id) { with_keywords.push(id); },
-                        None => { unmatched = true; break; }
-                    }
-                }
-            }
-        }
-        if unmatched { continue; }
-        let join = |v: &[i64]| v.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        if !with_genres.is_empty() { query.push(("with_genres", join(&with_genres))); }
-        if !with_keywords.is_empty() { query.push(("with_keywords", join(&with_keywords))); }
-        if !without.is_empty() { query.push(("without_genres", join(&without))); }
-        // A film by its release; a series by any episode aired in the range.
-        if tk == "movie" {
-            if let Some(f) = from { query.push(("primary_release_date.gte", format!("{f}-01-01"))); }
-            if let Some(t) = to { query.push(("primary_release_date.lte", format!("{t}-12-31"))); }
-        } else {
-            if let Some(f) = from { query.push(("air_date.gte", format!("{f}-01-01"))); }
-            if let Some(t) = to { query.push(("first_air_date.lte", format!("{t}-12-31"))); }
-        }
-        let mut results: Vec<Value> = Vec::new();
-        for page in &pages {
-            let mut q = query.clone(); q.push(("page", page.to_string()));
-            let Some(v) = tmdb(format!("discover/{tk}"), q).await else { break };
-            results.extend(v["results"].as_array().cloned().unwrap_or_default());
-        }
-        out.extend(tmdb_titles(tk, results, &selected_genres).await);
-    }
-    out
+    cinemeta_candidates(selected_genres, kind, style, from, to, pages).await
 }
 
-/// TMDB results (Discover, recommendations) as Cinemeta titles, so they open and play like any
-/// other: IMDb ids looked up together, a series with the years it aired. `ensure_genres` are added
-/// to a title that lacks them (keyword matches). Titles without an IMDb id are skipped.
-pub(super) async fn tmdb_titles(tk: &str, results: Vec<Value>, ensure_genres: &[String]) -> Vec<Media> {
-    let genres = tmdb_genre_list(tk).await;
-    let names = |ids: &[i64]| ids.iter().filter_map(|id| genres.iter().find(|(g, _)| g == id).map(|(_, n)| n.clone())).collect::<Vec<_>>();
-    let mut out = Vec::new();
-    // IMDb ids (and, for a series, the years it aired) for every result at once.
-    let ids: Vec<i64> = results.iter().filter_map(|r| r["id"].as_i64()).collect();
-    let kind_path = tk.to_owned();
-    let found: HashMap<i64, (String, String)> = on_runtime(async move {
-        let mut set = tokio::task::JoinSet::new();
-        // At most eight TMDB requests at a time (it rate-limits bursts).
-        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-        for id in ids {
-            let kp = kind_path.clone();
-            let gate = gate.clone();
-            set.spawn(async move {
-                let _permit = gate.acquire_owned().await;
-                if kp == "tv" {
-                    let d = tmdb(format!("tv/{id}"), vec![("append_to_response", "external_ids".into())]).await;
-                    (id, d.and_then(|d| {
-                        let imdb = d["external_ids"]["imdb_id"].as_str()?.to_owned();
-                        let first = d["first_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default().to_owned();
-                        let last = d["last_air_date"].as_str().and_then(|x| x.get(..4)).unwrap_or_default();
-                        let running = d["in_production"].as_bool().unwrap_or(false);
-                        let years = if first.is_empty() { String::new() } else if running { format!("{first}–") } else if last.is_empty() || last == first { first } else { format!("{first}–{last}") };
-                        Some((imdb, years))
-                    }))
-                } else {
-                    (id, tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(|i| (i.to_owned(), String::new()))))
-                }
-            });
-        }
-        let mut found = HashMap::new();
-        while let Some(done) = set.join_next().await {
-            if let Ok((id, Some((imdb, years)))) = done { if imdb.starts_with("tt") { found.insert(id, (imdb, years)); } }
-        }
-        found
-    }).await.unwrap_or_default();
-    for r in &results {
-        let Some((imdb, years)) = r["id"].as_i64().and_then(|id| found.get(&id).cloned()) else { continue };
-        let ids: Vec<i64> = r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
-        let mut genre_names: Vec<String> = names(&ids);
-        for g in ensure_genres { if !genre_names.iter().any(|n| crate::picks_rules::has_genre_name(n, g)) { genre_names.push(g.clone()); } }
-        // Japanese animation is anime.
-        if ids.contains(&16) && r["original_language"] == "ja" { genre_names.push("Anime".into()); }
-        let date = r[if tk == "movie" { "release_date" } else { "first_air_date" }].as_str().unwrap_or_default();
-        let release = if years.is_empty() { date.get(..4).unwrap_or_default().to_owned() } else { years };
-        let meta = json!({
-            "id": imdb, "type": if tk == "movie" { "movie" } else { "series" },
-            "name": r[if tk == "movie" { "title" } else { "name" }].as_str().unwrap_or("Untitled"),
-            "description": r["overview"].as_str().unwrap_or_default(),
-            "releaseInfo": release,
-            "poster": r["poster_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w780{p}")).unwrap_or_default(),
-            "background": r["backdrop_path"].as_str().map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")).unwrap_or_default(),
-            "genres": genre_names, "tmdbRating": r["vote_average"].as_f64().filter(|&v| v > 0.0).map(|v| format!("{v:.1}")).unwrap_or_default(),
-            "tmdb_id": r["id"],
-        });
-        if let Some(m) = Media::from_json(&meta, CINEMETA) { out.push(crate::picks_rules::tidy(m)); }
-    }
-    out
-}
-
-/// Titles TMDB recommends for one you kept or liked: the pool grows toward your taste. Without
-/// a key, Cinemeta's lists for its genres.
+/// Titles related to one you kept or liked: Cinemeta's lists for its genres, then re-ranked by
+/// Picks' on-device story embedding model.
 pub async fn related(m: &Media) -> Vec<Media> {
-    if !tmdb_ready() { return cinemeta_related(m).await; }
-    let Some((kind, id)) = artwork(m).await.and_then(|a| a.tmdb) else { return Vec::new() };
-    let Some(v) = tmdb(format!("{kind}/{id}/recommendations"), vec![("page", "1".into())]).await else { return Vec::new() };
-    // Formats (reality, news, soap, talk) and kids' series are never offered; skip their lookups.
-    let results: Vec<Value> = v["results"].as_array().into_iter().flatten()
-        .filter(|r| !r["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).any(|g| [10764, 10763, 10766, 10767, 10762].contains(&g)))
-        .filter(|r| r["vote_count"].as_i64().unwrap_or(0) >= 50)
-        .take(12).cloned().collect();
-    tmdb_titles(&kind, results, &[]).await
+    cinemeta_related(m).await
 }
 
 pub(super) fn tvmaze_genres(s: &Value) -> Vec<String> {
@@ -751,76 +642,31 @@ pub async fn tvmaze_candidates(selected_genres: Vec<String>, style: Style, from:
     out.into_iter().take(40).map(|(_, m)| m).collect()
 }
 
-pub(super) async fn tmdb_by_name(m: &Media) -> Option<(&'static str, i64)> {
-    let v = tmdb("search/multi".into(), vec![("query", m.name.clone()), ("include_adult", "false".into())]).await?;
-    let year = m.first_year();
-    let want_tv = m.kind != "movie";
-    let mut fits: Vec<(&'static str, i64, bool)> = v["results"].as_array().into_iter().flatten().filter_map(|r| {
-        let kind = match r["media_type"].as_str()? { "movie" => "movie", "tv" => "tv", _ => return None };
-        let date = r["release_date"].as_str().or(r["first_air_date"].as_str()).unwrap_or_default();
-        let ry: Option<i32> = date.get(..4).and_then(|y| y.parse().ok());
-        let year_ok = match (year, ry) { (Some(a), Some(b)) => (a - b).abs() <= 1, (None, _) => true, (Some(_), None) => false };
-        year_ok.then_some((kind, r["id"].as_i64()?, (kind == "tv") == want_tv))
-    }).collect();
-    fits.sort_by_key(|f| !f.2); // the right kind first
-    fits.first().map(|f| (f.0, f.1))
-}
-
 /// Episode stills for one season: episode number -> high-resolution image URL.
 /// Free keyless sources ALWAYS come first: TVmaze untouched originals (all series), then
-/// ARM + ani.zip TVDB screencaps (for animated series where TVmaze lacks an episode).
-/// TMDB (at w780, only when a key is set) fills ONLY episodes still missing after free sources.
+/// ARM + ani.zip TVDB screencaps (for animated series), then keyless ElfHosted stills for any
+/// remaining missing episodes.
 pub async fn season_stills(m: &Media, season: i64) -> HashMap<i64, String> {
     let (mut out, anime) = tokio::join!(tvmaze_stills(m, season), anime_stills(m, season));
     for (ep, url) in anime {
         out.entry(ep).or_insert(url);
     }
-    if !tmdb_ready() { return out; }
-    let Some(Artwork { tmdb: Some((kind, id)), .. }) = tmdb_artwork(m).await else { return out };
-    if kind != "tv" { return out; }
-    let Some(v) = tmdb(format!("tv/{id}/season/{season}"), vec![]).await else { return out };
-    for e in v["episodes"].as_array().into_iter().flatten() {
-        if let (Some(num), Some(path)) = (e["episode_number"].as_i64(), e["still_path"].as_str().filter(|p| !p.is_empty())) {
-            out.entry(num).or_insert_with(|| format!("https://image.tmdb.org/t/p/w780{path}"));
+    if m.kind != "series" { return out; }
+    let Some(imdb) = imdb_of(m) else { return out };
+    let Some(meta) = elfhosted_meta("series", &imdb).await else { return out };
+    for e in meta["videos"].as_array().into_iter().flatten() {
+        if e["season"].as_i64() != Some(season) { continue; }
+        let num = e["episode"].as_i64().or_else(|| e["number"].as_i64());
+        let thumb = e["thumbnail"].as_str().filter(|u| u.starts_with("https://"));
+        if let (Some(num), Some(thumb)) = (num, thumb) {
+            out.entry(num).or_insert_with(|| sized_tmdb_img(thumb, "w780"));
         }
     }
     out
 }
 
-/// Free-first Picks keywords: Wikidata's subjects, finer genres and settings come first; TMDB
-/// (when a key is set) supplements only when Wikidata is unreachable or has fewer than 3 terms.
-/// A successful empty list is distinct from a network/auth failure, which enrichment retries later.
+/// Keyless Picks keywords from Wikidata's subjects, finer genres and settings.
+/// A successful empty list is distinct from a network failure, which enrichment retries later.
 pub(crate) async fn picks_keywords(m: &Media) -> Option<Vec<String>> {
-    let wiki = wikidata_keywords(m).await;
-    if let Some(ref terms) = wiki {
-        if terms.len() >= 3 || !tmdb_ready() { return wiki; }
-    } else if !tmdb_ready() {
-        return None;
-    }
-    let kind = if m.kind == "movie" { "movie" } else { "tv" };
-    let id = if let Some(id) = m.raw["tmdb_id"].as_i64().filter(|i| *i > 0) { Some(id) }
-        else if let Some(imdb) = imdb_of(m) {
-            let found = tmdb(format!("find/{imdb}"), vec![("external_source","imdb_id".into())]).await;
-            match found {
-                Some(f) => f[if kind == "movie" { "movie_results" } else { "tv_results" }][0]["id"].as_i64(),
-                None => return wiki,
-            }
-        } else {
-            let found = tmdb(format!("search/{kind}"), vec![("query",m.name.clone()),("language","en-US".into())]).await;
-            let Some(found) = found else { return wiki };
-            let mut matches = found["results"].as_array().into_iter().flatten().filter(|r| {
-                let title = r[if kind == "movie" { "title" } else { "name" }].as_str().unwrap_or_default();
-                let year = r[if kind == "movie" { "release_date" } else { "first_air_date" }].as_str().and_then(|s| s.get(..4)).and_then(|s| s.parse::<i32>().ok());
-                search_words(title) == search_words(&m.name) && match (m.first_year(),year) { (Some(a),Some(b)) => (a-b).abs() <= 1, (None,_) => true, _ => false }
-            });
-            let first = matches.next().and_then(|r| r["id"].as_i64());
-            if matches.next().is_some() { None } else { first }
-        };
-    let Some(id) = id.filter(|id| *id > 0) else { return wiki.or_else(|| Some(Vec::new())) };
-    let Some(response) = tmdb(format!("{kind}/{id}/keywords"),vec![]).await else { return wiki };
-    let mut merged = wiki.unwrap_or_default();
-    for term in crate::picks_metadata::keywords(&response) {
-        if !merged.contains(&term) { merged.push(term); }
-    }
-    Some(merged)
+    wikidata_keywords(m).await
 }

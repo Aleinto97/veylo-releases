@@ -87,7 +87,7 @@ pub fn AccountBlock() -> Element {
                                     span { class: "setting-name", "End-to-end encryption key" }
                                     span { class: "setting-about",
                                         if key_needed { "This account has encrypted cloud data from another device. Link via QR or enter its Recovery Key to unlock sync." }
-                                        else { "Library, progress, likes, TMDB key and add-ons are AES-256-GCM encrypted on-device. Keep a backup of your Recovery Key for new devices." }
+                                        else { "Library, progress, likes, preferences and add-ons are AES-256-GCM encrypted on-device. Keep a backup of your Recovery Key for new devices." }
                                     }
                                 }
                                 div { class: "setting-controls",

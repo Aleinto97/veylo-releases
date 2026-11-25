@@ -7,7 +7,7 @@
 //!   scans it and hands the computer its session, sealed with the key in that code.
 //!
 //! What syncs: titles with history (saved, watched, rated, progress), each episode's record
-//! (`sync_changes` / `sync_apply`, newest change winning), and your TMDB key, audio language,
+//! (`sync_changes` / `sync_apply`, newest change winning), and your audio language,
 //! preferences and add-ons (`users/{uid}/config/keys`).
 //!
 //! Zero-knowledge E2EE (v3): both watch-history items and `config/keys` are encrypted on-device
@@ -716,7 +716,7 @@ pub fn start_sync() {
 }
 
 // ---------------------------------------------------------------- encrypted settings & add-ons sync
-// Your TMDB key, audio language, preferences and add-ons sync through your account's private
+// Your audio language, preferences and add-ons sync through your account's private
 // Firestore document (`users/{uid}/config/keys`), end-to-end encrypted with your 256-bit Sync Key.
 
 /// The device the synced settings came from, once they arrived here (shown once).
@@ -737,7 +737,7 @@ fn device_name() -> String {
 /// The settings this device can hand over during QR linking.
 fn keys_here() -> Value {
     let s = load_settings();
-    json!({"tmdb_key": s.tmdb_key, "stream_language": s.stream_language})
+    json!({"stream_language": s.stream_language})
 }
 
 /// The device your synced settings just came from (once).
@@ -758,8 +758,7 @@ fn keys_digest(payload: &Value) -> String {
 }
 
 fn has_any_sync_config(payload: &Value) -> bool {
-    payload["tmdb_key"].as_str().is_some_and(|v| !v.trim().is_empty())
-        || payload["addons"]["urls"].as_array().is_some_and(|a| !a.is_empty())
+    payload["addons"]["urls"].as_array().is_some_and(|a| !a.is_empty())
         || payload["addons"]["others"].as_array().is_some_and(|a| !a.is_empty())
 }
 
@@ -847,14 +846,13 @@ fn open_keys_payload(sync_key: &[u8; 32], uid: &str, project: &str, fields: &Val
     }
 }
 
-/// Automatically sync TMDB key, audio language, preferences and add-ons through
+/// Automatically sync audio language, preferences and add-ons through
 /// `users/{uid}/config/keys` using real zero-knowledge v3 AES-256-GCM encryption.
 async fn sync_keys(token: &str, uid: &str, base: &str, sync_key: &[u8; 32], st: &mut State) -> Result<()> {
     let project = config().map(|c| c.project).unwrap_or_default();
     let settings = load_settings();
     let local_addons = crate::addons::for_handoff().await;
     let local = json!({
-        "tmdb_key": settings.tmdb_key,
         "stream_language": settings.stream_language,
         "addons": local_addons,
         "prefs": {
@@ -917,7 +915,6 @@ async fn sync_keys(token: &str, uid: &str, base: &str, sync_key: &[u8; 32], st: 
                 adopt_keys(&remote).await;
                 let after = load_settings();
                 let adopted = json!({
-                    "tmdb_key": after.tmdb_key,
                     "stream_language": after.stream_language,
                     "addons": crate::addons::for_handoff().await,
                     "prefs": {
@@ -973,10 +970,8 @@ async fn sync_keys(token: &str, uid: &str, base: &str, sync_key: &[u8; 32], st: 
 /// Settings and add-ons from your account or another device: saved here, then add-ons adopted.
 async fn adopt_keys(v: &Value) {
     let text = |k: &str| v[k].as_str().map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
-    let (tmdb, language) = (text("tmdb_key"), text("stream_language"));
+    let language = text("stream_language");
     update_settings(|s| {
-        if tmdb.is_some() { s.tmdb_key = tmdb.clone(); }
-        else if v.get("tmdb_key").is_some_and(Value::is_null) { s.tmdb_key = None; }
         if let Some(l) = language.clone().filter(|l| crate::addons::language(l).is_some()) { s.stream_language = Some(l); }
         if let Some(p) = v.get("prefs") {
             if let Some(b) = p["better_posters"].as_bool() { s.better_posters = b; }

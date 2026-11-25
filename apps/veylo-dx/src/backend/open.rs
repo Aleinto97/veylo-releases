@@ -1,9 +1,8 @@
-//! Keyless sources: everything here works without a TMDB key and runs FIRST even when a key is
-//! configured (TMDB then fills only what free sources lack). TVmaze gives a series' cast and crew,
-//! untouched season posters, backgrounds, episode stills, next episode and Home's new episodes;
-//! ARM + AniList + ani.zip fill multi-season anime posters and episode stills where TVmaze or TMDB
-//! collapse seasons; Wikidata gives a film's credits with photos, studios, certificate, critics'
-//! scores and Picks keywords; Cinemeta's catalogues give Picks candidates and related titles.
+//! Keyless sources: TVmaze gives a series' cast and crew, untouched season posters, backgrounds,
+//! episode stills, next episode and Home's new episodes; ARM + AniList + ani.zip fill multi-season
+//! anime posters and episode stills; Wikidata gives a film's credits with photos, franchise
+//! collections, studios, certificate, language, critics' scores and Picks keywords; Wikipedia REST
+//! gives person bios and Wikidata IDs; Cinemeta's catalogues give Picks candidates and related titles.
 //! Answers are kept for the session, one request per title however many screens ask at once; a
 //! failed answer isn't kept, so the next visit asks again.
 use super::*;
@@ -116,9 +115,10 @@ pub(super) fn tvmaze_production(show: &Value) -> Artwork {
     }
     let season_posters = e["seasons"].as_array().into_iter().flatten()
         .filter_map(|x| Some((x["number"].as_i64()?, tvmaze_image(x)?))).collect();
-    // TVmaze backgrounds have no textless flag (some carry network watermarks like Netflix/Prime),
-    // so only keep the highest-res one as a single fallback backdrop, never as cycling hero stills.
-    let backdrop = tvmaze_embedded_images(show, "background").into_iter().next();
+    // Use TVmaze's highest-resolution backgrounds as backdrop + rotating hero stills (up to 4 extra).
+    let mut bgs = tvmaze_embedded_images(show, "background").into_iter();
+    let backdrop = bgs.next();
+    let stills: Vec<String> = bgs.take(4).collect();
     let poster = tvmaze_embedded_images(show, "poster").into_iter().next().or_else(|| tvmaze_image(show));
     let runtime_secs = show["averageRuntime"].as_u64()
         .or_else(|| show["runtime"].as_u64())
@@ -132,7 +132,7 @@ pub(super) fn tvmaze_production(show: &Value) -> Artwork {
         }
     }
     Artwork {
-        backdrop, poster, cast, crew, season_posters,
+        backdrop, stills, poster, cast, crew, season_posters,
         language: Some(s(show, "language")).filter(|l| !l.is_empty()),
         alt_titles,
         runtime_secs,
@@ -371,7 +371,7 @@ async fn wikidata_title(m: &Media) -> Option<Value> {
   UNION {{ ?f wdt:P86 ?v. BIND("Music by" AS ?k) OPTIONAL {{ ?v wdt:P18 ?img }} }}
   UNION {{ ?f wdt:P344 ?v. BIND("Cinematography by" AS ?k) OPTIONAL {{ ?v wdt:P18 ?img }} }}
   UNION {{ ?f wdt:P272|wdt:P449 ?v. BIND("studio" AS ?k) OPTIONAL {{ ?v wdt:P154 ?img }} }}
-  UNION {{ ?f wdt:P364 ?v. BIND("language" AS ?k) }}
+  UNION {{ ?f wdt:P364 ?v. BIND("language" AS ?k) OPTIONAL {{ ?v wdt:P218 ?role }} }}
   UNION {{ ?f wdt:P1657 ?v. BIND("certificate" AS ?k) }}
   UNION {{ ?f p:P444 ?st. ?st ps:P444 ?role. ?st pq:P447 ?v. BIND("score" AS ?k) OPTIONAL {{ ?st pq:P459 ?method }} OPTIONAL {{ ?st pq:P585 ?when }} }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
@@ -441,12 +441,20 @@ pub(super) fn wikidata_production(rows: &Value) -> Artwork {
         if studios.len() < 4 && !studios.iter().any(|x| x.name == name) { studios.push(Studio { name, logo }); }
     }
     // Only a title with one original language says which; several can't be told apart here.
-    let mut languages: Vec<String> = of(&rows, "language").filter_map(|r| label(r, "vLabel")).collect();
-    languages.dedup();
+    let mut languages: Vec<(String, String)> = of(&rows, "language")
+        .filter_map(|r| Some((label(r, "vLabel")?, field(r, "role").trim().to_lowercase())))
+        .collect();
+    languages.dedup_by(|a, b| a.0 == b.0);
+    let (language, original_language) = if languages.len() == 1 {
+        let (name, iso) = languages.remove(0);
+        (Some(name), (!iso.is_empty() && iso.len() <= 3).then_some(iso))
+    } else {
+        (None, None)
+    };
     let certificate = of(&rows, "certificate").filter_map(|r| label(r, "vLabel")).find(|c| c.len() <= 6);
     Artwork {
         cast: cast.into_iter().map(|(_, _, p)| p).take(30).collect(), crew, studios, certificate,
-        language: (languages.len() == 1).then(|| languages.remove(0)),
+        language, original_language,
         ..Artwork::default()
     }
 }
@@ -476,7 +484,68 @@ pub async fn review_scores(m: &Media) -> Scores {
     wikidata_title(m).await.map(|rows| scores_from(&rows)).unwrap_or_default()
 }
 
-/// Picks keywords without a TMDB key: Wikidata's subjects, finer genres and settings
+static COLLECTIONS: OnceLock<Mutex<Shared>> = OnceLock::new();
+
+/// Parse Wikidata `P179` franchise rows (`?colLabel`, `?imdb`, `?partLabel`, `?date`) into a
+/// chronologically sorted collection of released films.
+pub(super) fn parse_wikidata_collection(rows: &Value, today: &str) -> Option<CollectionShelf> {
+    let mut col_name = String::new();
+    let mut by_imdb: HashMap<String, (String, String)> = HashMap::new();
+    for r in rows.as_array().into_iter().flatten() {
+        let imdb = field(r, "imdb");
+        if !imdb.starts_with("tt") { continue; }
+        let Some(part_name) = label(r, "partLabel") else { continue };
+        if col_name.is_empty() {
+            if let Some(c) = label(r, "colLabel") { col_name = c; }
+        }
+        let date = field(r, "date").get(..10).unwrap_or_default();
+        if date.len() == 10 && date > today { continue; }
+        let entry = by_imdb.entry(imdb.to_owned()).or_insert_with(|| (part_name, date.to_owned()));
+        if !date.is_empty() && (entry.1.is_empty() || date < entry.1.as_str()) {
+            entry.1 = date.to_owned();
+        }
+    }
+    if by_imdb.len() < 2 { return None; }
+    let mut items: Vec<(String, String, String)> = by_imdb.into_iter()
+        .map(|(imdb, (name, date))| (date, imdb, name))
+        .collect();
+    items.sort_by(|a, b| {
+        fn date_key(d: &str) -> &str { if d.is_empty() { "9999-99-99" } else { d } }
+        date_key(&a.0).cmp(date_key(&b.0)).then_with(|| a.2.cmp(&b.2))
+    });
+    let parts: Vec<Media> = items.into_iter().filter_map(|(date, imdb, name)| {
+        let year = date.get(..4).unwrap_or_default();
+        let meta = json!({
+            "id": imdb, "type": "movie", "name": name, "releaseInfo": year,
+            "poster": format!("https://images.metahub.space/poster/medium/{imdb}/img"),
+        });
+        Media::from_json(&meta, CINEMETA).map(crate::picks_rules::tidy)
+    }).collect();
+    if parts.len() < 2 { return None; }
+    Some(CollectionShelf {
+        name: if col_name.is_empty() { "Collection".into() } else { col_name },
+        parts,
+    })
+}
+
+/// Keyless movie franchise collection from Wikidata (`P179` "part of the series"), cached per IMDb ID.
+pub(super) async fn wikidata_collection_parts(m: &Media) -> Option<CollectionShelf> {
+    if m.kind != "movie" { return None; }
+    let imdb = checked_imdb(m)?;
+    let query = format!(r#"SELECT DISTINCT ?colLabel ?imdb ?partLabel ?date WHERE {{
+  ?this wdt:P345 "{imdb}".
+  ?this wdt:P179 ?col.
+  ?part wdt:P179 ?col; wdt:P345 ?imdb.
+  ?part wdt:P31/wdt:P279* wd:Q11424.
+  OPTIONAL {{ ?part wdt:P577 ?date }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,mul". }}
+}} LIMIT 40"#);
+    let rows = once(&COLLECTIONS, imdb, sparql(query)).await?;
+    let today = { let (y, mo, d, _) = civil(now_secs()); format!("{y:04}-{mo:02}-{d:02}") };
+    parse_wikidata_collection(&rows, &today)
+}
+
+/// Picks keywords: Wikidata's subjects, finer genres and settings
 /// ("dream world", "heist", "Paris"). None when Wikidata can't be reached (asked again later).
 pub(crate) async fn wikidata_keywords(m: &Media) -> Option<Vec<String>> {
     let Some(imdb) = checked_imdb(m) else { return Some(Vec::new()) };
@@ -584,8 +653,6 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
     art.logo = art.logo.or(extra.logo);
     art.poster = art.poster.or(extra.poster);
     if art.trailers.is_empty() { art.trailers = extra.trailers; }
-    art.tmdb = art.tmdb.or(extra.tmdb);
-    art.collection = art.collection.or(extra.collection);
     for s in extra.stills {
         if art.stills.len() >= 4 { break; }
         if Some(s.as_str()) != art.backdrop.as_deref() && !art.stills.contains(&s) {
@@ -601,7 +668,6 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
             if let Some(m) = extra.cast.iter().find(|e| e.name.eq_ignore_ascii_case(&p.name)) {
                 if p.photo.is_none() && m.photo.is_some() { p.photo = m.photo.clone(); }
                 if p.role.is_empty() && !m.role.is_empty() { p.role = m.role.clone(); }
-                if p.tmdb_id.is_none() { p.tmdb_id = m.tmdb_id; }
                 if p.tvmaze_id.is_none() { p.tvmaze_id = m.tvmaze_id; }
                 if p.wikidata_id.is_none() { p.wikidata_id = m.wikidata_id.clone(); }
             }
@@ -626,7 +692,6 @@ pub fn with_extras(mut art: Artwork, extra: Artwork) -> Artwork {
                     for p in existing.iter_mut() {
                         if let Some(m) = people.iter().find(|e| e.name.eq_ignore_ascii_case(&p.name)) {
                             if p.photo.is_none() { p.photo = m.photo.clone(); }
-                            if p.tmdb_id.is_none() { p.tmdb_id = m.tmdb_id; }
                             if p.tvmaze_id.is_none() { p.tvmaze_id = m.tvmaze_id; }
                             if p.wikidata_id.is_none() { p.wikidata_id = m.wikidata_id.clone(); }
                         }
@@ -669,74 +734,50 @@ pub struct Filmography {
     pub credits: Vec<(String, Vec<Media>)>,
 }
 
-/// Fetch a person's real filmography (TMDB when configured, else keyless TVmaze / Wikidata).
+/// Parse a Wikipedia REST `/page/summary/{title}` payload into `(bio, photo, wikidata_qid)`.
+pub(super) fn parse_wiki_summary(v: &Value) -> (Option<String>, Option<String>, Option<String>) {
+    if v["type"].as_str() == Some("disambiguation") { return (None, None, None); }
+    let bio = v["extract"].as_str().map(str::trim).filter(|b| !b.is_empty())
+        .map(|b| b.lines().next().unwrap_or(b).chars().take(360).collect());
+    let photo = v["thumbnail"]["source"].as_str().filter(|u| u.starts_with("https://")).map(str::to_owned);
+    let qid = v["wikibase_item"].as_str()
+        .filter(|q| q.len() > 1 && q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_owned);
+    (bio, photo, qid)
+}
+
+async fn wikipedia_summary(name: &str) -> Option<Value> {
+    let title = name.trim().replace(' ', "_");
+    if title.is_empty() { return None; }
+    let encoded: String = title.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        _ => format!("%{b:02X}"),
+    }).collect();
+    let url = format!("https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}");
+    on_runtime(async move {
+        backend().http.get(url).timeout(Duration::from_secs(5)).send().await.ok()?.error_for_status().ok()?.json::<Value>().await.ok()
+    }).await.ok().flatten()
+}
+
+/// Fetch a person's real filmography & bio (100% keyless via Wikipedia REST, TVmaze and Wikidata).
 pub async fn person_filmography(person: &Person) -> Filmography {
     let mut out = Filmography { person: person.clone(), ..Default::default() };
-    // 1. TMDB combined credits when a TMDB key is configured (richest: movies + series + bio).
-    if tmdb_ready() {
-        let tid = match person.tmdb_id {
-            Some(id) => Some(id),
-            None => tmdb("search/person".into(), vec![("query", person.name.clone())]).await
-                .and_then(|v| v["results"][0]["id"].as_i64()),
-        };
-        if let Some(id) = tid {
-            if let Some(d) = tmdb(format!("person/{id}"), vec![("append_to_response", "combined_credits".into())]).await {
-                if let Some(bio) = d["biography"].as_str().map(str::trim).filter(|b| !b.is_empty()) {
-                    out.bio = bio.lines().next().unwrap_or(bio).chars().take(360).collect();
-                }
-                if out.person.photo.is_none() {
-                    if let Some(p) = d["profile_path"].as_str().filter(|p| !p.is_empty()) {
-                        out.person.photo = Some(format!("{TMDB_IMG}/h632{p}"));
-                    }
-                }
-                let pick_top = |arr: Option<&Vec<Value>>, filter_crew: bool| -> Vec<(String, Value)> {
-                    let mut seen = HashSet::new();
-                    let mut items: Vec<(i64, String, Value)> = arr.into_iter().flatten()
-                        .filter(|v| matches!(v["media_type"].as_str(), Some("movie" | "tv")))
-                        .filter(|v| !filter_crew || matches!(v["job"].as_str(), Some("Director" | "Creator" | "Screenplay" | "Writer" | "Executive Producer")))
-                        .filter(|v| v["vote_count"].as_i64().unwrap_or(0) >= 20)
-                        .filter_map(|v| {
-                            let mt = v["media_type"].as_str()?.to_owned();
-                            let vid = v["id"].as_i64()?;
-                            if !seen.insert((mt.clone(), vid)) { return None; }
-                            let pop = (v["popularity"].as_f64().unwrap_or(0.0) * 100.0) as i64 + v["vote_count"].as_i64().unwrap_or(0);
-                            Some((pop, mt, v.clone()))
-                        }).collect();
-                    items.sort_by_key(|(pop, _, _)| std::cmp::Reverse(*pop));
-                    items.into_iter().take(12).map(|(_, mt, v)| (mt, v)).collect()
-                };
-                let crew_raw = pick_top(d["combined_credits"]["crew"].as_array(), true);
-                let cast_raw = pick_top(d["combined_credits"]["cast"].as_array(), false);
-                let resolve_group = |raw: Vec<(String, Value)>| async move {
-                    let movies: Vec<Value> = raw.iter().filter(|(k, _)| k == "movie").map(|(_, v)| v.clone()).collect();
-                    let series: Vec<Value> = raw.iter().filter(|(k, _)| k == "tv").map(|(_, v)| v.clone()).collect();
-                    let (mut m, s) = tokio::join!(tmdb_titles("movie", movies, &[]), tmdb_titles("tv", series, &[]));
-                    m.extend(s);
-                    m
-                };
-                let (crew_media, cast_media) = tokio::join!(resolve_group(crew_raw), resolve_group(cast_raw));
-                if !crew_media.is_empty() { out.credits.push(("Directing & Writing".into(), crew_media)); }
-                if !cast_media.is_empty() { out.credits.push(("Acting".into(), cast_media)); }
-                if !out.credits.is_empty() { return out; }
-            }
-        }
+    // 1. Wikipedia REST summary (~70ms): bio, fallback portrait, and Wikidata QID when missing.
+    let wiki_fut = wikipedia_summary(&person.name);
+    let tvm_fut = async {
+        let tvm_id = person.tvmaze_id?;
+        get_json(format!("https://api.tvmaze.com/people/{tvm_id}/castcredits"), vec![("embed", "show".into())]).await
+    };
+    let (wiki_summary, tvm_list) = tokio::join!(wiki_fut, tvm_fut);
+    let mut qid = person.wikidata_id.clone();
+    if let Some(ref w) = wiki_summary {
+        let (bio, photo, wqid) = parse_wiki_summary(w);
+        if let Some(b) = bio { out.bio = b; }
+        if out.person.photo.is_none() { out.person.photo = photo; }
+        if qid.is_none() { qid = wqid; out.person.wikidata_id = qid.clone(); }
     }
-    // 2. Keyless TVmaze cast credits (series).
-    if let Some(tvm_id) = person.tvmaze_id {
-        if let Some(list) = get_json(format!("https://api.tvmaze.com/people/{tvm_id}/castcredits"), vec![("embed", "show".into())]).await {
-            let mut seen = HashSet::new();
-            let shows: Vec<Media> = list.as_array().into_iter().flatten()
-                .filter_map(|e| tvmaze_media(&e["_embedded"]["show"]))
-                .filter(|m| seen.insert(m.key()))
-                .take(18).collect();
-            if !shows.is_empty() {
-                out.credits.push(("Series".into(), shows));
-                return out;
-            }
-        }
-    }
-    // 3. Keyless Wikidata SPARQL filmography (movies & series with IMDb IDs).
-    if let Some(qid) = person.wikidata_id.as_deref().filter(|q| q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())) {
+    // 2. Keyless Wikidata SPARQL filmography (movies & series with IMDb IDs).
+    if let Some(qid) = qid.as_deref().filter(|q| q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())) {
         let query = format!(r#"SELECT DISTINCT ?imdb ?fLabel ?year ?isTv WHERE {{
   {{ ?f wdt:P57 wd:{qid}. }} UNION {{ ?f wdt:P161 wd:{qid}. }} UNION {{ ?f wdt:P170 wd:{qid}. }}
   ?f wdt:P345 ?imdb.
@@ -760,6 +801,19 @@ pub async fn person_filmography(person: &Person) -> Filmography {
                 if let Some(m) = Media::from_json(&meta, CINEMETA) { items.push(m); }
             }
             if !items.is_empty() { out.credits.push(("Known for".into(), items)); }
+        }
+    }
+    // 3. Keyless TVmaze cast credits (series fallback / supplement).
+    if out.credits.is_empty() {
+        if let Some(list) = tvm_list {
+            let mut seen = HashSet::new();
+            let shows: Vec<Media> = list.as_array().into_iter().flatten()
+                .filter_map(|e| tvmaze_media(&e["_embedded"]["show"]))
+                .filter(|m| seen.insert(m.key()))
+                .take(18).collect();
+            if !shows.is_empty() {
+                out.credits.push(("Series".into(), shows));
+            }
         }
     }
     out
@@ -906,7 +960,7 @@ mod tests {
         assert_eq!(art.crew[0].1[0].photo.as_deref(), Some("https://static.tvmaze.com/v.jpg"));
         assert_eq!(art.season_posters.get(&1).map(String::as_str), Some("https://static.tvmaze.com/s1-o.jpg"));
         assert_eq!(art.backdrop.as_deref(), Some("https://static.tvmaze.com/bg-1440.jpg"));
-        assert!(art.stills.is_empty(), "unverified TVmaze backgrounds must not cycle as hero stills");
+        assert_eq!(art.stills, ["https://static.tvmaze.com/bg-1080.jpg"]);
         assert_eq!(art.poster.as_deref(), Some("https://static.tvmaze.com/poster-4k.jpg"));
     }
 
@@ -1018,7 +1072,6 @@ mod tests {
         let series = Media::from_json(&json!({"id":"tt0903747","type":"series","name":"Breaking Bad","releaseInfo":"2008–2013","genres":["Drama","Crime"]}), CINEMETA).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            assert!(!tmdb_ready());
             let t = std::time::Instant::now();
             let f = open_production(&film).await.unwrap();
             println!("film ({:?}): cast {} ({} photos), first {:?}", t.elapsed(), f.cast.len(), f.cast.iter().filter(|p| p.photo.is_some()).count(), f.cast.first());

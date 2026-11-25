@@ -671,8 +671,7 @@ pub fn Picks() -> Element {
         let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
         for m in pool.read().iter() { for g in rules::genre_choices(m) { *counts.entry(g).or_default() += 1; } }
         let fetchable = catalog_genres.read().clone().unwrap_or_default();
-        let tmdb = backend::tmdb_ready();
-        counts.into_iter().map(|(g, n)| { let more = tmdb || fetchable.contains(&g.to_lowercase()); (g, n, more) })
+        counts.into_iter().map(|(g, n)| { let more = fetchable.contains(&g.to_lowercase()); (g, n, more) })
             .filter(|(_, n, more)| *n >= 2 || *more).collect()
     };
     let years = year_span(from(), to());
@@ -1117,7 +1116,7 @@ fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on
     if !media.poster.is_empty() && !bg_sources.contains(&media.poster) { bg_sources.push(media.poster.clone()); }
     let (open, pre_open, remove, play) = (media.clone(), media.clone(), media.clone(), media.clone());
     rsx! {
-        div { class: "short-item glass", role: "listitem",
+        div { class: "short-item", role: "listitem",
             button { class: "short-open", aria_label: "Open {media.name}",
                 onpointerdown: move |_| backend::prefetch_title(&pre_open),
                 onclick: move |_| shell.opened.set(Some(open.clone())),
@@ -1127,7 +1126,7 @@ fn ShortItem(media: Media, star: bool, pct: u8, on_play: EventHandler<Media>, on
             }
             div { class: "short-actions",
                 CardPlayButton { media: media.clone(), episodes: Vec::new(), compact: true, on_play: move |_| on_play.call(play.clone()) }
-                icons::IconButton { label: "Remove from the shortlist", class: "glass small", onclick: move |_| on_remove.call(remove.clone()), icons::Close {} }
+                icons::IconButton { label: "Remove from the shortlist", class: "small", onclick: move |_| on_remove.call(remove.clone()), icons::Close {} }
             }
         }
     }
@@ -1172,7 +1171,7 @@ fn CardPlayButton(media: Media, episodes: Vec<backend::Episode>, #[props(default
     };
     rsx! {
         if compact {
-            icons::IconButton { label: "{label}", class: "glass small", disabled: !ready, onclick: go, icons::Play {} }
+            icons::IconButton { label: "{label}", class: "small", disabled: !ready, onclick: go, icons::Play {} }
         } else {
             button { class: "pill glass", title: "Play or resume this title", disabled: !ready, onclick: go, icons::Play {} span { "{label}" } }
         }

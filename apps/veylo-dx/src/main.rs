@@ -40,7 +40,10 @@ use dioxus::prelude::*;
 const STYLE: &str = concat!(include_str!("styles/base.css"), include_str!("styles/screens.css"), include_str!("styles/sizes.css"),
     include_str!("styles/addons.css"), include_str!("styles/player.css"), include_str!("styles/pages.css"), include_str!("styles/motion.css"),
     include_str!("styles/tv.css"));
-const ARCHIVO: &[u8] = include_bytes!("../assets/fonts/archivo.ttf");
+const OUTFIT_LATIN: &[u8] = include_bytes!("../assets/fonts/outfit.woff2");
+const OUTFIT_EXT: &[u8] = include_bytes!("../assets/fonts/outfit-ext.woff2");
+const INTER_LATIN: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
+const INTER_EXT: &[u8] = include_bytes!("../assets/fonts/inter-ext.woff2");
 
 /// Whether Veylo runs on a television (Android TV and TVs that say so): Back never leaves the app,
 /// shelves are shorter, and tv.js drives focus from the remote.
@@ -296,9 +299,19 @@ fn window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
 }
 
 fn font_css() -> String {
-    let data = base64::engine::general_purpose::STANDARD.encode(ARCHIVO);
-    format!("@font-face{{font-family:'Archivo';src:url(data:font/ttf;base64,{data}) format('truetype');\
-        font-weight:100 900;font-stretch:62% 125%;font-display:block}}")
+    let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let latin = "U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD";
+    let ext = "U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF";
+    format!(
+        "@font-face{{font-family:'Outfit';font-style:normal;font-weight:100 900;font-display:block;src:url(data:font/woff2;base64,{}) format('woff2');unicode-range:{latin}}}\
+         @font-face{{font-family:'Outfit';font-style:normal;font-weight:100 900;font-display:block;src:url(data:font/woff2;base64,{}) format('woff2');unicode-range:{ext}}}\
+         @font-face{{font-family:'Inter';font-style:normal;font-weight:100 900;font-display:block;src:url(data:font/woff2;base64,{}) format('woff2');unicode-range:{latin}}}\
+         @font-face{{font-family:'Inter';font-style:normal;font-weight:100 900;font-display:block;src:url(data:font/woff2;base64,{}) format('woff2');unicode-range:{ext}}}",
+        enc(OUTFIT_LATIN),
+        enc(OUTFIT_EXT),
+        enc(INTER_LATIN),
+        enc(INTER_EXT),
+    )
 }
 
 /// Developer option: VEYLO_DX_TAB=home|picks|library|settings picks the first screen.
@@ -354,6 +367,7 @@ fn Shell_() -> Element {
     });
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
+        video::register_window();
         #[cfg(target_os = "android")]
         if let Some(list) = android::take_dev_autoplay() { spawn(backend::dev_autoplay(list)); }
         // Desktop: VEYLO_DX_DEV_AUTOPLAY names the same kind of list.
@@ -533,9 +547,11 @@ fn Shell_() -> Element {
             });
             let timer = null;
             const checkLayout = () => {
+                const sheets = document.querySelectorAll('.bottom-sheet, .player-sheet, .panel');
+                if (!sheets.length) return;
                 const vw = window.innerWidth || 0;
                 if (vw <= 0) return;
-                for (const el of document.querySelectorAll('.bottom-sheet, .player-sheet, .panel')) {
+                for (const el of sheets) {
                     const r = el.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) continue;
                     if (r.right > vw + 16 || r.left < -16) {
@@ -547,7 +563,7 @@ fn Shell_() -> Element {
             };
             new MutationObserver(() => {
                 clearTimeout(timer);
-                timer = setTimeout(checkLayout, 350);
+                timer = setTimeout(checkLayout, 450);
             }).observe(document.body, { childList: true, subtree: true });
         })();"#);
         while let Ok(v) = eval.recv::<serde_json::Value>().await {
@@ -562,40 +578,77 @@ fn Shell_() -> Element {
     // combined into one rAF-throttled MutationObserver instead of multiple observers.
     use_hook(|| { document::eval(r#"(() => {
         const savedScroll = Object.create(null);
+        let lastScrolled = null;
+        let lastHeroHost = null;
+        let lastHeroY = -1;
         const screenOf = p => {
-            if (!p) return null;
+            if (!p || !p.firstElementChild) return null;
+            const cls = p.firstElementChild.classList;
             for (const c of ['home', 'library', 'settings', 'duel']) {
-                if (p.querySelector('.' + c)) return c;
+                if (cls.contains(c)) return c;
             }
             return null;
         };
         const sync = () => {
             const p = document.querySelector('.page');
             const y = p ? p.scrollTop : 0;
-            document.documentElement.classList.toggle('scrolled', y > 4);
+            const scrolled = y > 4;
+            if (scrolled !== lastScrolled) {
+                lastScrolled = scrolled;
+                document.documentElement.classList.toggle('scrolled', scrolled);
+            }
             // Smooth GPU hero parallax on TitlePage and Home: drives a single clamped CSS var with zero reflow.
-            const heroHost = p && p.querySelector('.title-page, .home');
-            if (heroHost) heroHost.style.setProperty('--hero-y', Math.min(320, Math.max(0, y)) + 'px');
+            const first = p && p.firstElementChild;
+            const heroHost = first && (first.classList.contains('title-page') || first.classList.contains('home')) ? first : null;
+            if (heroHost) {
+                const hy = Math.min(320, Math.max(0, Math.round(y)));
+                if (heroHost !== lastHeroHost || hy !== lastHeroY) {
+                    lastHeroHost = heroHost;
+                    lastHeroY = hy;
+                    heroHost.style.setProperty('--hero-y', hy + 'px');
+                }
+            } else {
+                lastHeroHost = null;
+                lastHeroY = -1;
+            }
             const s = screenOf(p);
             if (s && p) savedScroll[s] = y;
         };
-        document.addEventListener('scroll', e => { if (e.target.classList && e.target.classList.contains('page')) sync(); }, true);
+        let scrollRaf = false;
+        const queueSync = () => {
+            if (scrollRaf) return;
+            scrollRaf = true;
+            requestAnimationFrame(() => { scrollRaf = false; sync(); });
+        };
         // Horizontal shelf edge-fades and desktop scroll chevrons.
         const syncStrip = wrap => {
             const st = wrap.querySelector(':scope > .strip');
             if (!st) return;
             const left = st.scrollLeft > 4;
             const right = st.scrollLeft + st.clientWidth < st.scrollWidth - 4;
-            wrap.toggleAttribute('data-left', left);
-            wrap.toggleAttribute('data-right', right);
+            if (wrap.hasAttribute('data-left') !== left) wrap.toggleAttribute('data-left', left);
+            if (wrap.hasAttribute('data-right') !== right) wrap.toggleAttribute('data-right', right);
         };
         const syncStrips = () => document.querySelectorAll('.strip-wrap').forEach(syncStrip);
+        const pendingStrips = new Set();
+        let stripRaf = false;
         document.addEventListener('scroll', e => {
-            const st = e.target;
-            if (st && st.classList && st.classList.contains('strip') && st.parentElement && st.parentElement.classList.contains('strip-wrap')) {
-                syncStrip(st.parentElement);
+            const t = e.target;
+            if (!t || !t.classList) return;
+            if (t.classList.contains('page')) {
+                queueSync();
+            } else if (t.classList.contains('strip') && t.parentElement && t.parentElement.classList.contains('strip-wrap')) {
+                pendingStrips.add(t.parentElement);
+                if (!stripRaf) {
+                    stripRaf = true;
+                    requestAnimationFrame(() => {
+                        stripRaf = false;
+                        pendingStrips.forEach(syncStrip);
+                        pendingStrips.clear();
+                    });
+                }
             }
-        }, true);
+        }, { capture: true, passive: true });
         document.addEventListener('click', e => {
             const btn = e.target.closest && e.target.closest('.strip-arrow');
             if (!btn) return;
@@ -649,14 +702,23 @@ fn Shell_() -> Element {
             const tabs = [...document.querySelectorAll('.dock-tab')], from = tabs.findIndex(x => x.classList.contains('on'));
             document.documentElement.style.setProperty('--dir', tabs.indexOf(t) < from ? '-1' : '1');
         }, true);
-        // Light on glass: mouse-only glare so touch scrolling never triggers getBoundingClientRect().
+        // Light on glass: mouse-only rAF-throttled glare so touch scrolling never touches layout.
+        let glareArt = null, glareX = 0, glareY = 0, glareRaf = false;
         const glare = e => {
             if (e.pointerType !== 'mouse') return;
             const art = e.target.closest && e.target.closest('.card-art');
             if (!art) return;
-            const r = art.getBoundingClientRect();
-            art.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100).toFixed(1) + '%');
-            art.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100).toFixed(1) + '%');
+            glareArt = art; glareX = e.clientX; glareY = e.clientY;
+            if (glareRaf) return;
+            glareRaf = true;
+            requestAnimationFrame(() => {
+                glareRaf = false;
+                if (!glareArt || !glareArt.isConnected) return;
+                const r = glareArt.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return;
+                glareArt.style.setProperty('--mx', ((glareX - r.left) / r.width * 100).toFixed(1) + '%');
+                glareArt.style.setProperty('--my', ((glareY - r.top) / r.height * 100).toFixed(1) + '%');
+            });
         };
         document.addEventListener('pointermove', glare, { passive: true });
         // Single rAF-throttled observer for scroll shadow, title scroll-reset, pill sliders, and shelf fades.

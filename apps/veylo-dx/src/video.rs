@@ -17,15 +17,45 @@ pub fn layout(live: &Live) { imp::layout(live) }
 pub fn set_frame_rate(fps: f64) { imp::set_frame_rate(fps) }
 /// Desktop window fullscreen; Android is always full screen while playing.
 pub fn set_fullscreen(on: bool) { imp::set_fullscreen(on) }
-/// Windows: the app window, for the screen's HDR state (display.rs).
+/// Cache the native window handle / display state on the Dioxus UI thread so background threads
+/// (Tokio autoplay probes, mpv player thread, telemetry) can read display capabilities without
+/// ever touching `dioxus::desktop::window()` outside a Dioxus runtime.
+pub fn register_window() {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = hwnd();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = potential_headroom();
+    }
+}
+/// Windows: the app window, for the screen's HDR state (display.rs). Safe from any thread once
+/// `register_window()` has run on the UI thread.
 #[cfg(target_os = "windows")]
 pub fn hwnd() -> Option<isize> {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    static CACHED: AtomicIsize = AtomicIsize::new(0);
+    let h = CACHED.load(Ordering::Relaxed);
+    if h != 0 { return Some(h); }
+    dioxus::core::Runtime::try_current()?; // off the UI thread window() would panic: use the cache
     use dioxus::desktop::tao::platform::windows::WindowExtWindows;
-    Some(dioxus::desktop::window().window.hwnd() as isize)
+    let h = dioxus::desktop::window().window.hwnd() as isize;
+    if h != 0 { CACHED.store(h, Ordering::Relaxed); Some(h) } else { None }
 }
 /// macOS: the most EDR headroom the window's screen can reach (1.0: SDR only; 0: not read yet).
+/// Safe from any thread: queries live on the Dioxus UI thread and returns the cached value off-thread.
 #[cfg(target_os = "macos")]
-pub fn potential_headroom() -> f64 { veylo_video_surface::potential_headroom(|| Some(imp::host())) }
+pub fn potential_headroom() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    if dioxus::core::Runtime::try_current().is_some() {
+        let h = veylo_video_surface::potential_headroom(|| Some(imp::host()));
+        if h > 0.0 { CACHED.store(h.to_bits(), Ordering::Relaxed); }
+        return h;
+    }
+    f64::from_bits(CACHED.load(Ordering::Relaxed))
+}
 /// macOS: the self-tests of the picture's pipeline, and the transfer it goes out with ("pq" in HDR).
 #[cfg(target_os = "macos")]
 pub use veylo_video_surface::{check, hdr_check, sent_transfer};

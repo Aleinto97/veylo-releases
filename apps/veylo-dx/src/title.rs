@@ -327,11 +327,13 @@ pub fn TitlePage(media: Media) -> Element {
     let fallback_bg = use_hook(|| media.background.clone());
     let ambient_fallback = use_hook(|| media.backdrop().to_owned());
     let has_art_backdrop = production.backdrop.is_some();
+    // BetterPosters catalog items already carry a w1280 backdrop: show it on Frame 0.
+    let instant_bp_bg = fallback_bg.starts_with("https://image.tmdb.org/t/p/");
     let mut frames: Vec<String> = if has_art_backdrop {
         let mut list = vec![backdrop.clone()];
         for s in &production.stills { list.push(s.clone()); }
         list
-    } else if allow_fallback() && !fallback_bg.is_empty() {
+    } else if (allow_fallback() || instant_bp_bg) && !fallback_bg.is_empty() {
         vec![fallback_bg.clone()]
     } else {
         Vec::new()
@@ -1134,7 +1136,7 @@ fn Credits(meta: TitleMeta, #[props(default)] production: backend::Artwork, on_p
                 span { class: "credit-icon", title: label, aria_label: label, {icon} }
                 div { class: "credit-chips",
                     for n in names.into_iter().take(12) {
-                        button { class: "name-chip glass", title: "View filmography: {n}",
+                        button { class: "name-chip", title: "View filmography: {n}",
                             onclick: { let n = n.clone(); move |_| on_person.call(backend::Person { name: n.clone(), ..Default::default() }) }, "{n}" }
                     }
                 }
@@ -1271,15 +1273,23 @@ fn SourceSheet(
     let mut sources = use_signal(|| Load::<(Vec<Source>, Vec<String>)>::Loading);
     let mut expanded = use_signal(|| None::<usize>);
     let mut pressed_backdrop = use_signal(|| false);
-    let (kind, video) = (media.kind.clone(), chooser.video.clone());
+    let (kind, video, media_for_sources) = (media.kind.clone(), chooser.video.clone(), media.clone());
     use_hook(move || { spawn(async move {
-        sources.set(match backend::sources(&kind, &video).await { Ok(r) => Load::Ready(r), Err(e) => Load::Failed(format!("{e:#}")) });
+        sources.set(match backend::sources(&kind, &video).await {
+            Ok((mut list, failed)) => {
+                backend::classify_manual_sources(&mut list, &media_for_sources, &video);
+                Load::Ready((list, failed))
+            }
+            Err(e) => Load::Failed(format!("{e:#}")),
+        });
     }); });
     let title = chooser.label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
     let (m, t, v) = (media.clone(), title.clone(), chooser.video.clone());
     let play = use_callback(move |src: Source| {
         let direct_list: Vec<Source> = match sources.peek().clone() {
-            Load::Ready((list, _)) => list.into_iter().filter(|s| s.kind == SourceKind::Direct).collect(),
+            Load::Ready((list, _)) => list.into_iter()
+                .filter(|s| s.kind == SourceKind::Direct && (src.off_title || !s.off_title))
+                .collect(),
             _ => Vec::new(),
         };
         start(shell, &m, &v, &t, src, direct_list, next.clone(), prev.clone(), season_eps.clone());
@@ -1357,12 +1367,13 @@ fn SourceRow(source: Source, open: bool, on_details: EventHandler<()>, on_play: 
     let src = source.clone();
     let src_dl = source.clone();
     rsx! {
-        div { class: if playable { "source glass" } else { "source glass muted" },
-            button { class: "source-main", disabled: !playable, title: why.unwrap_or(""),
+        div { class: if playable && !source.off_title { "source" } else { "source muted" },
+            button { class: "source-main", disabled: !playable, title: why.unwrap_or(if source.off_title { "Release name doesn't match this title" } else { "" }),
                 aria_label: "Play {label} from {source.addon}", onclick: move |_| on_play.call(src.clone()),
                 div { class: "source-tags",
                     span { class: "tag q", {source.quality.unwrap_or("?")} }
                     if let Some(h) = source.hdr { span { class: "tag hdr", "{h}" } }
+                    if source.off_title { span { class: "tag warn", "Other?" } }
                 }
                 div { class: "source-text",
                     span { class: "source-file", "{label}" }

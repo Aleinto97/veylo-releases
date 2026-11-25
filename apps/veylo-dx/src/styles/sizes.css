@@ -52,16 +52,17 @@
 /* A button inside a plain div shrinks to its content: the card must fill its grid cell. */
 .lib-item .card { width: 100%; }
 .forget { position: absolute; z-index: 5; display: flex; gap: 8px; align-items: center; transition: opacity .18s ease; }
-.forget .orb { width: 36px; height: 36px; }
-.forget .orb.glass { --glass-tint: rgba(8,8,10,.66); }
+.forget .orb { width: 36px; height: 36px; background: rgba(10,11,15,.78); -webkit-backdrop-filter: none; backdrop-filter: none;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.18), inset 0 0 0 1px rgba(255,255,255,.14), 0 6px 16px rgba(0,0,0,.35); }
+.forget .orb:hover { background: rgba(24,25,31,.92); }
 .forget .orb .icon { width: 17px; height: 17px; }
 .forget-confirm { min-height: 36px; height: 36px; padding: 0 14px; gap: 6px; color: #fff; background: rgba(200,48,48,.94);
   box-shadow: 0 6px 20px rgba(0,0,0,.35); font-size: 14px; }
 .forget-confirm .icon { width: 16px; height: 16px; }
 /* Asking before Picks forgets: the same red as removing a title, at the size of its row. */
 .confirm { display: inline-flex; align-items: center; gap: 8px; animation: arrive .14s ease-out; }
-.confirm .forget-confirm { height: 48px; min-height: 48px; padding: 0 18px; font-size: 15px; }
-.chips .confirm .forget-confirm { height: 56px; min-height: 56px; border-radius: 28px; }
+.confirm .forget-confirm { height: 44px; min-height: 44px; padding: 0 18px; font-size: 15px; }
+.chips .confirm .forget-confirm { height: 46px; min-height: 46px; border-radius: 23px; }
 /* Week cards & Continue watching: top right corner is free. */
 .week-card .forget { top: 12px; right: 12px; }
 /* Posters: top left (the watched tick owns top right); asking covers the poster. */

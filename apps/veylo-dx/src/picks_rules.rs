@@ -69,12 +69,6 @@ pub fn has_genre(m: &Media, wanted: &str) -> bool {
     m.genres.iter().any(|g| g.eq_ignore_ascii_case(&wanted) || halves(g).iter().any(|h| h.eq_ignore_ascii_case(&wanted)))
 }
 
-/// Whether a genre name (in any source's spelling) is, or contains, the wanted one.
-pub fn has_genre_name(g: &str, wanted: &str) -> bool {
-    let (g, wanted) = (canonical_genre(g), canonical_genre(wanted));
-    g.eq_ignore_ascii_case(&wanted) || halves(&g).iter().any(|h| h.eq_ignore_ascii_case(&wanted))
-}
-
 /// Genres to choose from, for the Genre list: single names, no styles or formats.
 pub fn genre_choices(m: &Media) -> Vec<String> {
     m.genres.iter().flat_map(|g| halves(g).into_iter().map(str::to_owned).collect::<Vec<_>>())

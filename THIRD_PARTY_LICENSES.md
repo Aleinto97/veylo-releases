@@ -29,11 +29,20 @@ repository):
   - Upstream formula recipes & source tarballs: https://formulae.brew.sh/formula/mpv
   - Per-formula license texts are copied into `Veylo.app/Contents/Resources/licenses/`.
 
-## Fonts
+## Fonts & Icons
 
-- **Archivo** (`apps/veylo-dx/assets/fonts/archivo.ttf`)
+- **Outfit** (`apps/veylo-dx/assets/fonts/outfit*.woff2`)
+  - Copyright 2021 The Outfit Project Authors (Outfit.io / Rodrigo Fuenzalida)
+  - Licensed under the SIL Open Font License, Version 1.1 (`apps/veylo-dx/assets/fonts/OFL.txt`).
+- **Inter** (`apps/veylo-dx/assets/fonts/inter*.woff2`)
+  - Copyright 2020 The Inter Project Authors (Rasmus Andersson)
+  - Licensed under the SIL Open Font License, Version 1.1 (`apps/veylo-dx/assets/fonts/OFL.txt`).
+- **Archivo** (`apps/veylo-dx/assets/fonts/archivo.ttf`, legacy desktop tooling)
   - Copyright 2020 The Archivo Project Authors (Omnibus-Type)
   - Licensed under the SIL Open Font License, Version 1.1 (`apps/veylo-dx/assets/fonts/OFL.txt`).
+- **Lucide Icons** (`apps/veylo-dx/src/icons.rs`)
+  - Copyright (c) for portions of Lucide are held by Cole Bemis 2013–2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022–present.
+  - Licensed under the ISC License (https://lucide.dev/license).
 
 ## On-Device AI Assets
 
@@ -48,9 +57,11 @@ repository):
 
 ## Metadata & Artwork Attributions
 
-- **TMDB**: This product uses the TMDB API but is not endorsed or certified by TMDB.
-  https://www.themoviedb.org/
 - **TVmaze**: Series metadata and air schedules are provided by TVmaze under CC BY-SA.
   https://www.tvmaze.com/
-- **Wikidata & Wikimedia Commons**: Open metadata under CC0; images under their
-  respective authors' licenses. https://www.wikidata.org/
+- **Wikidata & Wikimedia Commons**: Open metadata and franchise links under CC0; images under
+  their respective authors' licenses. https://www.wikidata.org/
+- **Wikipedia**: Person biographies via the Wikipedia REST API under CC BY-SA.
+  https://www.wikipedia.org/
+- **BetterPosters & ElfHosted TMDB Addon**: Keyless Stremio-protocol artwork and metadata
+  endpoints queried without API keys.

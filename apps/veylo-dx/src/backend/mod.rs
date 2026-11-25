@@ -130,7 +130,6 @@ pub fn init() -> Result<()> {
     set_prefetch_sources_enabled(saved["prefetch_sources"].as_bool().unwrap_or(false));
     set_max_bitrate_mbps(parse_max_bitrate(&saved));
     set_stream_language(Some(audio_language(&saved)));
-    set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     RUNTIME.set(runtime).map_err(|_| anyhow!("Backend already started"))?;
     BACKEND
         .set(Backend { core, proxy, data_dir: dir, http, accents: Mutex::new(HashMap::new()) })
@@ -389,10 +388,9 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
             raw.splice(0..0, charts);
         }
     }
-    // Recent digital & physical movie releases (TMDB / BetterPosters) and new TV episodes (TVmaze).
-    let has_tmdb = load_settings().tmdb_key.is_some();
+    // Recent digital & physical movie releases (BetterPosters) and new TV episodes (TVmaze).
     let at = raw.iter().position(|r| r.key.starts_with(BP_ROW) && r.id == "trakt-popular").unwrap_or(raw.len().min(2));
-    raw.insert(at, RawRow { key: NEW_DIGITAL_RELEASES_ROW.into(), title: "New digital releases".into(), addon_id: "releases".into(), addon_name: if has_tmdb { "TMDB".into() } else { "BetterPosters".into() },
+    raw.insert(at, RawRow { key: NEW_DIGITAL_RELEASES_ROW.into(), title: "New digital releases".into(), addon_id: "releases".into(), addon_name: "BetterPosters".into(),
         addon_url: CINEMETA.into(), kind: "movie".into(), id: "new-digital".into(), extra: None });
     raw.insert(at + 1, RawRow { key: NEW_EPISODES_ROW.into(), title: "New episodes".into(), addon_id: "tvmaze".into(), addon_name: "TVmaze".into(),
         addon_url: CINEMETA.into(), kind: "series".into(), id: "new-episodes".into(), extra: None });
@@ -407,7 +405,7 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
         let subtitle = if r.addon_id == "com.linvo.cinemeta" && r.extra.as_ref().is_some_and(|(_, v)| v == "Animation") {
             Some("Cinemeta · Animated series, including anime".to_owned())
         } else if r.key == NEW_DIGITAL_RELEASES_ROW {
-            Some(if has_tmdb { "Official digital & physical releases · TMDB".to_owned() } else { "Recent releases · BetterPosters / Cinemeta".to_owned() })
+            Some("Recent releases · BetterPosters / Cinemeta".to_owned())
         } else if r.key == NEW_EPISODES_ROW {
             Some("Out in the last three days · TVmaze".to_owned())
         } else if shared.contains(&r.title) && !r.addon_name.is_empty() { Some(r.addon_name.clone()) } else { None };
@@ -420,8 +418,13 @@ pub async fn catalog(row: CatalogRow) -> Result<Vec<Media>> {
     // A BetterPosters chart; Cinemeta's popular list of the same type when it can't answer.
     if row.key.starts_with(BP_ROW) {
         let mut titles = bp_get(format!("catalog/{}/{}.json", row.kind, row.id)).await.map(|v| bp_titles(&v, &row.addon_url)).unwrap_or_default();
-        if row.ranked { titles.truncate(10); }
-        if !titles.is_empty() { return Ok(titles); }
+        if !titles.is_empty() {
+            if row.kind == "movie" {
+                titles = filter_home_quality(titles).await;
+            }
+            if row.ranked { titles.truncate(10); }
+            if !titles.is_empty() { return Ok(titles); }
+        }
         return Box::pin(catalog(CatalogRow { key: String::new(), id: "top".into(), ranked: false, ..row })).await;
     }
     if row.key == NEW_DIGITAL_RELEASES_ROW {
@@ -443,6 +446,9 @@ pub async fn catalog(row: CatalogRow) -> Result<Vec<Media>> {
     let mut out = metas(&v, &row.addon_url);
     let mut keys = std::collections::HashSet::new();
     out.retain(|m| keys.insert(m.key()));
+    if row.kind == "movie" {
+        out = filter_home_quality(out).await;
+    }
     Ok(out)
 }
 
@@ -792,28 +798,15 @@ pub struct CollectionShelf {
     pub parts: Vec<Media>,
 }
 
-/// All released installments in a movie's collection (chronological), via TMDB when available,
-/// else falling back to `crates/core`'s curated franchise collections.
+/// All released installments in a movie's collection (chronological), via keyless Wikidata `P179`
+/// franchise links, falling back to `crates/core`'s curated franchise collections.
 pub async fn collection_parts(m: &Media) -> Option<CollectionShelf> {
     if m.kind == "movie" {
-        if let Some(Artwork { collection: Some(cid), .. }) = artwork(m).await {
-            if let Some(c) = tmdb(format!("collection/{cid}"), vec![]).await {
-                let cname = c["name"].as_str().unwrap_or("Collection").to_owned();
-                let today = { let (y, mo, d, _) = civil(now_secs()); format!("{y:04}-{mo:02}-{d:02}") };
-                let mut parts: Vec<Value> = c["parts"].as_array()?.iter()
-                    .filter(|p| p["release_date"].as_str().is_some_and(|d| !d.is_empty() && d <= today.as_str()))
-                    .cloned().collect();
-                parts.sort_by_key(|p| p["release_date"].as_str().unwrap_or_default().to_owned());
-                if parts.len() >= 2 {
-                    let resolved = tmdb_titles("movie", parts, &[]).await;
-                    if resolved.len() >= 2 {
-                        return Some(CollectionShelf { name: cname, parts: resolved });
-                    }
-                }
-            }
+        if let Some(shelf) = wikidata_collection_parts(m).await {
+            return Some(shelf);
         }
     }
-    // Keyless fallback: check core's local franchise collections.
+    // Fallback: check core's local franchise collections.
     let v = exec(json!({"op":"collections"})).await.ok()?;
     for col in v["collections"].as_array()? {
         if col["source"].as_str() != Some("addon_curated_franchise") { continue; }
@@ -936,42 +929,22 @@ pub async fn feedback(media: &Media, value: i64) -> Result<()> {
 
 /// For a later film in a collection: the first released part you have not watched, when it
 /// comes before this one (a Cinemeta title, ready for Picks). None when this film is where to
-/// start, or for anything that is not part of a collection.
+/// start, or for anything that is not part of a collection. Powered keylessly via Wikidata `P179`.
 pub async fn earlier_part(m: &Media, watched: &HashSet<String>) -> Option<Media> {
     if m.kind != "movie" { return None; }
-    let Artwork { collection: Some(cid), tmdb: Some((_, own)), .. } = artwork(m).await? else { return None };
-    let c = tmdb(format!("collection/{cid}"), vec![]).await?;
-    let today = { let (y, mo, d, _) = civil(now_secs()); format!("{y:04}-{mo:02}-{d:02}") };
-    let mut parts: Vec<&Value> = c["parts"].as_array()?.iter()
-        .filter(|p| p["release_date"].as_str().is_some_and(|d| !d.is_empty() && d <= today.as_str())).collect();
-    parts.sort_by_key(|p| p["release_date"].as_str().unwrap_or_default().to_owned());
-    let at = parts.iter().position(|p| p["id"].as_i64() == Some(own))?;
-    for p in parts.iter().take(at) {
-        // A part TMDB can't place (no id, no IMDb id) is skipped, not the end of the search.
-        let Some(id) = p["id"].as_i64() else { continue };
-        let Some(imdb) = tmdb(format!("movie/{id}/external_ids"), vec![]).await.and_then(|e| e["imdb_id"].as_str().map(str::to_owned)).filter(|i| i.starts_with("tt")) else { continue };
-        let name = p["title"].as_str().unwrap_or("Untitled");
-        let year = p["release_date"].as_str().and_then(|d| d.get(..4)).unwrap_or_default();
-        let Some(probe) = Media::from_json(&json!({"id": imdb, "name": name, "releaseInfo": year}), CINEMETA) else { continue };
-        let key = crate::picks_rules::title_key(&probe);
-        if watched.contains(&imdb) || watched.contains(&key) { continue; }
-        let genres = tmdb_genre_list("movie").await;
-        let genre_names: Vec<String> = p["genre_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64)
-            .filter_map(|g| genres.iter().find(|(x, _)| *x == g).map(|(_, n)| n.clone())).collect();
-        let meta = json!({
-            "id": imdb, "type": "movie", "name": name, "description": p["overview"].as_str().unwrap_or_default(), "releaseInfo": year,
-            "poster": p["poster_path"].as_str().map(|x| format!("https://image.tmdb.org/t/p/w500{x}")).unwrap_or_default(),
-            "background": p["backdrop_path"].as_str().map(|x| format!("https://image.tmdb.org/t/p/w1280{x}")).unwrap_or_default(),
-            "genres": genre_names, "tmdbRating": p["vote_average"].as_f64().filter(|&v| v > 0.0).map(|v| format!("{v:.1}")).unwrap_or_default(),
-        });
-        return Media::from_json(&meta, CINEMETA).map(crate::picks_rules::tidy);
+    let own_imdb = imdb_of(m)?;
+    let shelf = wikidata_collection_parts(m).await?;
+    let at = shelf.parts.iter().position(|p| p.id == own_imdb)?;
+    for part in shelf.parts.into_iter().take(at) {
+        let key = crate::picks_rules::title_key(&part);
+        if watched.contains(&part.id) || watched.contains(&key) { continue; }
+        return Some(part);
     }
     None
 }
 
-/// The trailers to play for a Picks card: TMDB's videos (official trailers first) when TMDB has
-/// any, the add-on's YouTube trailers after them as alternatives; the add-on's own list (direct
-/// links included) only when TMDB has none.
+/// The trailers to play for a Picks card: curated artwork trailers first when available, the
+/// add-on's YouTube trailers after them as alternatives; the add-on's own list only when empty.
 pub fn official_first(tmdb: &[String], addon: &[Trailer]) -> Vec<Trailer> {
     if tmdb.is_empty() { return addon.to_vec(); }
     let mut out: Vec<Trailer> = tmdb.iter().map(|k| Trailer { youtube: Some(k.clone()), url: None }).collect();
@@ -990,8 +963,7 @@ pub async fn duel_ready(m: &Media) -> Option<Media> {
     for genre in meta.genres { if !ready.genres.contains(&genre) { ready.genres.push(genre); } }
     ready = crate::picks_rules::tidy(ready);
     ready.raw["genres"] = json!(ready.genres);
-    // A catalogue's "Animation" can be wrong; TMDB's genres decide when TMDB knows the title.
-    if let Some(art) = artwork(&ready).await.filter(|a| a.tmdb.is_some() && !a.genres.is_empty()) {
+    if let Some(art) = artwork(&ready).await.filter(|a| !a.genres.is_empty()) {
         crate::picks_rules::settle_style(&mut ready, art.genres.iter().any(|g| g.eq_ignore_ascii_case("Animation")));
     }
     Some(ready)
@@ -1054,9 +1026,14 @@ pub fn language_key_of(raw: &str) -> Option<&'static str> {
 }
 
 /// True when `s` names ANY of `titles` (display title, original title, or localized alias).
+/// Secondary/alternate titles (`titles[1..]`) on movies with a known `year` require an explicit
+/// matching year (±1) right after the title so a working title or short alias (e.g. "Judy" for
+/// Digger 2026) can never match a year-less release of an older film (`Judy.BDRemux.1080p.pk.mkv`).
 pub fn names_title_any(s: &Source, titles: &[String], year: Option<i32>) -> bool {
     if titles.is_empty() { return true; }
-    titles.iter().filter(|t| !t.trim().is_empty()).any(|t| names_title(s, t, year))
+    titles.iter().enumerate()
+        .filter(|(_, t)| !t.trim().is_empty())
+        .any(|(idx, t)| names_title_inner(s, t, year, idx > 0 && year.is_some()))
 }
 
 /// Build an `AutoplayContext` synchronously from everything already cached in memory for `media`
@@ -1118,11 +1095,18 @@ pub fn parse_video_episode(video_id: &str) -> Option<(i64, i64)> {
     None
 }
 
+/// Whether a release names this title: its file name, or a line of its torrent name, starts with
 /// the title's words (leading "[site]" and "www.site - " tags and a first "The" aside) and has
 /// more after them; for a film, a year right after the title is within one of `year`. A line
-/// that is only the title says nothing (some add-ons print the requested title on its own line).
-/// A translated title may come first: "Kód 3 - Code 3 (2024)", "Код 3 / Code 3 (2025)".
+/// that is only the title — or only `Title (Year)` with no release tags — says nothing (add-ons
+/// often print the requested title and year as a header line). A translated title may come first:
+/// "Kód 3 - Code 3 (2024)", "Код 3 / Code 3 (2025)".
+#[cfg(test)]
 pub fn names_title(s: &Source, title: &str, year: Option<i32>) -> bool {
+    names_title_inner(s, title, year, false)
+}
+
+fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: bool) -> bool {
     fn words(text: &str) -> Vec<String> {
         let mut t = text.trim();
         loop {
@@ -1136,22 +1120,62 @@ pub fn names_title(s: &Source, title: &str, year: Option<i32>) -> bool {
         if w.first().is_some_and(|f| f == "the") { w.remove(0); }
         w
     }
-    let wanted = words(title);
-    if wanted.is_empty() { return true; }
-    let file = s.filename.rsplit(['/', '\\']).next().unwrap_or("");
-    // Each line as it is, and what follows a " - " or " / " in it (after a translated title).
-    let lines = std::iter::once(file).chain(s.description.lines()).flat_map(|line| {
-        std::iter::once(line).chain([" - ", " / "].into_iter().filter_map(move |sep| line.split_once(sep).map(|(_, rest)| rest)))
-    });
-    lines.into_iter().any(|line| {
+    fn line_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool) -> bool {
         let w = words(line);
         if w.len() <= wanted.len() || w[..wanted.len()] != wanted[..] { return false; }
         // What follows the title must not make it another one ("The Dark Knight Rises"): a year
-        // (the film's, give or take one), a season or episode, or a release tag.
+        // (the film's, give or take one, with release info after it so a bare "Title (2026)"
+        // add-on header line is rejected), a season or episode, or a release tag.
         let next = w[wanted.len()].as_str();
         match next.parse::<i32>().ok().filter(|y| (1900..2100).contains(y)) {
-            Some(got) => year.is_none_or(|want| (want - got).abs() <= 1),
-            None => release_word().is_match(next),
+            Some(got) => w.len() > wanted.len() + 1 && year.is_none_or(|want| (want - got).abs() <= 1),
+            None => !require_year && release_word().is_match(next),
+        }
+    }
+    fn segment_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool) -> bool {
+        std::iter::once(line)
+            .chain([" - ", " / "].into_iter().filter_map(|sep| line.split_once(sep).map(|(_, rest)| rest)))
+            .any(|seg| line_matches(seg, wanted, year, require_year))
+    }
+    let wanted = words(title);
+    if wanted.is_empty() { return true; }
+    let file = s.filename.rsplit(['/', '\\']).next().unwrap_or("");
+    if !file.is_empty() && segment_matches(file, &wanted, year, require_year) {
+        return true;
+    }
+    // For a movie with an explicit filename, never let a description header rescue a file that
+    // plainly names a different year or a completely different movie (e.g. `Judy.BDRemux.1080p.pk.mkv`
+    // under a `Digger (2026)` add-on header). Bilingual releases whose description line names both
+    // the file's leading title word and the wanted title (e.g. "Kód 3 - Code 3 (2024)") still pass.
+    let mut file_title_lead: Option<String> = None;
+    if !file.is_empty() {
+        let fw = words(file);
+        if let Some(want) = year {
+            let file_years: Vec<i32> = fw.iter().skip(1)
+                .filter_map(|t| t.parse::<i32>().ok().filter(|y| (1900..2100).contains(y)))
+                .collect();
+            if !file_years.is_empty() && !file_years.iter().any(|&y| (want - y).abs() <= 1) {
+                return false;
+            }
+            // Detect a named movie file (non-generic leading word followed by a year or release tag).
+            let first = fw.first().map(String::as_str).unwrap_or("");
+            let generic = first.is_empty()
+                || first.chars().all(|c| c.is_ascii_digit())
+                || matches!(first, "video" | "movie" | "film" | "stream" | "index" | "master" | "playlist" | "play" | "media")
+                || release_word().is_match(first);
+            let looks_like_release = !generic && fw.iter().skip(1).any(|t| {
+                t.parse::<i32>().ok().is_some_and(|y| (1900..2100).contains(&y)) || release_word().is_match(t)
+            });
+            if looks_like_release {
+                file_title_lead = Some(first.to_owned());
+            }
+        }
+    }
+    s.description.lines().any(|line| {
+        if !segment_matches(line, &wanted, year, require_year) { return false; }
+        match &file_title_lead {
+            Some(lead) => words(line).iter().any(|w| w == lead),
+            None => true,
         }
     })
 }
@@ -1474,36 +1498,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_production_from_one_tmdb_answer() {
-        let movie = json!({"tagline": "A tagline", "original_language": "en", "spoken_languages": [{"iso_639_1": "en", "english_name": "English"}],
-            "images": {"backdrops": [{"iso_639_1": null, "file_path": "/a.jpg", "vote_average": 5.0}, {"iso_639_1": null, "file_path": "/b.jpg", "vote_average": 7.0}, {"iso_639_1": "en", "file_path": "/t.jpg", "vote_average": 9.0}]},
-            "credits": {"cast": [{"name": "Matt Damon", "character": "Odysseus", "profile_path": "/m.jpg"}],
-                "crew": [{"name": "Ludwig Göransson", "job": "Original Music Composer"}, {"name": "Christopher Nolan", "job": "Director"}, {"name": "Christopher Nolan", "job": "Screenplay"}]},
-            "production_companies": [{"name": "Universal", "logo_path": "/u.png"}, {"name": "No logo", "logo_path": null}],
-            "release_dates": {"results": [{"iso_3166_1": "GB", "release_dates": [{"certification": "12A"}]}, {"iso_3166_1": "US", "release_dates": [{"certification": ""}, {"certification": "PG-13"}]}]},
-            "videos": {"results": [{"site": "YouTube", "type": "Featurette", "key": "k1", "name": "Making of"}, {"site": "Vimeo", "type": "Trailer", "key": "v"}]}});
-        let a = production(&movie, "movie", Some("https://image.tmdb.org/t/p/w1280/b.jpg"));
-        assert_eq!(a.stills, ["https://image.tmdb.org/t/p/w1280/a.jpg"], "textless only, the backdrop not twice");
-        assert_eq!(a.tagline.as_deref(), Some("A tagline"));
-        assert_eq!(a.cast[0].role, "Odysseus");
-        let crew: Vec<(&str, Vec<&str>)> = a.crew.iter().map(|(l, p)| (l.as_str(), p.iter().map(|p| p.name.as_str()).collect())).collect();
-        assert_eq!(crew, [("Directed by", vec!["Christopher Nolan"]), ("Written by", vec!["Christopher Nolan"]), ("Music by", vec!["Ludwig Göransson"])]);
-        assert_eq!(a.studios.len(), 1);
-        assert_eq!(a.certificate.as_deref(), Some("PG-13"), "the US certificate first");
-        assert_eq!(a.language.as_deref(), Some("English"));
-        assert_eq!(a.videos.len(), 1);
-        let show = json!({"created_by": [{"name": "Graham Wagner", "profile_path": "/g.jpg"}], "networks": [{"name": "Prime Video", "logo_path": "/p.png"}],
-            "aggregate_credits": {"cast": [{"name": "Ella Purnell", "roles": [{"character": "Lucy MacLean"}], "profile_path": null}]},
-            "content_ratings": {"results": [{"iso_3166_1": "DE", "rating": "16"}]}, "seasons": [{"season_number": 1, "poster_path": "/s1.jpg"}, {"season_number": 2, "poster_path": null}]});
-        let b = production(&show, "tv", None);
-        assert_eq!(b.crew[0].0, "Created by");
-        assert_eq!(b.crew[0].1[0].photo.as_deref(), Some("https://image.tmdb.org/t/p/h632/g.jpg"), "a creator's photo, for their card");
-        assert_eq!(b.cast[0].role, "Lucy MacLean");
-        assert_eq!(b.cast[0].photo, None);
-        assert_eq!(b.certificate.as_deref(), Some("16"), "any country when the US has none");
-        assert_eq!(b.season_posters.get(&1).map(String::as_str), Some("https://image.tmdb.org/t/p/w500/s1.jpg"));
-        assert_eq!(b.studios[0].name, "Prime Video");
-        assert_eq!(b.studios[0].logo, "https://image.tmdb.org/t/p/w300/p.png");
+    fn keyless_elfhosted_artwork_and_wikidata_collections_parse() {
+        let meta = json!({
+            "background": "https://image.tmdb.org/t/p/original/bg.jpg",
+            "logo": "https://image.tmdb.org/t/p/original/logo.png",
+            "poster": "https://image.tmdb.org/t/p/w500/p.jpg",
+            "runtime": "2h47min",
+            "ageRating": "PG-13",
+            "genres": ["Science Fiction", "Adventure"],
+            "director": ["Denis Villeneuve"],
+            "writer": ["Jon Spaihts"],
+            "trailers": [{"source": "U2Qp5pL3ovA", "type": "Trailer"}],
+            "app_extras": {
+                "cast": [
+                    {"name": "Timothée Chalamet", "character": "Paul Atreides", "photo": "https://image.tmdb.org/t/p/w276_and_h350_face/tc.jpg"},
+                    {"name": "Zendaya", "character": "Chani", "photo": ""}
+                ]
+            }
+        });
+        let a = parse_elfhosted_artwork(&meta);
+        assert_eq!(a.backdrop.as_deref(), Some("https://image.tmdb.org/t/p/w1280/bg.jpg"));
+        assert_eq!(a.logo.as_deref(), Some("https://image.tmdb.org/t/p/w500/logo.png"));
+        assert_eq!(a.certificate.as_deref(), Some("PG-13"));
+        assert_eq!(a.runtime_secs, Some(167.0 * 60.0));
+        assert_eq!(a.cast.len(), 2);
+        assert_eq!(a.cast[0].role, "Paul Atreides");
+        assert_eq!(a.cast[0].photo.as_deref(), Some("https://image.tmdb.org/t/p/w276_and_h350_face/tc.jpg"));
+        assert_eq!(a.cast[1].photo, None);
+        assert_eq!(a.crew[0].0, "Directed by");
+        assert_eq!(a.crew[0].1[0].name, "Denis Villeneuve");
+        assert_eq!(a.trailers, ["U2Qp5pL3ovA"]);
+
+        let rows = json!([
+            {"colLabel": {"value": "Dune"}, "imdb": {"value": "tt15239678"}, "partLabel": {"value": "Dune: Part Two"}, "date": {"value": "2024-03-01T00:00:00Z"}},
+            {"colLabel": {"value": "Dune"}, "imdb": {"value": "tt1160419"}, "partLabel": {"value": "Dune"}, "date": {"value": "2021-10-22T00:00:00Z"}},
+            {"colLabel": {"value": "Dune"}, "imdb": {"value": "tt9999999"}, "partLabel": {"value": "Dune: Messiah"}, "date": {"value": "2027-12-18T00:00:00Z"}}
+        ]);
+        let shelf = parse_wikidata_collection(&rows, "2026-11-25").unwrap();
+        assert_eq!(shelf.name, "Dune");
+        assert_eq!(shelf.parts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["tt1160419", "tt15239678"]);
+
+        let (bio, photo, qid) = parse_wiki_summary(&json!({
+            "type": "standard",
+            "extract": "Denis Villeneuve is a Canadian filmmaker.",
+            "thumbnail": {"source": "https://upload.wikimedia.org/dv.jpg"},
+            "wikibase_item": "Q3022982"
+        }));
+        assert_eq!(bio.as_deref(), Some("Denis Villeneuve is a Canadian filmmaker."));
+        assert_eq!(photo.as_deref(), Some("https://upload.wikimedia.org/dv.jpg"));
+        assert_eq!(qid.as_deref(), Some("Q3022982"));
     }
 
     #[test]
@@ -1862,7 +1905,7 @@ mod tests {
     fn better_posters_first_then_the_addon_poster() {
         let m = Media::from_json(&json!({"id":"tt6262770","name":"Tenzing","type":"movie","poster":"https://images.example/p.jpg"}), "a").unwrap();
         assert_eq!(posters(&m), [
-            "https://btttr.cc/poster/imdb/poster-default/tt6262770.jpg",
+            "https://btttr.cc/poster-q/imdb/poster-default/tt6262770.jpg",
             "https://images.example/p.jpg",
             "https://images.metahub.space/poster/large/tt6262770/img",
             "https://images.metahub.space/poster/medium/tt6262770/img",
@@ -1886,6 +1929,63 @@ mod tests {
         let (r, g, b) = artwork_accent(&[[120, 20, 20, 255], [40, 40, 40, 255]]).unwrap();
         assert!(luminance(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0) >= 0.17);
         assert!(artwork_accent(&[[128, 128, 128, 255]]).is_none());
+    }
+
+    #[test]
+    fn justwatch_stills_require_exact_imdb_match() {
+        let payload = json!({
+            "data": {
+                "popularTitles": {
+                    "edges": [
+                        { "node": { "content": {
+                            "externalIds": { "imdbId": "tt7549996" },
+                            "backdrops": [{ "backdropUrl": "/backdrop/999/s1440/judy.jpg" }]
+                        }}},
+                        { "node": { "content": {
+                            "externalIds": { "imdbId": "tt31450459" },
+                            "backdrops": [
+                                { "backdropUrl": "/backdrop/1/s1440/digger.jpg" },
+                                { "backdropUrl": "/backdrop/2/s1440/digger.jpg" },
+                                { "backdropUrl": "/backdrop/2/s1440/digger.jpg" },
+                                { "backdropUrl": "/poster/3/s718/ignored.jpg" }
+                            ]
+                        }}}
+                    ]
+                }
+            }
+        });
+        assert_eq!(parse_justwatch_stills(&payload, "tt31450459"), [
+            "https://images.justwatch.com/backdrop/1/s1440/digger.jpg",
+            "https://images.justwatch.com/backdrop/2/s1440/digger.jpg",
+        ]);
+        assert!(parse_justwatch_stills(&payload, "tt0000000").is_empty());
+    }
+
+    #[test]
+    fn digger_header_and_working_title_alias_never_match_judy() {
+        let src = |file: &str, description: &str| source_of("A", &json!({
+            "url": "https://x.invalid/a",
+            "behaviorHints": { "filename": file },
+            "title": description
+        }));
+        // Bare "Digger (2026)" add-on header line must never rescue a Judy filename.
+        let bare_header = src("Judy.BDRemux.1080p.pk.mkv", "Digger (2026)\n💾 18.4 GB");
+        assert!(!names_title(&bare_header, "Digger", Some(2026)));
+        // Even a tagged description line for Digger must not override a clearly different movie filename.
+        let tagged_header = src("Judy.BDRemux.1080p.pk.mkv", "Digger (2026) 1080p BDRemux\n💾 18.4 GB");
+        assert!(!names_title(&tagged_header, "Digger", Some(2026)));
+        // A filename with a different movie year (2019 vs 2026) is always rejected.
+        let wrong_year_file = src("Judy.2019.1080p.BluRay.mkv", "Digger 2026 1080p WEB-DL");
+        assert!(!names_title(&wrong_year_file, "Digger", Some(2026)));
+        // A secondary alias / working title ("Judy") requires a matching release year (±1) on movies.
+        let judy_no_year = src("Judy.BDRemux.1080p.pk.mkv", "Judy.BDRemux.1080p.pk.mkv\n💾 18.4 GB");
+        assert!(!names_title_any(&judy_no_year, &["Digger".into(), "Judy".into()], Some(2026)));
+        // Legitimate bilingual filename + description still matches.
+        let bilingual = src("Kod.3.2024.2160p.mkv", "Kód 3 - Code 3 (2024)(CZ.EN)[2160p][WebDL]");
+        assert!(names_title(&bilingual, "Code 3", Some(2025)));
+        // Legitimate localized alias with matching release year still matches.
+        let localized = src("Scontrarsi.a.Natale.2026.1080p.WEB-DL.ITA.mkv", "Scontrarsi.a.Natale.2026.1080p.WEB-DL.ITA.mkv");
+        assert!(names_title_any(&localized, &["Clashing Through the Snow".into(), "Scontrarsi a Natale".into()], Some(2026)));
     }
 }
 

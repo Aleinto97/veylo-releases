@@ -9,8 +9,6 @@ use super::*;
 pub struct Settings {
     /// BetterPosters (btttr.cc) first, the add-on's poster as fallback.
     pub better_posters: bool,
-    /// TMDB v3 key for artwork; never logged or shown.
-    pub tmdb_key: Option<String>,
     /// Picks leaves out titles you finished watching.
     pub picks_hide_watched: bool,
     /// Preferred audio language for streams (a key of `crate::addons::LANGUAGES`): English unless
@@ -89,7 +87,7 @@ pub(super) fn audio_language(saved: &Value) -> String {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            better_posters: true, tmdb_key: None, picks_hide_watched: true,
+            better_posters: true, picks_hide_watched: true,
             stream_language: Some(DEFAULT_LANGUAGE.into()), hdr_output: true,
             sub_scale: 1.05, sub_pos: 100, sub_bg: false, sub_color: "#F2EFEA".into(),
             audio_night_mode: false, audio_passthrough: false, hwdec_mode: "auto".into(),
@@ -111,7 +109,6 @@ pub fn load_settings() -> Settings {
         .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     Settings {
         better_posters: v["better_posters"].as_bool().unwrap_or(true),
-        tmdb_key: v["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         picks_hide_watched: v["picks_hide_watched"].as_bool().unwrap_or(true),
         stream_language: Some(audio_language(&v)),
         hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
@@ -168,7 +165,6 @@ pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::i
 pub fn save_settings(settings: &Settings) {
     let data = json!({
         "better_posters": settings.better_posters,
-        "tmdb_key": settings.tmdb_key,
         "picks_hide_watched": settings.picks_hide_watched,
         "stream_language": settings.stream_language,
         "hdr_output": settings.hdr_output,
@@ -191,7 +187,6 @@ pub fn save_settings(settings: &Settings) {
     set_prefetch_sources_enabled(settings.prefetch_sources);
     set_max_bitrate_mbps(settings.max_bitrate_mbps);
     set_stream_language(settings.stream_language.clone());
-    set_tmdb_key(settings.tmdb_key.clone());
     // Language or add-on preferences changed: forget cached source lists.
     forget_sources();
     sync_soon();
@@ -328,9 +323,8 @@ pub fn diagnostic_report() -> String {
     let (screen_title, _) = crate::display::summary(crate::display::screen(), settings.hdr_output);
     out.push_str(&format!("Veylo {} ({}/{})\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
     out.push_str(&format!("Screen: {screen_title}\n"));
-    out.push_str(&format!("Language: {} | TMDB key: {} | Account: {}\n",
+    out.push_str(&format!("Language: {} | Account: {}\n",
         settings.stream_language.as_deref().unwrap_or(DEFAULT_LANGUAGE),
-        if settings.tmdb_key.is_some() { "set" } else { "none" },
         if account().is_some() { "signed in" } else { "signed out" },
     ));
     out.push_str("--- Recent events ---\n");
@@ -479,16 +473,6 @@ pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Settings {
     change(&mut settings);
     save_settings(&settings);
     settings
-}
-
-/// Whether TMDB accepts a v3 API key (a cheap request that needs one).
-pub async fn check_tmdb_key(key: String) -> Result<()> {
-    on_runtime(async move {
-        let response = backend().http.get("https://api.themoviedb.org/3/configuration").query(&[("api_key", key)]).send().await
-            .map_err(|_| anyhow!("TMDB didn't answer. Check your connection."))?;
-        anyhow::ensure!(response.status().is_success(), "TMDB didn't accept this key. Use the API Key, not the Read Access Token.");
-        Ok(())
-    }).await?
 }
 
 // ---------------------------------------------------------------- picks duel

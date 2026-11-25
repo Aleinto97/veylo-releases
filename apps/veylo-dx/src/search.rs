@@ -165,7 +165,7 @@ pub fn SearchOverlay() -> Element {
                     if !history.queries.is_empty() {
                         div { class: "tokens",
                             for past in history.queries.iter().take(8).cloned() {
-                                button { key: "{past}", class: "token glass", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }
+                                button { key: "{past}", class: "token", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }
                             }
                             if arm_clear_history() {
                                 span { class: "confirm", role: "group", aria_label: "Clear search history?",
@@ -195,7 +195,11 @@ pub fn SearchOverlay() -> Element {
                         }
                     }
                 } else if vibe_mode() {
-                    if let Some(list) = vibe_results() {
+                    if searching() && vibe_results.read().as_ref().is_none_or(Vec::is_empty) {
+                        div { class: "grid", aria_hidden: "true",
+                            for i in 0..8 { div { key: "vs-{i}", class: "poster", div { class: "frame skeleton-card" } } }
+                        }
+                    } else if let Some(list) = vibe_results() {
                         if list.is_empty() && !searching() {
                             div { class: "center-note",
                                 div { class: "glass panel",
@@ -223,6 +227,11 @@ pub fn SearchOverlay() -> Element {
                         }
                     }
                 } else {
+                    if searching() && results.is_empty() {
+                        div { class: "grid", aria_hidden: "true",
+                            for i in 0..8 { div { key: "ss-{i}", class: "poster", div { class: "frame skeleton-card" } } }
+                        }
+                    }
                     if let Some((addon, media)) = top {
                         // Keyed: another best match starts from its own first poster.
                         TopMatch { key: "{media.key()}", media: media.clone(), source: several_addons.then_some(addon), on_open: open }
@@ -293,7 +302,7 @@ fn TopMatch(media: Media, source: Option<String>, on_open: EventHandler<Media>) 
             }
             div { class: "frame top-poster", crate::components::FallbackImg { sources: backend::posters(&media) } }
             div { class: "top-copy",
-                span { class: "lamp best", title: "Best match", aria_label: "Best match", icons::Star {} }
+                span { class: "top-badge", icons::Star {} span { "Best match" } }
                 span { class: "display top-title", "{media.name}" }
                 span { class: "meta", "{meta}" }
                 if !media.description.is_empty() { span { class: "synopsis clamp-2", "{media.description}" } }

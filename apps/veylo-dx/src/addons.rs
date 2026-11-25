@@ -11,9 +11,6 @@ use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-/// Where a TMDB v3 API key can be created: opened in the browser on explicit tap.
-pub const TMDB_KEY_PAGE: &str = "https://www.themoviedb.org/settings/api";
-
 // ---------------------------------------------------------------- languages
 
 /// An audio language: its settings key, display label, flag, common release tags, and ISO 639-1 /

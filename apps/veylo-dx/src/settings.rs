@@ -39,12 +39,6 @@ pub fn SettingsPage() -> Element {
     let mut dir_url = use_signal(String::new);
     let mut dir_entries = use_signal(Vec::<addons::DirectoryEntry>::new);
 
-    // Artwork / TMDB state
-    let mut tmdb_checking = use_signal(|| false);
-    let mut tmdb_problem = use_signal(|| None::<String>);
-    let mut tmdb_draft = use_signal(String::new);
-    let mut tmdb_open = use_signal(|| false);
-
     // Privacy, data & diagnostics state
     let mut import_open = use_signal(|| false);
     let mut import_text = use_signal(String::new);
@@ -74,24 +68,6 @@ pub fn SettingsPage() -> Element {
             else { crate::home::invalidate_cache(); }
             busy.set(None);
             overview.restart();
-        });
-    };
-    let mut save_tmdb_key = move |key: String| {
-        let key = key.trim().to_owned();
-        if key.is_empty() || *tmdb_checking.peek() { return; }
-        tmdb_checking.set(true);
-        tmdb_problem.set(None);
-        spawn(async move {
-            match backend::check_tmdb_key(key.clone()).await {
-                Ok(()) => {
-                    settings.set(backend::update_settings(|s| s.tmdb_key = Some(key)));
-                    tmdb_draft.set(String::new());
-                    tmdb_open.set(false);
-                    backend::clear_artwork_caches();
-                }
-                Err(e) => tmdb_problem.set(Some(format!("{e:#}"))),
-            }
-            tmdb_checking.set(false);
         });
     };
     let mut choose_language = move |key: String| {
@@ -488,7 +464,7 @@ pub fn SettingsPage() -> Element {
                             div { class: "setting-copy",
                                 span { class: "setting-name", "Charts & posters" }
                                 span { class: "setting-about",
-                                    if settings().better_posters { "BetterPosters charts, rating-tagged posters and fuller metadata; Cinemeta fills gaps." }
+                                    if settings().better_posters { "BetterPosters charts, rating & 4K/HD/Dolby quality badges, and fuller metadata; hides movies without digital HD/4K quality from Home." }
                                     else { "Use your installed add-ons' own catalogs, posters and metadata." }
                                 }
                             }
@@ -504,49 +480,6 @@ pub fn SettingsPage() -> Element {
                                 }
                             }
                         }
-                        div { class: "setting-row",
-                            div { class: "setting-copy",
-                                div { class: "setting-title-line",
-                                    span { class: "setting-name", "TMDB artwork & releases" }
-                                    if settings().tmdb_key.is_some() { span { class: "status-pill ok", "Connected" } }
-                                    else { span { class: "status-pill muted", "Optional" } }
-                                }
-                                span { class: "setting-about", "Free sources always run first. Adding a TMDB v3 API key adds textless backdrops, cast photos, trailers and official digital release listings." }
-                            }
-                            div { class: "setting-controls",
-                                if settings().tmdb_key.is_some() {
-                                    button { class: "pill glass small danger", onclick: move |_| {
-                                        settings.set(backend::update_settings(|s| s.tmdb_key = None));
-                                        backend::clear_artwork_caches();
-                                    }, icons::Trash {} span { "Remove key" } }
-                                } else {
-                                    button { class: "pill glass small", onclick: move |_| tmdb_open.set(!tmdb_open()),
-                                        icons::Plus {} span { if tmdb_open() { "Close" } else { "Add key" } } }
-                                }
-                            }
-                        }
-                        if tmdb_open() && settings().tmdb_key.is_none() {
-                            div { class: "setting-drawer",
-                                div { class: "setting-input-group",
-                                    input { class: "key-field", r#type: "password", placeholder: "TMDB v3 API key", aria_label: "TMDB API key", autocomplete: "off",
-                                        value: "{tmdb_draft}",
-                                        disabled: tmdb_checking(),
-                                        oninput: move |e| tmdb_draft.set(e.value()),
-                                        onkeydown: move |e| {
-                                            e.stop_propagation();
-                                            if e.key() == Key::Enter { save_tmdb_key(tmdb_draft.peek().clone()); }
-                                        },
-                                    }
-                                    button { class: "pill accent small",
-                                        disabled: tmdb_checking() || tmdb_draft().trim().is_empty(),
-                                        onclick: move |_| save_tmdb_key(tmdb_draft.peek().clone()),
-                                        icons::Check {} span { if tmdb_checking() { "Checking…" } else { "Save" } }
-                                    }
-                                    LinkButton { url: addons::TMDB_KEY_PAGE, label: "Get TMDB API key" }
-                                }
-                            }
-                        }
-                        if let Some(p) = tmdb_problem() { p { class: "addon-problem", role: "alert", icons::Alert {} span { "{p}" } } }
                         div { class: "setting-row",
                             div { class: "setting-copy",
                                 div { class: "setting-title-line",
@@ -778,7 +711,7 @@ pub fn SettingsPage() -> Element {
                         div { class: "setting-row",
                             div { class: "setting-copy",
                                 span { class: "setting-name", "Attributions & licences" }
-                                span { class: "setting-about", "This product uses the TMDB API but is not endorsed or certified by TMDB. Series schedules from TVmaze (CC BY-SA); open metadata from Wikidata (CC0)." }
+                                span { class: "setting-about", "Keyless metadata from BetterPosters, ElfHosted, TVmaze (CC BY-SA), Wikidata (CC0), Wikipedia (CC BY-SA) and AniList." }
                             }
                             div { class: "setting-controls",
                                 button { class: "pill glass small", onclick: move |_| legal_open.set(!legal_open()),
@@ -789,12 +722,12 @@ pub fn SettingsPage() -> Element {
                             div { class: "setting-drawer",
                                 div { class: "legal-text",
                                     p { "Privacy: Veylo is local-first, runs Picks AI on-device, disables telemetry and stream browsing-prefetch by default, and end-to-end encrypts optional cloud sync with your 256-bit Sync Key (see PRIVACY.md)." }
-                                    p { "Open-Source Licences: Veylo source is MIT-licensed. Distributed binaries link GPL-licensed libmpv and FFmpeg (combined packages governed by GPL; source links and licence files are bundled in licenses/ and THIRD_PARTY_LICENSES.md). Archivo font is licensed under SIL OFL 1.1. ONNX Runtime and bge-small-en-v1.5 are MIT-licensed." }
+                                    p { "Open-Source Licences: Veylo source is MIT-licensed. Distributed binaries link GPL-licensed libmpv and FFmpeg (combined packages governed by GPL; source links and licence files are bundled in licenses/ and THIRD_PARTY_LICENSES.md). Outfit and Inter fonts are licensed under SIL OFL 1.1; Lucide icons are ISC-licensed. ONNX Runtime and bge-small-en-v1.5 are MIT-licensed." }
                                 }
                                 div { class: "credit-pills",
-                                    LinkButton { url: "https://www.themoviedb.org/", label: "TMDB" }
                                     LinkButton { url: "https://www.tvmaze.com/", label: "TVmaze" }
                                     LinkButton { url: "https://www.wikidata.org/", label: "Wikidata" }
+                                    LinkButton { url: "https://www.wikipedia.org/", label: "Wikipedia" }
                                 }
                             }
                         }

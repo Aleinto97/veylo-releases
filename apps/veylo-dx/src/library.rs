@@ -100,10 +100,11 @@ pub fn Library() -> Element {
     let mut query = use_signal(String::new);
     let mut downloads = use_signal(backend::list_downloads);
     let mut active_dl = use_signal(backend::active_downloads);
-    // Poll active downloads gently while on Library so progress bars & newly completed files update live.
+    // Poll active downloads gently while on Library: responsive when running, low-power when idle.
     use_future(move || async move {
         loop {
-            backend::sleep(1000).await;
+            let delay = if active_dl.peek().is_empty() { 2500 } else { 750 };
+            backend::sleep(delay).await;
             let now_active = backend::active_downloads();
             let prev_len = active_dl.peek().len();
             if *active_dl.peek() != now_active { active_dl.set(now_active.clone()); }
@@ -143,12 +144,14 @@ pub fn Library() -> Element {
     };
     rsx! {
         div { class: "library",
-            h1 { class: "display title", "Library" }
-            if !stats_line.is_empty() { p { class: "dim tnum lib-stats", "{stats_line}" } }
+            div { class: "lib-head",
+                h1 { class: "display title", "Library" }
+                if !stats_line.is_empty() { p { class: "dim tnum lib-stats", "{stats_line}" } }
+            }
             div { class: "lib-toolbar",
                 div { class: "lib-filters", role: "tablist", aria_label: "Filter library",
                     for opt in LibFilter::ALL {
-                        button { key: "{opt.label()}", class: if f == opt { "pill accent small" } else { "pill glass small" },
+                        button { key: "{opt.label()}", class: if f == opt { "lib-filter-pill on" } else { "lib-filter-pill" },
                             role: "tab", aria_selected: "{f == opt}",
                             onclick: move |_| filter.set(opt),
                             "{opt.label()}"
@@ -171,7 +174,11 @@ pub fn Library() -> Element {
                     div { class: "group-head", span { class: "group-icon", icons::Download {} } span { class: "group-name", "Downloads" }
                         span { class: "tnum dim", "{dl_list.len()}" } }
                     if dl_list.is_empty() && active_list.is_empty() {
-                        p { class: "dim", "No offline downloads yet. Open any title's Sources list and tap Download." }
+                        div { class: "lib-empty",
+                            span { class: "big-icon dim", icons::Download {} }
+                            p { class: "body-strong", "No offline downloads yet" }
+                            p { class: "dim setting-about", "Open any title's Sources list and tap Download to save it for offline playback." }
+                        }
                     }
                     div { class: "addon-list",
                         for job in active_list {
@@ -246,7 +253,14 @@ pub fn Library() -> Element {
                                     }
                                 }
                             } else if f == LibFilter::Saved {
-                                p { class: "dim", "No saved titles match." }
+                                div { class: "lib-empty",
+                                    span { class: "big-icon dim", icons::Bookmark {} }
+                                    p { class: "body-strong", if q.is_empty() { "No saved titles yet" } else { "No saved titles match" } }
+                                    p { class: "dim setting-about", if q.is_empty() { "Bookmark any film or series to build your watchlist." } else { "Try a different filter or search phrase." } }
+                                    if !q.is_empty() {
+                                        button { class: "pill glass small", onclick: move |_| query.set(String::new()), icons::Undo {} span { "Clear search" } }
+                                    }
+                                }
                             }
                         }
                     }
@@ -274,7 +288,12 @@ pub fn Library() -> Element {
                         let this_year = backend::civil(now).0;
                         rsx! {
                             if list.is_empty() {
-                                p { class: "dim", "No titles match this filter." }
+                                div { class: "lib-empty",
+                                    span { class: "big-icon dim", icons::Search {} }
+                                    p { class: "body-strong", "No titles match this filter" }
+                                    p { class: "dim setting-about", "Reset the filter or search query to see your full library." }
+                                    button { class: "pill glass small", onclick: move |_| { filter.set(LibFilter::All); query.set(String::new()); }, icons::Undo {} span { "Show all" } }
+                                }
                             }
                             if !week.is_empty() {
                                 section { class: "lib-section",
@@ -346,7 +365,7 @@ fn WeekCard(seen: Seen, now: i64, ahead: bool) -> Element {
             }
             Forget { media: m.clone() }
             if !done {
-                icons::IconButton { label: "Resume {m.name}", class: "glass week-play", onclick: move |_| crate::title::resume_now(shell, resume.clone()), icons::Play {} }
+                icons::IconButton { label: "Resume {m.name}", class: "week-play", onclick: move |_| crate::title::resume_now(shell, resume.clone()), icons::Play {} }
             }
         }
     }
@@ -391,7 +410,7 @@ fn Forget(media: Media) -> Element {
                 }
                 icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
             } else {
-                icons::IconButton { label: "Remove {name} from Library", class: "glass small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
+                icons::IconButton { label: "Remove {name} from Library", class: "small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
             }
         }
     }
@@ -429,7 +448,7 @@ fn Unsave(media: Media) -> Element {
                 }
                 icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
             } else {
-                icons::IconButton { label: "Remove {name} from Saved", class: "glass small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
+                icons::IconButton { label: "Remove {name} from Saved", class: "small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
             }
         }
     }

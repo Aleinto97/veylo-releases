@@ -112,10 +112,11 @@ pub fn Home() -> Element {
             }
             Err(e) => if rows.peek().is_empty() { rows_error.set(Some(format!("{e:#}"))); },
         }
-        // Tonight's pick: recommendations you have neither watched nor started, in the order of
-        // the taste Picks learned (brain.rs), with its reason when it has one.
+        // Tonight's pick: recommendations you have neither watched nor started, filtered to
+        // confirmed digital HD/4K releases for recent movies, in the order of the taste Picks learned.
         if let Ok(p) = picks_res {
-            let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(24).collect();
+            let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(28).collect();
+            let fresh = backend::filter_home_quality(fresh).await;
             let known = library.peek().clone();
             let order = fresh.clone();
             let ranked = backend::on_runtime(async move {
@@ -170,7 +171,18 @@ pub fn Home() -> Element {
                     },
                 }
             } else if loading() && tonight.read().is_empty() {
-                section { class: "home-hero hero-skeleton", aria_hidden: "true" }
+                section { class: "home-hero hero-skeleton", aria_hidden: "true",
+                    div { class: "hero-skel-copy",
+                        div { class: "hero-skel-title skeleton-card" }
+                        div { class: "hero-skel-line skeleton-card" }
+                        div { class: "hero-skel-line short skeleton-card" }
+                        div { class: "hero-skel-actions",
+                            div { class: "hero-skel-btn skeleton-card" }
+                            div { class: "hero-skel-btn skeleton-card" }
+                            div { class: "hero-skel-orb skeleton-card" }
+                        }
+                    }
+                }
             } else {
                 div { class: "bar-clearance" }
             }
@@ -413,14 +425,6 @@ fn HomeHero(
                     );
                     rsx! {
                         div { key: "{k}", class: "home-hero-copy",
-                            span { class: "hero-eyebrow glass",
-                                span { class: "hero-eyebrow-icon", icons::Sparkles {} }
-                                span { class: "hero-eyebrow-label", "Tonight's pick" }
-                                if !media.reason.is_empty() {
-                                    span { class: "hero-eyebrow-sep", "·" }
-                                    span { class: "hero-eyebrow-why", "{media.reason}" }
-                                }
-                            }
                             button { class: "bare hero-title-btn", aria_label: "Open {media.name}",
                                 onpointerdown: move |_| backend::prefetch_title(&pre1),
                                 onclick: move |_| shell.opened.set(Some(open_title.clone())),
@@ -461,6 +465,12 @@ fn HomeHero(
                                 button { class: "orb glass", aria_label: "More picks", title: "More picks",
                                     onclick: move |_| { shell.opened.set(None); shell.tab.set(crate::Tab::Picks); },
                                     icons::ArrowRight {}
+                                }
+                            }
+                            if !media.reason.is_empty() {
+                                p { class: "hero-reason",
+                                    span { class: "hero-reason-icon", aria_hidden: "true", icons::Sparkles {} }
+                                    span { "{media.reason}" }
                                 }
                             }
                         }
@@ -570,7 +580,7 @@ fn ContinueCard(media: Media, ahead: bool, on_forget: EventHandler<Media>) -> El
             }
             icons::IconButton {
                 label: "Resume {media.name}",
-                class: "glass cw-play",
+                class: "cw-play",
                 onclick: move |_| crate::title::resume_now(shell, resume.clone()),
                 icons::Play {}
             }

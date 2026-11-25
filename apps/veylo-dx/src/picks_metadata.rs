@@ -1,10 +1,10 @@
-//! Public title metadata for local classification (TMDB keywords with a key, Wikidata's
-//! without). Fixed provider endpoints only; cache contains
+//! Public title metadata for local classification (keyless Wikidata subjects and genres).
+//! Fixed provider endpoints only; cache contains
 //! hashed identities and cleaned keywords/summaries, never provider URLs or credentials.
 use crate::backend::{self, Media};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path, sync::{Arc, Mutex, OnceLock, RwLock, Weak}};
+use std::{collections::{BTreeMap, HashMap}, path::Path, sync::{Arc, Mutex, OnceLock, RwLock, Weak}};
 
 const VERSION: u32 = 1;
 const LIMIT: usize = 1024;
@@ -136,19 +136,11 @@ pub fn clean(input: &str, max_chars: usize) -> String {
     decoded.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max_chars).collect()
 }
 
-pub fn keywords(payload: &Value) -> Vec<String> {
-    let mut seen = HashSet::new();
-    payload["keywords"].as_array().or_else(|| payload["results"].as_array()).into_iter().flatten()
-        .filter_map(|k| k["name"].as_str()).map(|s| clean(s,80)).filter(|s| !s.is_empty() && seen.insert(s.to_lowercase())).take(24).collect()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn handles_both_keyword_shapes_and_html_entities() {
-        let rows = json!([{"name":"psychological horror"},{"name":"Psychological Horror"},{"name":"<b>dark</b> &amp; disturbing"}]);
-        assert_eq!(keywords(&json!({"keywords": rows})), keywords(&json!({"results":rows})));
-        assert_eq!(keywords(&json!({"results":rows})).len(),2);
+    fn cleans_html_tags_and_entities() {
         assert_eq!(clean("I <3 you, a < b > c",100),"I <3 you, a < b > c");
         assert_eq!(clean("<p>Bob&#39;s <b>family</b>&nbsp;&amp; &#x66;riends.</p>",100),"Bob's family & friends.");
     }
