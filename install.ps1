@@ -27,11 +27,40 @@ Get-Process veylo-dx -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq 
 Start-Sleep -Milliseconds 500
 
 $zip = Join-Path ([IO.Path]::GetTempPath()) $assetName
-if ($env:VEYLO_ZIP) { Copy-Item -Force $env:VEYLO_ZIP $zip }
-else { Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip }
+if ($env:VEYLO_ZIP) {
+    Copy-Item -Force $env:VEYLO_ZIP $zip
+} else {
+    $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
+    if (-not $sumsAsset) { throw "Refusing to install: SHA256SUMS.txt is missing from the release." }
+    $sumsText = (Invoke-WebRequest -UseBasicParsing -Uri $sumsAsset.browser_download_url).Content
+    $expected = $null
+    foreach ($line in ($sumsText -split "`r?`n")) {
+        $parts = $line.Trim() -split '\s+'
+        if ($parts.Length -ge 2 -and $parts[1].TrimStart('*') -eq $assetName) {
+            $expected = $parts[0].ToLowerInvariant()
+            break
+        }
+    }
+    if (-not $expected) { throw "Refusing to install: $assetName checksum not found in SHA256SUMS.txt." }
+    Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        Remove-Item -Force $zip -ErrorAction SilentlyContinue
+        throw "Refusing to install: SHA-256 verification failed for $assetName."
+    }
+}
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Expand-Archive -Force -Path $zip -DestinationPath $dest
 Remove-Item -Force $zip
+
+# Register per-user stremio:// and veylo:// deep-link protocol handlers (no admin rights needed).
+foreach ($scheme in @('stremio', 'veylo')) {
+    $baseKey = "HKCU:\Software\Classes\$scheme"
+    New-Item -Path "$baseKey\shell\open\command" -Force | Out-Null
+    Set-ItemProperty -Path $baseKey -Name '(Default)' -Value "URL:$scheme Protocol"
+    Set-ItemProperty -Path $baseKey -Name 'URL Protocol' -Value ''
+    Set-ItemProperty -Path "$baseKey\shell\open\command" -Name '(Default)' -Value "`"$exe`" `"%1`""
+}
 
 $shell = New-Object -ComObject WScript.Shell
 foreach ($folder in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {

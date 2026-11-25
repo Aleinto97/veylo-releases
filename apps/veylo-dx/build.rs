@@ -62,12 +62,31 @@ fn main() {
         std::fs::create_dir_all(&assets).expect("assets dir");
         std::fs::copy(mpv.join("cacert.pem"), assets.join("cacert.pem")).expect("copy cacert.pem");
         println!("cargo:rerun-if-changed={}", assets.join("cacert.pem").display());
+        // Bundle Veylo's MIT license, SIL OFL 1.1 (Archivo), Privacy Policy, Third-Party Notices,
+        // and mpv-android's license into APK assets for open-source license compliance.
+        let licenses = assets.join("licenses");
+        std::fs::create_dir_all(&licenses).expect("licenses dir");
+        for (src, name) in [
+            ("../../LICENSE", "LICENSE"),
+            ("../../PRIVACY.md", "PRIVACY.md"),
+            ("../../THIRD_PARTY_LICENSES.md", "THIRD_PARTY_LICENSES.md"),
+            ("assets/fonts/OFL.txt", "OFL.txt"),
+            ("android/mpv/LICENSE-mpv-android", "LICENSE-mpv-android"),
+        ] {
+            let p = std::path::Path::new(src);
+            if p.is_file() {
+                let dest = licenses.join(name);
+                std::fs::copy(p, &dest).expect("copy license file");
+                println!("cargo:rerun-if-changed={src}");
+            }
+        }
     }
 }
 
 /// Android TV: the TV home screen lists only apps whose activity is in LEANBACK_LAUNCHER, shown by
 /// their banner (android/res/drawable-xhdpi/tv_banner.png, from branding/veylo-tv-banner.svg).
-/// dx 0.7 can't add either to its activity or application, so patch the manifest it generates.
+/// Also registers `stremio://` and `veylo://` deep links on the main activity.
+/// dx 0.7 can't add these to its activity or application, so patch the manifest it generates.
 fn tv_launcher(manifest: &std::path::Path) {
     let Ok(xml) = std::fs::read_to_string(manifest) else { return };
     let mut patched = xml.clone();
@@ -80,6 +99,19 @@ fn tv_launcher(manifest: &std::path::Path) {
     }
     if !patched.contains("supportsPictureInPicture") {
         patched = patched.replacen("<activity ", "<activity android:supportsPictureInPicture=\"true\" ", 1);
+    }
+    if !patched.contains("android:scheme=\"stremio\"") {
+        let deep_link_filter = concat!(
+            "</intent-filter>\n",
+            "            <intent-filter>\n",
+            "                <action android:name=\"android.intent.action.VIEW\" />\n",
+            "                <category android:name=\"android.intent.category.DEFAULT\" />\n",
+            "                <category android:name=\"android.intent.category.BROWSABLE\" />\n",
+            "                <data android:scheme=\"stremio\" />\n",
+            "                <data android:scheme=\"veylo\" />\n",
+            "            </intent-filter>"
+        );
+        patched = patched.replacen("</intent-filter>", deep_link_filter, 1);
     }
     if patched != xml { std::fs::write(manifest, patched).expect("patch AndroidManifest.xml"); }
     println!("cargo:rerun-if-changed={}", manifest.display());

@@ -13,13 +13,9 @@ pub struct Settings {
     pub tmdb_key: Option<String>,
     /// Picks leaves out titles you finished watching.
     pub picks_hide_watched: bool,
-    /// Real-Debrid API token shared by every add-on Veylo configures; never logged or shown.
-    pub rd_key: Option<String>,
     /// Preferred audio language for streams (a key of `crate::addons::LANGUAGES`): English unless
     /// chosen (there is no "any language"; settings saved without one read as English).
     pub stream_language: Option<String>,
-    /// You removed the Real-Debrid key: it is not adopted again from an add-on's link.
-    pub rd_key_removed: bool,
     /// Windows: send HDR to the screen when it is in HDR (off: always tone-map to SDR).
     pub hdr_output: bool,
     /// Subtitle font scale (0.6..=2.0, default 1.05).
@@ -41,11 +37,14 @@ pub struct Settings {
     /// Streaming bitrate cap for autoplay: None = Auto (match connection speed),
     /// Some(0) = Unlimited (always highest quality), Some(n) = cap at n Mbps.
     pub max_bitrate_mbps: Option<u32>,
-    /// Send redacted crashes, UI errors, playback failures and performance reports to Firebase.
+    /// Send redacted crashes, UI errors, playback failures and performance reports to Firebase (opt-in).
     pub telemetry_enabled: bool,
+    /// Query installed stream add-ons while browsing a title page (off by default for browsing privacy).
+    pub prefetch_sources: bool,
 }
 
-static TELEMETRY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static TELEMETRY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PREFETCH_SOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// -1 = Auto (match connection), 0 = Unlimited, >0 = manual cap in Mbps.
 static MAX_BITRATE_MBPS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
@@ -55,6 +54,14 @@ pub fn telemetry_enabled() -> bool {
 
 pub(super) fn set_telemetry_enabled(on: bool) {
     TELEMETRY_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn prefetch_sources_enabled() -> bool {
+    PREFETCH_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) fn set_prefetch_sources_enabled(on: bool) {
+    PREFETCH_SOURCES.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn max_bitrate_mbps() -> Option<u32> {
@@ -82,11 +89,12 @@ pub(super) fn audio_language(saved: &Value) -> String {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            better_posters: true, tmdb_key: None, picks_hide_watched: true, rd_key: None,
-            stream_language: Some(DEFAULT_LANGUAGE.into()), rd_key_removed: false, hdr_output: true,
+            better_posters: true, tmdb_key: None, picks_hide_watched: true,
+            stream_language: Some(DEFAULT_LANGUAGE.into()), hdr_output: true,
             sub_scale: 1.05, sub_pos: 100, sub_bg: false, sub_color: "#F2EFEA".into(),
             audio_night_mode: false, audio_passthrough: false, hwdec_mode: "auto".into(),
-            auto_next: true, max_bitrate_mbps: None, telemetry_enabled: true,
+            auto_next: true, max_bitrate_mbps: None, telemetry_enabled: false,
+            prefetch_sources: false,
         }
     }
 }
@@ -105,9 +113,7 @@ pub fn load_settings() -> Settings {
         better_posters: v["better_posters"].as_bool().unwrap_or(true),
         tmdb_key: v["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         picks_hide_watched: v["picks_hide_watched"].as_bool().unwrap_or(true),
-        rd_key: v["rd_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned),
         stream_language: Some(audio_language(&v)),
-        rd_key_removed: v["rd_key_removed"].as_bool().unwrap_or(false),
         hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
         sub_scale: v["sub_scale"].as_f64().unwrap_or(1.05).clamp(0.6, 2.0),
         sub_pos: v["sub_pos"].as_i64().unwrap_or(100).clamp(70, 100) as i32,
@@ -118,11 +124,13 @@ pub fn load_settings() -> Settings {
         hwdec_mode: match v["hwdec_mode"].as_str() { Some("copy") => "copy", Some("no") => "no", _ => "auto" }.to_owned(),
         auto_next: v["auto_next"].as_bool().unwrap_or(true),
         max_bitrate_mbps: parse_max_bitrate(&v),
-        telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(true),
+        telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(false),
+        prefetch_sources: v["prefetch_sources"].as_bool().unwrap_or(false),
     }
 }
 
-/// Write a file that may hold credentials or tokens, restricting it to owner-only (0600) on Unix.
+/// Write a file that may hold credentials or private user data, restricting permissions to the
+/// current user (`0600` on Unix; best-effort user-only ACL via `icacls` on Windows).
 pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
     #[cfg(unix)]
@@ -134,7 +142,26 @@ pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::i
         f.write_all(bytes)?;
         f.sync_all()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::fs::write(path, bytes)?;
+        if let Ok(user) = std::env::var("USERNAME") {
+            if !user.is_empty() {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let grant = format!("{user}:(R,W)");
+                let _ = std::process::Command::new("icacls")
+                    .arg(path)
+                    .args(["/inheritance:r", "/grant:r", &grant])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
     { std::fs::write(path, bytes) }
 }
 
@@ -143,9 +170,7 @@ pub fn save_settings(settings: &Settings) {
         "better_posters": settings.better_posters,
         "tmdb_key": settings.tmdb_key,
         "picks_hide_watched": settings.picks_hide_watched,
-        "rd_key": settings.rd_key,
         "stream_language": settings.stream_language,
-        "rd_key_removed": settings.rd_key_removed,
         "hdr_output": settings.hdr_output,
         "sub_scale": settings.sub_scale.clamp(0.6, 2.0),
         "sub_pos": settings.sub_pos.clamp(70, 100),
@@ -157,15 +182,17 @@ pub fn save_settings(settings: &Settings) {
         "auto_next": settings.auto_next,
         "max_bitrate_mbps": settings.max_bitrate_mbps,
         "telemetry_enabled": settings.telemetry_enabled,
+        "prefetch_sources": settings.prefetch_sources,
     }).to_string();
     let _ = write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes());
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
     set_telemetry_enabled(settings.telemetry_enabled);
+    set_prefetch_sources_enabled(settings.prefetch_sources);
     set_max_bitrate_mbps(settings.max_bitrate_mbps);
     set_stream_language(settings.stream_language.clone());
     set_tmdb_key(settings.tmdb_key.clone());
-    // The key and language decide which add-ons answer and with which links.
+    // Language or add-on preferences changed: forget cached source lists.
     forget_sources();
     sync_soon();
 }
@@ -268,11 +295,20 @@ pub(super) fn merge_track_prefs_value(v: &Value) {
 
 static DIAG_RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
 
-/// Strip URLs, API keys and tokens from diagnostic lines so logs are always safe to share.
+/// Strip URLs, API keys, tokens, emails, JWTs, and user home paths from diagnostic lines so logs
+/// are always safe to share.
 pub fn redact_diagnostic(line: &str) -> String {
-    static_re!(url_re, r"https?://[^\s\x22'<>]+");
-    static_re!(secret_re, r"(?i)(api[_-]?key|token|secret|password|authorization|rd_key|tmdb_key)\s*[:=]\s*[^\s&,\x22']+");
+    static_re!(url_re, r"(?:https?|stremio|veylo)://[^\s\x22'<>]+");
+    static_re!(jwt_re, r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b");
+    static_re!(email_re, r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b");
+    static_re!(home_unix_re, r"/(?:home|Users)/[^/\s\x22'<>]+");
+    static_re!(home_win_re, r"(?i)[A-Z]:\\Users\\[^\\\s\x22'<>]+");
+    static_re!(secret_re, r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|refresh|sync_key|rd_key|tmdb_key|realdebrid)\s*[:=]\s*[^\s&,\x22']+");
     let step = url_re().replace_all(line, "[URL]");
+    let step = jwt_re().replace_all(&step, "[JWT]");
+    let step = email_re().replace_all(&step, "[EMAIL]");
+    let step = home_unix_re().replace_all(&step, "[HOME]");
+    let step = home_win_re().replace_all(&step, "[HOME]");
     secret_re().replace_all(&step, "$1=[REDACTED]").into_owned()
 }
 
@@ -292,9 +328,8 @@ pub fn diagnostic_report() -> String {
     let (screen_title, _) = crate::display::summary(crate::display::screen(), settings.hdr_output);
     out.push_str(&format!("Veylo {} ({}/{})\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
     out.push_str(&format!("Screen: {screen_title}\n"));
-    out.push_str(&format!("Language: {} | RD key: {} | TMDB key: {} | Account: {}\n",
+    out.push_str(&format!("Language: {} | TMDB key: {} | Account: {}\n",
         settings.stream_language.as_deref().unwrap_or(DEFAULT_LANGUAGE),
-        if settings.rd_key.is_some() { "set" } else { "none" },
         if settings.tmdb_key.is_some() { "set" } else { "none" },
         if account().is_some() { "signed in" } else { "signed out" },
     ));
@@ -547,7 +582,7 @@ static WRITING: Mutex<()> = Mutex::new(());
 pub fn flush_writes() {
     let _turn = WRITING.lock();
     let batch = PENDING_WRITES.lock().ok().and_then(|mut p| p.take()).unwrap_or_default();
-    for (path, text) in batch { let _ = std::fs::write(path, text); }
+    for (path, text) in batch { let _ = write_private_file(&path, text.as_bytes()); }
 }
 
 pub fn save_duel(d: &DuelState) {
@@ -703,9 +738,11 @@ mod tests {
         assert_eq!(read_track_prefs_from(&path), map);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let clean = redact_diagnostic("fetch https://torrentio.strem.fun/rd=SECRET/manifest.json api_key=12345 token=abc");
-        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc"), "{clean}");
-        assert!(clean.contains("[URL]") && clean.contains("[REDACTED]"), "{clean}");
+        let clean = redact_diagnostic("fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc user=alice@example.com /home/alice/file.txt C:\\Users\\Alice\\file.txt");
+        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice"), "{clean}");
+        assert!(clean.contains("[URL]") && clean.contains("[REDACTED]") && clean.contains("[EMAIL]") && clean.contains("[HOME]"), "{clean}");
+        assert!(!Settings::default().telemetry_enabled, "telemetry must be opt-in by default");
+        assert!(!Settings::default().prefetch_sources, "browsing prefetch must be opt-in by default");
     }
 
     #[test]

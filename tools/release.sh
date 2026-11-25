@@ -66,9 +66,13 @@ cd "$app"
 # Static C runtime (as .cargo/config.toml).
 RUSTFLAGS="-C target-feature=+crt-static $remap" cargo xwin build --release --target x86_64-pc-windows-msvc
 win_out="$app/target/x86_64-pc-windows-msvc/release"
-mkdir -p "$work/win" && cp "$win_out/veylo-dx.exe" "$win_out/libmpv-2.dll" "$work/win/"
+mkdir -p "$work/win/licenses" && cp "$win_out/veylo-dx.exe" "$win_out/libmpv-2.dll" "$work/win/"
 cp -r "$win_out/picks-ai" "$work/win/"
-(cd "$work/win" && zip -q -r -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll picks-ai)
+cp "$root/LICENSE" "$root/PRIVACY.md" "$root/THIRD_PARTY_LICENSES.md" "$app/assets/fonts/OFL.txt" "$work/win/licenses/"
+for f in "$mpv"/LICENSE* "$mpv"/COPYING* "$mpv"/Copyright*; do
+    [ -f "$f" ] && cp "$f" "$work/win/licenses/mpv-$(basename "$f")"
+done
+(cd "$work/win" && zip -q -r -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll picks-ai licenses)
 
 # ---------------------------------------------------------------- Android
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
@@ -116,13 +120,18 @@ bsdtar -xf "$stage/$APK_ASSET" -C "$work/check/arm64"
 bsdtar -xf "$stage/$APK_ARMV7_ASSET" -C "$work/check/armv7"
 for f in ${extra[@]+"${extra[@]}"}; do mkdir -p "$work/check/extra/$(basename "$f")" && bsdtar -xf "$f" -C "$work/check/extra/$(basename "$f")"; done
 settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
-python3 - "$settings" "$HOME" "$work/check" <<'PY'
+sync_key="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/sync-key.json"
+python3 - "$settings" "$sync_key" "$HOME" "$work/check" <<'PY'
 import json, os, sys
-settings, home, folder = sys.argv[1:4]
+settings, sync_key, home, folder = sys.argv[1:5]
 values = []
 if os.path.isfile(settings):
-    values = [v for k, v in json.load(open(settings)).items() if k in ("tmdb_key", "rd_key") and isinstance(v, str) and len(v) >= 8]
-needles = [(v, "a key from settings.json") for v in values] + [(home, "your home folder path")]
+    values.extend(v for k, v in json.load(open(settings)).items() if k in ("tmdb_key", "rd_key") and isinstance(v, str) and len(v) >= 8)
+if os.path.isfile(sync_key):
+    k = json.load(open(sync_key)).get("key")
+    if isinstance(k, str) and len(k) >= 16:
+        values.append(k)
+needles = [(v, "a key from local data") for v in values] + [(home, "your home folder path")]
 for dirpath, _, files in os.walk(folder):
     for name in files:
         data = open(os.path.join(dirpath, name), "rb").read()

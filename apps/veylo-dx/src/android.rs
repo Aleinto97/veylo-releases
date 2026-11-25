@@ -40,6 +40,23 @@ pub fn files_dir() -> Result<PathBuf> {
     })
 }
 
+/// Read and clear an incoming `stremio://` or `veylo://` intent URI when Veylo was opened via a link.
+pub fn take_deep_link() -> Option<String> {
+    with_activity(|env, activity| {
+        let intent = env.call_method(activity, "getIntent", "()Landroid/content/Intent;", &[])?.l()?;
+        if intent.is_null() { return Ok(None); }
+        let data = env.call_method(&intent, "getDataString", "()Ljava/lang/String;", &[])?.l()?;
+        if data.is_null() { return Ok(None); }
+        let raw: String = env.get_string(&JString::from(data))?.into();
+        let parsed = crate::addons::parse_deep_link(&raw);
+        if parsed.is_some() {
+            let null_uri = JObject::null();
+            let _ = env.call_method(&intent, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;", &[JValue::Object(&null_uri)]);
+        }
+        Ok(parsed)
+    }).ok().flatten()
+}
+
 /// ACTION_VIEW for an https link the viewer chose to open (a YouTube trailer).
 pub fn open_url(url: &str) -> Result<()> {
     with_activity(|env, activity| {

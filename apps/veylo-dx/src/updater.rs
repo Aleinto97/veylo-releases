@@ -17,7 +17,7 @@ pub const ASSET: Option<&str> = if cfg!(all(target_os = "android", target_arch =
     else { None };
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Release { pub version: String, url: String, sha256: Option<String> }
+pub struct Release { pub version: String, url: String, sha256: String }
 
 /// Keep only safe path characters from a release version string.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", test)), allow(dead_code))]
@@ -91,20 +91,27 @@ pub async fn check() -> Option<Release> {
                 }
             }
         }
+        // Fail closed: never offer an update unless a valid 64-hex SHA-256 digest was verified.
+        let sha256 = sha256?;
         Some(Release { version, url, sha256 })
     }).await.ok().flatten()
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
-/// Stream the release file to `to` (an APK is ~150 MB: never held in memory) and verify SHA-256 when provided.
-async fn download(url: String, to: PathBuf, expected_sha256: Option<String>) -> Result<()> {
+/// Stream the release file to `to` (an APK is ~150 MB: never held in memory) and verify SHA-256.
+async fn download(url: String, to: PathBuf, expected_sha256: String) -> Result<()> {
     crate::backend::on_runtime(verify_download_to(url, to, expected_sha256)).await?
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos", test)), allow(dead_code))]
-async fn verify_download_to(url: String, to: PathBuf, expected_sha256: Option<String>) -> Result<()> {
+async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    anyhow::ensure!(
+        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Update refused: missing verified SHA-256 checksum."
+    );
     let mut response = client().get(&url).send().await.and_then(|r| r.error_for_status())
         .map_err(|_| anyhow!("Couldn't download the update"))?;
     if let Some(dir) = to.parent() { std::fs::create_dir_all(dir).context("Couldn't save the update")?; }
@@ -115,12 +122,10 @@ async fn verify_download_to(url: String, to: PathBuf, expected_sha256: Option<St
         file.write_all(&chunk).context("Couldn't save the update")?;
     }
     file.sync_all().context("Couldn't save the update")?;
-    if let Some(expected) = expected_sha256 {
-        let actual = format!("{:x}", hasher.finalize());
-        if actual != expected {
-            let _ = std::fs::remove_file(&to);
-            anyhow::bail!("The downloaded update failed verification. Try again.");
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        let _ = std::fs::remove_file(&to);
+        anyhow::bail!("The downloaded update failed verification. Try again.");
     }
     Ok(())
 }
@@ -336,13 +341,19 @@ mod tests {
             });
             let url = format!("http://127.0.0.1:{port}/release.zip");
             let ok_path = dir.join("good.zip");
-            super::verify_download_to(url.clone(), ok_path.clone(), Some(good_hash)).await.expect("matching SHA-256 must pass");
+            super::verify_download_to(url.clone(), ok_path.clone(), good_hash).await.expect("matching SHA-256 must pass");
             assert_eq!(std::fs::read(&ok_path).unwrap(), payload);
 
             let bad_path = dir.join("bad.zip");
-            let err = super::verify_download_to(url, bad_path.clone(), Some(bad_hash)).await.unwrap_err();
+            let err = super::verify_download_to(url.clone(), bad_path.clone(), bad_hash).await.unwrap_err();
             assert!(err.to_string().contains("verification"), "{err}");
             assert!(!bad_path.exists(), "corrupted download must be deleted");
+
+            // Fail closed: empty/missing checksum must be rejected before writing anything.
+            let missing_path = dir.join("missing.zip");
+            let err2 = super::verify_download_to(url, missing_path.clone(), String::new()).await.unwrap_err();
+            assert!(err2.to_string().contains("checksum"), "{err2}");
+            assert!(!missing_path.exists());
             server.await.unwrap();
         });
         let _ = std::fs::remove_dir_all(&dir);

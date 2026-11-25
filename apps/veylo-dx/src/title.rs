@@ -130,18 +130,6 @@ pub fn TitlePage(media: Media) -> Element {
     let mut rank = use_signal(|| None::<u64>);
     let for_rank = media.clone();
     use_hook(move || { spawn(async move { rank.set(backend::today_rank(&for_rank).await); }); });
-    // Verified HD/4K release availability from free srrDB + PreDB metadata (cached; warms autoplay).
-    let init_intel = (media.kind == "movie").then(|| backend::cached_release_intel(&media.id)).flatten();
-    let mut rel_intel = use_signal(move || init_intel);
-    let for_intel = media.clone();
-    use_hook(move || {
-        if for_intel.kind != "movie" { return; }
-        spawn(async move {
-            if let Some(info) = backend::release_intel(&for_intel.id, Some(&for_intel.name)).await {
-                rel_intel.set(Some(info));
-            }
-        });
-    });
     // The backdrop dissolves through the production's own textless frames every 9 seconds.
     let mut frame = use_signal(|| 0usize);
     use_future(move || async move {
@@ -481,15 +469,6 @@ pub fn TitlePage(media: Media) -> Element {
                         }
                         if !media.genres.is_empty() { span { class: "fact genres", title: media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", "), icons::Tag {} span { {media.genres.iter().take(3).cloned().collect::<Vec<_>>().join(", ")} } } }
                         if let Some(c) = production.certificate.clone() { span { class: "fact cert", title: "Certificate", "{c}" } }
-                        if film {
-                            if let Some(info) = rel_intel() {
-                                if let Some(badge) = info.best_badge {
-                                    span { class: "fact", title: "Verified release on srrDB", icons::Sparkles {} span { "{badge}" } }
-                                } else if media.first_year().is_some_and(|y| y >= 2025) {
-                                    span { class: "fact", title: "No verified HD/WEB/Blu-ray release on srrDB yet", icons::Alert {} span { "No HD release yet" } }
-                                }
-                            }
-                        }
                     }
                     div { class: "title-actions",
                         // A series carries on where you are: the started episode, else the one after the last you watched.

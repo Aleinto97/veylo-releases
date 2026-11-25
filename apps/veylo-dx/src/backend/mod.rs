@@ -112,7 +112,9 @@ pub fn init() -> Result<()> {
     let panic_file = dir.join("last-panic.txt");
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = std::fs::write(&panic_file, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
+        let raw = format!("{info}\n{}", std::backtrace::Backtrace::force_capture());
+        let clean = redact_diagnostic(&raw);
+        let _ = write_private_file(&panic_file, clean.as_bytes());
         default_hook(info);
     }));
     let core = Core::open(&dir)?;
@@ -124,7 +126,8 @@ pub fn init() -> Result<()> {
     let saved: Value = std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     BETTER_POSTERS.store(saved["better_posters"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(saved["hdr_output"].as_bool().unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
-    set_telemetry_enabled(saved["telemetry_enabled"].as_bool().unwrap_or(true));
+    set_telemetry_enabled(saved["telemetry_enabled"].as_bool().unwrap_or(false));
+    set_prefetch_sources_enabled(saved["prefetch_sources"].as_bool().unwrap_or(false));
     set_max_bitrate_mbps(parse_max_bitrate(&saved));
     set_stream_language(Some(audio_language(&saved)));
     set_tmdb_key(saved["tmdb_key"].as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
@@ -333,8 +336,8 @@ pub struct CatalogRow {
 
 /// Home's "New episodes" shelf (TVmaze's schedules), not an add-on catalog.
 const NEW_EPISODES_ROW: &str = "tvmaze|new-episodes";
-/// Home's "Just out in 4K & HD" shelf (verified srrDB release metadata, hydrated via free metadata).
-const NEW_HD_RELEASES_ROW: &str = "srrdb|new-hd-releases";
+/// Home's "New digital releases" shelf (official TMDB Digital/Physical releases or BetterPosters/Cinemeta).
+const NEW_DIGITAL_RELEASES_ROW: &str = "releases|new-digital";
 
 struct RawRow { key: String, title: String, addon_id: String, addon_name: String, addon_url: String, kind: String, id: String, extra: Option<(String, String)> }
 
@@ -386,10 +389,11 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
             raw.splice(0..0, charts);
         }
     }
-    // New verified 4K/HD movie releases (srrDB) and new TV episodes (TVmaze), after the leading charts.
+    // Recent digital & physical movie releases (TMDB / BetterPosters) and new TV episodes (TVmaze).
+    let has_tmdb = load_settings().tmdb_key.is_some();
     let at = raw.iter().position(|r| r.key.starts_with(BP_ROW) && r.id == "trakt-popular").unwrap_or(raw.len().min(2));
-    raw.insert(at, RawRow { key: NEW_HD_RELEASES_ROW.into(), title: "Just out in 4K & HD".into(), addon_id: "srrdb".into(), addon_name: "srrDB".into(),
-        addon_url: CINEMETA.into(), kind: "movie".into(), id: "new-hd-releases".into(), extra: None });
+    raw.insert(at, RawRow { key: NEW_DIGITAL_RELEASES_ROW.into(), title: "New digital releases".into(), addon_id: "releases".into(), addon_name: if has_tmdb { "TMDB".into() } else { "BetterPosters".into() },
+        addon_url: CINEMETA.into(), kind: "movie".into(), id: "new-digital".into(), extra: None });
     raw.insert(at + 1, RawRow { key: NEW_EPISODES_ROW.into(), title: "New episodes".into(), addon_id: "tvmaze".into(), addon_name: "TVmaze".into(),
         addon_url: CINEMETA.into(), kind: "series".into(), id: "new-episodes".into(), extra: None });
     let shared: Vec<String> = raw.iter().map(|r| r.title.clone()).filter(|t| {
@@ -402,8 +406,8 @@ pub async fn home_rows() -> Result<Vec<CatalogRow>> {
             else { format!("{} {}", r.title, group_label(&r.kind).to_lowercase()) };
         let subtitle = if r.addon_id == "com.linvo.cinemeta" && r.extra.as_ref().is_some_and(|(_, v)| v == "Animation") {
             Some("Cinemeta · Animated series, including anime".to_owned())
-        } else if r.key == NEW_HD_RELEASES_ROW {
-            Some("Verified 4K, Blu-ray & WEB-DL releases · srrDB".to_owned())
+        } else if r.key == NEW_DIGITAL_RELEASES_ROW {
+            Some(if has_tmdb { "Official digital & physical releases · TMDB".to_owned() } else { "Recent releases · BetterPosters / Cinemeta".to_owned() })
         } else if r.key == NEW_EPISODES_ROW {
             Some("Out in the last three days · TVmaze".to_owned())
         } else if shared.contains(&r.title) && !r.addon_name.is_empty() { Some(r.addon_name.clone()) } else { None };
@@ -420,8 +424,8 @@ pub async fn catalog(row: CatalogRow) -> Result<Vec<Media>> {
         if !titles.is_empty() { return Ok(titles); }
         return Box::pin(catalog(CatalogRow { key: String::new(), id: "top".into(), ranked: false, ..row })).await;
     }
-    if row.key == NEW_HD_RELEASES_ROW {
-        let titles = new_hd_releases().await;
+    if row.key == NEW_DIGITAL_RELEASES_ROW {
+        let titles = new_digital_releases().await;
         anyhow::ensure!(!titles.is_empty(), "Release feed can't be reached right now");
         return Ok(titles);
     }
@@ -1061,7 +1065,6 @@ pub fn names_title_any(s: &Source, titles: &[String], year: Option<i32>) -> bool
 pub fn autoplay_context_for_media(media: &Media, video_id: &str, pack_episodes: Option<usize>) -> AutoplayContext {
     let meta = cached_title_meta(media);
     let art = cached_title_artwork(media).or_else(|| cached_artwork(media));
-    let intel = (media.kind == "movie").then(|| cached_release_intel(&media.id)).flatten();
     let mut titles = vec![media.name.clone()];
     let mut push_title = |t: &str| {
         let t = t.trim();
@@ -1069,7 +1072,6 @@ pub fn autoplay_context_for_media(media: &Media, video_id: &str, pack_episodes: 
     };
     for field in ["original_title", "original_name"] { push_title(&s(&media.raw, field)); }
     if let Some(m) = &meta { for t in &m.alt_titles { push_title(t); } }
-    if let Some(i) = &intel { for t in &i.localized_titles { push_title(t); } }
     if let Some(a) = &art { for t in &a.alt_titles { push_title(t); } }
 
     // Always prioritize free metadata (TitleMeta from BetterPosters/Cinemeta, Media.raw, TVmaze/Wikidata)
@@ -1102,7 +1104,6 @@ pub fn autoplay_context_for_media(media: &Media, video_id: &str, pack_episodes: 
         original_language,
         episode_code,
         strict_title: true,
-        intel,
     }
 }
 
@@ -1628,19 +1629,16 @@ mod tests {
     }
 
     #[test]
-    fn real_debrid_plays_before_the_free_web_addons() {
-        let rd = source_of("Torrentio", &json!({"name":"[RD+] Torrentio 1080p","title":"Film.1080p.WEBRip.mkv","url":"https://x.invalid/rd"}));
-        let web = source_of("Absolute Cinema", &json!({"name":"Absolute Cinema","title":"[4KHDHub] Film 2160p REMUX\n💾 60 GB","url":"https://x.invalid/w"}));
-        let trial = source_of("NoTorrent", &json!({"name":"🌐 1080p - MPV Player","title":"Original Audio [FREE TRIAL]","url":"https://x.invalid/t"}));
-        let free = source_of("NoTorrent", &json!({"name":"🌐 1080p - VLC Player","title":"Original Audio [NEW FREE]","url":"https://x.invalid/f"}));
+    fn non_trial_and_preferred_language_streams_rank_first() {
+        let hd = source_of("Addon A", &json!({"name":"1080p","title":"Film.1080p.WEBRip.mkv","url":"https://x.invalid/hd"}));
+        let uhd = source_of("Addon B", &json!({"name":"4K","title":"Film 2160p REMUX\n💾 60 GB","url":"https://x.invalid/uhd"}));
+        let trial = source_of("Addon B", &json!({"name":"1080p","title":"Original Audio [FREE TRIAL]","url":"https://x.invalid/t"}));
         let urls = |v: Vec<Source>| v.into_iter().map(|s| s.url).collect::<Vec<_>>();
-        assert_eq!(urls(play_order_for(&[trial.clone(), free.clone(), web.clone(), rd.clone()], None, None)),
-            ["https://x.invalid/rd", "https://x.invalid/w", "https://x.invalid/f", "https://x.invalid/t"]);
-        // Without a key there are only web sources: they play.
-        assert_eq!(urls(play_order_for(&[free, web], None, None)), ["https://x.invalid/w", "https://x.invalid/f"]);
-        // The chosen language still comes first: Italian web audio before English Real-Debrid.
-        let ita = source_of("Absolute Cinema", &json!({"name":"Absolute Cinema","title":"[VixSrc] Film 1080P · 🇬🇧🇮🇹","url":"https://x.invalid/i"}));
-        assert_eq!(urls(play_order_for(&[rd, ita], None, Some("italian")))[0], "https://x.invalid/i");
+        assert_eq!(urls(play_order_for(&[trial.clone(), hd.clone(), uhd.clone()], None, None)),
+            ["https://x.invalid/uhd", "https://x.invalid/hd", "https://x.invalid/t"]);
+        // The chosen language still comes first: Italian audio before untagged English.
+        let ita = source_of("Addon B", &json!({"name":"1080p","title":"Film 1080P · 🇬🇧🇮🇹","url":"https://x.invalid/i"}));
+        assert_eq!(urls(play_order_for(&[uhd, ita], None, Some("italian")))[0], "https://x.invalid/i");
     }
     #[test]
     fn a_refusal_for_too_many_requests_says_so() {
@@ -1926,58 +1924,6 @@ mod autoplay_bench {
             while let Ok(Some(chunk)) = r.chunk().await { got += chunk.len() as u64; if got >= want { break; } }
             Some((ttfb, got as f64 * 8.0 / 1e6 / t2.elapsed().as_secs_f64().max(0.001)))
         }).await.ok().flatten()
-    }
-
-    /// A/B of AIOStreams scrapers: the usual three against them plus eight more, on the same titles,
-    /// through the whole pick (probe, real sizes, audio). Both configurations are deleted after.
-    #[test]
-    #[ignore]
-    fn addon_experiment() {
-        start();
-        set_stream_language(Some("english".into()));
-        let extra = [("knaben", "Knaben"), ("torrent-galaxy", "TorrentGalaxy"), ("the-pirate-bay", "The Pirate Bay"), ("therarbg", "TheRARBG"),
-            ("eztv", "EZTV"), ("torrents-db", "TorrentsDB"), ("peerflix", "Peerflix"), ("meteor", "Meteor")];
-        // BENCH_TIMEOUT=3000: compare the usual scrapers with a shorter per-scraper timeout instead.
-        let short: Option<u64> = std::env::var("BENCH_TIMEOUT").ok().and_then(|t| t.parse().ok());
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let base = crate::addons::trial_config(&[], None).await;
-            let more = match short { Some(ms) => crate::addons::trial_config(&[], Some(ms)).await, None => crate::addons::trial_config(&extra, None).await };
-            println!("configs: usual {}, more {}", base.as_ref().map(|_| "made").unwrap_or_else(|e| { println!("  {e:#}"); "failed" }),
-                more.as_ref().map(|_| "made").unwrap_or_else(|e| { println!("  {e:#}"); "failed" }));
-            if let (Ok((base_url, _)), Ok((more_url, _))) = (&base, &more) {
-                let titles: Vec<String> = std::env::var("BENCH_TITLES").map(|t| t.split(',').map(str::to_owned).collect())
-                    .unwrap_or_else(|_| TITLES.iter().map(|t| t.to_string()).collect());
-                for (n, entry) in titles.iter().enumerate() {
-                    let parts: Vec<&str> = entry.splitn(4, '/').collect();
-                    let (kind, id, name, year) = (parts[0], parts[1], parts.get(2).copied().unwrap_or(""), parts.get(3).and_then(|y| y.parse().ok()));
-                    println!("\n=== {name}");
-                    // AIOStreams limits how fast one client may ask.
-                    if n > 0 { tokio::time::sleep(Duration::from_secs(std::env::var("BENCH_PAUSE").ok().and_then(|p| p.parse().ok()).unwrap_or(0))).await; }
-                    // Alternate which goes first, so neither always meets warm upstream caches.
-                    let order = if n % 2 == 0 { [("usual", base_url), ("more", more_url)] } else { [("more", more_url), ("usual", base_url)] };
-                    for (label, base) in order {
-                        let url = format!("{base}/stream/{kind}/{id}.json");
-                        let t = Instant::now();
-                        let body = on_runtime(async move {
-                            let r = backend_http().get(url).timeout(Duration::from_secs(40)).send().await.ok()?;
-                            r.json::<Value>().await.ok()
-                        }).await.ok().flatten().unwrap_or_default();
-                        let fetch = t.elapsed().as_millis();
-                        let mut list: Vec<Source> = body["streams"].as_array().into_iter().flatten().map(|st| source_of("AIOStreams", st)).filter(|s| !is_3d(&s.label)).collect();
-                        for s in &mut list { s.off_title = !names_title(s, name, year); }
-                        let order = play_order(&list, (kind == "series").then_some(10));
-                        let t = Instant::now();
-                        let pick = pick_source(order.clone(), (kind == "series").then_some(10)).await;
-                        println!("  {label:<5} {:>3} streams in {fetch:>5} ms, {:>3} playable; pick in {:>4} ms: {}", list.len(), order.len(), t.elapsed().as_millis(),
-                            pick.best.as_ref().map(|b| format!("{} {:.60}", source_summary(b), b.filename)).unwrap_or_else(|| "nothing".into()));
-                    }
-                }
-            }
-            for login in [base, more].into_iter().flatten().map(|(_, l)| l) {
-                println!("delete: {}", crate::addons::trial_delete(login).await.map(|_| "ok".to_string()).unwrap_or_else(|e| format!("{e:#}")));
-            }
-        });
     }
 
     /// The app's developer benchmark (`dev_autoplay`) on BENCH_LIST: every title cold, then fetched ahead.

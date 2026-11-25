@@ -27,8 +27,8 @@
 | **Android, Tablet & TV Native** | Full Android TV D-pad/remote navigation and Leanback banner (`arm64` + 32-bit `armv7` APKs), `AudioFocus`, headphone/Bluetooth disconnect auto-pause, system `MediaSession` controls, `Surface.setFrameRate` matching, tablet touch gestures (double-tap ±10s, brightness/volume swipe, long-press 2×), rotation lock, and Picture-in-Picture. |
 | **Local AI Picks** | Endless two-card taste duel powered by an on-device INT8 `bge-small-en-v1.5` embedding model (ONNX Runtime, zero cloud inference) and online Bayesian preference learning with moods, match reasons, and a live shortlist. |
 | **Library & Offline Downloads** | Chronological history, filter tabs (*All, Movies, Series, In progress, Watched, Saved, Downloads*), in-library search, direct offline downloads with automatic offline playback, and Trakt / IMDb / Veylo JSON watch-history import & export. |
-| **Cross-OS Account & Key Sync** | Optional Firebase account (Email, Google, or QR-code desktop linking) that automatically syncs watch progress, library, likes, add-ons, and API keys (sealed with per-account AES-256-GCM) across all your devices. |
-| **Add-ons & Diagnostics** | One-key Real-Debrid setup for curated add-ons, custom Stremio manifest URL install (TorBox, AllDebrid, Premiumize, self-hosted AIOStreams, etc.) with credentials masked and never logged, SHA-256 verified in-app updates, and opt-out redacted cross-OS diagnostics. |
+| **Zero-Knowledge E2EE Sync** | Optional Firebase account (Email, Google, or QR-code desktop linking) that end-to-end encrypts watch progress, library, likes, preferences, TMDB key, and add-ons on-device with AES-256-GCM using a user-held 256-bit Sync Key (transferred automatically over encrypted QR linking). |
+| **Neutral Add-ons & Privacy** | Ships with zero pre-installed streaming add-ons. Supports one-tap `stremio://` & `veylo://` OS deep links, `configurable` manifests, portable add-on bundles, one-time on-device Stremio collection import, and user-supplied directory URLs. Credentials are masked and never logged; browsing prefetch and diagnostics are strictly opt-in; updates fail closed without verified SHA-256 checksums. See [PRIVACY.md](PRIVACY.md). |
 
 ---
 
@@ -160,4 +160,4 @@ Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` trigger
 
 ## Licence
 
-MIT. The bundled **Archivo** font is licensed under the SIL Open Font License. `libmpv`/FFmpeg ship as built by `mpv-android` (Android) and `mpv-winbuild-cmake` (Windows) under their respective licences; ONNX Runtime and `bge-small-en-v1.5` notices are bundled in `picks-ai/`.
+Veylo's source code is licensed under the [MIT License](LICENSE). Distributed binary packages dynamically link GPL-licensed `libmpv` and `FFmpeg` builds and are therefore governed as combined works under the GPL (with corresponding source links and license texts bundled in every release; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)). The bundled **Archivo** font is licensed under the [SIL Open Font License 1.1](apps/veylo-dx/assets/fonts/OFL.txt). ONNX Runtime and `bge-small-en-v1.5` notices are bundled in `picks-ai/`. This product uses the TMDB API but is not endorsed or certified by TMDB. See [PRIVACY.md](PRIVACY.md) for privacy details.

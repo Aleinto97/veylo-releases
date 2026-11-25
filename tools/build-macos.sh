@@ -62,11 +62,21 @@ cat > "$contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>$min_macos</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.entertainment</string>
     <key>NSHighResolutionCapable</key><true/>
-    <!-- Add-on catalogues and artwork aren't all served over HTTPS. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>dev.veylo.dx.addon</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>stremio</string>
+                <string>veylo</string>
+            </array>
+        </dict>
+    </array>
+    <!-- Allow loopback media-proxy and local LAN servers only; enforce HTTPS for remote hosts. -->
     <key>NSAppTransportSecurity</key>
     <dict>
-        <key>NSAllowsArbitraryLoads</key><true/>
-        <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
+        <key>NSAllowsLocalNetworking</key><true/>
     </dict>
 </dict>
 </plist>
@@ -78,9 +88,10 @@ search=(-s "$brew_prefix/lib")
 for formula in mpv $(brew deps mpv); do search+=(-s "$(brew --prefix "$formula")/lib"); done
 dylibbundler -of -b -x "$contents/MacOS/veylo-dx" -d "$contents/Frameworks" -p @executable_path/../Frameworks/ \
     "${search[@]}" < /dev/null >/dev/null
-# Licences of what the bundle carries (mpv, FFmpeg; ONNX Runtime and the model ship theirs in picks-ai).
+# Licences of Veylo, Archivo (SIL OFL), and every bundled Homebrew library (mpv, FFmpeg, codecs).
 mkdir -p "$contents/Resources/licenses"
-for formula in mpv ffmpeg; do
+cp "$root/LICENSE" "$root/PRIVACY.md" "$root/THIRD_PARTY_LICENSES.md" "$app_src/assets/fonts/OFL.txt" "$contents/Resources/licenses/"
+for formula in mpv $(brew deps mpv); do
     prefix=$(brew --prefix "$formula" 2>/dev/null) || continue
     for f in "$prefix"/LICENSE* "$prefix"/COPYING* "$prefix"/Copyright*; do
         [ -f "$f" ] && cp "$f" "$contents/Resources/licenses/$formula-$(basename "$f")"

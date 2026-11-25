@@ -7,12 +7,15 @@
 //!   scans it and hands the computer its session, sealed with the key in that code.
 //!
 //! What syncs: titles with history (saved, watched, rated, progress), each episode's record
-//! (`sync_changes` / `sync_apply`, newest change winning), and your API keys, audio language and
-//! add-ons (`users/{uid}/config/keys`, readable and writable only by your signed-in account).
-//! Signing in on any OS automatically pulls your keys and add-ons with no extra steps. Each
-//! document carries the server's time, so a device whose clock is off still sees every change.
-//! The session (its refresh token) is kept in the app's private folder (0600 on Unix), like
-//! settings.json; it is never logged.
+//! (`sync_changes` / `sync_apply`, newest change winning), and your TMDB key, audio language,
+//! preferences and add-ons (`users/{uid}/config/keys`).
+//!
+//! Zero-knowledge E2EE (v3): both watch-history items and `config/keys` are encrypted on-device
+//! with AES-256-GCM using a randomly generated 256-bit Sync Key that never leaves your devices
+//! in plaintext. QR device linking transfers the Sync Key inside its ephemeral encrypted handshake;
+//! email/Google sign-ins on additional devices can enter the Recovery Key once in Settings.
+//! The session (refresh token) and Sync Key are kept in the app's private folder (`0600` on Unix)
+//! and are never logged.
 use super::*;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -57,10 +60,72 @@ struct Session { account: Account, refresh: String, id_token: String, expires: i
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static LOADED: OnceLock<()> = OnceLock::new();
 static LAST_SYNCED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static SYNC_KEY_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STATE_LOCK: Mutex<()> = Mutex::new(());
 static FORGOTTEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
 fn session_path() -> PathBuf { backend().data_dir.join("account.json") }
+fn sync_key_path() -> PathBuf { backend().data_dir.join("sync-key.json") }
+
+/// Encode a 32-byte E2EE sync key as a human-copyable recovery code (`VEYLO-...`).
+pub fn format_recovery_code(key: &[u8; 32]) -> String {
+    format!("VEYLO-{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key))
+}
+
+/// Parse a `VEYLO-...` (or raw base64url) 256-bit recovery key.
+pub fn parse_recovery_code(raw: &str) -> Result<[u8; 32]> {
+    let clean: String = raw.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    let body = clean.strip_prefix("VEYLO-").or_else(|| clean.strip_prefix("veylo-")).unwrap_or(&clean);
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body)
+        .map_err(|_| anyhow!("That doesn't look like a valid Veylo recovery key."))?;
+    let key: [u8; 32] = bytes.try_into()
+        .map_err(|_| anyhow!("That recovery key is the wrong length."))?;
+    Ok(key)
+}
+
+fn load_sync_key() -> Option<[u8; 32]> {
+    let v: Value = std::fs::read_to_string(sync_key_path()).ok().and_then(|t| serde_json::from_str(&t).ok())?;
+    parse_recovery_code(v["key"].as_str()?).ok()
+}
+
+fn save_sync_key(key: &[u8; 32]) {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    let data = json!({"v": 3, "key": encoded}).to_string();
+    let _ = write_private_file(&sync_key_path(), data.as_bytes());
+}
+
+fn ensure_sync_key() -> Result<[u8; 32]> {
+    if let Some(k) = load_sync_key() { return Ok(k); }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|_| anyhow!("Couldn't generate an encryption key"))?;
+    save_sync_key(&key);
+    Ok(key)
+}
+
+/// The current device's E2EE Recovery Key (generated on first use when signed in).
+pub fn sync_recovery_code() -> Option<String> {
+    account()?;
+    ensure_sync_key().ok().map(|k| format_recovery_code(&k))
+}
+
+/// True when the account has v3 encrypted cloud data that this device's current key couldn't open.
+pub fn sync_key_needed() -> bool {
+    SYNC_KEY_NEEDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Replace this device's local Sync Key with a Recovery Key from another device and trigger sync.
+pub async fn set_sync_recovery_code(code: &str) -> Result<(usize, usize)> {
+    let key = parse_recovery_code(code)?;
+    save_sync_key(&key);
+    SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Reset sync cursors so encrypted cloud items and keys are re-read with the new key.
+    let mut st = load_state();
+    st.taken_until = None;
+    st.keys_hash.clear();
+    st.keys_updated = 0;
+    save_state(&st);
+    sync_now().await
+}
 
 fn load_session() {
     LOADED.get_or_init(|| {
@@ -82,7 +147,11 @@ fn save_session(session: Option<&Session>) {
             let data = json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":x.refresh}).to_string();
             let _ = write_private_file(&path, data.as_bytes());
         }
-        None => { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(state_path()); }
+        None => {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(state_path());
+            let _ = std::fs::remove_file(sync_key_path());
+        }
     }
 }
 
@@ -319,6 +388,7 @@ fn forget_session() {
     if let Ok(mut slot) = SESSION.lock() { *slot = None; }
     if let Ok(mut f) = FORGOTTEN.lock() { f.clear(); }
     LAST_SYNCED.store(0, std::sync::atomic::Ordering::Relaxed);
+    SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     save_session(None);
 }
 
@@ -363,7 +433,6 @@ pub(super) fn documents_pub() -> Option<String> { documents() }
 pub(super) async fn id_token_pub() -> Result<(String, String)> { id_token().await }
 pub(super) async fn commit_pub(token: &str, writes: Vec<Value>) -> Result<()> { commit(token, writes).await }
 pub(super) async fn get_doc_pub(token: &str, path: String) -> Result<Option<Value>> { get_doc(token, path).await }
-pub(super) fn device_name_pub() -> String { device_name() }
 pub(super) fn random_id_pub(bytes: usize) -> String { random_text(bytes).replace(['-', '_'], "x") }
 pub(super) async fn anon_sign_up_pub() -> Result<Value> { identity("signUp", json!({"returnSecureToken": true})).await }
 pub(super) async fn anon_delete_pub(token: &str) -> Result<Value> { identity("delete", json!({"idToken": token})).await }
@@ -391,10 +460,37 @@ async fn list_items(token: &str, uid: &str, since: Option<&str>, limit: usize) -
     }).collect())
 }
 
-/// A synced row as a document write: its data as JSON text, and the server's time.
-fn item_write(base: &str, uid: &str, id: &str, data: &Value) -> Value {
-    json!({"update":{"name":format!("{base}/users/{uid}/items/{id}"),"fields":{"data":{"stringValue":data.to_string()}}},
-        "updateTransforms":[{"fieldPath":"synced","setToServerValue":"REQUEST_TIME"}]})
+/// A synced row as an end-to-end encrypted document write (AES-256-GCM with the user's 256-bit
+/// Sync Key), plus the server's timestamp.
+fn item_write(base: &str, uid: &str, id: &str, data: &Value, sync_key: &[u8; 32]) -> Result<Value> {
+    let sealed = seal(sync_key, data.to_string().as_bytes())?;
+    Ok(json!({
+        "update": {
+            "name": format!("{base}/users/{uid}/items/{id}"),
+            "fields": {
+                "sealed": {"stringValue": sealed},
+                "v": {"integerValue": "3"},
+            }
+        },
+        "updateTransforms": [{"fieldPath": "synced", "setToServerValue": "REQUEST_TIME"}]
+    }))
+}
+
+#[derive(Debug, PartialEq)]
+enum ItemOpen { Ok(Value), WrongKey, Empty }
+
+fn open_item_fields(fields: &Value, sync_key: &[u8; 32]) -> ItemOpen {
+    if let Some(sealed) = fields["sealed"]["stringValue"].as_str() {
+        return match open_sealed(sync_key, sealed).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+            Some(v) => ItemOpen::Ok(v),
+            None => ItemOpen::WrongKey,
+        };
+    }
+    // Seamless migration fallback for legacy plaintext item docs.
+    match fields["data"]["stringValue"].as_str().and_then(|t| serde_json::from_str::<Value>(t).ok()) {
+        Some(v) => ItemOpen::Ok(v),
+        None => ItemOpen::Empty,
+    }
 }
 
 fn doc_id(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes()))[..40].to_owned() }
@@ -497,19 +593,29 @@ pub async fn sync_now() -> Result<(usize, usize)> {
     let _one = SYNCING.lock().await;
     let (token, uid) = id_token().await?;
     let base = documents().context("Accounts aren't set up in this build")?;
+    let sync_key = ensure_sync_key()?;
     let mut st = load_state();
     // Take: every document the server changed since the last time, in pages.
     let mut taken = 0;
+    let mut wrong_key_seen = false;
     loop {
         let docs = list_items(&token, &uid, st.taken_until.as_deref(), 300).await?;
         if docs.is_empty() { break; }
         let (mut media, mut playback) = (Vec::new(), Vec::new());
         for (_, fields) in &docs {
-            let Some(row) = fields["data"]["stringValue"].as_str().and_then(|t| serde_json::from_str::<Value>(t).ok()) else { continue };
+            let row = match open_item_fields(fields, &sync_key) {
+                ItemOpen::Ok(row) => row,
+                ItemOpen::WrongKey => { wrong_key_seen = true; continue; }
+                ItemOpen::Empty => continue,
+            };
             let key = row_key(&row);
             st.known.insert(key.clone());
             if let Some(t) = row["updated"].as_i64() { st.seen.insert(key.clone(), t); }
             if key.starts_with("p|") { playback.push(row) } else { media.push(row) }
+        }
+        if wrong_key_seen {
+            SYNC_KEY_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("Your synced data is encrypted with another device's Recovery Key. Enter it under Settings → Account.");
         }
         taken += docs.len();
         exec(json!({"op":"sync_apply","media":media,"playback":playback})).await?;
@@ -517,6 +623,12 @@ pub async fn sync_now() -> Result<(usize, usize)> {
         save_state(&st);
         if docs.len() < 300 { break; }
     }
+    // Sync encrypted keys & add-ons before pushing so we detect a mismatched key before overwriting.
+    if let Err(e) = sync_keys(&token, &uid, &base, &sync_key, &mut st).await {
+        if sync_key_needed() { return Err(e); }
+        dev_log(&format!("keys: {e}"));
+    }
+    SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     // Send: what changed here since the last time, but not what just came from elsewhere.
     let changes = exec(json!({"op":"sync_changes","since":st.sent_until})).await?;
     let mut writes = Vec::new();
@@ -532,7 +644,7 @@ pub async fn sync_now() -> Result<(usize, usize)> {
         if let Some(o) = data.as_object_mut() { o.remove("key"); o.remove("history"); }
         data["t"] = json!(if key.starts_with("p|") { "p" } else { "m" });
         if data.get("meta").is_some() { data["meta"] = slim_meta(&row["meta"]); }
-        writes.push(item_write(&base, &uid, &doc_id(&key), &data));
+        writes.push(item_write(&base, &uid, &doc_id(&key), &data, &sync_key)?);
         st.seen.insert(key.clone(), updated);
         st.known.insert(key);
     }
@@ -545,7 +657,7 @@ pub async fn sync_now() -> Result<(usize, usize)> {
     }
     for gone in &pending_forgotten {
         let key = row_key(gone);
-        writes.push(item_write(&base, &uid, &doc_id(&key), gone));
+        writes.push(item_write(&base, &uid, &doc_id(&key), gone, &sync_key)?);
     }
     let sent = writes.len();
     if let Err(e) = commit(&token, writes).await {
@@ -559,7 +671,6 @@ pub async fn sync_now() -> Result<(usize, usize)> {
     // A second's changes may still be coming: the next sync looks at that second again.
     st.sent_until = (newest - 1).max(st.sent_until);
     st.last = now_secs();
-    if let Err(e) = sync_keys(&token, &uid, &base, &mut st).await { dev_log(&format!("keys: {e}")); }
     save_state(&st);
     Ok((taken, sent))
 }
@@ -604,33 +715,32 @@ pub fn start_sync() {
     });
 }
 
-// ---------------------------------------------------------------- automatic API keys & add-ons sync
-// Your Real-Debrid key, TMDB key, audio language and add-ons sync automatically through your
-// account's private Firestore document (`users/{uid}/config/keys`, readable/writable only by your
-// signed-in account). Signing in on any OS pulls them automatically without prompting another device.
+// ---------------------------------------------------------------- encrypted settings & add-ons sync
+// Your TMDB key, audio language, preferences and add-ons sync through your account's private
+// Firestore document (`users/{uid}/config/keys`), end-to-end encrypted with your 256-bit Sync Key.
 
-/// The device the keys came from, once they arrived here (shown once).
+/// The device the synced settings came from, once they arrived here (shown once).
 static ARRIVED: Mutex<Option<String>> = Mutex::new(None);
 
-/// What this device is called in sync metadata.
+/// Generic platform label in sync metadata (never sends computer hostnames or device serials).
 fn device_name() -> String {
     #[cfg(target_os = "android")]
-    { crate::android::property(c"ro.product.model").unwrap_or_else(|| "Android device".into()) }
+    { if crate::is_tv() { "Android TV".into() } else { "Android".into() } }
     #[cfg(windows)]
-    { std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into()) }
+    { "Windows".into() }
     #[cfg(target_os = "macos")]
-    { "Mac".into() }
+    { "macOS".into() }
     #[cfg(all(not(target_os = "android"), not(windows), not(target_os = "macos")))]
-    { std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).unwrap_or_else(|| "Computer".into()) }
+    { "Linux".into() }
 }
 
-/// The keys this device can hand over, None when it has neither.
-fn keys_here() -> Option<Value> {
+/// The settings this device can hand over during QR linking.
+fn keys_here() -> Value {
     let s = load_settings();
-    (s.rd_key.is_some() || s.tmdb_key.is_some()).then(|| json!({"rd_key": s.rd_key, "tmdb_key": s.tmdb_key, "stream_language": s.stream_language}))
+    json!({"tmdb_key": s.tmdb_key, "stream_language": s.stream_language})
 }
 
-/// The device your keys just came from (once).
+/// The device your synced settings just came from (once).
 pub fn take_keys_arrived() -> Option<String> { ARRIVED.lock().ok()?.take() }
 
 async fn get_doc(token: &str, path: String) -> Result<Option<Value>> {
@@ -647,9 +757,10 @@ fn keys_digest(payload: &Value) -> String {
     format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
 }
 
-fn has_any_key(payload: &Value) -> bool {
-    payload["rd_key"].as_str().is_some_and(|v| !v.trim().is_empty())
-        || payload["tmdb_key"].as_str().is_some_and(|v| !v.trim().is_empty())
+fn has_any_sync_config(payload: &Value) -> bool {
+    payload["tmdb_key"].as_str().is_some_and(|v| !v.trim().is_empty())
+        || payload["addons"]["urls"].as_array().is_some_and(|a| !a.is_empty())
+        || payload["addons"]["others"].as_array().is_some_and(|a| !a.is_empty())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -657,7 +768,6 @@ enum KeysSyncAction { Adopt, Push, KeepSynced, Noop }
 
 struct KeysSyncInput<'a> {
     local_has_keys: bool,
-    local_rd_removed: bool,
     local_hash: &'a str,
     last_synced_hash: &'a str,
     last_synced_updated: i64,
@@ -666,18 +776,18 @@ struct KeysSyncInput<'a> {
     remote_updated: i64,
 }
 
-/// Decide whether this device should pull remote keys, push local keys, or do nothing.
+/// Decide whether this device should pull remote config, push local config, or do nothing.
 fn decide_keys_sync(i: &KeysSyncInput<'_>) -> KeysSyncAction {
     let local_changed = !i.last_synced_hash.is_empty() && i.local_hash != i.last_synced_hash;
-    // A newly signed-in device (any OS) without keys automatically adopts the account's keys.
-    if !i.local_has_keys && !i.local_rd_removed && i.remote_has_keys && !local_changed {
+    // A newly signed-in device without keys/add-ons adopts the account's config automatically.
+    if !i.local_has_keys && i.remote_has_keys && !local_changed {
         return KeysSyncAction::Adopt;
     }
-    // Local keys, language or add-ons were edited on this device since last sync: push them.
+    // Local settings or add-ons were edited on this device since last sync: push them.
     if local_changed {
         return KeysSyncAction::Push;
     }
-    // First sync on a device that already has keys configured.
+    // First sync on a device that already has keys/add-ons configured.
     if i.last_synced_hash.is_empty() && i.local_has_keys {
         return match i.remote_hash {
             Some(rh) if rh == i.local_hash => KeysSyncAction::KeepSynced,
@@ -696,10 +806,9 @@ fn decide_keys_sync(i: &KeysSyncInput<'_>) -> KeysSyncAction {
     KeysSyncAction::Noop
 }
 
-/// Derive a per-account 256-bit AES-GCM key so synced API keys & add-ons are never stored
-/// in plaintext in Firestore while remaining automatically decryptable on every OS signed in
-/// to this account.
-fn keys_envelope_key(uid: &str, project: &str) -> [u8; 32] {
+/// Legacy v2 deterministic key derivation, kept READ-ONLY strictly to migrate pre-E2EE documents
+/// into real v3 zero-knowledge encryption on first sync. Never used to encrypt new data.
+fn legacy_v2_envelope_key(uid: &str, project: &str) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"veylo-account-keys-v2\0");
     h.update(project.as_bytes());
@@ -708,28 +817,43 @@ fn keys_envelope_key(uid: &str, project: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn seal_keys_payload(uid: &str, project: &str, payload: &Value) -> Result<String> {
-    let key = keys_envelope_key(uid, project);
-    seal(&key, payload.to_string().as_bytes())
+fn seal_keys_payload(sync_key: &[u8; 32], payload: &Value) -> Result<String> {
+    seal(sync_key, payload.to_string().as_bytes())
 }
 
-fn open_keys_payload(uid: &str, project: &str, fields: &Value) -> Option<Value> {
+#[derive(Debug, PartialEq)]
+enum KeysOpen { V3(Value), Legacy(Value), WrongKey, Empty }
+
+fn open_keys_payload(sync_key: &[u8; 32], uid: &str, project: &str, fields: &Value) -> KeysOpen {
+    let ver = fields["v"]["integerValue"].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
     if let Some(sealed) = fields["sealed"]["stringValue"].as_str() {
-        let key = keys_envelope_key(uid, project);
-        let plain = open_sealed(&key, sealed)?;
-        return serde_json::from_slice::<Value>(&plain).ok();
+        if ver >= 3 {
+            return match open_sealed(sync_key, sealed).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                Some(v) => KeysOpen::V3(v),
+                None => KeysOpen::WrongKey,
+            };
+        }
+        // Legacy v2 doc: migrate cleanly to v3 E2EE.
+        let legacy_key = legacy_v2_envelope_key(uid, project);
+        if let Some(v) = open_sealed(&legacy_key, sealed).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+            return KeysOpen::Legacy(v);
+        }
+        return KeysOpen::Empty;
     }
-    // Seamless migration from v1 plaintext documents.
-    fields["data"]["stringValue"].as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
+    // Legacy v1 plaintext doc: migrate cleanly to v3 E2EE.
+    match fields["data"]["stringValue"].as_str().and_then(|t| serde_json::from_str::<Value>(t).ok()) {
+        Some(v) => KeysOpen::Legacy(v),
+        None => KeysOpen::Empty,
+    }
 }
 
-/// Automatically sync API keys, audio language and add-ons through `users/{uid}/config/keys`.
-async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result<()> {
+/// Automatically sync TMDB key, audio language, preferences and add-ons through
+/// `users/{uid}/config/keys` using real zero-knowledge v3 AES-256-GCM encryption.
+async fn sync_keys(token: &str, uid: &str, base: &str, sync_key: &[u8; 32], st: &mut State) -> Result<()> {
     let project = config().map(|c| c.project).unwrap_or_default();
     let settings = load_settings();
     let local_addons = crate::addons::for_handoff().await;
     let local = json!({
-        "rd_key": settings.rd_key,
         "tmdb_key": settings.tmdb_key,
         "stream_language": settings.stream_language,
         "addons": local_addons,
@@ -748,13 +872,20 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
         "track_prefs": export_track_prefs_value(),
     });
     let local_hash = keys_digest(&local);
-    let local_has_keys = has_any_key(&local);
+    let local_has_keys = has_any_sync_config(&local);
 
     let doc_path = format!("{base}/users/{uid}/config/keys");
     let remote_doc = get_doc(token, doc_path.clone()).await?;
     let remote_fields = remote_doc.as_ref().map(|d| &d["fields"]);
-    let remote_is_legacy_plain = remote_fields.is_some_and(|f| f["sealed"]["stringValue"].is_null() && f["data"]["stringValue"].is_string());
-    let remote_data = remote_fields.and_then(|f| open_keys_payload(uid, project, f));
+    let (remote_data, remote_is_legacy) = match remote_fields.map(|f| open_keys_payload(sync_key, uid, project, f)) {
+        Some(KeysOpen::V3(v)) => (Some(v), false),
+        Some(KeysOpen::Legacy(v)) => (Some(v), true),
+        Some(KeysOpen::WrongKey) => {
+            SYNC_KEY_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("Your synced settings are encrypted with another device's Recovery Key. Enter it under Settings → Account.");
+        }
+        Some(KeysOpen::Empty) | None => (None, false),
+    };
     let remote_updated = remote_fields
         .and_then(|f| f["updated"]["integerValue"].as_str())
         .and_then(|t| t.parse::<i64>().ok())
@@ -764,11 +895,10 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
         .unwrap_or_default()
         .to_owned();
     let remote_hash = remote_data.as_ref().map(keys_digest);
-    let remote_has_keys = remote_data.as_ref().is_some_and(has_any_key);
+    let remote_has_keys = remote_data.as_ref().is_some_and(has_any_sync_config);
 
     let mut action = decide_keys_sync(&KeysSyncInput {
         local_has_keys,
-        local_rd_removed: settings.rd_key_removed,
         local_hash: &local_hash,
         last_synced_hash: &st.keys_hash,
         last_synced_updated: st.keys_updated,
@@ -776,8 +906,8 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
         remote_hash: remote_hash.as_deref(),
         remote_updated,
     });
-    // Upgrade legacy plaintext documents to sealed v2 once local matches.
-    if remote_is_legacy_plain && matches!(action, KeysSyncAction::KeepSynced | KeysSyncAction::Noop) && local_has_keys {
+    // Upgrade legacy v1/v2 documents to true v3 E2EE once local matches.
+    if remote_is_legacy && matches!(action, KeysSyncAction::KeepSynced | KeysSyncAction::Noop) {
         action = KeysSyncAction::Push;
     }
 
@@ -787,7 +917,6 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
                 adopt_keys(&remote).await;
                 let after = load_settings();
                 let adopted = json!({
-                    "rd_key": after.rd_key,
                     "tmdb_key": after.tmdb_key,
                     "stream_language": after.stream_language,
                     "addons": crate::addons::for_handoff().await,
@@ -807,7 +936,7 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
                 });
                 st.keys_hash = keys_digest(&adopted);
                 st.keys_updated = remote_updated;
-                if has_any_key(&remote) {
+                if has_any_sync_config(&remote) {
                     if let Ok(mut a) = ARRIVED.lock() { *a = Some(remote_device); }
                 }
                 dev_log("keys: synced automatically from account");
@@ -815,13 +944,13 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
         }
         KeysSyncAction::Push => {
             let updated = now_secs().max(remote_updated + 1);
-            let sealed = seal_keys_payload(uid, project, &local)?;
+            let sealed = seal_keys_payload(sync_key, &local)?;
             commit(token, vec![json!({
                 "update": {
                     "name": doc_path,
                     "fields": {
                         "sealed": {"stringValue": sealed},
-                        "v": {"integerValue": "2"},
+                        "v": {"integerValue": "3"},
                         "updated": {"integerValue": updated.to_string()},
                         "device": {"stringValue": device_name()},
                     }
@@ -830,7 +959,7 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
             })]).await?;
             st.keys_hash = local_hash;
             st.keys_updated = updated;
-            dev_log("keys: saved (sealed) to account");
+            dev_log("keys: saved (E2EE v3) to account");
         }
         KeysSyncAction::KeepSynced => {
             st.keys_hash = local_hash;
@@ -841,13 +970,11 @@ async fn sync_keys(token: &str, uid: &str, base: &str, st: &mut State) -> Result
     Ok(())
 }
 
-/// Keys from your account or another device: saved here, then add-ons set up with them.
+/// Settings and add-ons from your account or another device: saved here, then add-ons adopted.
 async fn adopt_keys(v: &Value) {
     let text = |k: &str| v[k].as_str().map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
-    let (rd, tmdb, language) = (text("rd_key"), text("tmdb_key"), text("stream_language"));
+    let (tmdb, language) = (text("tmdb_key"), text("stream_language"));
     update_settings(|s| {
-        if rd.is_some() { s.rd_key = rd.clone(); s.rd_key_removed = false; }
-        else if v.get("rd_key").is_some_and(Value::is_null) { s.rd_key = None; s.rd_key_removed = true; }
         if tmdb.is_some() { s.tmdb_key = tmdb.clone(); }
         else if v.get("tmdb_key").is_some_and(Value::is_null) { s.tmdb_key = None; }
         if let Some(l) = language.clone().filter(|l| crate::addons::language(l).is_some()) { s.stream_language = Some(l); }
@@ -910,15 +1037,22 @@ pub async fn take_link(offer: &LinkOffer) -> Result<Option<Account>> {
         refresh: s(&v, "refresh"), ..Session::default()
     };
     anyhow::ensure!(!session.refresh.is_empty(), "The code didn't match. Show a new one and scan it again.");
-    if v["keys"].is_object() && keys_here().is_none() { adopt_keys(&v["keys"]).await; }
+    // Transfer the E2EE Sync Key before starting sync so encrypted history & add-ons open immediately.
+    if let Some(code) = v["sync_key"].as_str() {
+        if let Ok(k) = parse_recovery_code(code) {
+            save_sync_key(&k);
+            SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if v["keys"].is_object() { adopt_keys(&v["keys"]).await; }
     let account = set_session(session);
     id_token().await?;
     Ok(Some(account))
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-/// The phone's half: answer a computer's QR code with this account's session, sealed with the
-/// code's key (only that computer can open it).
+/// The phone's half: answer a computer's QR code with this account's session and E2EE Sync Key,
+/// sealed with the code's ephemeral key (only that computer can open it).
 pub async fn answer_link(code: &str) -> Result<()> {
     let parts: Vec<&str> = code.trim().split(':').collect();
     let ["veylo-link", "1", link, key] = parts[..] else { anyhow::bail!("That isn't a Veylo sign-in code.") };
@@ -926,11 +1060,17 @@ pub async fn answer_link(code: &str) -> Result<()> {
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(key).ok().filter(|k| k.len() == 32).context("That isn't a Veylo sign-in code.")?;
     let (token, _) = id_token().await?;
     let session = SESSION.lock().ok().and_then(|x| x.clone()).context("Not signed in")?;
+    let sync_key = ensure_sync_key()?;
     let a = &session.account;
-    // Your keys and add-ons go along, sealed the same way: the computer is set up like this phone.
-    let mut keys = keys_here().unwrap_or(Value::Null);
-    if !keys.is_null() { keys["addons"] = crate::addons::for_handoff().await; }
-    let plain = json!({"uid":a.uid,"email":a.email,"name":a.name,"provider":a.provider,"refresh":session.refresh,"keys":keys}).to_string();
+    // Your settings, add-ons and E2EE Sync Key travel inside the ephemeral encrypted QR handshake.
+    let mut keys = keys_here();
+    keys["addons"] = crate::addons::for_handoff().await;
+    let plain = json!({
+        "uid": a.uid, "email": a.email, "name": a.name, "provider": a.provider,
+        "refresh": session.refresh,
+        "sync_key": format_recovery_code(&sync_key),
+        "keys": keys,
+    }).to_string();
     let sealed = seal(&key, plain.as_bytes())?;
     let base = documents().context("Accounts aren't set up in this build")?;
     post(format!("https://firestore.googleapis.com/v1/{base}:commit"), json!({"writes":[{
@@ -996,32 +1136,32 @@ mod tests {
     fn automatic_keys_sync_decision_covers_cross_os_flows() {
         // Fresh device on a different OS (no keys): adopts automatically from account.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: false, local_rd_removed: false, local_hash: "h0", last_synced_hash: "", last_synced_updated: 0,
+            local_has_keys: false, local_hash: "h0", last_synced_hash: "", last_synced_updated: 0,
             remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
         }), KeysSyncAction::Adopt);
         // First device with keys, empty account: pushes automatically.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "", last_synced_updated: 0,
+            local_has_keys: true, local_hash: "h1", last_synced_hash: "", last_synced_updated: 0,
             remote_has_keys: false, remote_hash: None, remote_updated: 0,
         }), KeysSyncAction::Push);
         // Local edit after syncing: pushes new keys.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: true, local_rd_removed: false, local_hash: "h2", last_synced_hash: "h1", last_synced_updated: 100,
+            local_has_keys: true, local_hash: "h2", last_synced_hash: "h1", last_synced_updated: 100,
             remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
         }), KeysSyncAction::Push);
         // Another device pushed newer keys: adopts automatically.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
+            local_has_keys: true, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
             remote_has_keys: true, remote_hash: Some("h2"), remote_updated: 200,
         }), KeysSyncAction::Adopt);
         // Already in sync: noop.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: true, local_rd_removed: false, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
+            local_has_keys: true, local_hash: "h1", last_synced_hash: "h1", last_synced_updated: 100,
             remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
         }), KeysSyncAction::Noop);
         // Key removed locally after syncing: pushes removal.
         assert_eq!(decide_keys_sync(&KeysSyncInput {
-            local_has_keys: false, local_rd_removed: true, local_hash: "h_empty", last_synced_hash: "h1", last_synced_updated: 100,
+            local_has_keys: false, local_hash: "h_empty", last_synced_hash: "h1", last_synced_updated: 100,
             remote_has_keys: true, remote_hash: Some("h1"), remote_updated: 100,
         }), KeysSyncAction::Push);
     }
@@ -1049,16 +1189,36 @@ mod tests {
     }
 
     #[test]
-    fn account_keys_seal_roundtrip_and_uid_isolation() {
-        let payload = json!({"rd_key": "RD-SECRET-123", "tmdb_key": "TMDB-999", "stream_language": "italian", "addons": []});
-        let sealed = seal_keys_payload("uid-alice", "veylo-proj", &payload).unwrap();
-        assert!(!sealed.contains("RD-SECRET-123"), "sealed blob must not leak keys");
-        let fields = json!({"sealed": {"stringValue": sealed}});
-        assert_eq!(open_keys_payload("uid-alice", "veylo-proj", &fields), Some(payload.clone()));
-        assert_eq!(open_keys_payload("uid-bob", "veylo-proj", &fields), None, "other uid must not decrypt");
-        // Legacy v1 plaintext documents remain readable during migration.
+    fn e2ee_sync_key_protects_both_config_and_watch_history_items() {
+        let key_a = [0x42u8; 32];
+        let key_b = [0x99u8; 32];
+        let code = format_recovery_code(&key_a);
+        assert!(code.starts_with("VEYLO-"));
+        assert_eq!(parse_recovery_code(&code).unwrap(), key_a);
+        assert!(parse_recovery_code("not-a-valid-key").is_err());
+
+        // Config/keys v3 E2EE: Firebase operator (knowing uid + project) CANNOT decrypt.
+        let payload = json!({"tmdb_key": "TMDB-999", "stream_language": "italian", "addons": {"urls": ["https://a.example/manifest.json"]}});
+        let sealed = seal_keys_payload(&key_a, &payload).unwrap();
+        assert!(!sealed.contains("TMDB-999"), "sealed blob must not leak keys");
+        let fields = json!({"sealed": {"stringValue": sealed}, "v": {"integerValue": "3"}});
+        assert_eq!(open_keys_payload(&key_a, "uid-alice", "veylo-proj", &fields), KeysOpen::V3(payload.clone()));
+        assert_eq!(open_keys_payload(&key_b, "uid-alice", "veylo-proj", &fields), KeysOpen::WrongKey);
+        let deterministic = legacy_v2_envelope_key("uid-alice", "veylo-proj");
+        assert_eq!(open_keys_payload(&deterministic, "uid-alice", "veylo-proj", &fields), KeysOpen::WrongKey);
+
+        // Legacy v1 plaintext documents remain readable once for migration.
         let legacy = json!({"data": {"stringValue": payload.to_string()}});
-        assert_eq!(open_keys_payload("uid-alice", "veylo-proj", &legacy), Some(payload));
+        assert_eq!(open_keys_payload(&key_a, "uid-alice", "veylo-proj", &legacy), KeysOpen::Legacy(payload));
+
+        // Watch-history item v3 E2EE: title ID & name never appear in Firestore fields.
+        let item = json!({"t": "m", "type": "movie", "id": "tt1375666", "name": "Inception", "watched": true});
+        let write = item_write("projects/p/databases/(default)/documents", "uid-alice", "doc1", &item, &key_a).unwrap();
+        let write_str = write.to_string();
+        assert!(!write_str.contains("tt1375666") && !write_str.contains("Inception"));
+        let item_fields = &write["update"]["fields"];
+        assert_eq!(open_item_fields(item_fields, &key_a), ItemOpen::Ok(item.clone()));
+        assert_eq!(open_item_fields(item_fields, &key_b), ItemOpen::WrongKey);
     }
 
     #[test]
@@ -1115,7 +1275,7 @@ mod tests {
             let (token, uid) = id_token().await.unwrap();
             let docs = list_items(&token, &uid, None, 50).await.unwrap();
             println!("on the server: {} document(s)", docs.len());
-            assert!(docs.iter().any(|(_, f)| f["data"]["stringValue"].as_str().is_some_and(|d| d.contains("tt1375666"))));
+            assert!(docs.iter().any(|(_, f)| f["sealed"]["stringValue"].is_string() && f["data"].is_null()));
             // The QR handshake: a computer asks, the phone (this session) answers, the computer takes it.
             let offer = offer_link().await.unwrap();
             assert!(take_link(&offer).await.unwrap().is_none(), "unanswered yet");

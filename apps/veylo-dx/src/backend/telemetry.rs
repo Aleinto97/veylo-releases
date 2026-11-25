@@ -1,11 +1,11 @@
-//! Firebase cross-OS diagnostics & issue reporting (enabled by default, toggleable in Settings).
+//! Firebase cross-OS diagnostics & issue reporting (strictly opt-in: disabled by default in Settings).
 //! Captures crashes (`last-panic.txt`), WebView JS / layout overflow errors, playback failures,
 //! frame-drop / slow-autoplay performance issues, and manual user reports—always strictly redacted
-//! (never URLs, API keys, tokens, emails, or watch history).
+//! (never URLs, API keys, tokens, emails, hostnames, user home paths, or watch history).
 //!
 //! Signed-in devices write to `users/{uid}/diagnostics/{id}` (readable across all your devices
 //! in Settings and in Firebase Console). Signed-out devices submit create-only anonymous reports
-//! to `diagnostics/{id}` (when rules allow).
+//! to `diagnostics/{id}` only when explicitly opted in or manually submitted.
 use super::*;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,12 +56,13 @@ fn sanitize_text(text: &str, max_chars: usize) -> String {
 fn build_fields(kind: &str, summary: &str, details: &str, created: i64) -> Value {
     let settings = load_settings();
     let (screen, _) = crate::display::summary(crate::display::screen(), settings.hdr_output);
+    let generic_device = format!("{} ({})", platform_tag(), std::env::consts::ARCH);
     json!({
         "kind": {"stringValue": sanitize_text(kind, 40)},
         "os": {"stringValue": platform_tag()},
         "arch": {"stringValue": std::env::consts::ARCH},
         "version": {"stringValue": env!("CARGO_PKG_VERSION")},
-        "device": {"stringValue": sanitize_text(&account::device_name_pub(), 80)},
+        "device": {"stringValue": generic_device},
         "screen": {"stringValue": sanitize_text(&screen, 80)},
         "summary": {"stringValue": sanitize_text(summary, 360)},
         "details": {"stringValue": sanitize_text(details, 7500)},

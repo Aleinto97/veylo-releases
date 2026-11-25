@@ -37,17 +37,11 @@ pub struct Source {
     pub audio_tracks_count: Option<u8>,
     /// Video codec read from the container header ("av1", "hevc", "avc"), when available.
     pub video_codec: Option<&'static str>,
-    /// Marked nuked on PreDB (corrupt, out-of-sync, bad audio, fake): ranked behind clean releases.
-    pub nuked: bool,
-    /// Release authenticity against srrDB: +1 = verified release with expected size, 0 = neutral,
-    /// -1 = claims a verified scene release name with suspiciously tiny file size.
-    pub scene_trust: i8,
 }
 
-/// Full metadata and playback context passed to Autoplay v2 so it can match localized titles,
+/// Full metadata and playback context passed to Autoplay so it can match localized titles,
 /// pick the right language (including per-title preference & original-language fallback), reject
-/// hidden trailers/extras by runtime, avoid PreDB-nuked releases, and fit the stream bitrate to
-/// the current connection.
+/// hidden trailers/extras by runtime, and fit the stream bitrate to the current connection.
 #[derive(Clone, Debug, Default)]
 pub struct AutoplayContext {
     /// Display title plus original/localized alternate titles (free metadata prioritized).
@@ -67,8 +61,6 @@ pub struct AutoplayContext {
     pub episode_code: Option<(i64, i64)>,
     /// When true, autoplay never silently plays an off-title source (only exact title matches).
     pub strict_title: bool,
-    /// Optional release intelligence from free metadata-only srrDB + PreDB.net.
-    pub intel: Option<ReleaseIntel>,
 }
 
 impl AutoplayContext {
@@ -242,16 +234,12 @@ pub(super) fn source_of(addon: &str, v: &Value) -> Source {
         picture: None,
         audio_tracks_count: None,
         video_codec: None,
-        nuked: false,
-        scene_trust: 0,
     }
 }
 
 pub(super) fn quality_rank(q: Option<&str>) -> u8 { match q { Some("4K") => 0, Some("1440p") => 1, Some("1080p") => 2, Some("720p") => 3, Some("SD") => 4, _ => 5 } }
 
-/// Every add-on's sources for one video, best declared quality first; add-on order kept within a quality.
-/// With a Real-Debrid key the free web add-ons are asked only when the debrid ones have nothing
-/// Play could use (an expired subscription, an add-on down).
+/// Every installed stream add-on's sources for one video, best declared quality first; add-on order kept within a quality.
 pub async fn sources(kind: &str, video_id: &str) -> Result<(Vec<Source>, Vec<String>)> {
     sources_within(kind, video_id, None, None).await.map(|(list, failed, _)| (list, failed))
 }
@@ -266,17 +254,7 @@ pub(super) const ADDON_GRACE: Duration = Duration::from_secs(6);
 pub(super) async fn sources_within(kind: &str, video_id: &str, grace: Option<Duration>, early: Option<tokio::sync::mpsc::UnboundedSender<Vec<Source>>>) -> Result<(Vec<Source>, Vec<String>, bool)> {
     let targets = exec(json!({"op":"streams_targets","type":kind,"id":video_id})).await?;
     let targets: Vec<Value> = targets["targets"].as_array().cloned().unwrap_or_default();
-    let (free, debrid): (Vec<Value>, Vec<Value>) = targets.iter().cloned().partition(|t| crate::addons::is_free_addon(&s(t, "addon_name")));
-    let debrid_first = load_settings().rd_key.is_some() && !debrid.is_empty();
-    let first = if debrid_first { debrid } else { targets };
-    let (mut out, mut failed, mut complete) = ask_addons(kind, video_id, first, grace, early.clone()).await?;
-    // The free add-ons stand in when the debrid ones have nothing Play can use.
-    if debrid_first && !free.is_empty() && !out.iter().any(playable) {
-        let (more, more_failed, more_complete) = ask_addons(kind, video_id, free, grace, early).await?;
-        out.extend(more);
-        failed.extend(more_failed);
-        complete &= more_complete;
-    }
+    let (mut out, failed, complete) = ask_addons(kind, video_id, targets, grace, early).await?;
     out.sort_by_key(|x| (x.kind != SourceKind::Direct, quality_rank(x.quality)));
     Ok((out, failed, complete))
 }
@@ -534,7 +512,7 @@ pub(super) fn order_key_for(s: &Source, size: u64, lang: Option<&crate::addons::
         Some(l) if other_language_only(&s.label, l.key) => 2,
         Some(l) => u8::from(l.key != "english"),
     };
-    let provider = if !crate::addons::is_free_addon(&s.addon) { 0 } else if s.label.to_uppercase().contains("FREE TRIAL") { 2 } else { 1 };
+    let provider = u8::from(s.label.to_uppercase().contains("FREE TRIAL"));
     let hdr = verified_hdr_tier(s);
     // Dolby Vision alone (typically profile 5) ranks below SDR on screens without native DV,
     // because without a DV decoder its colours are wrong; on a native DV panel it ranks with HDR.
@@ -556,8 +534,8 @@ pub(super) enum QualityOrder {
 }
 
 /// One unified total order used for pre-probe optimism, wave early-stop, and final post-probe
-/// selection. `off_title`, connection fit, and PreDB nuke status can never be overridden by size.
-pub(super) type UnifiedKey = (bool, bool, bool, u8, u8, bool, bool, bool, QualityOrder);
+/// selection. `off_title` and connection fit can never be overridden by size.
+pub(super) type UnifiedKey = (bool, bool, u8, u8, bool, bool, bool, QualityOrder);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn unified_key(
@@ -581,7 +559,6 @@ pub(super) fn unified_key(
             } else if other_language_only(&s.label, l.key) {
                 2
             } else if l.key == "english" {
-                // Untagged English releases (e.g. YTS 4K) stay tier 0 alongside tagged English.
                 0
             } else {
                 1
@@ -591,24 +568,22 @@ pub(super) fn unified_key(
             if has_original_lang { 2 } else { 3 }
         }
     };
-    let provider = if !crate::addons::is_free_addon(&s.addon) { 0 } else if s.label.to_uppercase().contains("FREE TRIAL") { 2 } else { 1 };
+    let provider = u8::from(s.label.to_uppercase().contains("FREE TRIAL"));
     let hdr = verified_hdr_tier(s);
     let dv_penalty = hdr == 1 && !dolby_vision_screen;
     let is_hdr = hdr >= 2 || (hdr == 1 && dolby_vision_screen);
     let hdr_rank = match hdr { 1 if dolby_vision_screen => 2, 1 => 0, 0 => 1, t => t };
     let eff = effective_size(s, size);
-    let suspicious = s.scene_trust < 0;
-    let verified_bonus = s.scene_trust > 0;
     let quality = if over {
         let mbps_bucket = estimated_avg_mbps(s, size, expected_seconds).map_or(u64::MAX, |m| (m / 5.0).floor() as u64);
         let not_primary_remux = remux_group_size.is_some() && !matches!(audio, Some((true, true)));
         QualityOrder::OverBudget(mbps_bucket, not_primary_remux, size, std::cmp::Reverse(effective_codec_tier(s)))
     } else {
-        // Group near-identical encodes (within 50 MB) so a verified MKV (audio + picture read)
-        // or verified srrDB scene release wins cleanly over an unverified twin of virtually identical size.
+        // Group near-identical encodes (within 50 MB) so a container-verified file (audio + picture read)
+        // wins cleanly over an unverified twin of virtually identical size.
         let group_size = remux_group_size.unwrap_or_else(|| if eff >= 50_000_000 { (eff / 50_000_000) * 50_000_000 } else { eff });
         let not_primary_remux = remux_group_size.is_some() && !matches!(audio, Some((true, true)));
-        let unverified = (s.picture.is_none() && audio.is_none()) || !verified_bonus && s.picture.is_none();
+        let unverified = s.picture.is_none() && audio.is_none();
         QualityOrder::Fit(
             std::cmp::Reverse((is_hdr, picture_class(s, size), group_size)),
             not_primary_remux,
@@ -616,7 +591,7 @@ pub(super) fn unified_key(
             std::cmp::Reverse((eff, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, effective_codec_tier(s))),
         )
     };
-    (s.off_title, over, s.nuked, lang_tier, provider, dv_penalty, upscaled().is_match(&s.label) || suspicious, s.quality.is_none(), quality)
+    (s.off_title, over, lang_tier, provider, dv_penalty, upscaled().is_match(&s.label), s.quality.is_none(), quality)
 }
 
 /// Optimistic lower-bound key for an unprobed source (assuming its audio turns out to match your
@@ -675,9 +650,8 @@ pub async fn autoplay(kind: &str, video_id: &str, pack_episodes: Option<usize>, 
 }
 
 /// Play's automatic choice with full metadata context (localized titles, runtime, original
-/// language, per-title audio preference, episode validation, PreDB/srrDB release intelligence,
-/// and connection-aware bitrate fitting).
-pub async fn autoplay_for(kind: &str, video_id: &str, mut ctx: AutoplayContext) -> Pick {
+/// language, per-title audio preference, episode validation, and connection-aware bitrate fitting).
+pub async fn autoplay_for(kind: &str, video_id: &str, ctx: AutoplayContext) -> Pick {
     let started = std::time::Instant::now();
     dev_log("autoplay: start");
     // While slower add-ons answer, gently pre-warm only the top 3 exact-title files (never a
@@ -690,7 +664,7 @@ pub async fn autoplay_for(kind: &str, video_id: &str, mut ctx: AutoplayContext) 
             classify_sources(&mut batch, &early_ctx);
             let order = play_order_with_ctx(&batch, &early_ctx);
             let top: Vec<Source> = order.into_iter()
-                .filter(|s| !s.off_title && !s.nuked && warmed.insert(s.url.clone()))
+                .filter(|s| !s.off_title && warmed.insert(s.url.clone()))
                 .take(3)
                 .collect();
             if !top.is_empty() {
@@ -701,28 +675,9 @@ pub async fn autoplay_for(kind: &str, video_id: &str, mut ctx: AutoplayContext) 
             }
         }
     };
-    // Run free srrDB/PreDB lookup in parallel with add-on fetching (capped at 700 ms so it adds
-    // 0 ms to Play when add-ons answer faster).
-    let need_intel = ctx.intel.is_none() && kind == "movie" && video_id.starts_with("tt");
-    let title_hint = ctx.titles.first().cloned();
-    let intel_fut = async {
-        if !need_intel { return None; }
-        tokio::time::timeout(Duration::from_millis(700), release_intel(video_id, title_hint.as_deref())).await.ok().flatten()
-    };
-    let fetch = async {
-        let p = play_sources(kind, video_id, Some(tx));
-        tokio::join!(p, intel_fut)
-    };
+    let fetch = play_sources(kind, video_id, Some(tx));
     tokio::pin!(fetch, early);
-    let (mut list, fetched_intel) = tokio::select! { biased; res = &mut fetch => res, _ = &mut early => fetch.await };
-    if ctx.intel.is_none() {
-        if let Some(intel) = fetched_intel {
-            for t in &intel.localized_titles {
-                if !ctx.titles.iter().any(|x| x.eq_ignore_ascii_case(t)) { ctx.titles.push(t.clone()); }
-            }
-            ctx.intel = Some(intel);
-        }
-    }
+    let mut list = tokio::select! { biased; res = &mut fetch => res, _ = &mut early => fetch.await };
     classify_sources(&mut list, &ctx);
     let order = play_order_with_ctx(&list, &ctx);
     let listed = started.elapsed().as_millis();
@@ -758,7 +713,7 @@ pub async fn autoplay_for(kind: &str, video_id: &str, mut ctx: AutoplayContext) 
     pick
 }
 
-/// Apply title matching, episode matching, extra-clip filtering, and PreDB/srrDB intel in place.
+/// Apply title matching, episode matching, and extra-clip filtering in place.
 pub(super) fn classify_sources(list: &mut Vec<Source>, ctx: &AutoplayContext) {
     if !ctx.titles.is_empty() {
         list.retain(|s| !is_extra_clip(s, &ctx.titles));
@@ -767,14 +722,6 @@ pub(super) fn classify_sources(list: &mut Vec<Source>, ctx: &AutoplayContext) {
         let title_ok = ctx.titles.is_empty() || names_title_any(s, &ctx.titles, ctx.year);
         let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
         s.off_title = !(title_ok && ep_ok);
-        if let Some(intel) = &ctx.intel {
-            s.nuked = is_nuked_source(intel, s);
-            s.scene_trust = match verified_scene_check(intel, s) {
-                Some(true) => 1,
-                Some(false) => -1,
-                None => 0,
-            };
-        }
     }
 }
 
@@ -827,9 +774,10 @@ pub(super) async fn play_sources(kind: &str, video_id: &str, early: Option<tokio
     cell.get_or_init(|| async move { sources_within(&kind, &id, Some(ADDON_GRACE), early).await.map(|r| (r.0, r.2)).unwrap_or_default() }).await.0.clone()
 }
 
-/// Ask the add-ons for a video's sources before Play is pressed (a title page or Tonight's pick is
-/// open), so Play only has to check them. Nothing is resolved on the debrid service yet.
+/// Ask installed add-ons for a video's sources before Play is pressed, only when the viewer
+/// opted into browsing prefetch in Settings (off by default to protect browsing privacy).
 pub fn prefetch_sources(kind: &str, video_id: &str) {
+    if !prefetch_sources_enabled() { return; }
     let (kind, id) = (kind.to_owned(), video_id.to_owned());
     if let Some(runtime) = RUNTIME.get() { runtime.spawn(async move { play_sources(&kind, &id, None).await; }); }
 }
@@ -1405,10 +1353,11 @@ pub(super) async fn probe_wave(
                 let rep = &wave[i].mirrors[0];
                 let what = match &found {
                     Some(v) => format!("OK bytes={:?} {}", v.source.size_bytes, picture_summary(&v.source)),
-                    None => format!("FAIL debrid={status:?} 429={hit_429}"),
+                    None => format!("FAIL status={status:?} 429={hit_429}"),
                 };
-                dev_log(&format!("  wave #{i} ({} mirrors) {} {:.55} -> {what} at {} ms",
-                    wave[i].mirrors.len(), rep.hdr.unwrap_or("SDR"), rep.filename, started.elapsed().as_millis()));
+                // Never log raw filenames into DIAG_RING: log only technical summary.
+                dev_log(&format!("  wave #{i} ({} mirrors) {} -> {what} at {} ms",
+                    wave[i].mirrors.len(), source_summary(rep), started.elapsed().as_millis()));
             }
             match found {
                 Some(verified) => working.push(verified),
@@ -1435,13 +1384,13 @@ pub(super) async fn probe_wave(
                 let opt = optimistic_key(rep, sz, lang, expected_seconds, budget);
                 if opt < best_key || (wanted.is_some() && remux_class(rep) == wanted) {
                     any_can_beat = true;
-                    // Strictly higher tier (better budget fit, non-nuked, better language, or better HDR/resolution class).
-                    let higher_quality = match (opt.8, best_key.8) {
+                    // Strictly higher tier (better budget fit, better language, or better HDR/resolution class).
+                    let higher_quality = match (opt.7, best_key.7) {
                         (QualityOrder::Fit(a, _, _, _), QualityOrder::Fit(b, _, _, _)) => (a.0 .0, a.0 .1) > (b.0 .0, b.0 .1),
                         (QualityOrder::Fit(..), QualityOrder::OverBudget(..)) => true,
                         _ => false,
                     };
-                    if (opt.0, opt.1, opt.2, opt.3) < (best_key.0, best_key.1, best_key.2, best_key.3) || higher_quality {
+                    if (opt.0, opt.1, opt.2) < (best_key.0, best_key.1, best_key.2) || higher_quality {
                         better_tier_pending = true;
                     }
                 }
@@ -1519,22 +1468,22 @@ mod unit_tests {
     }
 
     #[test]
-    fn autoplay_ranking_matrix_language_free_trial_and_rivals() {
+    fn autoplay_ranking_matrix_language_trial_and_rivals() {
         let mk = |addon: &str, title: &str, url: &str| source_of(addon, &json!({"title": title, "url": url}));
-        let ita_free = mk("Absolute Cinema", "Film 2025 2160p HDR ITA 💾 20 GB", "https://x.invalid/ita-free");
-        let ita_trial = mk("Absolute Cinema", "Film 2025 2160p HDR ITA FREE TRIAL 💾 30 GB", "https://x.invalid/ita-trial");
-        let ita_rd = mk("Torrentio", "Film 2025 1080p ITA 💾 12 GB", "https://x.invalid/ita-rd");
-        let multi_rd = mk("Torrentio", "Film 2025 2160p HDR MULTI 💾 40 GB", "https://x.invalid/multi-rd");
-        let eng_only = mk("Torrentio", "Film 2025 2160p HDR ENG 💾 50 GB", "https://x.invalid/eng-rd");
-        let order = play_order_for(&[eng_only.clone(), ita_trial.clone(), multi_rd.clone(), ita_free.clone(), ita_rd.clone()], None, Some("italian"));
+        let ita_4k = mk("Addon A", "Film 2025 2160p HDR ITA 💾 20 GB", "https://x.invalid/ita-4k");
+        let ita_trial = mk("Addon A", "Film 2025 2160p HDR ITA FREE TRIAL 💾 30 GB", "https://x.invalid/ita-trial");
+        let ita_1080 = mk("Addon B", "Film 2025 1080p ITA 💾 12 GB", "https://x.invalid/ita-1080");
+        let multi = mk("Addon B", "Film 2025 2160p HDR MULTI 💾 40 GB", "https://x.invalid/multi");
+        let eng_only = mk("Addon B", "Film 2025 2160p HDR ENG 💾 50 GB", "https://x.invalid/eng");
+        let order = play_order_for(&[eng_only.clone(), ita_trial.clone(), multi.clone(), ita_4k.clone(), ita_1080.clone()], None, Some("italian"));
         let urls: Vec<&str> = order.iter().map(|s| s.url.as_str()).collect();
-        // Tier 0 (Italian claimed): RD > Free > Free trial; Tier 1 (untagged/MULTI); Tier 2 (other language only).
-        assert_eq!(urls, [ita_rd.url.as_str(), ita_free.url.as_str(), ita_trial.url.as_str(), multi_rd.url.as_str(), eng_only.url.as_str()]);
+        // Tier 0 (Italian claimed): full 4K > full 1080p > trial; Tier 1 (untagged/MULTI); Tier 2 (other language only).
+        assert_eq!(urls, [ita_4k.url.as_str(), ita_1080.url.as_str(), ita_trial.url.as_str(), multi.url.as_str(), eng_only.url.as_str()]);
 
         // Rivals wanted asks for up to REMUX_RIVALS working remuxes of the best class.
-        let r1 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 65 GB", "https://x.invalid/r1");
-        let r2 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 60 GB", "https://x.invalid/r2");
-        let r3 = mk("Torrentio", "Film 2025 2160p HDR REMUX 💾 58 GB", "https://x.invalid/r3");
+        let r1 = mk("Addon B", "Film 2025 2160p HDR REMUX 💾 65 GB", "https://x.invalid/r1");
+        let r2 = mk("Addon B", "Film 2025 2160p HDR REMUX 💾 60 GB", "https://x.invalid/r2");
+        let r3 = mk("Addon B", "Film 2025 2160p HDR REMUX 💾 58 GB", "https://x.invalid/r3");
         assert!(rivals_wanted(&[r1.clone(), r2.clone()], None, None).is_some());
         assert!(rivals_wanted(&[r1, r2, r3], None, None).is_none());
     }
@@ -1757,40 +1706,6 @@ mod unit_tests {
         assert!(!wrong_episode(&ep12, (1, 2)));
         assert!(wrong_episode(&anime_ep6, (1, 1)));
         assert!(!wrong_episode(&anime_ep1, (1, 1)));
-    }
-
-    #[test]
-    fn predb_nuked_and_fake_sized_scene_releases_rank_behind_clean_ones() {
-        let mk = |name: &str, url: &str, bytes: u64| source_of("A", &json!({
-            "title": name, "url": url, "behaviorHints": {"filename": name, "videoSize": bytes}
-        }));
-        let srr = json!({"results": [
-            {"release": "The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE", "date": "2026-11-24", "isForeign": "no", "imdbId": "21285562", "size": 29_900_000_000u64}
-        ]});
-        let pre = json!({"data": [
-            {"release": "The.Dog.Stars.2026.2160p.UHD.BluRay.x265-NUKEDGRP", "status": 1, "reason": "out.of.sync"}
-        ]});
-        let intel = parse_release_intel(&srr, Some(&pre));
-        let mut list = vec![
-            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-NUKEDGRP.mkv", "https://x.invalid/nuked", 32_000_000_000),
-            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE.mkv", "https://x.invalid/fake", 2_000_000_000),
-            mk("The.Dog.Stars.2026.2160p.UHD.BluRay.x265-SURCODE.mkv", "https://x.invalid/clean", 29_900_000_000),
-        ];
-        let ctx = AutoplayContext {
-            titles: vec!["The Dog Stars".into()],
-            year: Some(2026),
-            preferred_language: Some("english".into()),
-            strict_title: true,
-            intel: Some(intel),
-            ..AutoplayContext::default()
-        };
-        classify_sources(&mut list, &ctx);
-        assert!(list[0].nuked);
-        assert_eq!(list[1].scene_trust, -1);
-        assert_eq!(list[2].scene_trust, 1);
-        let ordered = play_order_with_ctx(&list, &ctx);
-        assert_eq!(ordered[0].url, "https://x.invalid/clean");
-        assert_eq!(ordered[2].url, "https://x.invalid/nuked");
     }
 }
 

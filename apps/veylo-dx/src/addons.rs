@@ -1,43 +1,27 @@
-//! The add-on marketplace: a short curated list of stream add-ons that Veylo sets up itself
-//! with the one Real-Debrid key from Settings, so no add-on website is needed.
+//! Neutral Stremio add-on management: installed add-ons, update checks, `stremio://` & `veylo://`
+//! deep-link installation, `configurable` manifest support, portable add-on bundle import/export,
+//! optional one-time import from a user's own Stremio account, and generic user-supplied add-on
+//! directory URLs.
 //!
-//! - Torrentio keeps its settings in the install link; Veylo writes it.
-//! - AIOStreams (the public ElfHosted instance, which has Torrentio turned off) keeps them on
-//!   its server; Veylo creates and updates that configuration through its API.
-//!
-//! Both ask for every cached Real-Debrid result with no quality filter and no limit: the
-//! Play order picks the best one.
-//!
-//! Two free add-ons need no key and are installed by default (a removal is remembered):
-//! NoTorrent (web streams in the original audio, Spanish, Portuguese and Turkish) and Absolute
-//! Cinema (web streams in the original audio and Italian), set to web streams only with none of
-//! its catalogues. With a Real-Debrid key they are not asked for sources at all (Play and the
-//! source list use Real-Debrid only); without one they are what plays. Install links, passwords and keys live only in the app's
-//! own folder (addons.json, settings.json) and are never logged, shown or put in errors.
+//! Veylo ships with zero third-party streaming add-ons or debrid credentials. Every add-on URL
+//! stays masked in the UI, stored only in the app's private folder, and is never logged or put in
+//! errors.
 use crate::backend::{self, exec, on_runtime, s};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-const TORRENTIO: &str = "https://torrentio.strem.fun";
-const AIOSTREAMS: &str = "https://aiostreams.elfhosted.com";
-const NOTORRENT: &str = "https://addon.notorrent2.workers.dev/manifest.json";
-/// Web streams only (no torrents), without its title-info row, rows on Home or discovery lists.
-const ABSOLUTE_CINEMA: &str = "https://cinema.debrid.in/mode=http|titleinfo=0|discoverycatalogs=0|genrecatalogs=0|searchcatalogs=0|animecatalogs=0|anilistcatalogs=0|tdcatalog=0|watchlist=0|upnext=0|streamingservices=none|hidecatalogs=magnetio_similar_movie,magnetio_similar_series/manifest.json";
-/// Where each key is copied from: opened in the browser by "Get your key".
-pub const RD_KEY_PAGE: &str = "https://real-debrid.com/apitoken";
+/// Where a TMDB v3 API key can be created: opened in the browser on explicit tap.
 pub const TMDB_KEY_PAGE: &str = "https://www.themoviedb.org/settings/api";
 
 // ---------------------------------------------------------------- languages
 
-/// A stream language: Torrentio's option key, the AIOStreams name, the flag both add-ons
-/// print, the release tags that name it in a file name and the codes a file's tracks use for it
-/// (mpv's `alang` order: ISO 639-1, then -2/B and -2/T).
+/// An audio language: its settings key, display label, flag, common release tags, and ISO 639-1 /
+/// 639-2 track codes (mpv's `alang` order).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Language {
     pub key: &'static str,
     pub label: &'static str,
-    aio: &'static str,
     flag: &'static str,
     tags: &'static [&'static str],
     pub codes: &'static [&'static str],
@@ -45,7 +29,7 @@ pub struct Language {
 
 impl Language {
     /// Whether a source's label says it has this audio (flag, name or release tag). Subtitle
-    /// languages do not count: flags after "Subs" (AIOStreams) or a tag after "Sub" ("Sub ITA").
+    /// languages do not count: flags after "Subs" or a tag after "Sub" ("Sub ITA").
     pub fn matches(&self, label: &str) -> bool {
         label.lines().any(|line| {
             let audio = line.find("Subs").map_or(line, |i| &line[..i]);
@@ -58,7 +42,7 @@ impl Language {
 }
 
 macro_rules! lang { ($key:expr, $label:expr, $flag:expr, [$($tag:expr),*], [$($code:expr),*]) => {
-    Language { key: $key, label: $label, aio: $label, flag: $flag, tags: &[$($tag),*], codes: &[$($code),*] }
+    Language { key: $key, label: $label, flag: $flag, tags: &[$($tag),*], codes: &[$($code),*] }
 }; }
 
 pub const LANGUAGES: &[Language] = &[
@@ -92,74 +76,27 @@ pub const LANGUAGES: &[Language] = &[
 
 pub fn language(key: &str) -> Option<&'static Language> { LANGUAGES.iter().find(|l| l.key == key) }
 
-// ---------------------------------------------------------------- catalogue
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Curated { Torrentio, AioStreams, NoTorrent, AbsoluteCinema }
-
-impl Curated {
-    pub const ALL: [Curated; 4] = [Curated::Torrentio, Curated::AioStreams, Curated::NoTorrent, Curated::AbsoluteCinema];
-    fn id(self) -> &'static str {
-        match self { Curated::Torrentio => "torrentio", Curated::AioStreams => "aiostreams", Curated::NoTorrent => "notorrent", Curated::AbsoluteCinema => "absolutecinema" }
-    }
-    pub fn name(self) -> &'static str {
-        match self { Curated::Torrentio => "Torrentio", Curated::AioStreams => "AIOStreams", Curated::NoTorrent => "NoTorrent", Curated::AbsoluteCinema => "Absolute Cinema" }
-    }
-    pub fn about(self) -> &'static str {
-        match self {
-            Curated::Torrentio => "Torrents from every public tracker, ready on Real-Debrid.",
-            Curated::AioStreams => "Comet, MediaFusion and StremThru together, on ElfHosted's public server.",
-            Curated::NoTorrent => "Free web streams: original audio, Spanish, Portuguese and Turkish.",
-            Curated::AbsoluteCinema => "Free web streams: original audio and Italian.",
-        }
-    }
-    /// The second line on its card.
-    pub fn detail(self) -> &'static str {
-        if self.needs_key() { "Cached Real-Debrid results only, no filters" } else { "No key needed. Used only while you have no Real-Debrid key" }
-    }
-    fn host(self) -> &'static str {
-        match self {
-            Curated::Torrentio => "torrentio.strem.fun", Curated::AioStreams => "aiostreams.elfhosted.com",
-            Curated::NoTorrent => "addon.notorrent2.workers.dev", Curated::AbsoluteCinema => "cinema.debrid.in",
-        }
-    }
-    /// Set up with the Real-Debrid key (its link or configuration holds it).
-    pub fn needs_key(self) -> bool { matches!(self, Curated::Torrentio | Curated::AioStreams) }
-    /// The install link of a free add-on.
-    fn free_url(self) -> Option<&'static str> {
-        match self { Curated::NoTorrent => Some(NOTORRENT), Curated::AbsoluteCinema => Some(ABSOLUTE_CINEMA), _ => None }
-    }
-}
-
-/// Whether a source comes from one of the free web add-ons (by the add-on's name, as streams carry it).
-pub fn is_free_addon(name: &str) -> bool {
-    Curated::ALL.iter().any(|c| !c.needs_key() && c.name().eq_ignore_ascii_case(name.trim()))
-}
-
-fn removed_key(c: Curated) -> String { format!("{}:removed", c.id()) }
-
 fn host_of(url: &str) -> String { url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default() }
 
-// ---------------------------------------------------------------- the app's own record
+fn is_cinemeta(url: &str) -> bool { url.contains("v3-cinemeta.strem.io") }
 
-/// addons.json: what Veylo set up (links, AIOStreams login) and the add-on versions you
-/// have seen, so a newer one can be announced once.
+// ---------------------------------------------------------------- local seen-version record
+
+/// addons.json: the add-on versions you have seen, so a newer one can be announced once.
 #[derive(Default)]
-struct Store { managed: HashMap<String, Value>, seen: HashMap<String, String> }
+struct Store { seen: HashMap<String, String> }
 
 fn store_path() -> std::path::PathBuf { backend::backend_data_dir().join("addons.json") }
 
 fn load() -> Store {
     let v: Value = std::fs::read_to_string(store_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let map = |k: &str| v[k].as_object().cloned().unwrap_or_default();
-    Store {
-        managed: map("managed").into_iter().collect(),
-        seen: map("seen").into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_owned()))).collect(),
-    }
+    let seen = v["seen"].as_object().cloned().unwrap_or_default()
+        .into_iter().filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_owned()))).collect();
+    Store { seen }
 }
 
 fn save(store: &Store) {
-    let v = json!({"managed": store.managed, "seen": store.seen});
+    let v = json!({"seen": store.seen});
     let _ = backend::write_private_file(&store_path(), v.to_string().as_bytes());
     backend::sync_soon();
 }
@@ -178,23 +115,42 @@ pub struct Row {
     /// A newer version you have not applied yet.
     pub update: Option<String>,
     pub offers: String,
-    /// The curated entry this is, when Veylo set it up.
-    pub curated: Option<Curated>,
-    /// Installed add-on's link: kept inside the app for Update and Remove, never displayed.
+    /// Manifest declares `behaviorHints.configurable == true`.
+    pub configurable: bool,
+    /// Installed add-on's link: kept inside the app for Configure, Update and Remove, never displayed.
     url: String,
 }
 
 impl Row {
     /// Custom user-installed add-ons can be removed; Cinemeta is the built-in metadata core.
-    pub fn removable(&self) -> bool { !self.url.contains("v3-cinemeta.strem.io") }
+    pub fn removable(&self) -> bool { !is_cinemeta(&self.url) }
+
+    /// Standard Stremio `/configure` page URL derived from `manifest_url`, when `configurable`.
+    pub fn configure_url(&self) -> Option<String> {
+        if !self.configurable { return None; }
+        derive_configure_url(&self.url)
+    }
+
+    /// Open this add-on's `/configure` page in the system browser on explicit user tap.
+    pub fn open_configure(&self) {
+        if let Some(url) = self.configure_url() {
+            crate::open_external(&url);
+        }
+    }
+}
+
+/// Derive a Stremio add-on's `/configure` URL from its manifest URL.
+pub fn derive_configure_url(manifest_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(manifest_url).ok()?;
+    if parsed.scheme() != "https" { return None; }
+    let trimmed = manifest_url.strip_suffix("/manifest.json").unwrap_or(manifest_url.trim_end_matches('/'));
+    Some(format!("{trimmed}/configure"))
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Overview {
-    /// Curated entries with their installed row, if any.
-    pub curated: Vec<(Curated, Option<Row>)>,
-    /// Everything else that is installed.
-    pub others: Vec<Row>,
+    /// All installed add-ons (built-in Cinemeta plus user-installed add-ons).
+    pub addons: Vec<Row>,
     pub updates: usize,
 }
 
@@ -208,11 +164,10 @@ pub async fn overview() -> Overview {
     let addons = installed().await;
     let mut store = load();
     let mut changed = false;
-    let mut out = Overview::default();
-    let managed_url = |c: Curated, store: &Store| store.managed.get(c.id()).map(|m| s(m, "url"));
     let mut rows = Vec::new();
     for a in &addons {
-        if crate::backend::retired_addon(&s(a, "manifest_url")) { continue; }
+        let url = s(a, "manifest_url");
+        if crate::backend::retired_addon(&url) { continue; }
         let version = s(a, "version");
         let key = seen_key(a);
         let update = match store.seen.get(&key) {
@@ -220,21 +175,15 @@ pub async fn overview() -> Overview {
             Some(_) => None,
             None => { store.seen.insert(key, version.clone()); changed = true; None }
         };
-        let url = s(a, "manifest_url");
-        // A free add-on is the same whoever installed it: matched by its server.
-        let curated = Curated::ALL.into_iter().find(|c| managed_url(*c, &store).as_deref() == Some(url.as_str())
-            || (!c.needs_key() && host_of(&url) == c.host()));
         let offers = a["resources"].as_array().into_iter().flatten()
             .filter_map(|r| r.as_str().map(str::to_owned).or_else(|| r["name"].as_str().map(str::to_owned))).collect::<Vec<_>>().join(", ");
-        rows.push(Row { name: s(a, "name"), version, update, offers, curated, url });
+        let configurable = a["behaviorHints"]["configurable"].as_bool().unwrap_or(false)
+            && derive_configure_url(&url).is_some();
+        rows.push(Row { name: s(a, "name"), version, update, offers, configurable, url });
     }
     if changed { save(&store); }
-    out.updates = rows.iter().filter(|r| r.update.is_some()).count();
-    for c in Curated::ALL {
-        out.curated.push((c, rows.iter().find(|r| r.curated == Some(c)).cloned()));
-    }
-    out.others = rows.into_iter().filter(|r| r.curated.is_none()).collect();
-    out
+    let updates = rows.iter().filter(|r| r.update.is_some()).count();
+    Overview { addons: rows, updates }
 }
 
 /// Ask every installed add-on for its manifest again (new versions), then count updates.
@@ -246,7 +195,7 @@ pub async fn check() -> (usize, String) {
     let unreachable: Vec<String> = refreshed.iter().flat_map(|v| v["results"].as_array().cloned().unwrap_or_default())
         .filter(|r| r.get("error").is_some()).map(|r| s(&r["addon"], "name")).collect();
     let ov = overview().await;
-    let total = ov.others.len() + ov.curated.iter().filter(|(_, r)| r.is_some()).count();
+    let total = ov.addons.len();
     let mut note = match ov.updates {
         0 => format!("All {total} add-ons are on their latest version."),
         1 => "1 update available: tap Update on it.".to_owned(),
@@ -262,200 +211,34 @@ fn mark_seen(store: &mut Store, addon: &Value) {
 
 // ---------------------------------------------------------------- install, update, remove
 
-fn rd_key() -> Result<String> {
-    backend::load_settings().rd_key.context("Add your Real-Debrid key first")
-}
-
-/// Torrentio: all trackers, every cached Real-Debrid result (no "download to debrid" links),
-/// no quality filter or limit, no Downloads catalogue; your language first when it has one.
-fn torrentio_url(key: &str, language: Option<&Language>) -> String {
-    let mut opts = Vec::new();
-    if let Some(l) = language.filter(|l| l.key != "english") { opts.push(format!("language={}", l.key)); }
-    opts.push("debridoptions=nodownloadlinks,nocatalog".into());
-    opts.push(format!("realdebrid={key}"));
-    format!("{TORRENTIO}/{}/manifest.json", opts.join("|"))
-}
-
-/// How long AIOStreams waits for each scraper. Measured over 18 titles: 3 s instead of 5 s took
-/// the slowest answer from 6.1 s to 3.8 s and changed no choice of Play's for the worse.
-const SCRAPER_TIMEOUT_MS: u64 = 3000;
-
-/// The AIOStreams configuration Veylo writes now; a lower one (or none) is written again at start.
-/// 1: 3D excluded. 2: the 3 s scraper timeout.
-const AIOSTREAMS_REVISION: u64 = 2;
-
-/// AIOStreams configuration: three debrid scrapers on Real-Debrid, cached only, streams only
-/// (no extra catalogues), the Torrentio-style labels the Play order reads, 3D excluded.
-fn aiostreams_config(key: &str, language: Option<&Language>) -> Value {
-    let preset = |kind: &str, name: &str| json!({"type": kind, "instanceId": kind, "enabled": true,
-        "options": {"name": name, "timeout": SCRAPER_TIMEOUT_MS, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false}});
-    let mut sort = vec![json!({"key": "cached", "direction": "desc"})];
-    if language.is_some() { sort.push(json!({"key": "language", "direction": "desc"})); }
-    sort.extend([json!({"key": "resolution", "direction": "desc"}), json!({"key": "size", "direction": "desc"})]);
-    let mut config = json!({
-        "services": [{"id": "realdebrid", "enabled": true, "credentials": {"apiKey": key}}],
-        "presets": [preset("comet", "Comet"), preset("mediafusion", "MediaFusion"), preset("stremthruTorz", "StremThru Torz")],
-        "formatter": {"id": "torrentio"},
-        "excludeUncached": true,
-        "excludedVisualTags": ["3D"],
-        "sortCriteria": {"global": sort},
-    });
-    if let Some(l) = language { config["preferredLanguages"] = json!([l.aio]); }
-    config
-}
-
-/// A throwaway AIOStreams configuration (the usual one plus `extra` presets, as (type, name)) for
-/// the add-on experiment in `backend::autoplay_bench`: its stream base link and its login.
-#[cfg(test)]
-pub(crate) async fn trial_config(extra: &[(&str, &str)], timeout_ms: Option<u64>) -> Result<(String, (String, String))> {
-    let key = rd_key()?;
-    let mut config = aiostreams_config(&key, language("english"));
-    let presets = config["presets"].as_array_mut().context("presets")?;
-    if let Some(ms) = timeout_ms { for p in presets.iter_mut() { p["options"]["timeout"] = json!(ms); } }
-    for (kind, name) in extra {
-        presets.push(json!({"type": kind, "instanceId": kind, "enabled": true,
-            "options": {"name": name, "timeout": SCRAPER_TIMEOUT_MS, "resources": ["stream"], "services": ["realdebrid"], "mediaTypes": [], "includeP2P": false, "useMultipleInstances": false, "showTorrentLinks": false}}));
-    }
-    let password = random_password()?;
-    let data = aiostreams_call(reqwest::Method::POST, json!({"config": config, "password": password}), None).await?;
-    let (uuid, encrypted) = (s(&data, "uuid"), s(&data, "encryptedPassword"));
-    ensure!(!uuid.is_empty() && !encrypted.is_empty(), "no configuration");
-    Ok((format!("{AIOSTREAMS}/stremio/{uuid}/{encrypted}"), (uuid, password)))
-}
-
-/// Delete a throwaway configuration made by `trial_config`.
-#[cfg(test)]
-pub(crate) async fn trial_delete(login: (String, String)) -> Result<()> {
-    aiostreams_call(reqwest::Method::DELETE, json!({}), Some(login)).await.map(|_| ())
-}
-
-fn random_password() -> Result<String> {
-    let mut bytes = [0u8; 18];
-    // The OS generator on every platform (Windows has no /dev/urandom).
-    getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("Couldn't make a password for AIOStreams"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// AIOStreams answers `{success, data, error:{message}}`; its messages hold no secrets.
-async fn aiostreams_call(method: reqwest::Method, body: Value, login: Option<(String, String)>) -> Result<Value> {
-    on_runtime(async move {
-        let mut req = backend::backend_http().request(method, format!("{AIOSTREAMS}/api/v1/user"))
-            .timeout(std::time::Duration::from_secs(20))
-            .header("Content-Type", "application/json").body(body.to_string());
-        if let Some((user, password)) = login { req = req.basic_auth(user, Some(password)); }
-        let resp = req.send().await.map_err(|_| anyhow::anyhow!("AIOStreams didn't answer"))?;
-        let v: Value = serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or_default();
-        if v["success"] != true {
-            let message = v["error"]["message"].as_str().unwrap_or("its server refused the settings");
-            bail!("AIOStreams: {}", message.chars().take(200).collect::<String>());
-        }
-        Ok(v["data"].clone())
-    }).await?
-}
-
-/// Writes the AIOStreams configuration (updating the one Veylo made before, if it still
-/// exists) and returns its install link with the login to keep.
-async fn aiostreams_link(key: &str, language: Option<&Language>, previous: Option<&Value>) -> Result<(String, Value)> {
-    let config = aiostreams_config(key, language);
-    if let Some(prev) = previous {
-        let (uuid, password, url) = (s(prev, "uuid"), s(prev, "password"), s(prev, "url"));
-        if !uuid.is_empty() && !password.is_empty() && !url.is_empty()
-            && aiostreams_call(reqwest::Method::PUT, json!({"config": config}), Some((uuid.clone(), password.clone()))).await.is_ok() {
-            return Ok((url.clone(), json!({"url": url, "uuid": uuid, "password": password})));
-        }
-    }
-    let password = random_password()?;
-    let data = aiostreams_call(reqwest::Method::POST, json!({"config": config, "password": password}), None).await?;
-    let (uuid, encrypted) = (s(&data, "uuid"), s(&data, "encryptedPassword"));
-    ensure!(!uuid.is_empty() && !encrypted.is_empty(), "AIOStreams didn't return a configuration");
-    let url = format!("{AIOSTREAMS}/stremio/{uuid}/{encrypted}/manifest.json");
-    Ok((url.clone(), json!({"url": url, "uuid": uuid, "password": password})))
-}
-
-/// One add-on change at a time: each reads addons.json, waits on the network and writes it back,
-/// so two at once (start-up's set-up and a tap in Settings) would lose one's record. Taken by the
-/// public entry points only; the `_unlocked` helpers run inside one.
 static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Install (or set up again) a curated add-on with the current key and language. Any other
-/// copy of it (one installed from its website) is replaced.
-pub async fn install(c: Curated) -> Result<()> {
-    let _one = CHANGING.lock().await;
-    install_unlocked(c).await
-}
-
-async fn install_unlocked(c: Curated) -> Result<()> {
-    if let Some(url) = c.free_url() { return install_free(c, url).await; }
-    let key = rd_key()?;
-    let settings = backend::load_settings();
-    let language = settings.stream_language.as_deref().and_then(language);
-    let mut store = load();
-    // An AIOStreams login made by an install that then failed is reused first.
-    let pending = format!("{}:pending", c.id());
-    let previous = store.managed.get(&pending).or_else(|| store.managed.get(c.id())).cloned();
-    let (url, record) = match c {
-        Curated::Torrentio => { let url = torrentio_url(&key, language); (url.clone(), json!({"url": url})) }
-        Curated::NoTorrent | Curated::AbsoluteCinema => unreachable!("free add-ons are installed above"),
-        Curated::AioStreams => {
-            let link = aiostreams_link(&key, language, previous.as_ref()).await?;
-            // Keep the new login aside before installing: if the install fails, a retry updates
-            // this configuration instead of making another, and the add-on still installed keeps
-            // its record (so it stays Veylo's, and Remove key still finds it).
-            store.managed.insert(pending.clone(), link.1.clone());
-            save(&store);
-            link
-        }
-    };
-    let addon = exec(json!({"op":"install_addon","url":url})).await.map_err(|_| anyhow::anyhow!("{} couldn't be installed. Check your connection and try again.", c.name()))?;
-    let new_url = s(&addon, "manifest_url");
-    // Replace older copies: the previous Veylo link and any same-host install.
-    for a in installed().await {
-        let u = s(&a, "manifest_url");
-        if u != new_url && host_of(&u) == c.host() {
-            let _ = exec(json!({"op":"remove_addon","url":u})).await;
-        }
-    }
-    let mut record = record;
-    record["url"] = json!(new_url);
-    if c == Curated::AioStreams { record["revision"] = json!(AIOSTREAMS_REVISION); }
-    store.managed.insert(c.id().into(), record);
-    store.managed.remove(&pending);
-    mark_seen(&mut store, &addon);
-    save(&store);
-    backend::forget_sources();
-    Ok(())
-}
-
-/// A free add-on: its fixed link, replacing any other copy (another configuration of it).
-async fn install_free(c: Curated, url: &str) -> Result<()> {
-    let addon = exec(json!({"op":"install_addon","url":url})).await.map_err(|_| anyhow::anyhow!("{} couldn't be installed. Check your connection and try again.", c.name()))?;
-    let new_url = s(&addon, "manifest_url");
-    for a in installed().await {
-        let u = s(&a, "manifest_url");
-        if u != new_url && host_of(&u) == c.host() { let _ = exec(json!({"op":"remove_addon","url":u})).await; }
-    }
-    let mut store = load();
-    store.managed.insert(c.id().into(), json!({"url": new_url}));
-    store.managed.remove(&removed_key(c));
-    mark_seen(&mut store, &addon);
-    save(&store);
-    backend::forget_sources();
-    Ok(())
-}
 
 pub async fn remove(row: &Row) -> Result<()> {
     let _one = CHANGING.lock().await;
-    // The AIOStreams login stays in addons.json so a later install updates the same configuration.
     exec(json!({"op":"remove_addon","url":row.url})).await?;
     backend::forget_sources();
-    // A free add-on you removed is not installed again by default.
-    if let Some(c) = row.curated.filter(|c| !c.needs_key()) {
-        let mut store = load();
-        store.managed.insert(removed_key(c), json!(true));
-        save(&store);
-    }
     backend::sync_soon();
     Ok(())
+}
+
+/// Extract a Stremio manifest URL from an OS deep link (`stremio://...` or `veylo://install?url=...`).
+pub fn parse_deep_link(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("stremio://") {
+        return normalize_custom_addon_url(trimmed).ok();
+    }
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        if parsed.scheme().eq_ignore_ascii_case("veylo") {
+            if let Some((_, target)) = parsed.query_pairs().find(|(k, _)| k == "url" || k == "manifest") {
+                return normalize_custom_addon_url(&target).ok();
+            }
+            if parsed.host_str().is_some_and(|h| !h.eq_ignore_ascii_case("install")) {
+                let rest = trimmed.strip_prefix("veylo://").unwrap_or_default();
+                return normalize_custom_addon_url(&format!("https://{rest}")).ok();
+            }
+        }
+    }
+    None
 }
 
 /// Normalize a user-provided Stremio add-on URL (`stremio://` -> `https://`, appending
@@ -464,6 +247,13 @@ pub fn normalize_custom_addon_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     ensure!(!trimmed.is_empty(), "Paste a Stremio add-on manifest URL.");
     let normalized = if let Some(rest) = trimmed.strip_prefix("stremio://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("veylo://") {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            if let Some((_, target)) = parsed.query_pairs().find(|(k, _)| k == "url" || k == "manifest") {
+                return normalize_custom_addon_url(&target);
+            }
+        }
         format!("https://{rest}")
     } else {
         trimmed.to_owned()
@@ -481,8 +271,47 @@ pub fn normalize_custom_addon_url(raw: &str) -> Result<String> {
     Ok(url)
 }
 
-/// Install any user-supplied Stremio add-on manifest URL (for TorBox, AllDebrid, Premiumize,
-/// custom ElfHosted instances, or community catalogs). Never logs or echoes the URL.
+/// Fetch basic public metadata (name, description, version, resources) of a manifest URL before
+/// confirming installation from a deep link, without installing it yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestPreview {
+    pub url: String,
+    pub host: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub offers: String,
+}
+
+pub async fn preview_manifest(raw: &str) -> Result<ManifestPreview> {
+    let url = normalize_custom_addon_url(raw)?;
+    let host = host_of(&url);
+    let fetch_url = url.clone();
+    let v: Value = on_runtime(async move {
+        let resp = backend::backend_http()
+            .get(&fetch_url)
+            .timeout(std::time::Duration::from_secs(12))
+            .send().await
+            .map_err(|_| anyhow::anyhow!("Couldn't reach that add-on server."))?;
+        ensure!(resp.status().is_success(), "That add-on server didn't return a manifest.");
+        resp.json::<Value>().await.map_err(|_| anyhow::anyhow!("That link didn't return a valid Stremio manifest."))
+    }).await??;
+    let name = s(&v, "name");
+    ensure!(!name.is_empty(), "That link didn't return a valid Stremio manifest.");
+    let offers = v["resources"].as_array().into_iter().flatten()
+        .filter_map(|r| r.as_str().map(str::to_owned).or_else(|| r["name"].as_str().map(str::to_owned)))
+        .collect::<Vec<_>>().join(", ");
+    Ok(ManifestPreview {
+        url,
+        host,
+        name,
+        version: s(&v, "version"),
+        description: s(&v, "description").chars().take(240).collect(),
+        offers,
+    })
+}
+
+/// Install any user-supplied Stremio add-on manifest URL. Never logs or echoes the URL.
 pub async fn install_custom(raw: String) -> Result<String> {
     let url = normalize_custom_addon_url(&raw)?;
     let _one = CHANGING.lock().await;
@@ -494,14 +323,12 @@ pub async fn install_custom(raw: String) -> Result<String> {
     backend::forget_sources();
     backend::sync_soon();
     let name = s(&addon, "name");
-    Ok(if name.is_empty() { "Custom add-on".into() } else { name })
+    Ok(if name.is_empty() { "Add-on".into() } else { name })
 }
 
-/// Apply a newer version: curated add-ons are set up again (so new defaults apply), others
-/// fetch their manifest again.
+/// Refresh a single installed add-on's manifest.
 pub async fn update(row: &Row) -> Result<()> {
     let _one = CHANGING.lock().await;
-    if let Some(c) = row.curated { return install_unlocked(c).await; }
     let addon = exec(json!({"op":"install_addon","url":row.url})).await?;
     let mut store = load();
     mark_seen(&mut store, &addon);
@@ -510,186 +337,220 @@ pub async fn update(row: &Row) -> Result<()> {
     Ok(())
 }
 
-/// After the key or language changes: set up every curated add-on that is installed again.
-pub async fn reconfigure() -> Result<()> {
-    let _one = CHANGING.lock().await;
-    let ov = overview().await;
-    let mut first_error = None;
-    for (c, row) in ov.curated {
-        if row.is_some() && c.needs_key() { if let Err(e) = install_unlocked(c).await { first_error.get_or_insert(e); } }
-    }
-    first_error.map_or(Ok(()), Err)
-}
+// ---------------------------------------------------------------- bundle import / export & Stremio import
 
-/// Your add-ons for another of your devices, inside the sealed key handoff (backend/account.rs):
-/// the curated ones by name (set up there again with the key) and the links of any others (a link
-/// can hold a key, so it never travels outside that sealed message).
-pub async fn for_handoff() -> Value {
+/// Export all user-installed add-ons (excluding built-in Cinemeta) as a portable JSON bundle.
+/// Saved to `veylo-addons-bundle.json` with owner-only permissions; returns the count exported.
+pub async fn export_bundle() -> Result<(usize, String)> {
     let all = installed().await;
-    let curated: Vec<&str> = Curated::ALL.into_iter()
-        .filter(|c| all.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host())).map(Curated::id).collect();
-    let others: Vec<String> = all.iter().map(|a| s(a, "manifest_url"))
-        .filter(|u| !u.is_empty() && Curated::ALL.iter().all(|c| host_of(u) != c.host())).collect();
-    json!({"curated": curated, "others": others})
+    let urls: Vec<String> = all.iter()
+        .map(|a| s(a, "manifest_url"))
+        .filter(|u| !u.is_empty() && !is_cinemeta(u) && !crate::backend::retired_addon(u))
+        .collect();
+    let count = urls.len();
+    let payload = json!({
+        "veylo_addons_bundle": 1,
+        "addons": urls.iter().map(|u| json!({"transportUrl": u})).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&payload)?;
+    let _ = backend::write_private_file(&backend::backend_data_dir().join("veylo-addons-bundle.json"), text.as_bytes());
+    Ok((count, text))
 }
 
-/// Set up the add-ons another device handed over (after its key was saved here). Add-ons already
-/// here stay; each failure is skipped so the rest still arrive.
+/// Parse manifest URLs from a Veylo bundle JSON, a Stremio `addonCollection` JSON array, a JSON
+/// array of strings, or a newline-separated list of manifest URLs.
+pub fn parse_bundle_urls(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |candidate: &str| {
+        if let Ok(url) = normalize_custom_addon_url(candidate) {
+            if !is_cinemeta(&url) && seen.insert(url.clone()) {
+                out.push(url);
+            }
+        }
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        let items = v.as_array()
+            .or_else(|| v["addons"].as_array())
+            .or_else(|| v["result"]["addons"].as_array());
+        if let Some(arr) = items {
+            for entry in arr {
+                if let Some(u) = entry.as_str() { push(u); }
+                else if let Some(u) = entry["transportUrl"].as_str().or_else(|| entry["manifestUrl"].as_str()).or_else(|| entry["url"].as_str()) {
+                    push(u);
+                }
+            }
+            return out;
+        }
+    }
+    for line in trimmed.lines() {
+        let t = line.trim();
+        if !t.is_empty() && !t.starts_with('#') { push(t); }
+    }
+    out
+}
+
+/// Install all valid add-on URLs from a pasted bundle or URL list. Returns `(installed, failed)`.
+pub async fn import_bundle(raw: &str) -> Result<(usize, usize)> {
+    let urls = parse_bundle_urls(raw);
+    ensure!(!urls.is_empty(), "No valid add-on URLs found. Paste a bundle JSON or one https:// or stremio:// link per line.");
+    let _one = CHANGING.lock().await;
+    let here: HashSet<String> = installed().await.iter().map(|a| s(a, "manifest_url")).collect();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut store = load();
+    for url in urls {
+        if here.contains(&url) { continue; }
+        match exec(json!({"op":"install_addon","url":url})).await {
+            Ok(addon) => { mark_seen(&mut store, &addon); ok += 1; }
+            Err(_) => { failed += 1; }
+        }
+    }
+    save(&store);
+    backend::forget_sources();
+    backend::sync_soon();
+    Ok((ok, failed))
+}
+
+/// One-time on-device import of the user's own add-ons from their Stremio account.
+/// Credentials and the Stremio auth key are used only in memory for this single call and discarded.
+pub async fn import_from_stremio(email: String, password: String) -> Result<(usize, usize)> {
+    let email = email.trim().to_owned();
+    ensure!(!email.is_empty() && !password.is_empty(), "Enter your Stremio email and password.");
+    let urls: Vec<String> = on_runtime(async move {
+        let http = backend::backend_http();
+        let login_resp = http.post("https://api.strem.io/api/login")
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&json!({"type": "Login", "email": email, "password": password}))
+            .send().await
+            .map_err(|_| anyhow::anyhow!("Couldn't reach Stremio's account server."))?;
+        let login_json: Value = login_resp.json().await.unwrap_or_default();
+        if let Some(err) = login_json["error"]["message"].as_str() {
+            bail!("Stremio sign-in failed: {}", err.chars().take(120).collect::<String>());
+        }
+        let auth_key = login_json["result"]["authKey"].as_str().unwrap_or_default().to_owned();
+        ensure!(!auth_key.is_empty(), "Stremio sign-in failed. Check your email and password.");
+        let col_resp = http.post("https://api.strem.io/api/addonCollectionGet")
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&json!({"type": "AddonCollectionGet", "authKey": auth_key, "update": true}))
+            .send().await
+            .map_err(|_| anyhow::anyhow!("Couldn't fetch your Stremio add-on collection."))?;
+        let col_json: Value = col_resp.json().await.unwrap_or_default();
+        // Best-effort logout so the temporary authKey is invalidated immediately.
+        let _ = http.post("https://api.strem.io/api/logout")
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&json!({"type": "Logout", "authKey": auth_key}))
+            .send().await;
+        let list = col_json["result"]["addons"].as_array().cloned().unwrap_or_default();
+        let mut urls = Vec::new();
+        for item in list {
+            if let Some(u) = item["transportUrl"].as_str() {
+                if let Ok(norm) = normalize_custom_addon_url(u) {
+                    if !is_cinemeta(&norm) { urls.push(norm); }
+                }
+            }
+        }
+        Ok::<Vec<String>, anyhow::Error>(urls)
+    }).await??;
+    ensure!(!urls.is_empty(), "No custom add-ons were found in that Stremio account.");
+    let bundle = json!({"addons": urls.iter().map(|u| json!({"transportUrl": u})).collect::<Vec<_>>()}).to_string();
+    import_bundle(&bundle).await
+}
+
+// ---------------------------------------------------------------- generic add-on directory reader
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub offers: String,
+    pub manifest_url: String,
+    pub installed: bool,
+}
+
+/// Read any user-supplied Stremio add-on directory JSON URL (e.g. a community catalog list or
+/// self-hosted directory). Veylo ships with zero pre-installed stream directories.
+pub async fn fetch_directory(raw_url: String) -> Result<Vec<DirectoryEntry>> {
+    let trimmed = raw_url.trim().to_owned();
+    let parsed = url::Url::parse(&trimmed).map_err(|_| anyhow::anyhow!("That doesn't look like a valid directory URL."))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let is_local = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    ensure!(parsed.scheme() == "https" || (parsed.scheme() == "http" && is_local),
+        "Directory URLs must start with https://.");
+    let v: Value = on_runtime(async move {
+        let resp = backend::backend_http()
+            .get(&trimmed)
+            .timeout(std::time::Duration::from_secs(15))
+            .send().await
+            .map_err(|_| anyhow::anyhow!("Couldn't reach that directory URL."))?;
+        ensure!(resp.status().is_success(), "That directory server returned an error.");
+        resp.json::<Value>().await.map_err(|_| anyhow::anyhow!("That URL didn't return a valid JSON directory."))
+    }).await??;
+    let here: HashSet<String> = installed().await.iter().map(|a| s(a, "manifest_url")).collect();
+    let arr = v.as_array().or_else(|| v["addons"].as_array()).cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(raw) = item["transportUrl"].as_str().or_else(|| item["manifestUrl"].as_str()).or_else(|| item["url"].as_str()) else { continue };
+        let Ok(manifest_url) = normalize_custom_addon_url(raw) else { continue };
+        if is_cinemeta(&manifest_url) { continue; }
+        let m = if item["manifest"].is_object() { &item["manifest"] } else { &item };
+        let name = s(m, "name");
+        if name.is_empty() { continue; }
+        let offers = m["resources"].as_array().into_iter().flatten()
+            .filter_map(|r| r.as_str().map(str::to_owned).or_else(|| r["name"].as_str().map(str::to_owned)))
+            .collect::<Vec<_>>().join(", ");
+        out.push(DirectoryEntry {
+            name,
+            version: s(m, "version"),
+            description: s(m, "description").chars().take(180).collect(),
+            offers,
+            installed: here.contains(&manifest_url),
+            manifest_url,
+        });
+    }
+    ensure!(!out.is_empty(), "No Stremio add-ons were found in that directory.");
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- cross-device sync & startup
+
+/// User-installed add-on URLs for encrypted cross-device sync (backend/account.rs).
+/// Travels only inside the end-to-end encrypted sync envelope.
+pub async fn for_handoff() -> Value {
+    let urls: Vec<String> = installed().await.iter()
+        .map(|a| s(a, "manifest_url"))
+        .filter(|u| !u.is_empty() && !is_cinemeta(u) && !crate::backend::retired_addon(u))
+        .collect();
+    json!({"urls": urls})
+}
+
+/// Adopt user-installed add-ons synced from another of your devices.
+/// Supports both the current `{"urls": [...]}` shape and legacy `{"others": [...]}`.
 pub async fn adopt(handoff: &Value) {
     let _one = CHANGING.lock().await;
-    let here: Vec<String> = installed().await.iter().map(|a| s(a, "manifest_url")).collect();
-    for id in handoff["curated"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        let Some(c) = Curated::ALL.into_iter().find(|c| c.id() == id) else { continue };
-        if c.needs_key() || !here.iter().any(|u| host_of(u) == c.host()) { let _ = install_unlocked(c).await; }
-    }
-    for url in handoff["others"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if !here.iter().any(|u| u == url) { let _ = exec(json!({"op":"install_addon","url":url})).await; }
+    let here: HashSet<String> = installed().await.iter().map(|a| s(a, "manifest_url")).collect();
+    let iter = handoff["urls"].as_array().into_iter().flatten()
+        .chain(handoff["others"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str);
+    for raw in iter {
+        let Ok(url) = normalize_custom_addon_url(raw) else { continue };
+        if !is_cinemeta(&url) && !here.contains(&url) {
+            let _ = exec(json!({"op":"install_addon","url":url})).await;
+        }
     }
     backend::forget_sources();
 }
 
-/// "Remove key": forget the Real-Debrid key, and take out the add-ons Veylo set up with it
-/// (their links carry the key). Add-ons you installed yourself stay.
-pub async fn remove_rd_key() -> Result<()> {
-    let _one = CHANGING.lock().await;
-    // The add-ons go first: if one can't be removed, the key stays so Remove key can be tried again.
-    for row in overview().await.curated.into_iter().filter(|(c, _)| c.needs_key()).filter_map(|(_, row)| row) {
-        exec(json!({"op":"remove_addon","url":row.url})).await
-            .map_err(|_| anyhow::anyhow!("{} couldn't be removed, so the key was kept. Try again.", row.name))?;
-    }
-    // Veylo's own records of those add-ons hold the key too (Torrentio's link, the AIOStreams
-    // login of a configuration that has the key): delete the AIOStreams configuration on its
-    // server where it still answers, and forget all of them.
-    // If AIOStreams doesn't answer, its login and the key stay so Remove key can be tried again;
-    // a configuration its server no longer has (or won't let us in) is simply forgotten.
-    let mut store = load();
-    let mut unreachable = false;
-    for c in Curated::ALL {
-        for name in [c.id().to_owned(), format!("{}:pending", c.id())] {
-            let Some(record) = store.managed.get(&name).cloned() else { continue };
-            let (uuid, password) = (s(&record, "uuid"), s(&record, "password"));
-            if c == Curated::AioStreams && !uuid.is_empty() && !password.is_empty() {
-                if let Err(e) = aiostreams_call(reqwest::Method::DELETE, json!({}), Some((uuid, password))).await {
-                    if format!("{e}").starts_with("AIOStreams didn't answer") { unreachable = true; continue; }
-                }
-            }
-            store.managed.remove(&name);
-        }
-    }
-    save(&store);
-    ensure!(!unreachable, "AIOStreams didn't answer, so its copy of your key is still there. Try Remove key again later.");
-    backend::update_settings(|s| { s.rd_key = None; s.rd_key_removed = true; });
-    Ok(())
-}
-
-/// Real-Debrid account check for a pasted key: "Premium until 2027-03-12".
-pub async fn check_rd_key(key: String) -> Result<String> {
-    on_runtime(async move {
-        let resp = backend::backend_http().get("https://api.real-debrid.com/rest/1.0/user")
-            .bearer_auth(&key).send().await.map_err(|_| anyhow::anyhow!("Real-Debrid didn't answer. Check your connection."))?;
-        ensure!(resp.status().is_success(), "Real-Debrid didn't accept this key");
-        let v: Value = serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or_default();
-        let until = s(&v, "expiration").chars().take(10).collect::<String>();
-        Ok(match s(&v, "type").as_str() {
-            "premium" if !until.is_empty() => format!("Premium until {until}"),
-            "premium" => "Premium".to_owned(),
-            _ => "Free account: Real-Debrid streams need premium".to_owned(),
-        })
-    }).await?
-}
-
-// Only Veylo-managed, installed AIOStreams configurations written by an older Veylo are written again.
-fn needs_config_update(c: Curated, record: Option<&Value>) -> bool {
-    c == Curated::AioStreams && record.is_some_and(|r| r["revision"].as_u64().unwrap_or(u64::from(r["exclude_3d"] == true)) < AIOSTREAMS_REVISION)
-}
-
-/// At start: adopt the Real-Debrid key from a Torrentio link installed from its website,
-/// replace website installs of curated add-ons with Veylo's own, then look for new versions.
+/// At start: check for new versions on user-installed add-ons (never auto-installs anything).
 pub async fn startup() -> usize {
-    {
-        let _one = CHANGING.lock().await;
-        set_up().await;
-    }
     check_updates().await
-}
-
-/// `startup` before the update check: key adoption, the free add-ons, replacing website installs.
-async fn set_up() {
-    let mut settings = backend::load_settings();
-    let addons = installed().await;
-    // A key you removed in Settings is not taken back from an add-on's link.
-    if settings.rd_key.is_none() && !settings.rd_key_removed {
-        let key = addons.iter().map(|a| s(a, "manifest_url")).filter(|u| host_of(u) == Curated::Torrentio.host())
-            .find_map(|u| u.split(['/', '|']).find_map(|p| p.strip_prefix("realdebrid=").map(str::to_owned)))
-            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric()));
-        if let Some(key) = key {
-            settings.rd_key = Some(key);
-            backend::save_settings(&settings);
-        }
-    }
-    // The free add-ons, unless you removed them.
-    {
-        let store = load();
-        for c in Curated::ALL.into_iter().filter(|c| !c.needs_key()) {
-            let present = addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
-            if !present && !store.managed.contains_key(&removed_key(c)) { let _ = install_unlocked(c).await; }
-        }
-    }
-    if settings.rd_key.is_some() {
-        let store = load();
-        for c in Curated::ALL.into_iter().filter(|c| c.needs_key()) {
-            let managed = store.managed.get(c.id()).map(|m| s(m, "url"));
-            let foreign = addons.iter().any(|a| { let u = s(a, "manifest_url"); host_of(&u) == c.host() && Some(&u) != managed.as_ref() });
-            let outdated = needs_config_update(c, store.managed.get(c.id()))
-                && addons.iter().any(|a| host_of(&s(a, "manifest_url")) == c.host());
-            if foreign || outdated { let _ = install_unlocked(c).await; }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn torrentio_asks_for_everything_cached() {
-        let url = torrentio_url("KEY", language("italian"));
-        assert_eq!(url, "https://torrentio.strem.fun/language=italian|debridoptions=nodownloadlinks,nocatalog|realdebrid=KEY/manifest.json");
-        assert!(!url.contains("qualityfilter") && !url.contains("limit"));
-        // English is Torrentio's default order, not an option.
-        assert_eq!(torrentio_url("KEY", language("english")), "https://torrentio.strem.fun/debridoptions=nodownloadlinks,nocatalog|realdebrid=KEY/manifest.json");
-    }
-
-    #[test]
-    fn aiostreams_config_excludes_3d_without_size_or_resolution_limits() {
-        let c = aiostreams_config("KEY", language("italian"));
-        assert_eq!(c["excludeUncached"], true);
-        assert_eq!(c["excludedVisualTags"], json!(["3D"]));
-        assert_eq!(c["preferredLanguages"], json!(["Italian"]));
-        assert_eq!(c["services"][0]["credentials"]["apiKey"], "KEY");
-        assert!(c["presets"].as_array().unwrap().iter().all(|p| p["options"]["resources"] == json!(["stream"])));
-        assert!(c.get("excludedResolutions").is_none() && c.get("resultLimits").is_none());
-    }
-
-    #[test]
-    fn existing_managed_aiostreams_is_written_again_once_per_revision() {
-        assert!(needs_config_update(Curated::AioStreams, Some(&json!({}))));
-        assert!(needs_config_update(Curated::AioStreams, Some(&json!({"exclude_3d":true}))));
-        assert!(!needs_config_update(Curated::AioStreams, Some(&json!({"exclude_3d":true, "revision": AIOSTREAMS_REVISION}))));
-        assert!(!needs_config_update(Curated::AioStreams, None));
-        assert!(!needs_config_update(Curated::Torrentio, Some(&json!({}))));
-        assert_eq!(aiostreams_config("KEY", None)["presets"][0]["options"]["timeout"], 3000);
-    }
-
-    #[test]
-    fn free_addons_need_no_key_and_are_known_by_name() {
-        assert!(Curated::ALL.iter().filter(|c| !c.needs_key()).all(|c| c.free_url().is_some_and(|u| host_of(u) == c.host())));
-        assert!(Curated::ALL.iter().filter(|c| c.needs_key()).all(|c| c.free_url().is_none()));
-        assert!(is_free_addon("Absolute Cinema") && is_free_addon("NoTorrent"));
-        assert!(!is_free_addon("Torrentio") && !is_free_addon("AIOStreams") && !is_free_addon(""));
-        // Absolute Cinema: web streams only, no catalogues.
-        assert!(ABSOLUTE_CINEMA.contains("mode=http") && ABSOLUTE_CINEMA.contains("streamingservices=none"));
-    }
 
     #[test]
     fn languages_match_flags_and_release_tags() {
@@ -712,11 +573,35 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_and_validates_custom_addon_urls() {
+    fn normalizes_validates_and_parses_deep_links_and_configure_urls() {
         assert_eq!(normalize_custom_addon_url("stremio://example.com/cfg").unwrap(), "https://example.com/cfg/manifest.json");
         assert_eq!(normalize_custom_addon_url("https://example.com/manifest.json").unwrap(), "https://example.com/manifest.json");
         assert_eq!(normalize_custom_addon_url("http://127.0.0.1:7000/").unwrap(), "http://127.0.0.1:7000/manifest.json");
         assert!(normalize_custom_addon_url("http://remote.example.com/manifest.json").is_err());
         assert!(normalize_custom_addon_url("not-a-url").is_err());
+
+        assert_eq!(parse_deep_link("stremio://addons.example/my-addon/manifest.json").as_deref(),
+            Some("https://addons.example/my-addon/manifest.json"));
+        assert_eq!(parse_deep_link("veylo://install?url=https%3A%2F%2Faddons.example%2Fcfg%2Fmanifest.json").as_deref(),
+            Some("https://addons.example/cfg/manifest.json"));
+        assert_eq!(parse_deep_link("https://example.com/not-a-deep-link"), None);
+
+        assert_eq!(derive_configure_url("https://addons.example/cfg/manifest.json").as_deref(),
+            Some("https://addons.example/cfg/configure"));
+        assert_eq!(derive_configure_url("http://127.0.0.1:7000/manifest.json"), None);
+    }
+
+    #[test]
+    fn parses_stremio_veylo_and_plain_addon_bundles() {
+        let stremio = r#"{"addons":[{"transportUrl":"https://v3-cinemeta.strem.io/manifest.json"},{"transportUrl":"https://a.example/manifest.json"},{"transportUrl":"stremio://b.example/cfg"}]}"#;
+        assert_eq!(parse_bundle_urls(stremio), vec![
+            "https://a.example/manifest.json",
+            "https://b.example/cfg/manifest.json",
+        ]);
+        let plain = "# comment\nhttps://a.example/manifest.json\nstremio://b.example\nhttp://insecure.example/manifest.json\n";
+        assert_eq!(parse_bundle_urls(plain), vec![
+            "https://a.example/manifest.json",
+            "https://b.example/manifest.json",
+        ]);
     }
 }

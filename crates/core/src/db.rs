@@ -20,7 +20,13 @@ pub(crate) fn now() -> i64 {
 
 pub(crate) fn open(path: &Path) -> Result<Connection> {
     std::fs::create_dir_all(path)?;
-    let mut db = Connection::open(path.join("core.sqlite3"))?;
+    let db_path = path.join("core.sqlite3");
+    let mut db = Connection::open(&db_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+    }
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON;")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;

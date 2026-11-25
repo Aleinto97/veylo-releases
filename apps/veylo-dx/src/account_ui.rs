@@ -1,5 +1,5 @@
 //! Settings → Account: sign in (Google, email and password, or a computer linked by scanning its
-//! QR code with a signed-in phone or tablet), and what sync is doing. All of it in the app.
+//! QR code with a signed-in phone or tablet), zero-knowledge E2EE Recovery Key, and sync status.
 use crate::{backend, icons};
 use dioxus::prelude::*;
 
@@ -17,9 +17,12 @@ pub fn AccountBlock() -> Element {
     let mut password = use_signal(String::new);
     let mut last = use_signal(backend::last_synced);
     let mut confirm_delete = use_signal(|| false);
+    let mut show_key = use_signal(|| false);
+    let mut key_copied = use_signal(|| false);
+    let mut recovery_draft = use_signal(String::new);
+    let mut enter_key_open = use_signal(backend::sync_key_needed);
     if !backend::accounts_available() { return rsx! {}; }
 
-    // One account job at a time; its error is said in the app's words.
     let mut run = move |label: &'static str, job: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>>>>| {
         if busy.peek().is_some() { return; }
         busy.set(Some(label));
@@ -42,105 +45,195 @@ pub fn AccountBlock() -> Element {
 
     rsx! {
         section { class: "settings-block account-block",
-            div { class: "group-head", span { class: "group-icon", icons::Users {} } span { class: "group-name", "Account" } }
-            match account() {
-                Some(a) => rsx! {
-                    div { class: "setting-row glass",
-                        div { class: "setting-copy",
-                            span { class: "setting-name", if !a.name.is_empty() { "{a.name}" } else if !a.email.is_empty() { "{a.email}" } else { "Signed in" } }
-                            span { class: "dim setting-about",
-                                if !a.email.is_empty() && !a.name.is_empty() { "{a.email} · " }
-                                if a.provider == "google" { "Google · " }
-                                {synced_label(last())}
-                            }
-                        }
-                        button { class: "pill glass", disabled: working.is_some(),
-                            onclick: move |_| run("sync", Box::pin(async { let (took, sent) = backend::sync_now().await?;
-                                Ok(Some(if took + sent == 0 { "Everything is up to date.".into() } else { format!("Synced: {took} in, {sent} out.") })) })),
-                            icons::Refresh {} span { if working == Some("sync") { "Syncing…" } else { "Sync now" } } }
-                    }
-                    div { class: "setting-row glass",
-                        div { class: "setting-copy", span { class: "setting-name", "What syncs" }
-                            span { class: "dim setting-about", "Your library, where you are in each film and episode, what you watched, your likes, API keys and add-ons. Every device signed in to this account shares them automatically." } }
-                    }
-                    if cfg!(target_os = "android") && !crate::is_tv() {
-                        div { class: "setting-row glass",
-                            div { class: "setting-copy", span { class: "setting-name", "Sign in on a computer or TV" }
-                                span { class: "dim setting-about", "On the computer or TV: Settings → Account → Sign in with your phone. Then scan the code it shows." } }
-                            button { class: "pill glass", disabled: working.is_some(),
-                                onclick: move |_| run("scan", Box::pin(async { scan().await?; Ok(Some("The device is signed in.".into())) })),
-                                icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan its code" } } }
-                        }
-                    }
-                    div { class: "setting-row glass",
-                        div { class: "setting-copy", span { class: "setting-name", "Sign out" }
-                            span { class: "dim setting-about", "This device stops syncing. Its library stays." } }
-                        button { class: "pill glass", disabled: working.is_some(), onclick: move |_| { backend::sign_out(); account.set(None); note.set(None); }, span { "Sign out" } }
-                    }
-                    div { class: "setting-row glass",
-                        div { class: "setting-copy", span { class: "setting-name", "Delete account" }
-                            span { class: "dim setting-about", "Deletes the account and everything synced to it. Each device keeps its own library." } }
-                        if confirm_delete() {
-                            span { class: "confirm", role: "group", aria_label: "Delete the account?",
-                                button { class: "pill forget-confirm", disabled: working.is_some(),
-                                    onclick: move |_| { confirm_delete.set(false); run("delete", Box::pin(async { backend::delete_account().await?; Ok(Some("Account deleted.".into())) })); },
-                                    icons::Trash {} span { "Delete for good" } }
-                                icons::IconButton { label: "Keep it", class: "glass small", onclick: move |_| confirm_delete.set(false), icons::Close {} }
-                            }
-                        } else {
-                            button { class: "pill glass", disabled: working.is_some(), onclick: move |_| confirm_delete.set(true), icons::Trash {} span { "Delete account" } }
-                        }
-                    }
-                },
-                None => rsx! {
-                    div { class: "setting-row glass",
-                        div { class: "setting-copy", span { class: "setting-name", "Sync your devices" }
-                            span { class: "dim setting-about", "Sign in to share your library, progress and likes between your phone, tablet and computer." } }
-                    }
-                    div { class: "account-choices",
-                        if backend::google_available() {
-                            button { class: "pill accent", disabled: working.is_some(),
-                                onclick: move |_| run("google", Box::pin(async { backend::sign_in_google().await?; Ok(None) })),
-                                span { class: "google-g", aria_hidden: "true", "G" }
-                                span { if working == Some("google") { if cfg!(target_os = "android") { "Signing in…" } else { "Finish in your browser…" } } else { "Continue with Google" } } }
-                        }
-                        button { class: if panel() == Panel::Email { "pill glass on" } else { "pill glass" }, disabled: working.is_some(),
-                            onclick: move |_| panel.set(if panel() == Panel::Email { Panel::Choices } else { Panel::Email }), icons::Pen {} span { "Use email" } }
-                        if !cfg!(target_os = "android") || crate::is_tv() {
-                            button { class: if panel() == Panel::Qr { "pill glass on" } else { "pill glass" }, disabled: working.is_some() && panel() != Panel::Qr,
-                                onclick: move |_| panel.set(if panel() == Panel::Qr { Panel::Choices } else { Panel::Qr }), icons::Grid {} span { "Sign in with your phone" } }
-                        }
-                    }
-                    if panel() == Panel::Email {
-                        div { class: "account-form glass",
-                            input { class: "key-field", r#type: "email", placeholder: "Email", aria_label: "Email", autocomplete: "email",
-                                value: "{email}",
-                                onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
-                                oninput: move |e| email.set(e.value()) }
-                            input { class: "key-field", r#type: "password", placeholder: "Password", aria_label: "Password", autocomplete: "current-password",
-                                value: "{password}",
-                                onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
-                                oninput: move |e| password.set(e.value()) }
-                            div { class: "account-actions",
-                                button { class: "pill accent", disabled: working.is_some() || creds_empty,
-                                    onclick: move |_| submit_sign_in(),
-                                    span { if working == Some("in") { "Signing in…" } else { "Sign in" } } }
-                                button { class: "pill glass", disabled: working.is_some() || creds_empty,
-                                    onclick: move |_| { let (e, p) = (email(), password()); run("up", Box::pin(async move { backend::sign_up(e, p).await?; Ok(None) })); },
-                                    span { if working == Some("up") { "Creating…" } else { "Create account" } } }
-                                button { class: "link-btn", disabled: working.is_some(),
-                                    onclick: move |_| { let e = email(); run("reset", Box::pin(async move {
-                                        anyhow::ensure!(!e.trim().is_empty(), "Type your email first.");
-                                        backend::reset_password(e).await?; Ok(Some("Check your email for a link to choose a new password.".into())) })); },
-                                    span { "Forgot password?" } }
-                            }
-                        }
-                    }
-                    if panel() == Panel::Qr { LinkPanel { on_signed_in: move |_| { account.set(backend::account()); panel.set(Panel::Choices); } } }
-                },
+            div { class: "group-head",
+                span { class: "group-icon", icons::Users {} }
+                span { class: "group-name", "Account & Sync" }
             }
-            if let Some(p) = problem() { p { class: "addon-problem", role: "alert", icons::Alert {} span { "{p}" } } }
-            if let Some(n) = note() { p { class: "account-note", role: "status", icons::Check {} span { "{n}" } } }
+            div { class: "settings-group glass",
+                match account() {
+                    Some(a) => {
+                        let display = if !a.name.is_empty() { a.name.clone() } else if !a.email.is_empty() { a.email.clone() } else { "Signed in".to_owned() };
+                        let initial = display.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "V".to_owned());
+                        let key_needed = backend::sync_key_needed();
+                        rsx! {
+                            div { class: "setting-row",
+                                div { class: "account-hero",
+                                    span { class: "account-avatar", aria_hidden: "true", "{initial}" }
+                                    div { class: "setting-copy",
+                                        div { class: "setting-title-line",
+                                            span { class: "setting-name", "{display}" }
+                                            if key_needed {
+                                                span { class: "status-pill warn", icons::Alert {} span { "Key needed" } }
+                                            } else {
+                                                span { class: "status-pill ok", icons::Lock {} span { "E2EE active" } }
+                                            }
+                                        }
+                                        span { class: "setting-about",
+                                            if !a.email.is_empty() && !a.name.is_empty() { "{a.email} · " }
+                                            if a.provider == "google" { "Google · " }
+                                            {synced_label(last())}
+                                        }
+                                    }
+                                }
+                                div { class: "setting-controls",
+                                    button { class: "pill glass small", disabled: working.is_some(),
+                                        onclick: move |_| run("sync", Box::pin(async { let (took, sent) = backend::sync_now().await?;
+                                            Ok(Some(if took + sent == 0 { "Everything is up to date.".into() } else { format!("Synced: {took} in, {sent} out.") })) })),
+                                        icons::Refresh {} span { if working == Some("sync") { "Syncing…" } else { "Sync now" } } }
+                                }
+                            }
+                            div { class: "setting-row",
+                                div { class: "setting-copy",
+                                    span { class: "setting-name", "End-to-end encryption key" }
+                                    span { class: "setting-about",
+                                        if key_needed { "This account has encrypted cloud data from another device. Link via QR or enter its Recovery Key to unlock sync." }
+                                        else { "Library, progress, likes, TMDB key and add-ons are AES-256-GCM encrypted on-device. Keep a backup of your Recovery Key for new devices." }
+                                    }
+                                }
+                                div { class: "setting-controls",
+                                    if let Some(code) = backend::sync_recovery_code() {
+                                        button { class: "pill glass small", onclick: move |_| show_key.set(!show_key()),
+                                            span { if show_key() { "Hide" } else { "Reveal" } } }
+                                        button { class: "pill glass small", onclick: move |_| {
+                                            let js = format!("navigator.clipboard?.writeText({}).catch(()=>{{}})", serde_json::to_string(&code).unwrap_or_default());
+                                            let _ = document::eval(&js);
+                                            key_copied.set(true);
+                                            spawn(async move { backend::sleep(2200).await; key_copied.set(false); });
+                                        }, icons::Copy {} span { if key_copied() { "Copied" } else { "Copy" } } }
+                                    }
+                                    button { class: if key_needed { "pill accent small" } else { "pill glass small" },
+                                        onclick: move |_| enter_key_open.set(!enter_key_open()),
+                                        span { if enter_key_open() { "Close" } else { "Enter key" } } }
+                                }
+                            }
+                            if show_key() {
+                                if let Some(code) = backend::sync_recovery_code() {
+                                    div { class: "setting-drawer",
+                                        span { class: "setting-about", "Your 256-bit Sync Recovery Key (never shared with Firebase):" }
+                                        pre { class: "diag-log", "{code}" }
+                                    }
+                                }
+                            }
+                            if enter_key_open() || key_needed {
+                                div { class: "setting-drawer",
+                                    div { class: "setting-input-group",
+                                        input { class: "key-field", r#type: "password", placeholder: "VEYLO-… recovery key", aria_label: "Sync recovery key", autocomplete: "off",
+                                            value: "{recovery_draft}",
+                                            onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); },
+                                            oninput: move |e| recovery_draft.set(e.value()),
+                                        }
+                                        button { class: "pill accent small", disabled: working.is_some() || recovery_draft().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let code = recovery_draft.peek().clone();
+                                                run("unlock", Box::pin(async move {
+                                                    let (took, sent) = backend::set_sync_recovery_code(&code).await?;
+                                                    recovery_draft.set(String::new());
+                                                    enter_key_open.set(false);
+                                                    Ok(Some(format!("Recovery key applied ({took} in, {sent} out).")))
+                                                }));
+                                            },
+                                            icons::Unlock {} span { if working == Some("unlock") { "Unlocking…" } else { "Unlock & sync" } }
+                                        }
+                                    }
+                                }
+                            }
+                            if cfg!(target_os = "android") && !crate::is_tv() {
+                                div { class: "setting-row",
+                                    div { class: "setting-copy",
+                                        span { class: "setting-name", "Link a computer or TV" }
+                                        span { class: "setting-about", "Scan the QR code shown on another device to transfer your session and encryption key securely." }
+                                    }
+                                    div { class: "setting-controls",
+                                        button { class: "pill glass small", disabled: working.is_some(),
+                                            onclick: move |_| run("scan", Box::pin(async { scan().await?; Ok(Some("The device is signed in.".into())) })),
+                                            icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan QR code" } } }
+                                    }
+                                }
+                            }
+                            div { class: "setting-row",
+                                div { class: "setting-copy",
+                                    span { class: "setting-name", "Session & cloud data" }
+                                    span { class: "setting-about", "Signing out keeps your local library. Deleting removes your account and all encrypted cloud data." }
+                                }
+                                div { class: "setting-controls",
+                                    button { class: "pill glass small", disabled: working.is_some(),
+                                        onclick: move |_| { backend::sign_out(); account.set(None); note.set(None); },
+                                        span { "Sign out" } }
+                                    if confirm_delete() {
+                                        span { class: "confirm", role: "group", aria_label: "Delete the account?",
+                                            button { class: "pill forget-confirm", disabled: working.is_some(),
+                                                onclick: move |_| { confirm_delete.set(false); run("delete", Box::pin(async { backend::delete_account().await?; Ok(Some("Account deleted.".into())) })); },
+                                                icons::Trash {} span { "Confirm delete" } }
+                                            icons::IconButton { label: "Keep it", class: "glass small", onclick: move |_| confirm_delete.set(false), icons::Close {} }
+                                        }
+                                    } else {
+                                        button { class: "pill glass small danger", disabled: working.is_some(),
+                                            onclick: move |_| confirm_delete.set(true),
+                                            icons::Trash {} span { "Delete account" } }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    None => rsx! {
+                        div { class: "setting-row",
+                            div { class: "setting-copy",
+                                div { class: "setting-title-line",
+                                    span { class: "setting-name", "Zero-knowledge cloud sync" }
+                                    span { class: "status-pill muted", "Optional" }
+                                }
+                                span { class: "setting-about", "Sign in to end-to-end encrypt and sync your library, progress, likes, preferences and add-ons across devices." }
+                            }
+                            div { class: "account-choices",
+                                if backend::google_available() {
+                                    button { class: "pill accent small", disabled: working.is_some(),
+                                        onclick: move |_| run("google", Box::pin(async { backend::sign_in_google().await?; Ok(None) })),
+                                        span { class: "google-g", aria_hidden: "true", "G" }
+                                        span { if working == Some("google") { if cfg!(target_os = "android") { "Signing in…" } else { "Finish in browser…" } } else { "Google" } } }
+                                }
+                                button { class: if panel() == Panel::Email { "pill glass small on" } else { "pill glass small" }, disabled: working.is_some(),
+                                    onclick: move |_| panel.set(if panel() == Panel::Email { Panel::Choices } else { Panel::Email }), icons::Pen {} span { "Email" } }
+                                if !cfg!(target_os = "android") || crate::is_tv() {
+                                    button { class: if panel() == Panel::Qr { "pill glass small on" } else { "pill glass small" }, disabled: working.is_some() && panel() != Panel::Qr,
+                                        onclick: move |_| panel.set(if panel() == Panel::Qr { Panel::Choices } else { Panel::Qr }), icons::Grid {} span { "Phone QR" } }
+                                }
+                            }
+                        }
+                        if panel() == Panel::Email {
+                            div { class: "setting-drawer",
+                                input { class: "key-field", r#type: "email", placeholder: "Email", aria_label: "Email", autocomplete: "email",
+                                    value: "{email}",
+                                    onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
+                                    oninput: move |e| email.set(e.value()) }
+                                input { class: "key-field", r#type: "password", placeholder: "Password", aria_label: "Password", autocomplete: "current-password",
+                                    value: "{password}",
+                                    onkeydown: move |e: KeyboardEvent| { e.stop_propagation(); if e.key() == Key::Enter { submit_sign_in(); } },
+                                    oninput: move |e| password.set(e.value()) }
+                                div { class: "account-actions",
+                                    button { class: "pill accent small", disabled: working.is_some() || creds_empty,
+                                        onclick: move |_| submit_sign_in(),
+                                        span { if working == Some("in") { "Signing in…" } else { "Sign in" } } }
+                                    button { class: "pill glass small", disabled: working.is_some() || creds_empty,
+                                        onclick: move |_| { let (e, p) = (email(), password()); run("up", Box::pin(async move { backend::sign_up(e, p).await?; Ok(None) })); },
+                                        span { if working == Some("up") { "Creating…" } else { "Create account" } } }
+                                    button { class: "link-btn", disabled: working.is_some(),
+                                        onclick: move |_| { let e = email(); run("reset", Box::pin(async move {
+                                            anyhow::ensure!(!e.trim().is_empty(), "Type your email first.");
+                                            backend::reset_password(e).await?; Ok(Some("Check your email for a link to choose a new password.".into())) })); },
+                                        span { "Forgot password?" } }
+                                }
+                            }
+                        }
+                        if panel() == Panel::Qr {
+                            div { class: "setting-drawer",
+                                LinkPanel { on_signed_in: move |_| { account.set(backend::account()); panel.set(Panel::Choices); } }
+                            }
+                        }
+                    },
+                }
+                if let Some(p) = problem() { p { class: "addon-problem", role: "alert", icons::Alert {} span { "{p}" } } }
+                if let Some(n) = note() { p { class: "account-note", role: "status", icons::Check {} span { "{n}" } } }
+            }
         }
     }
 }
@@ -172,7 +265,6 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
             let started = backend::now_secs();
             while backend::now_secs() - started < 600 {
                 backend::sleep(2000).await;
-                // Closed, or a new code meanwhile: this wait is over.
                 if offer.peek().as_ref() != Some(&made) { return; }
                 match backend::take_link(&made).await {
                     Ok(Some(_)) => { on_signed_in.call(()); return; }
@@ -185,22 +277,24 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
     });
     let qr = offer().and_then(|o| backend::qr_svg(&o.code));
     rsx! {
-        div { class: "account-form glass link-panel",
+        div { class: "link-panel",
             match qr {
                 Some(src) => rsx! { img { class: "link-qr", src: "{src}", alt: "Sign-in code" } },
                 None => rsx! { div { class: "link-qr skeleton-card" } },
             }
             div { class: "setting-copy",
                 span { class: "setting-name", "Scan with Veylo on your phone or tablet" }
-                span { class: "dim setting-about", "There: Settings → Account → Scan its code. This device signs in to the same account." }
+                span { class: "setting-about", "Open Settings → Account → Scan QR code. Transfers your account and E2EE key in one scan." }
                 if let Some(p) = problem() { span { class: "addon-problem", icons::Alert {} span { "{p}" } } }
-                button { class: "pill glass", onclick: move |_| round += 1, icons::Refresh {} span { "New code" } }
+                div { class: "account-actions",
+                    button { class: "pill glass small", onclick: move |_| round += 1, icons::Refresh {} span { "New code" } }
+                }
             }
         }
     }
 }
 
-/// Confirmation toast when your synced API keys and add-ons arrive automatically on this device.
+/// Confirmation toast when your synced settings and add-ons arrive automatically on this device.
 #[component]
 pub fn KeysPrompt() -> Element {
     let mut arrived = use_signal(|| None::<String>);
@@ -218,8 +312,8 @@ pub fn KeysPrompt() -> Element {
             div { class: "toast glass", role: "status",
                 span { class: "lamp", icons::Check {} }
                 span { class: "toast-title",
-                    if from.is_empty() { "Your keys and add-ons synced to this device" }
-                    else { "Your keys and add-ons arrived from {from}" }
+                    if from.is_empty() { "Your settings and add-ons synced to this device" }
+                    else { "Your settings and add-ons arrived from {from}" }
                 }
             }
         }

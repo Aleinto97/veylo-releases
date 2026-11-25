@@ -22,8 +22,15 @@ if [ -n "${VEYLO_ZIP:-}" ]; then
     cp "$VEYLO_ZIP" "$work/$asset"
 else
     echo "Downloading Veylo..."
-    curl -fL --progress-bar -o "$work/$asset" "https://github.com/$repo/releases/latest/download/$asset" \
+    base="https://github.com/$repo/releases/latest/download"
+    curl -fL --progress-bar -o "$work/$asset" "$base/$asset" \
         || fail "The latest Veylo release has no macOS download yet."
+    curl -fsSL -o "$work/SHA256SUMS.txt" "$base/SHA256SUMS.txt" \
+        || fail "Refusing to install: couldn't download SHA256SUMS.txt to verify the release."
+    expected=$(awk -v f="$asset" '{gsub(/^\*/, "", $2); if ($2 == f) print tolower($1)}' "$work/SHA256SUMS.txt" | head -1)
+    [ -n "$expected" ] || fail "Refusing to install: $asset is missing from SHA256SUMS.txt."
+    actual=$(shasum -a 256 "$work/$asset" | awk '{print tolower($1)}')
+    [ "$actual" = "$expected" ] || fail "Refusing to install: SHA-256 verification failed for $asset."
 fi
 ditto -x -k "$work/$asset" "$work/unpacked"
 [ -d "$work/unpacked/Veylo.app" ] || fail "The download isn't a Veylo app."

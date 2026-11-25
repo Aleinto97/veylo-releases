@@ -216,8 +216,21 @@ fn check_picture(path: &str, report: Option<&str>) -> i32 {
     code
 }
 
-/// Developer command: `veylo-dx --addons` runs the start-up add-on setup (key adoption,
-/// replacing website installs, update check) and prints names and versions; never links.
+/// Deep-link manifest URL passed on launch (`stremio://...` or `veylo://install?url=...`).
+static PENDING_DEEP_LINK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn take_pending_deep_link() -> Option<String> {
+    if let Some(url) = PENDING_DEEP_LINK.lock().ok().and_then(|mut s| s.take()) {
+        return Some(url);
+    }
+    #[cfg(target_os = "android")]
+    { android::take_deep_link() }
+    #[cfg(not(target_os = "android"))]
+    { None }
+}
+
+/// Developer command: `veylo-dx --addons` checks installed add-on versions and prints names and
+/// versions; never links.
 #[cfg(not(target_os = "android"))]
 fn print_addons() {
     if let Err(e) = backend::init() { eprintln!("{e:#}"); return; }
@@ -225,9 +238,8 @@ fn print_addons() {
     runtime.block_on(async {
         let updates = addons::startup().await;
         let ov = addons::overview().await;
-        println!("Real-Debrid key: {}, updates: {updates}", if backend::load_settings().rd_key.is_some() { "set" } else { "missing" });
-        for (c, row) in &ov.curated { println!("{}: {}", c.name(), row.as_ref().map(|r| format!("v{} {:?}", r.version, r.update)).unwrap_or_else(|| "not installed".into())); }
-        for r in &ov.others { println!("other: {} v{} {:?}", r.name, r.version, r.update); }
+        println!("Installed add-ons: {}, updates: {updates}", ov.addons.len());
+        for r in &ov.addons { println!("  {} v{} {:?}", r.name, r.version, r.update); }
     });
 }
 
@@ -250,6 +262,9 @@ fn launch_desktop() {
     if args.get(1).map(String::as_str) == Some("--check-picture") && args.len() >= 3 {
         let report = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1));
         std::process::exit(check_picture(&args[2], report.map(String::as_str)));
+    }
+    if let Some(url) = args.iter().skip(1).find_map(|a| addons::parse_deep_link(a)) {
+        if let Ok(mut slot) = PENDING_DEEP_LINK.lock() { *slot = Some(url); }
     }
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
     // WebKitGTK's DMA-BUF renderer repaints only damaged tiles of a transparent page, so the
@@ -370,9 +385,10 @@ fn Shell_() -> Element {
             start_playback(shell, player::PlayRequest { title: "Sintel trailer".into(), subtitle: "Test player".into(), url: backend::DEMO_STREAM.into(), ..Default::default() }, None);
         }
     });
-    // Once per launch: adopt the debrid key, replace website installs, look for new versions.
+    // Once per launch: check for new versions of user-installed add-ons.
     let mut addon_updates = shell.addon_updates;
     use_future(move || async move { addon_updates.set(addons::startup().await); });
+    let mut deep_link = use_signal(take_pending_deep_link);
     let Shell { tab, mut search_open, mut opened, lamp_source, mut pick_command, player_status, mut shortcuts_open, mut title_command, .. } = shell;
     let lamp = use_resource(move || async move { backend::accent(lamp_source()).await });
     let lamp_css = lamp().flatten().unwrap_or_else(|| "#f2efea".into());
@@ -724,6 +740,81 @@ fn Shell_() -> Element {
                 updater::UpdateNotice {}
             }
             if let Some(theatre) = (shell.trailer)() { theatre::TheatreSheet { theatre } }
+            if let Some(url) = deep_link() {
+                DeepLinkInstallModal { url, on_close: move |_| deep_link.set(None) }
+            }
+        }
+    }
+}
+
+/// One-tap confirmation dialog when Veylo is opened with a `stremio://` or `veylo://` add-on link.
+#[component]
+fn DeepLinkInstallModal(url: String, on_close: EventHandler<()>) -> Element {
+    let fetch_url = url.clone();
+    let preview = use_resource(move || {
+        let u = fetch_url.clone();
+        async move { addons::preview_manifest(&u).await.map_err(|e| format!("{e:#}")) }
+    });
+    let mut installing = use_signal(|| false);
+    let mut err = use_signal(|| None::<String>);
+    rsx! {
+        div { class: "scrim", role: "dialog", aria_modal: "true", aria_label: "Install Stremio add-on",
+            div { class: "modal-card glass",
+                div { class: "modal-head",
+                    span { class: "group-icon", icons::Stack {} }
+                    div { class: "setting-copy",
+                        span { class: "group-name", "Install add-on?" }
+                        span { class: "dim setting-about", "Review this add-on before adding it to Veylo." }
+                    }
+                }
+                match preview() {
+                    None => rsx! { p { class: "dim setting-about", "Reading add-on manifest…" } },
+                    Some(Err(e)) => rsx! {
+                        p { class: "addon-problem", role: "alert", icons::Alert {} span { "{e}" } }
+                        div { class: "modal-actions",
+                            button { class: "pill glass small", onclick: move |_| on_close.call(()), span { "Close" } }
+                        }
+                    },
+                    Some(Ok(info)) => rsx! {
+                        div { class: "modal-preview",
+                            div { class: "setting-title-line",
+                                span { class: "setting-name", "{info.name}" }
+                                if !info.version.is_empty() { span { class: "status-pill muted tnum", "v{info.version}" } }
+                            }
+                            p { class: "dim setting-about", "Host: {info.host}" if !info.offers.is_empty() { " · {info.offers}" } }
+                            if !info.description.is_empty() {
+                                p { class: "setting-about", "{info.description}" }
+                            }
+                        }
+                        if let Some(e) = err() {
+                            p { class: "addon-problem", role: "alert", icons::Alert {} span { "{e}" } }
+                        }
+                        div { class: "modal-actions",
+                            button { class: "pill glass small", disabled: installing(), onclick: move |_| on_close.call(()), span { "Cancel" } }
+                            button { class: "pill accent small", disabled: installing(),
+                                onclick: move |_| {
+                                    let target = info.url.clone();
+                                    installing.set(true);
+                                    err.set(None);
+                                    spawn(async move {
+                                        match addons::install_custom(target).await {
+                                            Ok(_) => {
+                                                crate::home::invalidate_cache();
+                                                on_close.call(());
+                                            }
+                                            Err(e) => {
+                                                err.set(Some(format!("{e:#}")));
+                                                installing.set(false);
+                                            }
+                                        }
+                                    });
+                                },
+                                icons::Plus {} span { if installing() { "Installing…" } else { "Install" } }
+                            }
+                        }
+                    },
+                }
+            }
         }
     }
 }
