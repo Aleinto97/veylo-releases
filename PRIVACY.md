@@ -46,8 +46,8 @@ using Firebase Authentication & Firestore:
 
 Veylo connects directly from your device to:
 - **Metadata & artwork providers** you enable (Cinemeta, BetterPosters, TVmaze,
-  Wikidata/Wikimedia/Wikipedia, AniList, ElfHosted, OpenSubtitles /
-  IntroDB / AniSkip during playback).
+  Wikidata/Wikimedia/Wikipedia, AniList, ElfHosted, JustWatch (title name only,
+  for backdrop images), OpenSubtitles / IntroDB / AniSkip during playback).
 - **User-installed add-ons**: Veylo ships with no third-party streaming add-ons.
   Any add-on URL you install is contacted directly by your device according to
   that add-on's own privacy policy. By default, Veylo does **not** prefetch
