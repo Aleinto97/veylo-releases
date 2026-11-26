@@ -24,6 +24,7 @@ object VeyloUpdate {
     private const val ACTION = "dev.veylo.dx.UPDATE_STATUS"
     private const val EXTRA_NONCE = "dev.veylo.dx.UPDATE_NONCE"
     private val rng = SecureRandom()
+    private val lock = Any()
     private var receiver: BroadcastReceiver? = null
     private var receiverContext: Context? = null
     private var activeSessionId: Int = -1
@@ -38,54 +39,74 @@ object VeyloUpdate {
         }
         val file = File(path)
         val installer = activity.packageManager.packageInstaller
+        val prevId = synchronized(lock) { activeSessionId }
+        if (prevId != -1) {
+            runCatching { installer.abandonSession(prevId) }
+            stopListening(prevId)
+        }
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
         params.setAppPackageName(activity.packageName)
         val id = installer.createSession(params)
         val nonceBytes = ByteArray(18)
         rng.nextBytes(nonceBytes)
         val nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(nonceBytes)
-        activeSessionId = id
-        activeNonce = nonce
-        listen(activity.applicationContext)
-        installer.openSession(id).use { session ->
-            file.inputStream().use { input ->
-                session.openWrite("veylo.apk", 0, file.length()).use { out ->
-                    input.copyTo(out)
-                    session.fsync(out)
+        synchronized(lock) {
+            activeSessionId = id
+            activeNonce = nonce
+            listenLocked(activity.applicationContext)
+        }
+        try {
+            installer.openSession(id).use { session ->
+                file.inputStream().use { input ->
+                    session.openWrite("veylo.apk", 0, file.length()).use { out ->
+                        input.copyTo(out)
+                        session.fsync(out)
+                    }
                 }
+                val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+                val callback = Intent(ACTION)
+                    .setPackage(activity.packageName)
+                    .putExtra(EXTRA_NONCE, nonce)
+                val status = PendingIntent.getBroadcast(activity, id, callback, flags)
+                session.commit(status.intentSender)
             }
-            val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-                (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
-            val callback = Intent(ACTION)
-                .setPackage(activity.packageName)
-                .putExtra(EXTRA_NONCE, nonce)
-            val status = PendingIntent.getBroadcast(activity, id, callback, flags)
-            session.commit(status.intentSender)
+        } catch (t: Throwable) {
+            runCatching { installer.abandonSession(id) }
+            stopListening(id)
+            throw t
         }
         return "installing"
     }
 
-    private fun stopListening() {
-        val r = receiver
-        val ctx = receiverContext
-        receiver = null
-        receiverContext = null
-        activeSessionId = -1
-        activeNonce = null
-        if (r != null && ctx != null) {
-            try { ctx.unregisterReceiver(r) } catch (_: Exception) {}
+    private fun stopListening(expectedSessionId: Int) {
+        val pair: Pair<BroadcastReceiver, Context>? = synchronized(lock) {
+            if (activeSessionId != expectedSessionId) return
+            val r = receiver
+            val ctx = receiverContext
+            receiver = null
+            receiverContext = null
+            activeSessionId = -1
+            activeNonce = null
+            if (r != null && ctx != null) Pair(r, ctx) else null
+        }
+        if (pair != null) {
+            try { pair.second.unregisterReceiver(pair.first) } catch (_: Exception) {}
         }
     }
 
     /** The installer reports back here; "pending user action" carries the confirmation screen. */
-    private fun listen(appContext: Context) {
+    private fun listenLocked(appContext: Context) {
         if (receiver != null) return
         val r = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (intent.action != ACTION) return
-                val expectedNonce = activeNonce ?: return
                 val sessionId = intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1)
-                if (sessionId != activeSessionId || intent.getStringExtra(EXTRA_NONCE) != expectedNonce) return
+                val matched = synchronized(lock) {
+                    val expectedNonce = activeNonce ?: return@synchronized false
+                    sessionId == activeSessionId && intent.getStringExtra(EXTRA_NONCE) == expectedNonce
+                }
+                if (!matched) return
                 val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
                 if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                     val confirm: Intent = if (Build.VERSION.SDK_INT >= 33) {
@@ -100,7 +121,7 @@ object VeyloUpdate {
                     confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     context.startActivity(confirm)
                 } else {
-                    stopListening()
+                    stopListening(sessionId)
                 }
             }
         }

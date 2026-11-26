@@ -510,9 +510,9 @@ impl Core {
         db::strip_streams(&mut persistent_body);
         self.with_db(|db| {
             if fetched.persist {
-                // Dropping inline streams would change exclusive playback semantics. Never
-                // serve a stripped resource response; keep only a sanitized ranking index.
-                if has_inline_streams {
+                // Dropping inline streams would change exclusive playback semantics, and `no-cache`
+                // must never be served stale without revalidation. Keep only sanitized metadata index.
+                if has_inline_streams || fetched.must_revalidate {
                     db.execute("DELETE FROM cache WHERE key=?1",[url])?;
                 } else {
                 db.execute(
@@ -926,21 +926,23 @@ impl Core {
         self.with_db(|db| {
             let tx=db.transaction()?;
             let key=db::upsert_meta(&tx,kind,id,&addon,meta)?;
-            if op != "forget" {
-                tx.execute("DELETE FROM deleted_media WHERE key=?1", params![key])?;
-            }
+            // Keep any prior deletion tombstone as a permanent lower bound against older episode
+            // playback from other devices, and ensure new local user mutations strictly post-date it.
+            let deleted_at: Option<i64> = tx
+                .query_row("SELECT deleted_at FROM deleted_media WHERE key=?1", [&key], |r| r.get(0))
+                .optional()?;
+            let ts = db::now().max(deleted_at.map_or(0, |t| t.saturating_add(1)));
             match op {
                 "set_library"=>{
-                    tx.execute("UPDATE media SET saved=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"saved",false)?,db::now()])?;
+                    tx.execute("UPDATE media SET saved=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"saved",false)?,ts])?;
                 },
                 "mark_watched"=>{
                     let watched=boolean(req,"watched",true)?;
-                    let now=db::now();
-                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,now])?;
+                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,ts])?;
                     if !watched {
                         // A film watched through is unmarked to watch again: timestamp the reset so
                         // other devices receive the unmark in sync_changes.
-                        tx.execute("UPDATE playback SET watched=0,watched_ms=0,updated=?3 WHERE media_key=?1 AND video_id=?2",params![key,id,now])?;
+                        tx.execute("UPDATE playback SET watched=0,watched_ms=0,updated=?3 WHERE media_key=?1 AND video_id=?2",params![key,id,ts])?;
                         tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1) WHERE key=?1",params![key])?;
                     }
                 },
@@ -949,26 +951,25 @@ impl Core {
                     let watched=boolean(req,"watched",true)?;
                     let videos=req["video_ids"].as_array().context("video_ids must be an array")?;
                     ensure!(videos.len()<=2000,"Too many videos");
-                    let now=db::now();
                     for v in videos {
                         let v=v.as_str().filter(|v| !v.is_empty() && v.len()<=512).context("Invalid video id")?;
                         if watched {
                             tx.execute(
                                 "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated,watched) VALUES(?1,?2,0,0,0,?3,1)
                                  ON CONFLICT(media_key,video_id) DO UPDATE SET watched=1,updated=excluded.updated",
-                                params![key,v,now],
+                                params![key,v,ts],
                             )?;
                         } else {
                             // Keep a timestamped cleared row so sync_changes propagates episode unmarks to other devices.
                             tx.execute(
                                 "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated,watched) VALUES(?1,?2,0,0,0,?3,0)
                                  ON CONFLICT(media_key,video_id) DO UPDATE SET watched=0,watched_ms=0,updated=excluded.updated",
-                                params![key,v,now],
+                                params![key,v,ts],
                             )?;
                         }
                     }
                     // The title's measured total follows its episodes.
-                    tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1),updated=?2 WHERE key=?1",params![key,now])?;
+                    tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1),updated=?2 WHERE key=?1",params![key,ts])?;
                 },
                 "forget"=>{
                     // Stop tracking a title: record a tombstone so older playback from another device cannot resurrect it.
@@ -984,7 +985,7 @@ impl Core {
                 "feedback"=>{
                     let value=req["value"].as_i64().context("Feedback value must be -1, 0, or 1")?;
                     ensure!((-1..=1).contains(&value),"Feedback value must be -1, 0, or 1");
-                    tx.execute("UPDATE media SET liked=?2,updated=?3 WHERE key=?1",params![key,value,db::now()])?;
+                    tx.execute("UPDATE media SET liked=?2,updated=?3 WHERE key=?1",params![key,value,ts])?;
                 },
                 "progress"=>{
                     let position=nonnegative(req,"position_ms",None)?;
@@ -999,7 +1000,7 @@ impl Core {
                         "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated) VALUES(?1,?2,?3,?4,?5,?6)
                          ON CONFLICT(media_key,video_id) DO UPDATE SET position_ms=excluded.position_ms,duration_ms=excluded.duration_ms,
                          watched_ms=MAX(playback.watched_ms,excluded.watched_ms),updated=excluded.updated",
-                        params![key,video,position,duration,watched,db::now()],
+                        params![key,video,position,duration,watched,ts],
                     )?;
                     if added>0 {
                         tx.execute(
@@ -1017,7 +1018,7 @@ impl Core {
                     let auto=kind=="movie" && tx.query_row("SELECT watched FROM playback WHERE media_key=?1 AND video_id=?2",params![key,video],|r|r.get::<_,bool>(0))?;
                     tx.execute(
                         "UPDATE media SET position_ms=?2,duration_ms=?3,watched_ms=?4,video_id=?5,watched=MAX(watched,?6),updated=?7 WHERE key=?1",
-                        params![key,position,duration,total,video,auto,db::now()],
+                        params![key,position,duration,total,video,auto,ts],
                     )?;
                 },
                 _=>unreachable!(),
@@ -1139,12 +1140,17 @@ impl Core {
             .await
             .context("Network scheduler closed")?;
         let mut target = url::Url::parse(url).context("Invalid subtitle URL")?;
+        let allow_loopback = addon::is_loopback(&target);
         let mut cacheable = true;
         let mut expiry = None;
         for redirects in 0..=3 {
             // A redirect is a separate network request and must not bypass
-            // scoped consent or inject URL credentials.
+            // scoped consent, redirect to loopback, or inject URL credentials.
             addon::validate_transport(&target, allow_http)?;
+            ensure!(
+                allow_loopback || !addon::is_loopback(&target),
+                "Remote subtitle cannot redirect to loopback"
+            );
             let sent_at = std::time::SystemTime::now();
             let mut response = self
                 .inner

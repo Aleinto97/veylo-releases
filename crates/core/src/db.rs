@@ -487,9 +487,6 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
         if deleted_at.is_some_and(|t| t >= updated) {
             continue;
         }
-        if deleted_at.is_some() {
-            tx.execute("DELETE FROM deleted_media WHERE key=?1", [&key])?;
-        }
         let meta = if m["meta"].is_object() {
             m["meta"].clone()
         } else {
@@ -526,9 +523,6 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
             .optional()?;
         if deleted_at.is_some_and(|t| t >= updated) {
             continue;
-        }
-        if deleted_at.is_some() {
-            tx.execute("DELETE FROM deleted_media WHERE key=?1", [&key])?;
         }
         let key = upsert_meta(&tx, &kind, &id, &addon, &json!({}))?;
         applied += tx.execute(

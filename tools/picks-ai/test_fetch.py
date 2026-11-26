@@ -90,11 +90,32 @@ class FetchTests(unittest.TestCase):
             old_dest = fetch.DEST
             fetch.DEST = Path(tmp)
             try:
-                with mock.patch.object(fetch.urllib.request, 'urlopen', return_value=io.BytesIO(b'bad')), \
+                with mock.patch.object(fetch.urllib.request, 'urlopen', side_effect=lambda *a, **kw: io.BytesIO(b'bad')), \
                      mock.patch.object(fetch.time, 'sleep'):
                     with self.assertRaises(RuntimeError):
                         fetch.download(['https://primary.invalid/bad'], digest)
                 self.assertFalse((Path(tmp) / 'downloads' / digest).exists())
+            finally:
+                fetch.DEST = old_dest
+
+    def test_checksum_mismatch_fails_over_to_mirror(self):
+        good = b'verified payload'
+        digest = hashlib.sha256(good).hexdigest()
+        seen = []
+
+        def fake_urlopen(req, timeout=120):
+            seen.append(req.full_url)
+            return io.BytesIO(b'corrupt' if 'primary' in req.full_url else good)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dest = fetch.DEST
+            fetch.DEST = Path(tmp)
+            try:
+                with mock.patch.object(fetch.urllib.request, 'urlopen', side_effect=fake_urlopen), \
+                     mock.patch.object(fetch.time, 'sleep'):
+                    out = fetch.download(['https://primary.invalid/f', 'https://mirror.invalid/f'], digest)
+                self.assertEqual(seen, ['https://primary.invalid/f', 'https://mirror.invalid/f'])
+                self.assertEqual(out.read_bytes(), good)
             finally:
                 fetch.DEST = old_dest
 

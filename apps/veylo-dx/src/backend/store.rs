@@ -340,19 +340,23 @@ pub(super) fn merge_track_prefs_value(v: &Value) {
 
 static DIAG_RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
 
-/// Strip URLs, API keys, tokens, emails, JWTs, and user home paths from diagnostic lines so logs
-/// are always safe to share.
+/// Strip URLs, API keys, tokens, emails, JWTs, recovery keys, and user home paths from diagnostic
+/// lines so logs are always safe to share.
 pub fn redact_diagnostic(line: &str) -> String {
-    static_re!(url_re, r"(?:https?|stremio|veylo)://[^\s\x22'<>]+");
+    static_re!(url_re, r"(?:https?|stremio|veylo|wss?|ftp)://[^\s\x22'<>]+");
+    static_re!(magnet_re, r"(?i)\bmagnet:\?[^\s\x22'<>]+");
     static_re!(jwt_re, r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b");
+    static_re!(recovery_re, r"\bVEYLO-[A-Za-z0-9_-]{16,}\b");
     static_re!(email_re, r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b");
     static_re!(home_unix_re, r"/(?:home|Users)/[^/\s\x22'<>]+");
-    static_re!(home_win_re, r"(?i)[A-Z]:\\Users\\[^\\\s\x22'<>]+");
-    static_re!(auth_hdr_re, r"(?i)\b(authorization)\s*[:=]\s*(?:bearer|basic|token|digest)\s+[^\s&,\x22']+");
-    static_re!(bearer_re, r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}");
-    static_re!(secret_re, r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|refresh|sync_key|rd_key|tmdb_key|realdebrid)\s*[:=]\s*[^\s&,\x22']+");
+    static_re!(home_win_re, r"(?i)[A-Z]:[/\\]Users[/\\][^/\\\s\x22'<>]+");
+    static_re!(auth_hdr_re, r"(?i)[\x22']?\b(authorization)[\x22']?\s*[:=]\s*[\x22']?(?:bearer|basic|token|digest)\s+[^\s&,\x22'\}]+");
+    static_re!(bearer_re, r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}");
+    static_re!(secret_re, r"(?i)[\x22']?(api[_-]?key|token|secret|password|authorization|bearer|refresh[_-]?token|refresh|sync_key|rd_key|tmdb_key|realdebrid)[\x22']?\s*[:=]\s*[\x22']?[^\s&,\x22'\}]+");
     let step = url_re().replace_all(line, "[URL]");
+    let step = magnet_re().replace_all(&step, "[URL]");
     let step = jwt_re().replace_all(&step, "[JWT]");
+    let step = recovery_re().replace_all(&step, "[KEY]");
     let step = email_re().replace_all(&step, "[EMAIL]");
     let step = home_unix_re().replace_all(&step, "[HOME]");
     let step = home_win_re().replace_all(&step, "[HOME]");
@@ -788,9 +792,9 @@ mod tests {
         assert_eq!(read_track_prefs_from(&path), map);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let clean = redact_diagnostic("fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc Authorization: Bearer jwt_secret_999 Bearer other_tok_777 Authorization: Basic dXNlcjpwYXNz user=alice@example.com /home/alice/file.txt C:\\Users\\Alice\\file.txt");
-        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("jwt_secret_999") && !clean.contains("other_tok_777") && !clean.contains("dXNlcjpwYXNz") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice"), "{clean}");
-        assert!(clean.contains("[URL]") && clean.contains("[REDACTED]") && clean.contains("[EMAIL]") && clean.contains("[HOME]"), "{clean}");
+        let clean = redact_diagnostic(r#"fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc {"rd_key": "QUOTED_RD", "refresh_token": "QUOTED_REF"} VEYLO-ABCDEFGHIJKLMNOPQRSTUVWX Authorization: Bearer jwt_secret_999 Bearer other_tok_777 Basic dXNlcjpwYXNz magnet:?xt=urn:btih:DEADBEEF user=alice@example.com /home/alice/file.txt C:\Users\Alice\file.txt C:/Users/Bob/file.txt"#);
+        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("QUOTED_RD") && !clean.contains("QUOTED_REF") && !clean.contains("ABCDEFGHIJKLMNOPQRSTUVWX") && !clean.contains("jwt_secret_999") && !clean.contains("other_tok_777") && !clean.contains("dXNlcjpwYXNz") && !clean.contains("DEADBEEF") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice") && !clean.contains("Users/Bob"), "{clean}");
+        assert!(clean.contains("[URL]") && clean.contains("[KEY]") && clean.contains("[REDACTED]") && clean.contains("[EMAIL]") && clean.contains("[HOME]"), "{clean}");
         assert!(!Settings::default().telemetry_enabled, "telemetry must be opt-in by default");
         assert!(!Settings::default().prefetch_sources, "browsing prefetch must be opt-in by default");
     }

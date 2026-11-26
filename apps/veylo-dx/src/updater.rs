@@ -64,19 +64,34 @@ pub fn newer(latest: &str, current: &str) -> bool {
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
 static CHECKED: tokio::sync::OnceCell<Option<Release>> = tokio::sync::OnceCell::const_new();
 
+fn is_allowed_release_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else { return false };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else { return false };
+    host.eq_ignore_ascii_case("github.com")
+        || host.eq_ignore_ascii_case("objects.githubusercontent.com")
+        || host.eq_ignore_ascii_case("release-assets.githubusercontent.com")
+        || host.to_ascii_lowercase().ends_with(".githubusercontent.com")
+}
+
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent("veylo-dx")
         .connect_timeout(std::time::Duration::from_secs(15))
-        .read_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default()
+        .read_timeout(std::time::Duration::from_secs(30));
+    #[cfg(not(test))]
+    let builder = builder.https_only(true);
+    builder.build().unwrap_or_default()
 }
 
 /// The latest release when it is newer than this build and has this platform's file; None offline or up to date.
 /// Cached for the session so navigating overlays never burns through GitHub's unauthenticated rate limit.
 pub async fn check() -> Option<Release> {
     let asset = ASSET?;
+    #[cfg(target_os = "android")]
+    prune_old_android_apks();
     crate::backend::on_runtime(async move {
         CHECKED.get_or_init(|| async move {
             let http = client();
@@ -89,9 +104,13 @@ pub async fn check() -> Option<Release> {
             let assets = v["assets"].as_array()?;
             let entry = assets.iter().find(|a| a["name"] == asset)?;
             let url = entry["browser_download_url"].as_str()?.to_owned();
+            if !is_allowed_release_url(&url) { return None; }
             let mut sha256 = parse_github_digest(entry["digest"].as_str());
             if sha256.is_none() {
-                if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(|a| a["browser_download_url"].as_str()) {
+                if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt")
+                    .and_then(|a| a["browser_download_url"].as_str())
+                    .filter(|u| is_allowed_release_url(u))
+                {
                     if let Ok(resp) = http.get(sums_url).send().await {
                         if let Ok(ok_resp) = resp.error_for_status() {
                             if let Ok(text) = ok_resp.text().await {
@@ -185,7 +204,7 @@ async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn update_work_dir(version: &str) -> Result<PathBuf> {
     let mut rnd = [0u8; 8];
-    let _ = getrandom::fill(&mut rnd);
+    getrandom::fill(&mut rnd).map_err(|_| anyhow!("Couldn't generate an update folder name"))?;
     let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
     let dir = crate::backend::backend_data_dir().join("updates").join(format!("veylo-{}-{suffix}", safe_version(version)));
     std::fs::create_dir_all(&dir).context("Couldn't prepare the update folder")?;
@@ -195,6 +214,21 @@ fn update_work_dir(version: &str) -> Result<PathBuf> {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     Ok(dir)
+}
+
+/// Remove cached Android APKs from completed upgrades (version <= running build) so ~150 MB isn't stranded.
+#[cfg(target_os = "android")]
+fn prune_old_android_apks() {
+    let Ok(dir) = crate::android::files_dir().map(|d| d.join("updates")) else { return };
+    let Some(asset) = ASSET else { return };
+    let apk = dir.join(asset);
+    let ver_file = apk.with_extension("version");
+    if let Ok(ver) = std::fs::read_to_string(&ver_file) {
+        if !newer(ver.trim(), env!("CARGO_PKG_VERSION")) {
+            let _ = std::fs::remove_file(&apk);
+            let _ = std::fs::remove_file(&ver_file);
+        }
+    }
 }
 
 /// What Install led to, when it returns at all (Windows quits to swap its files).
@@ -216,22 +250,59 @@ pub async fn install(release: Release) -> Result<Outcome> {
         download(release.url.clone(), apk.clone(), release.sha256.clone()).await?;
         let _ = crate::backend::write_private_file(&apk.with_extension("version"), release.version.as_bytes());
     }
-    match crate::android::install_update(&apk)?.as_str() {
+    let apk_install = apk.clone();
+    let status = crate::backend::on_runtime(async move {
+        tokio::task::spawn_blocking(move || crate::android::install_update(&apk_install))
+            .await
+            .map_err(|_| anyhow!("Installer task failed"))?
+    }).await??;
+    match status.as_str() {
         "permission" => Ok(Outcome::NeedsPermission),
         _ => Ok(Outcome::Installing),
     }
 }
 
-/// Waits for Veylo to close, unpacks the new build over the old one and starts it again.
+/// Waits for Veylo to close, stages the zip into a fresh folder, swaps atomically with backup/rollback, and relaunches.
 #[cfg(target_os = "windows")]
 const APPLY: &str = r#"param([int]$ProcessId, [string]$Zip, [string]$Dest)
-try { Wait-Process -Id $ProcessId -Timeout 30 -ErrorAction SilentlyContinue } catch {}
-Start-Sleep -Milliseconds 500
-for ($i = 0; $i -lt 10; $i++) {
-    try { Expand-Archive -Force -Path $Zip -DestinationPath $Dest -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 }
+$ErrorActionPreference = 'Stop'
+$work = Split-Path -Parent $Zip
+$stage = Join-Path $work 'new'
+$backup = "$Dest.old"
+try {
+    try { Wait-Process -Id $ProcessId -Timeout 30 -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    Expand-Archive -Force -Path $Zip -DestinationPath $stage
+    if (-not (Test-Path (Join-Path $stage 'veylo-dx.exe'))) { throw 'Update archive missing veylo-dx.exe' }
+    $swapped = $false
+    for ($i = 0; $i -lt 10; $i++) {
+        try {
+            if (Test-Path $backup) { Remove-Item -Recurse -Force $backup }
+            Move-Item -Path $Dest -Destination $backup -ErrorAction Stop
+            try {
+                Move-Item -Path $stage -Destination $Dest -ErrorAction Stop
+                $swapped = $true
+                break
+            } catch {
+                if (-not (Test-Path $Dest) -and (Test-Path $backup)) {
+                    Move-Item -Path $backup -Destination $Dest -ErrorAction SilentlyContinue
+                }
+                throw
+            }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ($swapped -and (Test-Path $backup)) {
+        Remove-Item -Recurse -Force $backup -ErrorAction SilentlyContinue
+    }
+} finally {
+    if (Test-Path (Join-Path $Dest 'veylo-dx.exe')) {
+        Start-Process (Join-Path $Dest 'veylo-dx.exe')
+    }
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
-Start-Process (Join-Path $Dest 'veylo-dx.exe')
-Remove-Item -Recurse -Force (Split-Path $Zip) -ErrorAction SilentlyContinue
 "#;
 
 /// Download the release, hand it to the helper and quit so the files can be replaced.
@@ -244,7 +315,12 @@ pub async fn install(release: Release) -> Result<Outcome> {
     let script = work.join("apply.ps1");
     download(release.url.clone(), zip.clone(), release.sha256.clone()).await?;
     std::fs::write(&script, APPLY).context("Couldn't save the update")?;
-    let mut helper = std::process::Command::new("powershell");
+    let ps = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|r| r.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+    let mut helper = std::process::Command::new(ps);
     helper.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]).arg(&script)
         .arg("-ProcessId").arg(std::process::id().to_string()).arg("-Zip").arg(&zip).arg("-Dest").arg(dest);
     #[cfg(windows)]
@@ -258,17 +334,27 @@ pub async fn install(release: Release) -> Result<Outcome> {
     std::process::exit(0);
 }
 
-/// macOS: waits for Veylo to close, swaps Veylo.app for the new one and opens it again.
+/// macOS: waits for Veylo to close, stages on the same volume, swaps Veylo.app with rollback on failure, and relaunches.
 #[cfg(target_os = "macos")]
 const APPLY_MAC: &str = r#"pid="$1"; zip="$2"; app="$3"
-for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
 work=$(dirname "$zip")
-rm -rf "$work/new" && mkdir -p "$work/new" && ditto -x -k "$zip" "$work/new" || exit 1
-[ -d "$work/new/Veylo.app" ] || exit 1
-rm -rf "$app.old" && mv "$app" "$app.old" && mv "$work/new/Veylo.app" "$app" && rm -rf "$app.old"
-xattr -dr com.apple.quarantine "$app" 2>/dev/null
+parent=$(dirname "$app")
+stage="$parent/.Veylo.app.new.$$"
+cleanup() { rm -rf "$work" "$stage"; }
+trap cleanup EXIT
+for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+mkdir -p "$stage" && ditto -x -k "$zip" "$stage" || { open "$app"; exit 1; }
+[ -d "$stage/Veylo.app" ] && [ ! -L "$stage/Veylo.app" ] || { open "$app"; exit 1; }
+rm -rf "$app.old"
+if mv "$app" "$app.old"; then
+    if mv "$stage/Veylo.app" "$app"; then
+        rm -rf "$app.old"
+        xattr -dr com.apple.quarantine "$app" 2>/dev/null
+    else
+        mv "$app.old" "$app" 2>/dev/null
+    fi
+fi
 open "$app"
-rm -rf "$work"
 "#;
 
 /// The Veylo.app this copy runs from (Veylo.app/Contents/MacOS/veylo-dx).
@@ -282,6 +368,11 @@ pub fn app_bundle() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 pub async fn install(release: Release) -> Result<Outcome> {
     let app = app_bundle().context("Only an installed Veylo.app can update itself: run the install command again")?;
+    let parent = app.parent().context("Couldn't locate Veylo.app's folder")?;
+    // Verify the target folder is writable before quitting so we don't fail silently after exit.
+    let probe = parent.join(format!(".veylo-update-probe-{}", std::process::id()));
+    std::fs::File::create(&probe).context("Veylo doesn't have permission to update its Applications folder")?;
+    let _ = std::fs::remove_file(&probe);
     let work = update_work_dir(&release.version)?;
     let zip = work.join(ASSET.context("No update for this platform")?);
     let script = work.join("apply.sh");

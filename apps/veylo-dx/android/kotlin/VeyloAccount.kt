@@ -49,18 +49,25 @@ object VeyloAccount {
         val request = GetCredentialRequest.Builder().addCredentialOption(option).build()
         val onUi = Executor { activity.runOnUiThread(it) }
         activity.runOnUiThread {
-            CredentialManager.create(activity).getCredentialAsync(activity, request, CancellationSignal(), onUi,
-                object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
-                    override fun onResult(response: GetCredentialResponse) {
-                        val c = response.credential
-                        publish(seq, if (c is CustomCredential && c.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                            "token:" + GoogleIdTokenCredential.createFrom(c.data).idToken
-                        } else "error:Google gave no account")
-                    }
-                    override fun onError(e: GetCredentialException) {
-                        publish(seq, if (e is GetCredentialCancellationException) "cancel:" else "error:" + (e.message ?: e.type))
-                    }
-                })
+            runCatching {
+                CredentialManager.create(activity).getCredentialAsync(activity, request, CancellationSignal(), onUi,
+                    object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
+                        override fun onResult(response: GetCredentialResponse) {
+                            val c = response.credential
+                            val out = runCatching {
+                                if (c is CustomCredential && c.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                                    "token:" + GoogleIdTokenCredential.createFrom(c.data).idToken
+                                } else {
+                                    "error:Google gave no account"
+                                }
+                            }.getOrElse { "error:" + (it.message ?: it.javaClass.simpleName) }
+                            publish(seq, out)
+                        }
+                        override fun onError(e: GetCredentialException) {
+                            publish(seq, if (e is GetCredentialCancellationException) "cancel:" else "error:" + (e.message ?: e.type))
+                        }
+                    })
+            }.onFailure { publish(seq, "error:" + (it.message ?: it.javaClass.simpleName)) }
         }
     }
 
@@ -70,10 +77,12 @@ object VeyloAccount {
         result.set(null)
         val options = GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
         activity.runOnUiThread {
-            GmsBarcodeScanning.getClient(activity, options).startScan()
-                .addOnSuccessListener { publish(seq, "code:" + (it.rawValue ?: "")) }
-                .addOnCanceledListener { publish(seq, "cancel:") }
-                .addOnFailureListener { publish(seq, "error:" + (it.message ?: "scanner unavailable")) }
+            runCatching {
+                GmsBarcodeScanning.getClient(activity, options).startScan()
+                    .addOnSuccessListener { publish(seq, "code:" + (it.rawValue ?: "")) }
+                    .addOnCanceledListener { publish(seq, "cancel:") }
+                    .addOnFailureListener { publish(seq, "error:" + (it.message ?: "scanner unavailable")) }
+            }.onFailure { publish(seq, "error:" + (it.message ?: it.javaClass.simpleName)) }
         }
     }
 }

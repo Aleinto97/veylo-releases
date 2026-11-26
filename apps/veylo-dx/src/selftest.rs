@@ -9,27 +9,49 @@ use libmpv2::{events::Event, mpv_end_file_reason, Mpv};
 use std::time::{Duration, Instant};
 
 pub fn run(args: &[String]) -> i32 {
+    // Set C numeric locale once before spawning any worker threads (libmpv requires it, and
+    // calling setlocale after multithreading begins is UB on POSIX).
+    unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
     let online = args.iter().any(|a| a == "--online");
     let report = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1)).cloned();
-    // An isolated store, removed afterwards (set before the backend starts: it reads VEYLO_DX_DATA once).
-    let data = std::env::temp_dir().join(format!("veylo-self-test-{}", std::process::id()));
+    // An isolated, unpredictable store, removed afterwards (set before the backend starts).
+    let mut rnd = [0u8; 8];
+    let _ = getrandom::fill(&mut rnd);
+    let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let data = std::env::temp_dir().join(format!("veylo-self-test-{}-{suffix}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&data);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir_all(&data);
+    }
     std::env::set_var("VEYLO_DX_DATA", &data);
 
     let mut lines = vec![format!("Veylo {} self-test on {} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH)];
     println!("{}", lines[0]);
     let mut failed = 0;
-    let mut check = |name: &str, result: Result<String>| {
+    let mut check = |name: &str, result: Result<String>| -> bool {
+        let ok = result.is_ok();
         let line = match result {
             Ok(detail) => format!("PASS  {name:<10} {detail}"),
             Err(e) => { failed += 1; format!("FAIL  {name:<10} {e:#}") }
         };
         println!("{line}");
         lines.push(line);
+        ok
     };
     check("bundle", bundle());
-    check("store", store());
-    check("display", display_and_autoplay());
-    check("picks-ai", picks());
+    let store_ok = check("store", store());
+    if store_ok {
+        check("display", display_and_autoplay());
+        check("picks-ai", picks());
+    } else {
+        check("display", Err(anyhow!("skipped because store initialization failed")));
+        check("picks-ai", Err(anyhow!("skipped because store initialization failed")));
+    }
     check("player", player(&data));
     check("hdr", hdr(&data));
     if online {
@@ -125,7 +147,6 @@ fn player(data: &std::path::Path) -> Result<String> {
     std::fs::create_dir_all(data)?;
     let clip = data.join("selftest.mp4");
     std::fs::write(&clip, CLIP)?;
-    unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
     let mpv = Mpv::with_initializer(|o| {
         o.set_property("config", false)?;
         o.set_property("terminal", false)?;
@@ -184,9 +205,16 @@ fn hdr(data: &std::path::Path) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let params = loop {
         ensure!(Instant::now() < deadline, "the HDR clip didn't start in 20 s");
-        if let Some(Ok(Event::VideoReconfig)) = mpv.wait_event(0.5) {
-            let p = |n: &str| mpv.get_property::<String>(&format!("video-params/{n}")).unwrap_or_default();
-            if !p("gamma").is_empty() { break (p("gamma"), p("primaries"), p("pixelformat")); }
+        match mpv.wait_event(0.5) {
+            Some(Ok(Event::VideoReconfig)) => {
+                let p = |n: &str| mpv.get_property::<String>(&format!("video-params/{n}")).unwrap_or_default();
+                if !p("gamma").is_empty() { break (p("gamma"), p("primaries"), p("pixelformat")); }
+            }
+            Some(Ok(Event::EndFile(reason))) => {
+                return Err(anyhow!("the HDR clip ended before video config (reason {reason})"));
+            }
+            Some(Err(e)) => return Err(anyhow!("mpv: {e}")),
+            _ => {}
         }
     };
     ensure!(params.0 == "pq" && params.1 == "bt.2020", "the HDR10 clip read as {}/{}", params.0, params.1);

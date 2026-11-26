@@ -389,6 +389,61 @@ async fn dash_inherits_baseurl_and_keeps_template_placeholders() {
             .unwrap(),
         "\0GET /video/high/v/00001.m4s HTTP/1.1"
     );
+
+    // AdaptationSet-level SegmentTemplate must resolve against each Representation's own BaseURL.
+    let upstream2 = fixture(|r| {
+        if r.starts_with("GET /manifest.mpd ") {
+            reply(
+                "200 OK",
+                "Content-Type: application/dash+xml\r\n",
+                r#"<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><SegmentTemplate media="seg_$Number$.m4s" initialization="init.mp4"/><Representation id="a"><BaseURL>/tracks/low/</BaseURL></Representation><Representation id="b"><BaseURL>/tracks/high/</BaseURL></Representation></AdaptationSet></Period></MPD>"#,
+            )
+        } else {
+            reply("200 OK", "", &format!("\0{}", r.lines().next().unwrap()))
+        }
+    })
+    .await;
+    let v2 = prepare(&p, &format!("{}/manifest.mpd", upstream2.base)).await;
+    let xml2 = client()
+        .get(v2["url"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let media_urls: Vec<String> = xml2
+        .split("media=\"")
+        .skip(1)
+        .map(|s| s.split('"').next().unwrap().replace("$Number$", "1"))
+        .collect();
+    assert_eq!(
+        media_urls.len(),
+        2,
+        "expected per-representation templates: {xml2}"
+    );
+    assert_eq!(
+        client()
+            .get(&media_urls[0])
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "\0GET /tracks/low/seg_1.m4s HTTP/1.1"
+    );
+    assert_eq!(
+        client()
+            .get(&media_urls[1])
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "\0GET /tracks/high/seg_1.m4s HTTP/1.1"
+    );
 }
 #[tokio::test]
 async fn unsafe_or_unsupported_manifests_fail_closed() {

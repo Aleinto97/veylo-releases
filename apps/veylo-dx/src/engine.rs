@@ -316,16 +316,26 @@ impl Live {
     /// Android: switch between MediaCodec straight to the display and mpv's renderer.
     pub fn set_direct(&self, direct: bool) {
         if !cfg!(target_os = "android") || self.state().direct == direct { return; }
+        let s = self.state();
+        let dv5_needs_sw = !direct && s.dv_profile == 5 && !self.screen.unwrap_or_default().dolby_vision;
         self.update(|s| { s.direct = direct; true });
-        let _ = self.mpv.set_property("hwdec", if direct { "mediacodec" } else { "mediacodec-copy" });
-        let _ = self.mpv.set_property("vo", if direct { "mediacodec_embed" } else { "gpu-next" });
+        let _ = self.mpv.set_property("hwdec", if direct { "mediacodec" } else if dv5_needs_sw { "no" } else { "mediacodec-copy" });
+        #[cfg(target_os = "android")]
+        if crate::android::has_surface() {
+            let _ = self.mpv.set_property("vo", if direct { "mediacodec_embed" } else { "gpu-next" });
+        }
     }
     /// Dolby Vision profile 5 without a Dolby Vision panel: the RPU that rebuilds its colours only
     /// survives FFmpeg's own decoder, so mpv decodes on the CPU and reshapes on the GPU.
     pub fn render_dolby_vision(&self) {
         self.update(|s| { s.direct = false; true });
         let _ = self.mpv.set_property("hwdec", "no");
-        let _ = self.mpv.set_property("vo", if cfg!(any(target_os = "android", target_os = "windows")) { "gpu-next" } else { "libmpv" });
+        #[cfg(target_os = "android")]
+        if crate::android::has_surface() {
+            let _ = self.mpv.set_property("vo", "gpu-next");
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = self.mpv.set_property("vo", if cfg!(target_os = "windows") { "gpu-next" } else { "libmpv" });
     }
     pub fn set_online_segments(&self, found: Vec<Segment>) {
         self.update(|s| { let c = s.online_segments != found; s.online_segments = found; c });
@@ -364,7 +374,18 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
     });
     let session_id = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let live = Arc::new(Live { session_id, mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
-    if let Ok(mut a) = ACTIVE.lock() { *a = Some(live.clone()); }
+    // Release any previous session's Android surface and quit it immediately before the new
+    // session attaches, so two mpv instances never fight over the same ANativeWindow.
+    let prev = ACTIVE.lock().ok().and_then(|mut a| a.replace(live.clone()));
+    if let Some(prev) = prev {
+        #[cfg(target_os = "android")]
+        {
+            let _ = prev.mpv.set_property("vo", "null");
+            let _ = prev.mpv.set_property("force-window", "no");
+            let _ = prev.mpv.set_property("wid", 0i64);
+        }
+        prev.finish(Finish::Close);
+    }
     let _ = events.send(PlayerEvent::Attached(LiveRef(live.clone())));
     std::thread::Builder::new().name("veylo-engine".into()).spawn(move || run(live, events, stop))?;
     Ok(())

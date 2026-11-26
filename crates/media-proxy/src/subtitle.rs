@@ -70,25 +70,33 @@ fn timestamp(text: &str, vtt: bool) -> Result<u64> {
         millis.len() == 3 && millis.bytes().all(|b| b.is_ascii_digit()),
         "invalid milliseconds"
     );
-    let parts: Vec<_> = clock.split(':').collect();
+    let mut split = clock.split(':');
+    let p0 = split.next().ok_or_else(|| anyhow!("invalid cue clock"))?;
+    let p1 = split.next().ok_or_else(|| anyhow!("invalid cue clock"))?;
+    let p2 = split.next();
+    ensure!(split.next().is_none(), "invalid cue clock");
+    let (hours_str, minutes_str, seconds_str) = match p2 {
+        Some(sec) => (Some(p0), p1, sec),
+        None => {
+            ensure!(vtt, "invalid cue clock");
+            (None, p0, p1)
+        }
+    };
     ensure!(
-        parts.len() == 3 || (vtt && parts.len() == 2),
-        "invalid cue clock"
-    );
-    ensure!(
-        parts.iter().enumerate().all(|(i, p)| {
-            (p.len() == 2 || (parts.len() == 3 && i == 0 && (2..=6).contains(&p.len())))
-                && p.bytes().all(|b| b.is_ascii_digit())
-        }),
+        hours_str
+            .is_none_or(|h| (2..=6).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_digit()))
+            && minutes_str.len() == 2
+            && minutes_str.bytes().all(|b| b.is_ascii_digit())
+            && seconds_str.len() == 2
+            && seconds_str.bytes().all(|b| b.is_ascii_digit()),
         "invalid cue clock digits"
     );
-    let seconds = parts[parts.len() - 1].parse::<u64>()?;
-    let minutes = parts[parts.len() - 2].parse::<u64>()?;
+    let seconds = seconds_str.parse::<u64>()?;
+    let minutes = minutes_str.parse::<u64>()?;
     ensure!(seconds < 60 && minutes < 60, "invalid cue clock range");
-    let hours = if parts.len() == 3 {
-        parts[0].parse::<u64>()?
-    } else {
-        0
+    let hours = match hours_str {
+        Some(h) => h.parse::<u64>()?,
+        None => 0,
     };
     Ok(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis.parse::<u64>()?)
 }

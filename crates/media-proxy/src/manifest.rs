@@ -267,13 +267,13 @@ fn allowed_hls_attribute(tag: &str, key: &str) -> bool {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Element {
     name: String,
     attrs: Vec<(String, String)>,
     children: Vec<Node>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Node {
     Element(Element),
     Text(String),
@@ -604,25 +604,71 @@ fn rewrite_element(
             ),
         "unsupported DASH BaseURL placement"
     );
-    let base = if let Some(b) = bases.first() {
+    let owned_base;
+    let base: &Url = if let Some(b) = bases.first() {
         let text = text_content(b)?;
         ensure!(!text.is_empty(), "empty DASH BaseURL");
         ensure!(!text.contains('$'), "DASH BaseURL templates unsupported");
         validate_reference(&text)?;
         let url = inherited.join(&text)?;
-        validate_url(&url, lease.allow_http)?;
-        url
+        ensure!(url.as_str().len() <= 16_384, "DASH BaseURL too long");
+        lease.validate_url(&url)?;
+        owned_base = url;
+        &owned_base
     } else {
-        inherited.clone()
+        inherited
     };
+    // If an AdaptationSet declares a SegmentTemplate while any child Representation declares its
+    // own BaseURL, push the SegmentTemplate down into each Representation so relative template URLs
+    // resolve against each Representation's effective BaseURL instead of the parent's.
+    if name == "AdaptationSet" {
+        let rep_has_base = el.children.iter().any(|n| match n {
+            Node::Element(rep) if local(&rep.name) == "Representation" => rep
+                .children
+                .iter()
+                .any(|c| matches!(c, Node::Element(e) if local(&e.name) == "BaseURL")),
+            _ => false,
+        });
+        let parent_tpl_idx = el
+            .children
+            .iter()
+            .position(|n| matches!(n, Node::Element(e) if local(&e.name) == "SegmentTemplate"));
+        if rep_has_base {
+            if let Some(idx) = parent_tpl_idx {
+                if let Node::Element(parent_tpl) = el.children.remove(idx) {
+                    for child in &mut el.children {
+                        if let Node::Element(rep) = child {
+                            if local(&rep.name) != "Representation" {
+                                continue;
+                            }
+                            if let Some(Node::Element(rep_tpl)) = rep.children.iter_mut().find(|c| {
+                                matches!(c, Node::Element(e) if local(&e.name) == "SegmentTemplate")
+                            }) {
+                                for (k, v) in &parent_tpl.attrs {
+                                    if !rep_tpl.attrs.iter().any(|(rk, _)| local(rk) == local(k)) {
+                                        rep_tpl.attrs.push((k.clone(), v.clone()));
+                                    }
+                                }
+                                if rep_tpl.children.is_empty() && !parent_tpl.children.is_empty() {
+                                    rep_tpl.children = parent_tpl.children.clone();
+                                }
+                            } else {
+                                rep.children.push(Node::Element(parent_tpl.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     for (key, value) in &mut el.attrs {
         if matches!(
             local(key),
             "media" | "initialization" | "sourceURL" | "index"
         ) || (name == "SegmentTemplate" && local(key) == "bitstreamSwitching")
         {
-            validate_template(value, &base)?;
-            let mapped = lease.map_reference(&base, value)?;
+            validate_template(value, base)?;
+            let mapped = lease.map_reference(base, value)?;
             *budget += mapped.len();
             ensure!(*budget <= MANIFEST_LIMIT * 4, "rewritten DASH too large");
             *value = mapped;
@@ -637,7 +683,7 @@ fn rewrite_element(
         if let Node::Element(child) = child {
             if local(&child.name) == "BaseURL" {
                 // BaseURL never reaches the engine with its upstream authority.
-                let mapped = lease.local_url(&base)?;
+                let mapped = lease.local_url(base)?;
                 *budget += mapped.len();
                 ensure!(*budget <= MANIFEST_LIMIT * 4, "rewritten DASH too large");
                 child.children = vec![Node::Text(mapped)];
@@ -654,7 +700,7 @@ fn rewrite_element(
                     );
                 }
             } else {
-                rewrite_element(child, lease, &base, budget)?;
+                rewrite_element(child, lease, base, budget)?;
             }
         }
     }

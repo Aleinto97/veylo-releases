@@ -100,6 +100,12 @@ fn tv_launcher(manifest: &std::path::Path) {
     if !patched.contains("supportsPictureInPicture") {
         patched = patched.replacen("<activity ", "<activity android:supportsPictureInPicture=\"true\" ", 1);
     }
+    if !patched.contains("smallestScreenSize") {
+        if let Some(pos) = patched.find("android:configChanges=\"") {
+            let insert_at = pos + "android:configChanges=\"".len();
+            patched.insert_str(insert_at, "smallestScreenSize|");
+        }
+    }
     if !patched.contains("android:scheme=\"stremio\"") {
         let deep_link_filter = concat!(
             "</intent-filter>\n",

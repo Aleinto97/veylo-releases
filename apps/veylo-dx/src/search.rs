@@ -175,7 +175,7 @@ pub fn SearchOverlay() -> Element {
             p { class: "visually-hidden", aria_live: "polite", "{status}" }
             div { class: "search-body",
                 if q.trim().is_empty() {
-                    if !history.queries.is_empty() {
+                    if !history.queries.is_empty() || !history.items.is_empty() {
                         div { class: "tokens",
                             for past in history.queries.iter().take(8).cloned() {
                                 button { key: "{past}", class: "token", onclick: move |_| set_query(past.clone(), 0), icons::History {} span { "{past}" } }

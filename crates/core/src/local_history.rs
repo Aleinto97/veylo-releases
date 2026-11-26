@@ -108,8 +108,17 @@ pub(crate) fn migrate(
              ON CONFLICT(media_key,video_id) DO UPDATE SET
              position_ms=CASE WHEN excluded.updated>playback.updated THEN excluded.position_ms ELSE playback.position_ms END,
              duration_ms=CASE WHEN excluded.updated>playback.updated THEN excluded.duration_ms ELSE playback.duration_ms END,
-             watched_ms=MAX(playback.watched_ms,excluded.watched_ms),
-             watched=MAX(playback.watched,excluded.watched),updated=MAX(playback.updated,excluded.updated)",
+             watched_ms=CASE
+               WHEN excluded.updated>playback.updated AND excluded.watched=0 AND excluded.watched_ms=0 AND excluded.position_ms=0 THEN 0
+               WHEN playback.updated>excluded.updated AND playback.watched=0 AND playback.watched_ms=0 AND playback.position_ms=0 THEN 0
+               ELSE MAX(playback.watched_ms,excluded.watched_ms)
+             END,
+             watched=CASE
+               WHEN excluded.updated>playback.updated AND excluded.watched=0 AND excluded.watched_ms=0 AND excluded.position_ms=0 THEN 0
+               WHEN playback.updated>excluded.updated AND playback.watched=0 AND playback.watched_ms=0 AND playback.position_ms=0 THEN 0
+               ELSE MAX(playback.watched,excluded.watched)
+             END,
+             updated=MAX(playback.updated,excluded.updated)",
             params![old_key,new_key],
         )?;
     }

@@ -141,8 +141,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     });
     // The picture goes under the page while this screen exists.
     let attach = live.clone();
+    let detach_id = live.0.session_id;
     use_hook(move || crate::video::attach(&attach.0));
-    use_drop(crate::video::detach);
+    use_drop(move || crate::video::detach(detach_id));
 
     // Controls fade three seconds after the last touch, key or pointer movement (one timer task,
     // never spawning per mousemove pixel).

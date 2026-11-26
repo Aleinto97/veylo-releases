@@ -160,11 +160,14 @@ pub fn AccountBlock() -> Element {
                                     }
                                     div { class: "setting-controls",
                                         button { class: "pill glass small", disabled: working.is_some(),
-                                            onclick: move |_| run("scan", Box::pin(async move {
-                                                let scanned = scan().await?;
-                                                pending_link.set(Some(scanned));
-                                                Ok(None)
-                                            })),
+                                            onclick: move |_| {
+                                                pending_link.set(None);
+                                                run("scan", Box::pin(async move {
+                                                    let scanned = scan().await?;
+                                                    pending_link.set(Some(scanned));
+                                                    Ok(None)
+                                                }));
+                                            },
                                             icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan QR code" } } }
                                     }
                                 }

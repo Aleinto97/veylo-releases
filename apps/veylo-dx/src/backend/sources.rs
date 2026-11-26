@@ -833,13 +833,14 @@ pub(crate) fn source_summary(s: &Source) -> String {
     format!("{} {} {} ({})", s.quality.unwrap_or("?"), s.hdr.unwrap_or("SDR"), s.size.as_deref().unwrap_or("size?"), s.addon)
 }
 
-/// One line in the developer log (logcat "veylo" on Android, stderr elsewhere). Never URLs or keys.
+/// One line in the developer log (logcat "veylo" on Android, stderr elsewhere). Always redacted.
 pub(crate) fn dev_log(message: &str) {
-    record_diag_line(message);
+    let clean = redact_diagnostic(message);
+    record_diag_line(&clean);
     #[cfg(target_os = "android")]
-    crate::android::log(message);
+    crate::android::log(&clean);
     #[cfg(not(target_os = "android"))]
-    eprintln!("{message}");
+    eprintln!("{clean}");
 }
 
 /// Mirrors of the same underlying release (same normalized stem + similar size) grouped together

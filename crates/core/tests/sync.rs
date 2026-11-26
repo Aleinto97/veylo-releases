@@ -215,6 +215,26 @@ async fn forgotten_title_tombstone_blocks_older_playback_resurrection() {
         .await
         .unwrap();
     assert_eq!(pb["entries"][0]["video_id"], json!("tt0903747:1:3"));
+
+    // A later sync page delivering an older episode (t=950 <= 1000) MUST still be blocked even
+    // after S1E3 resumed at t=1001, so forgotten episodes never resurrect across pages.
+    core.execute(json!({
+        "op": "sync_apply",
+        "media": [],
+        "playback": [{
+            "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+            "video_id": "tt0903747:1:4", "position_ms": 800000, "duration_ms": 3000000,
+            "watched_ms": 800000, "watched": true, "updated": 950
+        }]
+    }))
+    .await
+    .unwrap();
+    let pb_after = core
+        .execute(json!({"op": "playback_all", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+        .await
+        .unwrap();
+    assert_eq!(pb_after["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(pb_after["entries"][0]["video_id"], json!("tt0903747:1:3"));
 }
 
 #[tokio::test]

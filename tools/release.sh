@@ -43,8 +43,9 @@ fi
 if [ "$publish" = 1 ] && { [ "$target_mode" = all ] || [ "$target_mode" = publish ]; } && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
     echo "$tag is already released: bump version in apps/veylo-dx/Cargo.toml first." >&2; exit 1
 fi
-IFS=. read -r major minor patch <<< "$version"
-version_code=$((major * 10000 + minor * 100 + patch))
+clean_ver=${version%%-*}
+IFS=. read -r major minor patch <<< "$clean_ver"
+version_code=$((10#${major:-0} * 10000 + 10#${minor:-0} * 100 + 10#${patch:-0}))
 
 work=$(mktemp -d)
 stage="$work/stage"
@@ -118,6 +119,8 @@ build_android() {
     find "$project/app/src/main/jniLibs" -mindepth 1 -maxdepth 1 -type d ! -name "$abi" -exec rm -rf {} +
     # dx always writes versionCode 1; Android only updates to a higher one.
     sed -i "s/versionCode = [0-9]*/versionCode = $version_code/; s/versionName = \"[^\"]*\"/versionName = \"$version\"/" "$project/app/build.gradle.kts"
+    grep -q "versionCode = $version_code" "$project/app/build.gradle.kts" || { echo "Failed to patch versionCode in build.gradle.kts" >&2; exit 1; }
+    grep -q "versionName = \"$version\"" "$project/app/build.gradle.kts" || { echo "Failed to patch versionName in build.gradle.kts" >&2; exit 1; }
     # Route Maven Central through Google's official GCS mirror first so GitHub runners don't hit
     # repo.maven.apache.org HTTP 429 rate limits; fall back to stock repositories on retry.
     local gradle_init="$work/maven-mirror.gradle"
@@ -149,6 +152,10 @@ GRADLE
     )
     local unsigned="$project/app/build/outputs/apk/release/app-release-unsigned.apk"
     [ -f "$unsigned" ] || unsigned="$project/app/build/outputs/apk/release/app-release.apk"
+    if [ "${VEYLO_SIGN:-1}" = "0" ]; then
+        cp "$unsigned" "$stage/unsigned-$out_asset"
+        return 0
+    fi
     # Sign the release APK with Veylo's own key (never debuggable).
     # (PKCS12: the key's password is the keystore's. Passing the same file twice would make apksigner read a second line.)
     "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias veylo --ks-pass "file:$pass_file" \
@@ -198,21 +205,23 @@ case "$target_mode" in
         exit 0
         ;;
     android-arm64)
-        setup_keystore
+        [ "${VEYLO_SIGN:-1}" != "0" ] && setup_keystore
         setup_android_env
         build_android aarch64-linux-android arm64-v8a "$APK_ASSET" android-arm64
-        run_privacy_check "$stage/$APK_ASSET"
-        mkdir -p "$out_dir" && cp "$stage/$APK_ASSET" "$out_dir/"
-        echo "Built $APK_ASSET ($version, versionCode $version_code): $out_dir/$APK_ASSET"
+        out_name="$APK_ASSET"; [ "${VEYLO_SIGN:-1}" = "0" ] && out_name="unsigned-$APK_ASSET"
+        run_privacy_check "$stage/$out_name"
+        mkdir -p "$out_dir" && cp "$stage/$out_name" "$out_dir/"
+        echo "Built $out_name ($version, versionCode $version_code): $out_dir/$out_name"
         exit 0
         ;;
     android-armv7)
-        setup_keystore
+        [ "${VEYLO_SIGN:-1}" != "0" ] && setup_keystore
         setup_android_env
         build_android armv7-linux-androideabi armeabi-v7a "$APK_ARMV7_ASSET" android-armv7
-        run_privacy_check "$stage/$APK_ARMV7_ASSET"
-        mkdir -p "$out_dir" && cp "$stage/$APK_ARMV7_ASSET" "$out_dir/"
-        echo "Built $APK_ARMV7_ASSET ($version, versionCode $version_code): $out_dir/$APK_ARMV7_ASSET"
+        out_name="$APK_ARMV7_ASSET"; [ "${VEYLO_SIGN:-1}" = "0" ] && out_name="unsigned-$APK_ARMV7_ASSET"
+        run_privacy_check "$stage/$out_name"
+        mkdir -p "$out_dir" && cp "$stage/$out_name" "$out_dir/"
+        echo "Built $out_name ($version, versionCode $version_code): $out_dir/$out_name"
         exit 0
         ;;
     all)
@@ -234,7 +243,7 @@ esac
 run_privacy_check "${assets[@]}"
 
 # Publish SHA-256 checksums for every release asset so the in-app updater can verify downloads.
-(cd "$stage" && LC_ALL=C sha256sum $(for f in "${assets[@]}"; do basename "$f"; done | sort) > "$stage/SHA256SUMS.txt")
+(cd "$stage" && printf '%s\0' "${assets[@]##*/}" | LC_ALL=C sort -z | xargs -0 sha256sum > "$stage/SHA256SUMS.txt")
 
 mkdir -p "$out_dir" && cp "${assets[@]}" "$stage/SHA256SUMS.txt" "$out_dir/"
 if [ "$publish" != 1 ]; then echo "Built $tag (not published): $out_dir"; exit 0; fi

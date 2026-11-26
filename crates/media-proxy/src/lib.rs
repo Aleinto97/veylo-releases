@@ -389,20 +389,31 @@ fn validate_reference(reference: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_url(url: &Url, allow_http: bool) -> Result<()> {
-    ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "URL credentials are forbidden"
-    );
-    let loopback = match url.host() {
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
         None => false,
-    };
+    }
+}
+fn validate_url(url: &Url, allow_http: bool) -> Result<()> {
+    validate_target_url(url, allow_http, true)
+}
+fn validate_target_url(url: &Url, allow_http: bool, allow_loopback: bool) -> Result<()> {
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "URL credentials are forbidden"
+    );
+    let loopback = is_loopback(url);
     ensure!(url.host().is_some(), "URL must have a host");
     ensure!(
-        url.scheme() == "https" || (url.scheme() == "http" && (allow_http || loopback)),
+        allow_loopback || !loopback,
+        "remote media source cannot reference loopback"
+    );
+    ensure!(
+        url.scheme() == "https"
+            || (url.scheme() == "http" && (allow_http || (allow_loopback && loopback))),
         "HTTP requires explicit consent; unsupported URL scheme"
     );
     Ok(())
@@ -449,8 +460,11 @@ fn scoped_headers(value: &Value) -> Result<HeaderMap> {
     Ok(out)
 }
 impl Lease {
+    fn validate_url(&self, url: &Url) -> Result<()> {
+        validate_target_url(url, self.allow_http, is_loopback(&self.original))
+    }
     fn local_url(&self, url: &Url) -> Result<String> {
-        validate_url(url, self.allow_http)?;
+        self.validate_url(url)?;
         let origin = url.origin().ascii_serialization();
         let mut result = format!(
             "http://{}/{}/{}/{}",
@@ -487,7 +501,7 @@ impl Lease {
         );
         let target = Url::parse(&format!("{origin}/{path}"))?;
         ensure!(same_origin(&parsed, &target), "route changed origin");
-        validate_url(&target, self.allow_http)?;
+        self.validate_url(&target)?;
         Ok(target)
     }
     fn map_reference(&self, base: &Url, reference: &str) -> Result<String> {
@@ -506,7 +520,7 @@ impl Lease {
         incoming: &HeaderMap,
     ) -> Result<(Response, Url)> {
         for hop in 0..=8 {
-            validate_url(&url, self.allow_http)?;
+            self.validate_url(&url)?;
             let mut headers = if same_origin(&self.original, &url) {
                 self.headers.clone()
             } else {
@@ -1662,6 +1676,17 @@ mod tests {
                 "{reference}"
             );
         }
+    }
+    #[test]
+    fn remote_source_cannot_reference_loopback() {
+        let loopback = Url::parse("http://127.0.0.1:8080/internal").unwrap();
+        let loopback_https = Url::parse("https://localhost:8443/internal").unwrap();
+        let remote = Url::parse("https://cdn.example.invalid/video.mp4").unwrap();
+        assert!(validate_target_url(&loopback, false, false).is_err());
+        assert!(validate_target_url(&loopback, true, false).is_err());
+        assert!(validate_target_url(&loopback_https, false, false).is_err());
+        assert!(validate_target_url(&loopback, false, true).is_ok());
+        assert!(validate_target_url(&remote, false, false).is_ok());
     }
     #[test]
     fn range_validation_rejects_mismatched_upstream_content_range() {

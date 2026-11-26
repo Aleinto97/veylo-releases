@@ -59,11 +59,22 @@ object VeyloVideo {
     /** Implemented in Rust (src/android.rs). Commands from AudioFocus, noisy audio, or MediaSession. */
     @JvmStatic external fun nativeCommand(cmd: String)
 
-    /** mpv-android's CA bundle (assets/cacert.pem), copied once into the app's files. */
+    /** mpv-android's CA bundle (assets/cacert.pem), copied atomically once into the app's files. */
     @JvmStatic
     fun prepare(activity: Activity): String {
         val file = File(activity.filesDir, "cacert.pem")
-        if (!file.isFile) runCatching { activity.assets.open("cacert.pem").use { input -> file.outputStream().use { input.copyTo(it) } } }
+        if (!file.isFile || file.length() == 0L) {
+            runCatching {
+                val tmp = File(activity.filesDir, "cacert.pem.tmp")
+                activity.assets.open("cacert.pem").use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                if (tmp.length() > 0L) {
+                    if (file.exists()) file.delete()
+                    tmp.renameTo(file)
+                } else {
+                    tmp.delete()
+                }
+            }
+        }
         return file.path
     }
 
@@ -88,7 +99,9 @@ object VeyloVideo {
             if (visibilityGen.get() != gen) return@runOnUiThread
             // If Android recreated the Activity in the same process, discard stale views bound to the old one.
             if (frame != null && hostActivity?.get() !== activity) {
-                hostActivity?.get()?.let { stopMediaControls(it) }
+                stopMediaControls(activity.applicationContext)
+                // Always detach mpv from the old Surface before removing callbacks so Rust never keeps a dead wid.
+                nativeSurface(null, 0, 0)
                 surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
                 surfaceCallback = null
                 frame = null; surface = null; hostActivity = null
@@ -133,7 +146,7 @@ object VeyloVideo {
         activity.runOnUiThread {
             // A newer show() (source/episode switch) already took ownership: do not tear it down.
             if (visibilityGen.get() != gen) return@runOnUiThread
-            stopMediaControls(activity)
+            stopMediaControls(activity.applicationContext)
             // Restore system brightness & orientation when leaving the player.
             runCatching {
                 val lp = activity.window.attributes
@@ -144,6 +157,8 @@ object VeyloVideo {
                 activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
             val box = frame ?: return@runOnUiThread
+            // Detach mpv synchronously before removing callbacks/view so Rust's SURFACE never retains a destroyed Surface.
+            nativeSurface(null, 0, 0)
             surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
             surfaceCallback = null
             (box.parent as? ViewGroup)?.removeView(box)
@@ -269,8 +284,13 @@ object VeyloVideo {
     }
 
     private fun startMediaControls(activity: Activity) {
+        val appCtx = activity.applicationContext
         runCatching {
-            val am = activity.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val am = appCtx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (Build.VERSION.SDK_INT >= 26) {
+                focusRequest?.let { prev -> audioManager?.abandonAudioFocusRequest(prev) }
+                focusRequest = null
+            }
             audioManager = am
             pausedByFocus = false
             val listener = AudioManager.OnAudioFocusChangeListener { change ->
@@ -319,14 +339,14 @@ object VeyloVideo {
                     }
                 }
                 val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-                if (Build.VERSION.SDK_INT >= 33) activity.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
-                else activity.registerReceiver(r, filter)
+                if (Build.VERSION.SDK_INT >= 33) appCtx.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
+                else appCtx.registerReceiver(r, filter)
                 noisyReceiver = r
             }
         }
         runCatching {
             if (mediaSession == null) {
-                val session = MediaSession(activity, "Veylo")
+                val session = MediaSession(appCtx, "Veylo")
                 session.setCallback(object : MediaSession.Callback() {
                     override fun onPlay() { pausedByFocus = false; nativeCommand("play") }
                     override fun onPause() { pausedByFocus = false; nativeCommand("pause") }
@@ -342,22 +362,23 @@ object VeyloVideo {
         }
     }
 
-    private fun stopMediaControls(activity: Activity) {
-        runCatching {
-            noisyReceiver?.let { activity.unregisterReceiver(it) }
-            noisyReceiver = null
+    private fun stopMediaControls(appCtx: Context) {
+        val r = noisyReceiver
+        noisyReceiver = null
+        if (r != null) runCatching { appCtx.unregisterReceiver(r) }
+        val req = focusRequest
+        focusRequest = null
+        pausedByFocus = false
+        if (req != null && Build.VERSION.SDK_INT >= 26) {
+            runCatching { audioManager?.abandonAudioFocusRequest(req) }
         }
-        runCatching {
-            if (Build.VERSION.SDK_INT >= 26) {
-                focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+        val session = mediaSession
+        mediaSession = null
+        if (session != null) {
+            runCatching {
+                session.isActive = false
+                session.release()
             }
-            focusRequest = null
-            pausedByFocus = false
-        }
-        runCatching {
-            mediaSession?.isActive = false
-            mediaSession?.release()
-            mediaSession = null
         }
     }
 

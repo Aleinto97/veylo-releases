@@ -393,7 +393,8 @@ async fn id_token() -> Result<(String, String)> {
     let api = c.api_key;
     let v: Result<Value> = on_runtime(async move {
         let response = backend().http.post(format!("https://securetoken.googleapis.com/v1/token?key={api}"))
-            .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]).timeout(Duration::from_secs(20)).send().await?;
+            .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())]).timeout(Duration::from_secs(20)).send().await
+            .map_err(|_| anyhow!("Could not reach the account service"))?;
         let ok = response.status().is_success();
         let v: Value = response.json().await.unwrap_or_default();
         if ok { Ok(v) } else { Err(anyhow!("{}", v["error"]["message"].as_str().unwrap_or(""))) }
@@ -601,11 +602,17 @@ fn load_state_unlocked() -> State {
     let last = v["last"].as_i64().unwrap_or(0);
     let keys_hash = s(&v, "keys_hash");
     let sent_until = v["sent_until"].as_i64().unwrap_or(0);
+    // Legacy state files stored one shared `sent_until` cursor; if upgrading from that format,
+    // rescan both tables from 0 once (deduplicated against `seen`) so rows skipped by a newer
+    // playback timestamp are recovered.
+    let split_cursors = v.get("media_sent_until").is_some() && v.get("playback_sent_until").is_some();
+    let media_sent_until = if split_cursors { v["media_sent_until"].as_i64().unwrap_or(0) } else { 0 };
+    let playback_sent_until = if split_cursors { v["playback_sent_until"].as_i64().unwrap_or(0) } else { 0 };
     LAST_SYNCED.store(last, std::sync::atomic::Ordering::Relaxed);
     State {
         sent_until,
-        media_sent_until: v["media_sent_until"].as_i64().unwrap_or(sent_until),
-        playback_sent_until: v["playback_sent_until"].as_i64().unwrap_or(sent_until),
+        media_sent_until,
+        playback_sent_until,
         taken_until: v["taken_until"].as_str().map(str::to_owned),
         taken_doc: v["taken_doc"].as_str().map(str::to_owned),
         seen: v["seen"].as_object().map(|o| o.iter().filter_map(|(k, t)| Some((k.clone(), t.as_i64()?))).collect()).unwrap_or_default(),
@@ -716,7 +723,11 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
                 ItemOpen::Empty => continue,
             };
             let key = row_key(&row);
-            st.known.insert(key.clone());
+            if row["deleted"] == true {
+                st.known.remove(&key);
+            } else {
+                st.known.insert(key.clone());
+            }
             if let Some(t) = row["updated"].as_i64() { st.seen.insert(key.clone(), t); }
             if key.starts_with("p|") { playback.push(row) } else { media.push(row) }
         }
@@ -774,11 +785,40 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
         let playback_rows = changes["playback"].as_array().cloned().unwrap_or_default();
         let media_more = changes["media_more"].as_bool().unwrap_or(false);
         let playback_more = changes["playback_more"].as_bool().unwrap_or(false);
+        // Drain both persisted and concurrently queued tombstones on the first page; coalesce
+        // with live media writes by row key so re-saving after forget publishes the newer state
+        // and never emits duplicate document writes in one Firestore commit.
+        let mut pending_forgotten: Vec<Value> = Vec::new();
+        let mut forgotten_by_key: HashMap<String, Value> = HashMap::new();
+        if first_page {
+            pending_forgotten = std::mem::take(&mut st.forgotten);
+            if let Ok(mut queued) = FORGOTTEN.lock() {
+                for item in queued.drain(..) {
+                    if !pending_forgotten.contains(&item) { pending_forgotten.push(item); }
+                }
+            }
+            for gone in &pending_forgotten {
+                let key = row_key(gone);
+                let ts = gone["updated"].as_i64().unwrap_or(0);
+                let replace = forgotten_by_key.get(&key).is_none_or(|prev| prev["updated"].as_i64().unwrap_or(0) <= ts);
+                if replace { forgotten_by_key.insert(key, gone.clone()); }
+            }
+        }
         let mut writes = Vec::new();
         for row in &media_rows {
             let key = row_key(row);
             let updated = row["updated"].as_i64().unwrap_or(0);
             newest_media = newest_media.max(updated);
+            if let Some(gone) = forgotten_by_key.get(&key) {
+                let del_ts = gone["updated"].as_i64().unwrap_or(0);
+                if row["history"] == true && updated >= del_ts {
+                    // User re-saved or re-watched after forgetting: media wins, drop stale tombstone.
+                    forgotten_by_key.remove(&key);
+                } else {
+                    // Tombstone is newer (or row is metadata-only): keep tombstone, skip media write.
+                    continue;
+                }
+            }
             if st.seen.get(&key) == Some(&updated) { continue; }
             if row["history"] == false && !st.known.contains(&key) { continue; }
             let mut data = row.clone();
@@ -801,22 +841,12 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
             st.seen.insert(key.clone(), updated);
             st.known.insert(key);
         }
-        // Drain both persisted and concurrently queued tombstones on the first page; restore on commit failure.
-        let pending_forgotten = if first_page {
-            let mut pf = std::mem::take(&mut st.forgotten);
-            if let Ok(mut queued) = FORGOTTEN.lock() {
-                for item in queued.drain(..) {
-                    if !pf.contains(&item) { pf.push(item); }
-                }
-            }
-            for gone in &pf {
-                let key = row_key(gone);
-                writes.push(item_write(&base, &uid, &doc_id(&key), gone, &sync_key)?);
-            }
-            pf
-        } else {
-            Vec::new()
-        };
+        for (key, gone) in &forgotten_by_key {
+            let del_ts = gone["updated"].as_i64().unwrap_or(0);
+            writes.push(item_write(&base, &uid, &doc_id(key), gone, &sync_key)?);
+            st.seen.insert(key.clone(), del_ts);
+            st.known.remove(key);
+        }
         first_page = false;
         let page_sent = writes.len();
         if let Err(e) = commit(&token, writes).await {
@@ -946,10 +976,11 @@ pub fn take_keys_arrived() -> Option<String> { ARRIVED.lock().ok()?.take() }
 async fn get_doc(token: &str, path: String) -> Result<Option<Value>> {
     let token = token.to_owned();
     on_runtime(async move {
-        let r = backend().http.get(format!("https://firestore.googleapis.com/v1/{path}")).bearer_auth(token).timeout(Duration::from_secs(15)).send().await?;
+        let r = backend().http.get(format!("https://firestore.googleapis.com/v1/{path}")).bearer_auth(token).timeout(Duration::from_secs(15)).send().await
+            .map_err(|_| anyhow!("Could not reach the sync service"))?;
         if r.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None) }
         anyhow::ensure!(r.status().is_success(), "Firestore answered {}", r.status());
-        Ok(Some(r.json::<Value>().await?))
+        r.json::<Value>().await.map(Some).map_err(|_| anyhow!("Sync service returned an unreadable response"))
     }).await?
 }
 

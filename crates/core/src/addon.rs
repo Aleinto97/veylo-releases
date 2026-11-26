@@ -141,13 +141,16 @@ pub(crate) fn normalize(input: &str, allow_http: bool) -> Result<String> {
     }
     Ok(url.to_string())
 }
-pub(crate) fn validate_transport(url: &Url, allow_http: bool) -> Result<()> {
-    let loopback = url.host_str().is_some_and(|h| {
+pub(crate) fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|h| {
         h.eq_ignore_ascii_case("localhost")
             || h.trim_matches(['[', ']'])
                 .parse::<IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
-    });
+    })
+}
+pub(crate) fn validate_transport(url: &Url, allow_http: bool) -> Result<()> {
+    let loopback = is_loopback(url);
     ensure!(url.host_str().is_some(), "Addon URL needs a host");
     ensure!(
         url.username().is_empty() && url.password().is_none(),
@@ -274,6 +277,7 @@ pub(crate) struct Fetched {
     pub body: Value,
     pub ttl: i64,
     pub persist: bool,
+    pub must_revalidate: bool,
 }
 pub(crate) async fn fetch(
     client: &Client,
@@ -283,8 +287,13 @@ pub(crate) async fn fetch(
     max_ttl: i64,
 ) -> Result<Fetched> {
     let mut url = Url::parse(target).map_err(|_| anyhow!("Invalid addon URL"))?;
+    let allow_loopback = is_loopback(&url);
     for redirects in 0..=3 {
         validate_transport(&url, allow_http)?;
+        ensure!(
+            allow_loopback || !is_loopback(&url),
+            "Remote addon cannot redirect to loopback"
+        );
         let mut response = client.get(url.clone()).send().await.map_err(|e| {
             if e.is_timeout() {
                 anyhow!("Addon request timed out")
@@ -331,6 +340,7 @@ pub(crate) async fn fetch(
         let persist = !directives
             .iter()
             .any(|(name, _)| name == "no-store" || name == "private");
+        let must_revalidate = directives.iter().any(|(name, _)| name == "no-cache");
         let mut ttl = directives
             .iter()
             .filter(|(name, _)| name == "max-age")
@@ -338,7 +348,7 @@ pub(crate) async fn fetch(
             .min()
             .unwrap_or(default_ttl)
             .clamp(0, max_ttl);
-        if directives.iter().any(|(name, _)| name == "no-cache") {
+        if must_revalidate {
             ttl = 0;
         }
         if let Some(age) = response
@@ -368,7 +378,12 @@ pub(crate) async fn fetch(
         let body: Value =
             serde_json::from_slice(&bytes).map_err(|_| anyhow!("Addon returned invalid JSON"))?;
         ensure!(body.is_object(), "Addon response must be an object");
-        return Ok(Fetched { body, ttl, persist });
+        return Ok(Fetched {
+            body,
+            ttl,
+            persist,
+            must_revalidate,
+        });
     }
     bail!("Too many addon redirects")
 }

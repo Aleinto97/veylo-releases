@@ -94,7 +94,10 @@ fn parse_report_doc(doc: &Value) -> Option<DiagReport> {
 
 async fn upload_fields(fields: Value) -> Result<()> {
     let Some(base) = account::documents_pub() else { return Ok(()) };
-    let doc_id = format!("{}-{}", now_secs(), account::random_id_pub(6));
+    // Invert timestamp so Firestore's default ascending listDocuments?pageSize=100 always returns
+    // the 100 newest reports instead of getting stuck on the 100 oldest.
+    let inv_ts = (9_999_999_999_999i64 - now_secs()).max(0);
+    let doc_id = format!("{inv_ts:013}-{}", account::random_id_pub(6));
     if let Ok((token, uid)) = account::id_token_pub().await {
         let doc_path = format!("{base}/users/{uid}/diagnostics/{doc_id}");
         account::commit_pub(&token, vec![json!({

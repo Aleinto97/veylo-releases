@@ -39,6 +39,7 @@ struct ActiveJob {
 static DOWNLOADS_LOCK: Mutex<()> = Mutex::new(());
 static DOWNLOADS_CACHE: Mutex<Option<Vec<DownloadEntry>>> = Mutex::new(None);
 static DOWNLOADS_REV: AtomicU64 = AtomicU64::new(0);
+static DOWNLOAD_NONCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_DOWNLOADS: Mutex<Option<HashMap<String, ActiveJob>>> = Mutex::new(None);
 static DOWNLOAD_SLOTS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
@@ -70,7 +71,9 @@ fn safe_filename(key: &str, url: &str) -> String {
         .filter(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "mkv" | "webm" | "m4v" | "mov" | "avi" | "ts"))
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| "mkv".into());
-    format!("{hex}.{ext}")
+    let nonce = DOWNLOAD_NONCE.fetch_add(1, Ordering::Relaxed);
+    let ts = now_secs().max(0) as u64;
+    format!("{hex}-{ts:x}-{nonce:x}.{ext}")
 }
 
 /// Bind each `.part` file to both the title key AND source URL so resuming after a mirror/encode
@@ -307,12 +310,15 @@ pub fn start_download(
     let runtime = RUNTIME.get().context("Backend not started")?;
     let slots = download_slots();
     runtime.spawn(async move {
+        let cleanup_part_path = dir.join(part_filename(&spec.key, &spec.url));
         let permit = tokio::select! {
             biased;
             _ = cancel_rx.wait_for(|&c| c) => None,
             p = slots.acquire_owned() => p.ok(),
         };
         let res = if *cancel_rx.borrow() {
+            let _ = std::fs::remove_file(&cleanup_part_path);
+            let _ = std::fs::remove_file(part_meta_path(&cleanup_part_path));
             Err(anyhow!("Cancelled"))
         } else {
             let sub_kind = spec.media.kind.clone();
@@ -321,6 +327,10 @@ pub fn start_download(
             let res = run_download_to(&dir, &idx, spec, cancel_rx.clone()).await;
             // Release the download slot before best-effort subtitle fetching so queued videos start immediately.
             drop(permit);
+            if *cancel_rx.borrow() {
+                let _ = std::fs::remove_file(&cleanup_part_path);
+                let _ = std::fs::remove_file(part_meta_path(&cleanup_part_path));
+            }
             if res.is_ok() {
                 if let Ok(subs) = online_subtitles(&sub_kind, &sub_video, sub_fname.as_deref(), None).await {
                     if let Some(best) = subs.first() {
@@ -430,10 +440,11 @@ async fn run_download_to(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range);
     let (resumed, mut written, range_total) = if existing > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        // Require a known total and an end offset reaching EOF (`end + 1 == total`) so a bounded
+        // `206` slice with an unknown total (`/*`) can never be published as a complete file.
         let valid_resume = match content_range {
             Some((start, end, Some(total))) => start == existing && end.checked_add(1) == Some(total),
-            Some((start, _end, None)) => start == existing,
-            None => false,
+            _ => false,
         };
         if valid_resume {
             let total = content_range.and_then(|(_, _, t)| t);
@@ -463,9 +474,6 @@ async fn run_download_to(
         anyhow::bail!("Download source returned partial or unexpected status (HTTP {})", resp.status().as_u16());
     }
     let validator = extract_strong_validator(resp.headers());
-    if !resumed {
-        write_part_validator(&part_path, validator.as_deref());
-    }
     let total = range_total.or_else(|| resp.content_length().map(|len| if resumed { len.saturating_add(existing) } else { len }));
     if let Ok(mut g) = ACTIVE_DOWNLOADS.lock() {
         if let Some(job) = g.as_mut().and_then(|m| m.get_mut(&key)) {
@@ -476,7 +484,12 @@ async fn run_download_to(
     let mut file = if resumed {
         tokio::fs::OpenOptions::new().write(true).append(true).open(&part_path).await?
     } else {
-        tokio::fs::File::create(&part_path).await?
+        // Invalidate the old sidecar, truncate `.part`, then record the new validator so a crash
+        // between steps can never pair old bytes with the new object's validator.
+        write_part_validator(&part_path, None);
+        let f = tokio::fs::File::create(&part_path).await?;
+        write_part_validator(&part_path, validator.as_deref());
+        f
     };
     use tokio::io::AsyncWriteExt;
     let mut last_update = std::time::Instant::now();

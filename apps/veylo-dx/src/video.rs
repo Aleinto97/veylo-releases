@@ -5,12 +5,25 @@
 //!   the window and keeps what belongs to Dioxus (the page's background, full screen).
 //! Android: a SurfaceView below the WebView (VeyloVideo.kt), handed to mpv as its window.
 use crate::engine::Live;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+
+/// Tracks which `Live::session_id` owns the attached surface so an old `PlayerScreen`'s `use_drop`
+/// (which in Dioxus 0.7 can run *after* the replacement `PlayerScreen`'s `use_hook`) never tears
+/// down the newly attached playback session.
+static ATTACHED_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// Put the session's picture on screen (call on the UI thread).
-pub fn attach(live: &Arc<Live>) { imp::attach(live) }
-/// Take the picture away and give the app its opaque background back.
-pub fn detach() { imp::detach() }
+pub fn attach(live: &Arc<Live>) {
+    ATTACHED_SESSION.store(live.session_id, Ordering::Release);
+    imp::attach(live);
+}
+/// Take the picture away and give the app its opaque background back, only if `session_id` is still active.
+pub fn detach(session_id: u64) {
+    if ATTACHED_SESSION.compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    imp::detach();
+}
 /// The picture's aspect or fit changed (any thread).
 pub fn layout(live: &Live) { imp::layout(live) }
 /// Hint the content frame rate (e.g. 23.976 Hz) to the display surface where supported (Android 11+).

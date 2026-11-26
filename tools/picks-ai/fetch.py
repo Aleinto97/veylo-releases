@@ -54,9 +54,11 @@ def download(urls, digest):
                 req = urllib.request.Request(source, headers={'User-Agent': USER_AGENT})
                 with urllib.request.urlopen(req, timeout=120) as response, open(cache, 'wb') as out:
                     shutil.copyfileobj(response, out)
+                if _sha256_file(cache) != digest:
+                    raise RuntimeError('Checksum mismatch: ' + source)
                 last_err = None
                 break
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
                 last_err = exc
                 if cache.exists():
                     cache.unlink()

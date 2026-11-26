@@ -73,6 +73,7 @@ fn load_home_disk() -> Option<HomeSnapshot> {
 
 static HOME_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HOME_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static HOME_SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn save_home_disk(snap: &HomeSnapshot) {
     let rows: Vec<serde_json::Value> = snap.rows.iter().filter_map(|(r, st)| {
@@ -86,6 +87,7 @@ fn save_home_disk(snap: &HomeSnapshot) {
     }).collect();
     if rows.is_empty() && snap.tonight.is_empty() { return; }
     let gen = HOME_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let seq = HOME_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
     let payload = serde_json::json!({
         "at": backend::now_secs(),
         "rows": rows,
@@ -97,6 +99,7 @@ fn save_home_disk(snap: &HomeSnapshot) {
     std::thread::spawn(move || {
         let _io = HOME_SAVE_LOCK.lock();
         if HOME_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire) != gen { return; }
+        if HOME_SAVE_SEQ.load(std::sync::atomic::Ordering::Acquire) != seq { return; }
         let _ = backend::write_private_file(&path, text.as_bytes());
     });
 }
@@ -104,6 +107,7 @@ fn save_home_disk(snap: &HomeSnapshot) {
 /// Drop cached Home shelves (called when the user switches BetterPosters/add-on settings).
 pub fn invalidate_cache() {
     HOME_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    HOME_SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let _io = HOME_SAVE_LOCK.lock();
     if let Some(m) = HOME_SNAPSHOT.get() {
         if let Ok(mut s) = m.lock() { *s = HomeSnapshot::default(); }

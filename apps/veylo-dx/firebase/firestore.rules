@@ -2,28 +2,65 @@ rules_version = '2';
 // Veylo's accounts (src/backend/account.rs). Paste into Firebase → Firestore Database → Rules.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each account's synced titles, episodes, keys and diagnostics: only that account reads or writes them.
-    match /users/{uid}/{rest=**} {
-      allow read, write: if request.auth != null && request.auth.uid == uid
+    function isSignedInUser(uid) {
+      return request.auth != null && request.auth.uid == uid
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
+    function validDiagnostic(d) {
+      return d.keys().hasAll(['kind', 'os', 'arch', 'version', 'device', 'screen', 'summary', 'details', 'created', 'synced'])
+        && d.keys().hasOnly(['kind', 'os', 'arch', 'version', 'device', 'screen', 'summary', 'details', 'created', 'synced'])
+        && d.kind is string && d.kind.size() > 0 && d.kind.size() <= 48
+        && d.os is string && d.os.size() > 0 && d.os.size() <= 32
+        && d.arch is string && d.arch.size() > 0 && d.arch.size() <= 32
+        && d.version is string && d.version.size() > 0 && d.version.size() <= 32
+        && d.device is string && d.device.size() <= 80
+        && d.screen is string && d.screen.size() <= 100
+        && d.summary is string && d.summary.size() > 0 && d.summary.size() <= 400
+        && d.details is string && d.details.size() <= 8000
+        && d.created is int
+        && d.synced == request.time;
+    }
+
+    // Each account's synced titles, episodes, keys and diagnostics: only that account reads or writes them.
+    match /users/{uid}/items/{id} {
+      allow read, delete: if isSignedInUser(uid);
+      allow create, update: if isSignedInUser(uid)
+        && request.resource.data.keys().hasOnly(['sealed', 'v', 'synced', 'data', 't', 'type', 'id', 'addon_url', 'video_id', 'meta', 'saved', 'watched', 'position_ms', 'duration_ms', 'watched_ms', 'liked', 'updated', 'deleted'])
+        && (!('sealed' in request.resource.data) || (request.resource.data.sealed is string && request.resource.data.sealed.size() <= 262144));
+    }
+    match /users/{uid}/config/keys {
+      allow read, delete: if isSignedInUser(uid);
+      allow create, update: if isSignedInUser(uid)
+        && request.resource.data.keys().hasOnly(['sealed', 'v', 'updated', 'device', 'synced'])
+        && (!('sealed' in request.resource.data) || (request.resource.data.sealed is string && request.resource.data.sealed.size() <= 262144))
+        && (!('device' in request.resource.data) || (request.resource.data.device is string && request.resource.data.device.size() <= 128));
+    }
+    match /users/{uid}/diagnostics/{id} {
+      allow read, delete: if isSignedInUser(uid);
+      allow create, update: if isSignedInUser(uid) && validDiagnostic(request.resource.data);
+    }
+
     // Redacted diagnostics from signed-out installs: create-only, never readable by clients.
     match /diagnostics/{id} {
-      allow create: if request.auth != null
-        && request.resource.data.keys().hasOnly(['kind', 'os', 'arch', 'version', 'device', 'screen', 'summary', 'details', 'created', 'synced'])
-        && request.resource.data.summary is string && request.resource.data.summary.size() <= 400
-        && request.resource.data.details is string && request.resource.data.details.size() <= 8000;
+      allow create: if request.auth != null && validDiagnostic(request.resource.data);
       allow read, update, delete: if false;
     }
+
     // A computer's sign-in request (its QR code): the computer, signed in for the moment without
     // an account, creates and reads its own; a signed-in phone may only add the sealed answer.
     match /links/{link} {
-      allow create: if request.auth != null && request.resource.data.asker == request.auth.uid
-        && request.resource.data.keys().hasOnly(['asker', 'created']);
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['asker', 'created'])
+        && request.resource.data.keys().hasOnly(['asker', 'created'])
+        && request.resource.data.asker == request.auth.uid
+        && request.resource.data.created == request.time;
       allow read, delete: if request.auth != null && resource.data.asker == request.auth.uid;
       allow update: if request.auth != null && request.auth.token.firebase.sign_in_provider != 'anonymous'
         && !('sealed' in resource.data)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sealed'])
+        && request.resource.data.sealed is string
+        && request.resource.data.sealed.size() > 0
+        && request.resource.data.sealed.size() <= 65536
         && resource.data.created > request.time - duration.value(15, 'm');
     }
   }

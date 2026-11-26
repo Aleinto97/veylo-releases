@@ -146,6 +146,21 @@ impl SubtitleCache {
         }
         Ok(entries)
     }
+    fn is_fresh_marker(path: &Path) -> bool {
+        let Ok(marker) = fs::read_to_string(Self::metadata_path(path)) else {
+            return false;
+        };
+        if marker == "never" {
+            true
+        } else {
+            marker.parse::<u64>().ok().is_some_and(|expires| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .is_some_and(|now| now.as_secs() < expires)
+            })
+        }
+    }
     fn prune(&self, available: u64, protected: Option<&Path>) -> Result<()> {
         let mut entries = Vec::new();
         let mut total = 0u64;
@@ -157,11 +172,13 @@ impl SubtitleCache {
                 Self::remove_entry(&path)?;
             } else {
                 total = total.saturating_add(size);
-                entries.push((path, size, modified));
+                let fresh = Self::is_fresh_marker(&path);
+                entries.push((path, size, modified, fresh));
             }
         }
-        entries.sort_by_key(|e| e.2);
-        for (path, size, _) in entries {
+        // Evict expired or unmarked entries before fresh reusable ones, oldest-first within each group.
+        entries.sort_by_key(|e| (e.3, e.2));
+        for (path, size, _, _) in entries {
             if total <= available {
                 break;
             }

@@ -23,7 +23,7 @@ on:
         type: boolean
         default: true
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: release
   cancel-in-progress: false
@@ -207,33 +207,43 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0" >/dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-      - name: Release key
-        env:
-          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-        run: |
-          [ -n "$KEYSTORE" ] || { echo "::error::The ANDROID_KEYSTORE_B64 secret is missing."; exit 1; }
-          umask 077 && printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
-          echo "VEYLO_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-      - name: Build and sign Android APK (${{ matrix.abi }})
+      - name: Build unsigned Android APK (${{ matrix.abi }})
         env:
           VEYLO_TARGET: android-${{ matrix.abi }}
           VEYLO_PUBLISH: "0"
-          VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          VEYLO_SIGN: "0"
           VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
           VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
           VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
         run: tools/release.sh
+      - name: Sign Android APK (${{ matrix.abi }})
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEYSTORE" ] || { echo "::error::The ANDROID_KEYSTORE_B64 secret is missing."; exit 1; }
+          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          trap 'rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/keystore.pass" "dist/${{ matrix.asset }}.idsig"' EXIT
+          ( umask 077
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+            printf '%s' "$VEYLO_KEYSTORE_PASS" > "$RUNNER_TEMP/keystore.pass" )
+          "$build_tools/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias veylo \
+            --ks-pass "file:$RUNNER_TEMP/keystore.pass" \
+            --out "dist/${{ matrix.asset }}" "dist/unsigned-${{ matrix.asset }}"
+          rm -f "dist/unsigned-${{ matrix.asset }}"
+          "$build_tools/apksigner" verify --print-certs "dist/${{ matrix.asset }}" | grep 'SHA-256' | sed "s/^/APK (${{ matrix.abi }}) /"
       - uses: actions/upload-artifact@v4
         with:
           name: release-android-${{ matrix.abi }}
           path: dist/${{ matrix.asset }}
-      - if: always()
-        run: rm -f "$RUNNER_TEMP/release.jks"
 
   # 4. Run privacy check across all 4 archives, generate SHA256SUMS.txt, and publish the release.
   publish:
     needs: [plan, macos, windows, android]
     if: needs.plan.outputs.build == 'true'
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

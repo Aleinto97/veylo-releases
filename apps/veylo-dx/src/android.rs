@@ -284,6 +284,11 @@ pub fn prepare_mpv() -> Result<String> {
     })
 }
 
+/// Whether Android currently holds a live `Surface` attached to the player.
+pub fn has_surface() -> bool {
+    SURFACE.lock().is_ok_and(|slot| slot.is_some())
+}
+
 /// Hand the current surface (if any) to a session that has just started.
 pub fn attach_surface(live: &crate::engine::Live) {
     if let Ok(slot) = SURFACE.lock() {

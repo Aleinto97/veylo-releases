@@ -276,7 +276,8 @@ pub fn TitlePage(media: Media) -> Element {
         spawn(async move { if backend::set_watched(&m, next).await.is_err() { watched.set(!next); } else { *shell.picks_dirty.write() += 1; } });
     });
     let toggle_series_watched = use_callback(move |_: ()| {
-        let all_reg: Vec<String> = episodes().into_iter().filter(|e| e.season != 0).map(|e| e.id).collect();
+        let eps = episodes();
+        let all_reg: Vec<String> = crate::picks_rules::regular_episodes(&eps, backend::now_secs()).into_iter().map(|e| e.id.clone()).collect();
         if all_reg.is_empty() { return; }
         let all_done = all_reg.iter().all(|id| seen.peek().contains(id));
         let next = !all_done;
@@ -552,7 +553,8 @@ pub fn TitlePage(media: Media) -> Element {
                         }
                         if !film && !episodes().is_empty() {
                             {
-                                let all_reg: Vec<String> = episodes().into_iter().filter(|e| e.season != 0).map(|e| e.id).collect();
+                                let eps = episodes();
+                                let all_reg: Vec<String> = crate::picks_rules::regular_episodes(&eps, backend::now_secs()).into_iter().map(|e| e.id.clone()).collect();
                                 let all_done = !all_reg.is_empty() && all_reg.iter().all(|id| seen.read().contains(id));
                                 rsx! {
                                     button { class: if all_done { "pill glass watched-switch on" } else { "pill glass watched-switch" },
@@ -639,12 +641,13 @@ pub fn TitlePage(media: Media) -> Element {
 }
 
 /// Where a series carries on: the episode you started, unless you have watched it; else the
-/// first unwatched one after the furthest you watched; a series not begun starts at its first
-/// regular episode. None once everything after the furthest watched episode is seen.
+/// first unwatched released one after the furthest you watched; a series not begun starts at its
+/// first released regular episode. None once everything released after the furthest watched is seen.
 fn up_next(list: &[Episode], media: &Media, seen: &std::collections::HashSet<String>) -> Option<String> {
     if let Some(last) = media.last_video_id.as_ref().filter(|l| !seen.contains(*l) && backend::in_progress(media)) { return Some(last.clone()); }
-    let start = list.iter().rposition(|e| e.season != 0 && seen.contains(&e.id)).map_or(0, |i| i + 1);
-    list.iter().skip(start).find(|e| e.season != 0 && !seen.contains(&e.id)).map(|e| e.id.clone())
+    let released = crate::picks_rules::regular_episodes(list, backend::now_secs());
+    let start = released.iter().rposition(|e| seen.contains(&e.id)).map_or(0, |i| i + 1);
+    released.iter().skip(start).find(|e| !seen.contains(&e.id)).map(|e| e.id.clone())
 }
 
 fn next_episode(list: &[Episode], video: &str) -> Option<Episode> {
