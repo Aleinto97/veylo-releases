@@ -2,7 +2,7 @@
 """Prepare pinned, offline Picks inference assets for a supported release target."""
 import argparse
 import hashlib
-import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,66 +14,70 @@ import urllib.error
 import urllib.request
 import zipfile
 
-REVISION = 'ea104dacec62c0de699686887e3f920caeb4f3e3'
-MODEL_BASE = f'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/{REVISION}/'
-# Microsoft's NuGet package contains the same native binaries as the desktop release archives.
-ORT_DESKTOP = (
-    'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg',
-    'd571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a',
-)
-ORT_ANDROID = (
-    'https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar',
-    '04a4617a9c797cf49225595e45b5546081cb34c86ac817581141577d3b7dbfe2',
-)
-RUNTIMES = {
-    'linux-aarch64': 'runtimes/linux-arm64/native/libonnxruntime.so',
-    'linux-x64': 'runtimes/linux-x64/native/libonnxruntime.so',
-    'windows-x64': 'runtimes/win-x64/native/onnxruntime.dll',
-    'macos-arm64': 'runtimes/osx-arm64/native/libonnxruntime.dylib',
-    'android-arm64': 'jni/arm64-v8a/libonnxruntime.so',
-    'android-armv7': 'jni/armeabi-v7a/libonnxruntime.so',
-}
-ASSETS = {
-    'model.onnx': ('onnx/model_quantized.onnx', '6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4'),
-    'tokenizer.json': ('tokenizer.json', 'd241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66'),
-}
-ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+PINS = json.loads((HERE / 'pins.json').read_text(encoding='utf-8'))
+MODEL_BASE = PINS['model_base']
+ORT_DESKTOP = (PINS['ort_desktop']['urls'], PINS['ort_desktop']['sha256'])
+ORT_ANDROID = (PINS['ort_android']['urls'], PINS['ort_android']['sha256'])
+VC_REDIST = (PINS['vc_redist_x64']['urls'], PINS['vc_redist_x64']['sha256'])
+RUNTIMES = PINS['runtimes']
+ASSETS = {name: (spec['remote'], spec['sha256']) for name, spec in PINS['assets'].items()}
+ROOT = HERE.parents[1]
 DEST = ROOT / 'apps/veylo-dx/picks-ai'
+MAX_RETRY_WAIT = 120
+USER_AGENT = 'veylo-fetch/1.0'
 
-MAVEN_CENTRAL = 'https://repo.maven.apache.org/maven2/'
-MAVEN_MIRROR = 'https://maven-central.storage-download.googleapis.com/maven2/'
 
-def download(url, digest):
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download(urls, digest):
+    if isinstance(urls, str):
+        urls = [urls]
     cache = DEST / 'downloads' / digest
     cache.parent.mkdir(parents=True, exist_ok=True)
-    if not cache.exists() or hashlib.sha256(cache.read_bytes()).hexdigest() != digest:
-        print('Fetching', url, flush=True)
-        # Direct writes avoid this host's broken atomic-new-file links; retry transient 5xx/network errors.
+    if not cache.exists() or _sha256_file(cache) != digest:
+        print('Fetching', urls[0], flush=True)
+        # Direct writes avoid this host's broken atomic-new-file links; retry transient errors and
+        # rotate across configured mirrors (e.g. Google's Maven Central mirror on HTTP 429).
         last_err = None
         attempts = 7
         for attempt in range(attempts):
-            # Maven Central rate-limits GitHub's shared runner IPs (HTTP 429): every other attempt uses
-            # Google's official Maven Central mirror. The SHA-256 check below covers either source.
-            source = url
-            if attempt % 2 == 1 and url.startswith(MAVEN_CENTRAL):
-                source = MAVEN_MIRROR + url[len(MAVEN_CENTRAL):]
+            source = urls[attempt % len(urls)]
+            next_source = urls[(attempt + 1) % len(urls)]
             try:
-                with urllib.request.urlopen(source, timeout=120) as response, open(cache, 'wb') as out:
+                req = urllib.request.Request(source, headers={'User-Agent': USER_AGENT})
+                with urllib.request.urlopen(req, timeout=120) as response, open(cache, 'wb') as out:
                     shutil.copyfileobj(response, out)
                 last_err = None
                 break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_err = exc
+                if cache.exists():
+                    cache.unlink()
                 if attempt < attempts - 1:
-                    # Rate limits (429) need longer than a blip: honour Retry-After, else back off to ~1 min.
-                    retry_after = getattr(exc, 'headers', None) and exc.headers.get('Retry-After')
-                    wait = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** (attempt + 1), 60)
-                    print(f'Fetch attempt {attempt + 1} failed ({exc}); retrying in {wait}s...', flush=True)
+                    # Switching to a distinct mirror needs only a brief pause; retrying the same host
+                    # honours a capped Retry-After or backs off exponentially up to 60 s.
+                    if next_source != source:
+                        wait = 2
+                    else:
+                        retry_after = getattr(exc, 'headers', None) and exc.headers.get('Retry-After')
+                        if retry_after and retry_after.isdigit():
+                            wait = min(int(retry_after), MAX_RETRY_WAIT)
+                        else:
+                            wait = min(2 ** (attempt + 1), 60)
+                    print(f'Fetch attempt {attempt + 1} ({source}) failed ({exc}); retrying in {wait}s...', flush=True)
                     time.sleep(wait)
         if last_err is not None:
             raise last_err
-    if hashlib.sha256(cache.read_bytes()).hexdigest() != digest:
-        raise RuntimeError('Checksum mismatch: ' + url)
+    if _sha256_file(cache) != digest:
+        cache.unlink(missing_ok=True)
+        raise RuntimeError('Checksum mismatch: ' + urls[0])
     return cache
 
 def prepare(target):
@@ -113,8 +117,7 @@ def find_bsdtar():
 def prepare_windows_crt(dest):
     # App-local dependencies from Microsoft's pinned VC++ 2022 redistributable.
     # Extract only the four runtime DLLs ONNX Runtime imports, and retain its EULA.
-    url = 'https://download.visualstudio.microsoft.com/download/pr/e9604e21-4b79-4096-a4b3-1b63d4b55b4d/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe'
-    data = download(url, 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b').read_bytes()
+    data = download(*VC_REDIST).read_bytes()
     bsdtar = find_bsdtar()
     # This pinned WiX Burn executable has a UX cabinet and a payload cabinet.
     with tempfile.TemporaryDirectory(dir=DEST) as work:

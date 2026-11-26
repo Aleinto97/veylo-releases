@@ -28,6 +28,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     check("bundle", bundle());
     check("store", store());
+    check("display", display_and_autoplay());
     check("picks-ai", picks());
     check("player", player(&data));
     check("hdr", hdr(&data));
@@ -86,6 +87,16 @@ fn store() -> Result<String> {
     backend::save_settings(&before);
     ensure!(read_back == flipped, "settings didn't read back");
     Ok("library saved and read back; settings round-trip".into())
+}
+
+/// Display probing and autoplay ranking must work off the Dioxus UI thread (OS thread + Tokio
+/// worker pool) without panicking — guards against Windows/macOS `dioxus::desktop::window()` panics.
+fn display_and_autoplay() -> Result<String> {
+    std::thread::spawn(crate::display::screen)
+        .join()
+        .map_err(|_| anyhow!("display::screen() panicked on a background thread"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(backend::selftest_autoplay_off_thread())
 }
 
 /// The bundled model runs on this CPU and its embeddings mean something.

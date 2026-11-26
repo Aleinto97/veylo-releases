@@ -9,11 +9,31 @@ $Asset = 'mpv-dev-x86_64-20261111-git-bcde6b93cc.7z'
 $Sha256 = '273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452'
 
 $out = Join-Path $PSScriptRoot 'mpv'
+$tagFile = Join-Path $out 'TAG'
+if ((Test-Path $tagFile) -and ((Get-Content -Raw $tagFile).Trim() -eq $Tag) `
+    -and (Test-Path (Join-Path $out 'libmpv-2.dll')) -and (Test-Path (Join-Path $out 'mpv.lib'))) {
+    Write-Host "Windows libmpv $Tag already present."
+    exit 0
+}
 $work = Join-Path ([IO.Path]::GetTempPath()) ("veylo-mpv-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $work, $out | Out-Null
 try {
     $archive = Join-Path $work $Asset
-    Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$Tag/$Asset" -OutFile $archive
+    $uri = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$Tag/$Asset"
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $archive
+            $downloaded = $true
+            break
+        } catch {
+            if ($attempt -eq 5) { throw }
+            $wait = [Math]::Min([Math]::Pow(2, $attempt), 30)
+            Write-Host "Fetch attempt $attempt failed ($($_.Exception.Message)); retrying in ${wait}s..."
+            Start-Sleep -Seconds $wait
+        }
+    }
+    if (-not $downloaded) { throw "Failed to download $Asset" }
     $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
     if ($hash -ne $Sha256) { throw "Checksum mismatch for ${Asset}: $hash" }
 

@@ -22,19 +22,23 @@ mkdir -p "$(dirname "$shot")"
 
 "$exe" >"$log" 2>&1 &
 pid=$!
-sleep "$seconds"
-if ! kill -0 "$pid" 2>/dev/null; then
-    wait "$pid" && code=0 || code=$?
-    echo "Veylo exited (code $code) within $seconds s. Its output:" >&2
-    cat "$log" >&2
-    [ -f "$data/last-panic.txt" ] && cat "$data/last-panic.txt" >&2
-    exit 1
-fi
+elapsed=0
+while [ "$elapsed" -lt "$seconds" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" && code=0 || code=$?
+        echo "Veylo exited (code $code) after ${elapsed}s. Its output:" >&2
+        cat "$log" >&2
+        [ -f "$data/last-panic.txt" ] && cat "$data/last-panic.txt" >&2
+        exit 1
+    fi
+    if [ -f "$data/last-panic.txt" ]; then
+        echo "Veylo panicked after ${elapsed}s:" >&2; cat "$data/last-panic.txt" >&2; exit 1
+    fi
+done
 if [ -n "${VEYLO_EXPECT_LOG:-}" ] && ! grep -q -F "$VEYLO_EXPECT_LOG" "$log"; then
     echo "Veylo never logged \"$VEYLO_EXPECT_LOG\". Its output:" >&2; cat "$log" >&2; exit 1
-fi
-if [ -f "$data/last-panic.txt" ]; then
-    echo "Veylo panicked while running:" >&2; cat "$data/last-panic.txt" >&2; exit 1
 fi
 
 case "$(uname -s)" in

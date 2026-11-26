@@ -95,4 +95,13 @@ mod tests {
         assert_eq!(summary(Some(tv), true).0, "HDR: Dolby Vision, HDR10+, HDR10");
         assert_eq!(summary(Some(Screen::default()), true).0, "SDR");
     }
+
+    /// Regression test for v0.13.0 on Windows/macOS: querying display capabilities from a worker
+    /// thread (Tokio probe / mpv engine) must never touch Dioxus runtime state or panic.
+    #[test]
+    fn screen_is_safe_off_ui_thread() {
+        let _ = std::thread::spawn(screen)
+            .join()
+            .expect("display::screen() panicked off the Dioxus UI thread");
+    }
 }

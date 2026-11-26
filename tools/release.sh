@@ -4,6 +4,9 @@
 #
 #   tools/release.sh ["notes"]            build, then publish v<version> (gh logged in, or GH_TOKEN)
 #   VEYLO_PUBLISH=0 tools/release.sh      build only; the files stay in dist/ (or VEYLO_OUT)
+#   VEYLO_TARGET=windows|android-arm64|android-armv7|publish|all (default: all)
+#                                         build one platform or publish prebuilt VEYLO_EXTRA_ASSETS
+#                                         (used by parallel jobs in .github/workflows/release.yml)
 #
 # GitHub Actions runs this on every push to main that raises `version` in apps/veylo-dx/Cargo.toml
 # (.github/workflows/release.yml); it runs the same way here.
@@ -22,6 +25,11 @@ WIN_ASSET=veylo-windows-x64.zip
 APK_ASSET=veylo-android-arm64.apk
 APK_ARMV7_ASSET=veylo-android-armv7.apk
 publish=${VEYLO_PUBLISH:-1}
+target_mode=${VEYLO_TARGET:-all}
+case "$target_mode" in
+    all|windows|android-arm64|android-armv7|publish) ;;
+    *) echo "Unknown VEYLO_TARGET: $target_mode (expected all, windows, android-arm64, android-armv7, or publish)" >&2; exit 1 ;;
+esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 app="$root/apps/veylo-dx"
 out_dir=${VEYLO_OUT:-$root/dist}
@@ -32,65 +40,77 @@ extra=()
 if [ -n "${VEYLO_EXTRA_ASSETS:-}" ]; then
     for f in "$VEYLO_EXTRA_ASSETS"/*; do [ -f "$f" ] && extra+=("$f"); done
 fi
-if [ "$publish" = 1 ] && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+if [ "$publish" = 1 ] && { [ "$target_mode" = all ] || [ "$target_mode" = publish ]; } && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
     echo "$tag is already released: bump version in apps/veylo-dx/Cargo.toml first." >&2; exit 1
 fi
 IFS=. read -r major minor patch <<< "$version"
 version_code=$((major * 10000 + minor * 100 + patch))
 
-keystore=${VEYLO_KEYSTORE:-$HOME/.config/veylo/release.jks}
-[ -f "$keystore" ] || { echo "No release key at $keystore (VEYLO_KEYSTORE): without it the APK can't update installed copies." >&2; exit 1; }
 work=$(mktemp -d)
 stage="$work/stage"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$stage"
-pass_file="$work/keystore.pass"
-( umask 077
-  if [ -n "${VEYLO_KEYSTORE_PASS:-}" ]; then printf '%s' "$VEYLO_KEYSTORE_PASS" > "$pass_file"
-  else cp "${VEYLO_KEYSTORE_PASS_FILE:-$HOME/.config/veylo/release.pass}" "$pass_file"; fi )
 # No local folder names (your home path, so your username) inside the binaries.
 remap="--remap-path-prefix=$HOME=~ --remap-path-prefix=$root=veylo"
 
-# Model assets and native runtimes are bundled: classification never downloads at runtime.
-python3 "$root/tools/picks-ai/fetch.py" windows-x64 android-arm64 android-armv7
+setup_keystore() {
+    keystore=${VEYLO_KEYSTORE:-$HOME/.config/veylo/release.jks}
+    [ -f "$keystore" ] || { echo "No release key at $keystore (VEYLO_KEYSTORE): without it the APK can't update installed copies." >&2; exit 1; }
+    pass_file="$work/keystore.pass"
+    ( umask 077
+      if [ -n "${VEYLO_KEYSTORE_PASS:-}" ]; then printf '%s' "$VEYLO_KEYSTORE_PASS" > "$pass_file"
+      else cp "${VEYLO_KEYSTORE_PASS_FILE:-$HOME/.config/veylo/release.pass}" "$pass_file"; fi )
+}
 
-# ---------------------------------------------------------------- Windows
-mpv="$app/windows/mpv"
-if [ ! -f "$mpv/libmpv-2.dll" ]; then
+build_windows() {
+    python3 "$root/tools/picks-ai/fetch.py" windows-x64
+    local mpv="$app/windows/mpv"
     pin() { tr -d '\r' < "$app/windows/fetch-mpv.ps1" | sed -n "s/^\$$1 = '\(.*\)'/\1/p"; }
-    curl -fsSL -o "$work/mpv.7z" "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$(pin Tag)/$(pin Asset)"
-    echo "$(pin Sha256)  $work/mpv.7z" | sha256sum -c -
-    mkdir -p "$mpv" && bsdtar -xf "$work/mpv.7z" -C "$mpv" && cp "$mpv/libmpv.dll.a" "$mpv/mpv.lib" && pin Tag > "$mpv/TAG"
-fi
-cd "$app"
-# Static C runtime (as .cargo/config.toml).
-RUSTFLAGS="-C target-feature=+crt-static $remap" cargo xwin build --release --target x86_64-pc-windows-msvc
-win_out="$app/target/x86_64-pc-windows-msvc/release"
-mkdir -p "$work/win/licenses" && cp "$win_out/veylo-dx.exe" "$win_out/libmpv-2.dll" "$work/win/"
-cp -r "$win_out/picks-ai" "$work/win/"
-cp "$root/LICENSE" "$root/PRIVACY.md" "$root/THIRD_PARTY_LICENSES.md" "$app/assets/fonts/OFL.txt" "$work/win/licenses/"
-for f in "$mpv"/LICENSE* "$mpv"/COPYING* "$mpv"/Copyright*; do
-    [ -f "$f" ] && cp "$f" "$work/win/licenses/mpv-$(basename "$f")"
-done
-(cd "$work/win" && zip -q -r -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll picks-ai licenses)
+    local want_tag
+    want_tag=$(pin Tag)
+    if [ ! -f "$mpv/libmpv-2.dll" ] || [ ! -f "$mpv/mpv.lib" ] || [ ! -f "$mpv/TAG" ] || [ "$(cat "$mpv/TAG")" != "$want_tag" ]; then
+        curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 --max-time 300 \
+            -o "$work/mpv.7z" "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$want_tag/$(pin Asset)"
+        echo "$(pin Sha256)  $work/mpv.7z" | sha256sum -c -
+        mkdir -p "$mpv" && bsdtar -xf "$work/mpv.7z" -C "$mpv" && cp "$mpv/libmpv.dll.a" "$mpv/mpv.lib" && printf '%s\n' "$want_tag" > "$mpv/TAG"
+    fi
+    (
+        cd "$app"
+        # Static C runtime (as .cargo/config.toml).
+        RUSTFLAGS="-C target-feature=+crt-static $remap" cargo xwin build --locked --release --target x86_64-pc-windows-msvc
+    )
+    local win_out="$app/target/x86_64-pc-windows-msvc/release"
+    mkdir -p "$work/win/licenses" && cp "$win_out/veylo-dx.exe" "$win_out/libmpv-2.dll" "$work/win/"
+    cp -r "$win_out/picks-ai" "$work/win/"
+    cp "$root/LICENSE" "$root/PRIVACY.md" "$root/THIRD_PARTY_LICENSES.md" "$app/assets/fonts/OFL.txt" "$work/win/licenses/"
+    for f in "$mpv"/LICENSE* "$mpv"/COPYING* "$mpv"/Copyright*; do
+        [ -f "$f" ] && cp "$f" "$work/win/licenses/mpv-$(basename "$f")"
+    done
+    (cd "$work/win" && zip -q -r -9 "$stage/$WIN_ASSET" veylo-dx.exe libmpv-2.dll picks-ai licenses)
+}
 
-# ---------------------------------------------------------------- Android
-export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
-if [ -z "${JAVA_HOME:-}" ] && [ -d "$HOME/Android/jdk17" ]; then export JAVA_HOME=$HOME/Android/jdk17; fi
-if [ -z "${ANDROID_NDK_HOME:-}" ]; then
-    # ARM64 Linux hosts use a shim over the NDK (README); elsewhere the newest NDK in the SDK.
-    if [ -d "$HOME/Android/host-tools/ndk-shim" ]; then export ANDROID_NDK_HOME=$HOME/Android/host-tools/ndk-shim
-    else export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1); fi
-fi
-# ARM64 hosts run Gradle's x86 aapt2 under qemu (README).
-if [ -d "$HOME/Android/host-tools/x86_64-root" ]; then export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-$HOME/Android/host-tools/x86_64-root}; fi
-[ -f "$app/android/mpv/arm64-v8a/libmpv.so" ] && [ -f "$app/android/mpv/armeabi-v7a/libmpv.so" ] || "$app/android/fetch-mpv.sh"
-strip_tool=${LLVM_STRIP:-$(command -v llvm-strip || ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)}
-build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+setup_android_env() {
+    export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
+    if [ -z "${JAVA_HOME:-}" ] && [ -d "$HOME/Android/jdk17" ]; then export JAVA_HOME=$HOME/Android/jdk17; fi
+    if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+        # ARM64 Linux hosts use a shim over the NDK (README); elsewhere the newest NDK in the SDK.
+        if [ -d "$HOME/Android/host-tools/ndk-shim" ]; then export ANDROID_NDK_HOME=$HOME/Android/host-tools/ndk-shim
+        else export ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1); fi
+    fi
+    # ARM64 hosts run Gradle's x86 aapt2 under qemu (README).
+    if [ -d "$HOME/Android/host-tools/x86_64-root" ]; then export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-$HOME/Android/host-tools/x86_64-root}; fi
+    "$app/android/fetch-mpv.sh"
+    strip_tool=${LLVM_STRIP:-$(command -v llvm-strip || ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)}
+    build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+}
 
 build_android() {
-    local rust_target="$1" abi="$2" out_asset="$3"
-    RUSTFLAGS="$remap" dx build --android --target "$rust_target" --release
+    local rust_target="$1" abi="$2" out_asset="$3" picks_target="$4"
+    python3 "$root/tools/picks-ai/fetch.py" "$picks_target"
+    (
+        cd "$app"
+        RUSTFLAGS="$remap" dx build --android --target "$rust_target" --release
+    )
     local project="$app/target/dx/veylo-dx/release/android/app"
     # The C parts (ring) keep build paths in debug info only: ship the app's library without it (smaller too).
     "$strip_tool" --strip-debug "$project/app/src/main/jniLibs/$abi/libmain.so"
@@ -109,19 +129,18 @@ build_android() {
     "$build_tools/apksigner" verify --print-certs "$stage/$out_asset" | grep 'SHA-256' | sed "s/^/APK ($abi) /"
 }
 
-build_android aarch64-linux-android arm64-v8a "$APK_ASSET"
-build_android armv7-linux-androideabi armeabi-v7a "$APK_ARMV7_ASSET"
-
-# ---------------------------------------------------------------- privacy check
-# Unpack everything that will be public and refuse if a key from your settings.json or your home path is inside.
-mkdir -p "$work/check" && cp -r "$work/win/"* "$work/check/"
-mkdir -p "$work/check/arm64" "$work/check/armv7"
-bsdtar -xf "$stage/$APK_ASSET" -C "$work/check/arm64"
-bsdtar -xf "$stage/$APK_ARMV7_ASSET" -C "$work/check/armv7"
-for f in ${extra[@]+"${extra[@]}"}; do mkdir -p "$work/check/extra/$(basename "$f")" && bsdtar -xf "$f" -C "$work/check/extra/$(basename "$f")"; done
-settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
-sync_key="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/sync-key.json"
-python3 - "$settings" "$sync_key" "$HOME" "$work/check" <<'PY'
+run_privacy_check() {
+    # Unpack every archive that will be public and refuse if a key from settings.json or your home path is inside.
+    mkdir -p "$work/check"
+    for f in "$@"; do
+        local name
+        name=$(basename "$f")
+        mkdir -p "$work/check/$name"
+        bsdtar -xf "$f" -C "$work/check/$name"
+    done
+    local settings="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/settings.json"
+    local sync_key="${XDG_DATA_HOME:-$HOME/.local/share}/veylo-dx/sync-key.json"
+    python3 - "$settings" "$sync_key" "$HOME" "$work/check" <<'PY'
 import json, os, sys
 settings, sync_key, home, folder = sys.argv[1:5]
 values = []
@@ -140,14 +159,58 @@ for dirpath, _, files in os.walk(folder):
                 sys.exit(f"Refusing to publish: {what} is inside {os.path.relpath(os.path.join(dirpath, name), folder)}")
 print("Privacy check: no keys or local paths in the release files.")
 PY
+}
+
+case "$target_mode" in
+    windows)
+        build_windows
+        run_privacy_check "$stage/$WIN_ASSET"
+        mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$out_dir/"
+        echo "Built $WIN_ASSET ($version): $out_dir/$WIN_ASSET"
+        exit 0
+        ;;
+    android-arm64)
+        setup_keystore
+        setup_android_env
+        build_android aarch64-linux-android arm64-v8a "$APK_ASSET" android-arm64
+        run_privacy_check "$stage/$APK_ASSET"
+        mkdir -p "$out_dir" && cp "$stage/$APK_ASSET" "$out_dir/"
+        echo "Built $APK_ASSET ($version, versionCode $version_code): $out_dir/$APK_ASSET"
+        exit 0
+        ;;
+    android-armv7)
+        setup_keystore
+        setup_android_env
+        build_android armv7-linux-androideabi armeabi-v7a "$APK_ARMV7_ASSET" android-armv7
+        run_privacy_check "$stage/$APK_ARMV7_ASSET"
+        mkdir -p "$out_dir" && cp "$stage/$APK_ARMV7_ASSET" "$out_dir/"
+        echo "Built $APK_ARMV7_ASSET ($version, versionCode $version_code): $out_dir/$APK_ARMV7_ASSET"
+        exit 0
+        ;;
+    all)
+        setup_keystore
+        build_windows
+        setup_android_env
+        build_android aarch64-linux-android arm64-v8a "$APK_ASSET" android-arm64
+        build_android armv7-linux-androideabi armeabi-v7a "$APK_ARMV7_ASSET" android-armv7
+        assets=("$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$stage/$APK_ARMV7_ASSET")
+        for f in ${extra[@]+"${extra[@]}"}; do cp "$f" "$stage/"; assets+=("$stage/$(basename "$f")"); done
+        ;;
+    publish)
+        [ "${#extra[@]}" -gt 0 ] || { echo "VEYLO_TARGET=publish requires VEYLO_EXTRA_ASSETS with built release files." >&2; exit 1; }
+        assets=()
+        for f in "${extra[@]}"; do cp "$f" "$stage/"; assets+=("$stage/$(basename "$f")"); done
+        ;;
+esac
+
+run_privacy_check "${assets[@]}"
 
 # Publish SHA-256 checksums for every release asset so the in-app updater can verify downloads.
-for f in ${extra[@]+"${extra[@]}"}; do cp "$f" "$stage/"; done
-(cd "$stage" && sha256sum "$WIN_ASSET" "$APK_ASSET" "$APK_ARMV7_ASSET" $(for f in ${extra[@]+"${extra[@]}"}; do basename "$f"; done) > "$stage/SHA256SUMS.txt")
+(cd "$stage" && LC_ALL=C sha256sum $(for f in "${assets[@]}"; do basename "$f"; done | sort) > "$stage/SHA256SUMS.txt")
 
-mkdir -p "$out_dir" && cp "$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$stage/$APK_ARMV7_ASSET" "$stage/SHA256SUMS.txt" ${extra[@]+"${extra[@]}"} "$out_dir/"
+mkdir -p "$out_dir" && cp "${assets[@]}" "$stage/SHA256SUMS.txt" "$out_dir/"
 if [ "$publish" != 1 ]; then echo "Built $tag (not published): $out_dir"; exit 0; fi
 # On Actions the tag goes on the commit that was built.
 target=(); [ -n "${GITHUB_SHA:-}" ] && target=(--target "$GITHUB_SHA")
-gh release create "$tag" "$stage/$WIN_ASSET" "$stage/$APK_ASSET" "$stage/$APK_ARMV7_ASSET" "$stage/SHA256SUMS.txt" ${extra[@]+"${extra[@]}"} --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
+gh release create "$tag" "${assets[@]}" "$stage/SHA256SUMS.txt" --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
 echo "Published $tag (Android versionCode $version_code): installs and in-app updates now get it."

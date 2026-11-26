@@ -1,13 +1,18 @@
 name: build-and-test
 on: [push, pull_request, workflow_dispatch]
-# Every desktop OS runs the same suite on its own machine:
-#   1. clippy and the unit tests (cargo test), natively;
-#   2. `veylo-dx --self-test --online`: the shipped files, the store, the Picks model, libmpv/FFmpeg
-#      playing a real H.264/AAC clip, TLS and the update channel (apps/veylo-dx/src/selftest.rs);
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  NDK_VERSION: 28.2.13676358
+# Every desktop OS runs the same suite on its own machine, and Android cross-checks run in parallel:
+#   1. clippy and the unit tests (cargo test), natively (plus Android arm64 clippy + armv7 check);
+#   2. `veylo-dx --self-test --online`: the shipped files, the store, off-thread display & autoplay,
+#      the Picks model, libmpv/FFmpeg playing a real H.264/AAC clip, TLS and the update channel;
 #   3. Windows and macOS: package the app as a release would, install it with the real installer
 #      (install.ps1, install.sh) and self-test the installed copy;
-#   4. a launch check: the app runs for a while without exiting or panicking, and a screenshot of it
-#      is kept with the run (Artifacts: screenshots-<os>), once on Home and once playing a test stream;
+#   4. a launch check: the app runs for a while without exiting or panicking (failing fast on crash),
+#      and a screenshot of it is kept with the run (Artifacts: screenshots-<os>);
 #   5. the picture test: six colour bars play, and the screenshot must show them in order (what the
 #      OS really composes, not just "the window drew something"; crates/picture-check). Required
 #      on Windows and macOS; on Linux it only reports (software GL leaves the GL area black there).
@@ -15,6 +20,7 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   core:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,9 +30,59 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked -- --test-threads=2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Verify release and CI tooling scripts
+        run: |
+          bash -n tools/release.sh tools/build-macos.sh tools/ci/launch-check.sh apps/veylo-dx/android/fetch-mpv.sh install.sh
+          python3 -m unittest discover -s tools/picks-ai -p 'test_*.py' -v
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/veylo-dx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+          shared-key: ci-android
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/android/mpv
+          key: android-mpv-${{ hashFiles('apps/veylo-dx/android/fetch-mpv.sh') }}
+      - name: Android NDK and assets
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" >/dev/null
+          bin="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION"
+            echo "CC_aarch64_linux_android=$bin/aarch64-linux-android24-clang"
+            echo "AR_aarch64_linux_android=$bin/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android24-clang"
+            echo "CC_armv7_linux_androideabi=$bin/armv7a-linux-androideabi24-clang"
+            echo "AR_armv7_linux_androideabi=$bin/llvm-ar"
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$bin/armv7a-linux-androideabi24-clang"
+          } >> "$GITHUB_ENV"
+          ./android/fetch-mpv.sh
+          python3 ../../tools/picks-ai/fetch.py android-arm64 android-armv7
+      - name: Clippy (Android arm64)
+        run: cargo clippy --locked --target aarch64-linux-android -- -D warnings
+      - name: Check (Android TV armv7)
+        run: cargo check --locked --target armv7-linux-androideabi
 
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: apps/veylo-dx
@@ -40,11 +96,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/veylo-dx -> target
-      # Inference assets are pinned but not committed; fetch.py verifies their checksums.
+      # Inference assets are pinned in pins.json; fetch.py verifies their SHA-256 checksums.
       - uses: actions/cache@v4
         with:
-          path: apps/veylo-dx/picks-ai
-          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-linux-x64
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
       - run: python3 ../../tools/picks-ai/fetch.py linux-x64
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
@@ -67,6 +123,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
@@ -81,8 +138,12 @@ jobs:
           workspaces: apps/veylo-dx -> target
       - uses: actions/cache@v4
         with:
-          path: apps/veylo-dx/picks-ai
-          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-windows-x64
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/windows/mpv
+          key: windows-mpv-${{ hashFiles('apps/veylo-dx/windows/fetch-mpv.ps1') }}
       - name: Fetch libmpv and the Picks assets
         run: |
           powershell -ExecutionPolicy Bypass -File windows/fetch-mpv.ps1
@@ -122,7 +183,7 @@ jobs:
       - name: Launch check, playing the test stream
         continue-on-error: true
         working-directory: .
-        run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-player.png -Seconds 40 -Demo
+        run: ./tools/ci/launch-check.ps1 -Exe (Join-Path $env:LOCALAPPDATA 'Programs\Veylo\veylo-dx.exe') -Shot screenshots/windows-player.png -Seconds 30 -Demo
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -136,6 +197,11 @@ jobs:
 
   macos:
     runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
     defaults:
       run:
         working-directory: apps/veylo-dx
@@ -150,8 +216,8 @@ jobs:
           workspaces: apps/veylo-dx -> target
       - uses: actions/cache@v4
         with:
-          path: apps/veylo-dx/picks-ai
-          key: picks-ai-${{ hashFiles('tools/picks-ai/fetch.py') }}-macos-arm64
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
       - run: python3 ../../tools/picks-ai/fetch.py macos-arm64
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # crates/video-surface's tests (path order, fallback memory) run on Linux: on its own it doesn't
@@ -174,7 +240,7 @@ jobs:
       - name: Launch check, playing the test stream
         continue-on-error: true
         working-directory: .
-        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-player.png 40 --demo
+        run: tools/ci/launch-check.sh /Applications/Veylo.app/Contents/MacOS/veylo-dx screenshots/macos-player.png 30 --demo
       # HDR through the window: the HDR10 clip on a pretend EDR screen (VEYLO_DX_EDR; the runner's
       # display is SDR): the layer must switch to PQ and keep drawing.
       - name: Launch check, HDR10 through the video layer

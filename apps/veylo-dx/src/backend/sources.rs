@@ -886,6 +886,30 @@ pub async fn pick_source(candidates: Vec<Source>, pack_episodes: Option<usize>) 
     pick_source_with(candidates, &ctx).await
 }
 
+/// Self-test hook: exercises off-thread `display::screen()` and the Tokio autoplay ranking path
+/// (same worker pool as `probe_wave`) so an unguarded Dioxus runtime call on Windows/macOS is
+/// caught in CI before release.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+pub(crate) async fn selftest_autoplay_off_thread() -> Result<String> {
+    let dv_screen = screen_supports_dv();
+    let sample = source_of("SelfTest", &json!({
+        "title": "SelfTest.2026.2160p.WEB-DL.HDR10.HEVC.mkv",
+        "url": "https://self-test.invalid/clip.mkv",
+        "behaviorHints": { "filename": "SelfTest.2026.2160p.WEB-DL.HDR10.HEVC.mkv", "videoSize": 12_000_000_000u64 }
+    }));
+    let lang = crate::addons::language("english");
+    let ranked = on_runtime(async move {
+        let _ = crate::display::screen();
+        let budget = BandwidthBudget::unlimited();
+        let _ = optimistic_key(&sample, 12_000_000_000, lang, Some(6600.0), budget, dv_screen);
+        let working = vec![VerifiedSource { source: sample, audio: Some((true, true)), has_original_lang: true }];
+        let _ = rivals_wanted_verified(&working, lang, None, dv_screen);
+        rank_verified(working, lang, None, Some(6600.0), budget, dv_screen)
+    }).await?;
+    anyhow::ensure!(ranked.len() == 1, "expected 1 ranked self-test source");
+    Ok(format!("off-thread display & autoplay ok (dv={dv_screen})"))
+}
+
 /// Verified working source ready for unified final ranking.
 #[derive(Clone, Debug)]
 pub(super) struct VerifiedSource {

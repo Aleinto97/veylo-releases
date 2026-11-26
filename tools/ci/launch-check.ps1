@@ -14,12 +14,14 @@ $panic = Join-Path $data 'last-panic.txt'
 
 $process = Start-Process -FilePath $Exe -PassThru
 try {
-    Start-Sleep -Seconds $Seconds
-    if ($process.HasExited) {
-        if (Test-Path $panic) { Get-Content $panic }
-        throw "Veylo exited (code $($process.ExitCode)) within $Seconds s."
+    for ($elapsed = 1; $elapsed -le $Seconds; $elapsed++) {
+        Start-Sleep -Seconds 1
+        if ($process.HasExited) {
+            if (Test-Path $panic) { Get-Content $panic }
+            throw "Veylo exited (code $($process.ExitCode)) after ${elapsed}s."
+        }
+        if (Test-Path $panic) { Get-Content $panic; throw "Veylo panicked after ${elapsed}s." }
     }
-    if (Test-Path $panic) { Get-Content $panic; throw "Veylo panicked while running." }
 
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen

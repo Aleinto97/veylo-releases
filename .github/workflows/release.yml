@@ -1,6 +1,6 @@
-# Builds Windows, macOS and Android and publishes them as a release of this repo whenever a push to main
-# raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch and offer Update.
-# Run it by hand from the Actions tab with "publish" off to only build (the files become an artifact).
+# Builds Windows, macOS, and both Android ABIs IN PARALLEL and publishes them as a release whenever
+# a push to main raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch
+# and offer Update. Run manually from Actions with "publish" off to only build (saved as artifact).
 # Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD; for
 # accounts, the Firebase project and Google clients (apps/veylo-dx/firebase/README.md). A build
 # without those has no Account section.
@@ -8,7 +8,14 @@ name: release
 on:
   push:
     branches: [main]
-    paths: ["apps/veylo-dx/**", "crates/**", "Cargo.lock", "tools/release.sh", ".github/workflows/release.yml"]
+    paths:
+      - "apps/veylo-dx/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "tools/release.sh"
+      - "tools/build-macos.sh"
+      - "tools/picks-ai/**"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       publish:
@@ -26,12 +33,16 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.plan.outputs.version }}
       build: ${{ steps.plan.outputs.build }}
       publish: ${{ steps.plan.outputs.publish }}
+      notes_sha: ${{ steps.plan.outputs.notes_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
       - name: Is this version new?
         id: plan
         env:
@@ -44,14 +55,27 @@ jobs:
             echo "::notice::v$version is already released; raise version in apps/veylo-dx/Cargo.toml to release."
             build=false
           fi
-          { echo "version=$version"; echo "build=$build"; echo "publish=$PUBLISH"; } >> "$GITHUB_OUTPUT"
+          # Use the commit that actually bumped Cargo.toml to $version for release notes, even if a
+          # follow-up build/CI tweak commit landed on top before the release succeeded.
+          notes_sha=$(git log -n 1 --format=%H -S "version = \"$version\"" -- apps/veylo-dx/Cargo.toml || true)
+          [ -n "$notes_sha" ] || notes_sha=$(git rev-parse HEAD)
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "publish=$PUBLISH"
+            echo "notes_sha=$notes_sha"
+          } >> "$GITHUB_OUTPUT"
 
-  # Veylo.app is built on a Mac (tools/build-macos.sh) and handed to the release job.
+  # 1. macOS universal-style Apple Silicon bundle (runs in parallel with Windows and Android).
   macos:
     needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,6 +83,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/veylo-dx -> target
+          shared-key: release-macos
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
       - run: tools/build-macos.sh
         env:
           VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
@@ -70,23 +99,79 @@ jobs:
           "$RUNNER_TEMP/app/Veylo.app/Contents/MacOS/veylo-dx" --self-test
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-app
+          name: release-macos
           path: dist/veylo-macos-arm64.zip
 
-  release:
-    needs: [plan, macos]
+  # 2. Windows x64 cross-build via cargo-xwin (runs in parallel with macOS and Android).
+  windows:
+    needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-app
-          path: ${{ runner.temp }}/extra
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+          shared-key: release-windows
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-v1
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xwin
+          key: tool-cargo-xwin-v1
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/windows/mpv
+          key: windows-mpv-${{ hashFiles('apps/veylo-dx/windows/fetch-mpv.ps1') }}
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm libarchive-tools zip
+          command -v cargo-xwin >/dev/null || cargo binstall -y --locked cargo-xwin
+      - name: Build Windows zip
+        env:
+          VEYLO_TARGET: windows
+          VEYLO_PUBLISH: "0"
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
+        run: tools/release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/veylo-windows-x64.zip
+
+  # 3. Android arm64 (phones/tablets) and armv7 (32-bit Android TVs) built & signed in parallel.
+  android:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64
+            target: aarch64-linux-android
+            asset: veylo-android-arm64.apk
+          - abi: armv7
+            target: armv7-linux-androideabi
+            asset: veylo-android-armv7.apk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -94,21 +179,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/veylo-dx -> target
+          shared-key: release-android-${{ matrix.abi }}
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/cargo-xwin
-          key: cargo-xwin-v1
-      # Pinned Picks AI downloads (checksummed by fetch.py): reuse them so a Maven/NuGet rate limit
-      # (HTTP 429) can't fail a release.
+          path: ~/.cargo/bin/dx
+          key: tool-dx-${{ env.DX_VERSION }}
       - uses: actions/cache@v4
         with:
           path: apps/veylo-dx/picks-ai/downloads
-          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/fetch.py') }}
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/android/mpv
+          key: android-mpv-${{ hashFiles('apps/veylo-dx/android/fetch-mpv.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-android-${{ env.DX_VERSION }}-${{ hashFiles('apps/veylo-dx/build.rs', 'apps/veylo-dx/android/**') }}
+          restore-keys: gradle-android-${{ env.DX_VERSION }}-
       - uses: cargo-bins/cargo-binstall@main
       - name: Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y clang lld llvm libarchive-tools zip
-          cargo binstall -y --locked "dioxus-cli@$DX_VERSION" cargo-xwin
+          sudo apt-get update && sudo apt-get install -y libarchive-tools
+          command -v dx >/dev/null || cargo binstall -y --locked "dioxus-cli@$DX_VERSION"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0" >/dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
@@ -119,21 +214,55 @@ jobs:
           [ -n "$KEYSTORE" ] || { echo "::error::The ANDROID_KEYSTORE_B64 secret is missing."; exit 1; }
           umask 077 && printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "VEYLO_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-      - name: Build and publish
+      - name: Build and sign Android APK (${{ matrix.abi }})
         env:
-          GH_TOKEN: ${{ github.token }}
-          VEYLO_REPO: ${{ github.repository }}
-          VEYLO_PUBLISH: ${{ needs.plan.outputs.publish == 'true' && '1' || '0' }}
+          VEYLO_TARGET: android-${{ matrix.abi }}
+          VEYLO_PUBLISH: "0"
           VEYLO_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          VEYLO_EXTRA_ASSETS: ${{ runner.temp }}/extra
           VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
           VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
           VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
-        run: tools/release.sh "$(git log -1 --format=%B)"
+        run: tools/release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-${{ matrix.abi }}
+          path: dist/${{ matrix.asset }}
+      - if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+  # 4. Run privacy check across all 4 archives, generate SHA256SUMS.txt, and publish the release.
+  publish:
+    needs: [plan, macos, windows, android]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/extra
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+      - name: Verify all platform assets are present
+        run: |
+          for asset in veylo-windows-x64.zip veylo-macos-arm64.zip veylo-android-arm64.apk veylo-android-armv7.apk; do
+            [ -s "${{ runner.temp }}/extra/$asset" ] || { echo "::error::Missing release asset: $asset"; exit 1; }
+          done
+          ls -lh "${{ runner.temp }}/extra"
+      - name: Privacy check, checksums, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VEYLO_REPO: ${{ github.repository }}
+          VEYLO_TARGET: publish
+          VEYLO_PUBLISH: ${{ needs.plan.outputs.publish == 'true' && '1' || '0' }}
+          VEYLO_EXTRA_ASSETS: ${{ runner.temp }}/extra
+        run: tools/release.sh "$(git log -1 --format=%B "${{ needs.plan.outputs.notes_sha }}")"
       - if: needs.plan.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: veylo-${{ needs.plan.outputs.version }}
           path: dist/
-      - if: always()
-        run: rm -f "$RUNNER_TEMP/release.jks"

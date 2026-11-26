@@ -1,0 +1,41 @@
+{
+  "model_revision": "ea104dacec62c0de699686887e3f920caeb4f3e3",
+  "model_base": "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/",
+  "assets": {
+    "model.onnx": {
+      "remote": "onnx/model_quantized.onnx",
+      "sha256": "6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4"
+    },
+    "tokenizer.json": {
+      "remote": "tokenizer.json",
+      "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+    }
+  },
+  "ort_desktop": {
+    "urls": [
+      "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg"
+    ],
+    "sha256": "d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a"
+  },
+  "ort_android": {
+    "urls": [
+      "https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar",
+      "https://maven-central.storage-download.googleapis.com/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.22.0/onnxruntime-android-1.22.0.aar"
+    ],
+    "sha256": "04a4617a9c797cf49225595e45b5546081cb34c86ac817581141577d3b7dbfe2"
+  },
+  "vc_redist_x64": {
+    "urls": [
+      "https://download.visualstudio.microsoft.com/download/pr/e9604e21-4b79-4096-a4b3-1b63d4b55b4d/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe"
+    ],
+    "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+  },
+  "runtimes": {
+    "linux-aarch64": "runtimes/linux-arm64/native/libonnxruntime.so",
+    "linux-x64": "runtimes/linux-x64/native/libonnxruntime.so",
+    "windows-x64": "runtimes/win-x64/native/onnxruntime.dll",
+    "macos-arm64": "runtimes/osx-arm64/native/libonnxruntime.dylib",
+    "android-arm64": "jni/arm64-v8a/libonnxruntime.so",
+    "android-armv7": "jni/armeabi-v7a/libonnxruntime.so"
+  }
+}
