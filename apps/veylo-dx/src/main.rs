@@ -133,8 +133,10 @@ impl Shell {
 /// Open the player at once while a source is found; the finder starts playback only while
 /// `still_wanted` holds for the ticket returned here.
 pub fn finding(mut shell: Shell, title: String) -> u64 {
+    let next = *shell.play_ticket.peek() + 1;
+    shell.play_ticket.set(next);
     shell.player_status.set(Some(PlayerStatus::Finding(title)));
-    *shell.play_ticket.peek()
+    next
 }
 
 pub fn still_wanted(shell: Shell, ticket: u64) -> bool { *shell.play_ticket.peek() == ticket }
@@ -792,7 +794,7 @@ fn Shell_() -> Element {
                     status => rsx! { StatusChip { status } },
                 }
             } }
-            if let Some(live) = (shell.player)() { player_ui::PlayerScreen { live } }
+            if let Some(live) = (shell.player)() { for live in [live] { player_ui::PlayerScreen { key: "{live.0.session_id}", live } } }
             // Another of your devices asking for your keys, or yours arriving here.
             if (shell.player)().is_none() { account_ui::KeysPrompt {} }
             if search_open() { search::SearchOverlay {} }
@@ -980,35 +982,59 @@ pub fn start_playback(shell: Shell, request: player::PlayRequest, on_next: Optio
 pub fn start_playback_hooks(mut shell: Shell, mut request: player::PlayRequest, hooks: PlaybackHooks) {
     if request.accent.is_empty() { request.accent = try_consume_context::<Accent>().map(|a| a.0.peek().clone()).unwrap_or_default(); }
     let title = request.title.clone();
+    let ticket = *shell.play_ticket.peek() + 1;
+    shell.play_ticket.set(ticket);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     shell.player_status.set(Some(PlayerStatus::Opening(title.clone())));
     player::play(request, tx);
-    follow_playback_events(shell, title, rx, hooks);
+    follow_playback_events(shell, title, ticket, rx, hooks);
 }
 
-fn follow_playback_events(mut shell: Shell, title: String, mut rx: tokio::sync::mpsc::UnboundedReceiver<player::PlayerEvent>,
+fn follow_playback_events(mut shell: Shell, title: String, ticket: u64, mut rx: tokio::sync::mpsc::UnboundedReceiver<player::PlayerEvent>,
     hooks: PlaybackHooks) {
     // Playback belongs to the app, even when its source chooser closes immediately.
     dioxus::core::spawn_forever(async move {
-        // This playback's in-app session: only it may take the player off screen.
+        // This playback's in-app session: only it may update status or take the player off screen.
         let mut mine: Option<engine::LiveRef> = None;
+        let is_current = move |mine: &Option<engine::LiveRef>| {
+            *shell.play_ticket.peek() == ticket || (mine.is_some() && *shell.player.peek() == *mine)
+        };
         let mut clear = move |mine: &Option<engine::LiveRef>| if mine.is_some() && *shell.player.peek() == *mine { shell.player.set(None); };
         while let Some(event) = rx.recv().await {
             match event {
-                player::PlayerEvent::Started { decoder, codec, facts } =>
-                    shell.player_status.set(Some(PlayerStatus::Playing { title: title.clone(), codec, hardware: decoder, facts })),
-                player::PlayerEvent::Attached(live) => { mine = Some(live.clone()); shell.player.set(Some(live)); }
-                player::PlayerEvent::Failed(error) => { clear(&mine); shell.player_status.set(Some(PlayerStatus::Failed(error))); break; }
-                player::PlayerEvent::Finished { next, prev, another, language, switch_source, switch_episode, position_ms, .. } => {
+                player::PlayerEvent::Started { decoder, codec, facts } => {
+                    if is_current(&mine) {
+                        shell.player_status.set(Some(PlayerStatus::Playing { title: title.clone(), codec, hardware: decoder, facts }));
+                    }
+                }
+                player::PlayerEvent::Attached(live) => {
+                    if *shell.play_ticket.peek() == ticket {
+                        mine = Some(live.clone());
+                        shell.player.set(Some(live));
+                    } else {
+                        live.0.finish(engine::Finish::Close);
+                    }
+                }
+                player::PlayerEvent::Failed(error) => {
                     clear(&mine);
-                    shell.player_status.set(None);
+                    if is_current(&mine) {
+                        shell.player_status.set(Some(PlayerStatus::Failed(error)));
+                    }
+                    break;
+                }
+                player::PlayerEvent::Finished { next, prev, another, language, switch_source, switch_episode, position_ms, .. } => {
+                    let current = is_current(&mine);
+                    clear(&mine);
+                    if current { shell.player_status.set(None); }
                     backend::flush_progress().await;
                     *shell.picks_dirty.write() += 1;
-                    if let Some(idx) = switch_source { if let Some(cb) = &hooks.on_switch_source { cb(shell, idx, position_ms); } }
-                    else if let Some(ep) = switch_episode { if let Some(cb) = &hooks.on_switch_episode { cb(shell, ep); } }
-                    else if next { if let Some(play_next) = &hooks.on_next { play_next(shell); } }
-                    else if prev { if let Some(play_prev) = &hooks.on_prev { play_prev(shell); } }
-                    else if another { if let Some(try_another) = &hooks.on_another { try_another(shell, position_ms, language); } }
+                    if current {
+                        if let Some(idx) = switch_source { if let Some(cb) = &hooks.on_switch_source { cb(shell, idx, position_ms); } }
+                        else if let Some(ep) = switch_episode { if let Some(cb) = &hooks.on_switch_episode { cb(shell, ep); } }
+                        else if next { if let Some(play_next) = &hooks.on_next { play_next(shell); } }
+                        else if prev { if let Some(play_prev) = &hooks.on_prev { play_prev(shell); } }
+                        else if another { if let Some(try_another) = &hooks.on_another { try_another(shell, position_ms, language); } }
+                    }
                     break;
                 }
             }
@@ -1114,7 +1140,8 @@ mod playback_lifetime_tests {
         use_hook(move || {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             *probe.sender.borrow_mut() = Some(tx);
-            follow_playback_events(shell, "Test film".into(), rx, PlaybackHooks::default());
+            let ticket = *shell.play_ticket.peek();
+            follow_playback_events(shell, "Test film".into(), ticket, rx, PlaybackHooks::default());
         });
         rsx! { div {} }
     }

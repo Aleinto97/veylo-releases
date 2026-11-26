@@ -71,15 +71,25 @@ pub fn Library() -> Element {
     let snap = LIB_SNAPSHOT.get().and_then(|m| m.lock().ok()).map(|s| s.clone()).unwrap_or_default();
     let mut history = use_signal(move || snap.history.map(Ok::<Vec<Seen>, String>));
     let mut saved = use_signal(move || snap.saved);
+    // Titles removed this visit vanish at once; the store already forgot them.
+    let mut gone = use_signal(std::collections::HashSet::<String>::new);
+    let mut unsaved = use_signal(std::collections::HashSet::<String>::new);
+    use_context_provider(|| Gone(gone));
+    use_context_provider(|| Unsaved(unsaved));
     // Refresh from SQLite silently on mount and whenever playback or saves update (`picks_dirty`),
     // keeping cached Frame-0 paint while reflecting newly watched/saved/progressed titles live.
+    let mut load_gen = use_signal(|| 0u64);
     use_effect(move || {
         let _ = (shell.picks_dirty)();
+        let gen = *load_gen.peek() + 1;
+        load_gen.set(gen);
         spawn(async move {
             let (hist_res, lib_res) = tokio::join!(backend::viewing_history(), backend::library());
+            if *load_gen.peek() != gen { return; }
             match hist_res {
                 Ok(list) => {
                     if let Ok(mut s) = LIB_SNAPSHOT.get_or_init(Default::default).lock() { s.history = Some(list.clone()); }
+                    gone.write().clear();
                     history.set(Some(Ok(list)));
                 }
                 Err(e) => if history.peek().is_none() { history.set(Some(Err(format!("{e:#}")))); },
@@ -87,28 +97,29 @@ pub fn Library() -> Element {
             if let Ok(all) = lib_res {
                 let s_list: Vec<Media> = all.into_iter().filter(|m| m.saved).collect();
                 if let Ok(mut s) = LIB_SNAPSHOT.get_or_init(Default::default).lock() { s.saved = Some(s_list.clone()); }
+                unsaved.write().clear();
                 saved.set(Some(s_list));
             }
         });
     });
-    // Titles removed this visit vanish at once; the store already forgot them.
-    let gone = use_signal(std::collections::HashSet::<String>::new);
-    let unsaved = use_signal(std::collections::HashSet::<String>::new);
-    use_context_provider(|| Gone(gone));
-    use_context_provider(|| Unsaved(unsaved));
     let mut filter = use_signal(|| LibFilter::All);
     let mut query = use_signal(String::new);
     let mut downloads = use_signal(backend::list_downloads);
     let mut active_dl = use_signal(backend::active_downloads);
-    // Poll active downloads gently while on Library: responsive when running, low-power when idle.
+    // Poll active downloads gently while on Library: responsive when running, low-power when idle,
+    // and track completed/removed downloads via monotonic revision instead of active list length.
     use_future(move || async move {
+        let mut last_rev = backend::downloads_revision();
         loop {
             let delay = if active_dl.peek().is_empty() { 2500 } else { 750 };
             backend::sleep(delay).await;
             let now_active = backend::active_downloads();
-            let prev_len = active_dl.peek().len();
-            if *active_dl.peek() != now_active { active_dl.set(now_active.clone()); }
-            if prev_len > 0 && now_active.len() < prev_len { downloads.set(backend::list_downloads()); }
+            if *active_dl.peek() != now_active { active_dl.set(now_active); }
+            let rev = backend::downloads_revision();
+            if rev != last_rev {
+                last_rev = rev;
+                downloads.set(backend::list_downloads());
+            }
         }
     });
     let q = query().trim().to_lowercase();

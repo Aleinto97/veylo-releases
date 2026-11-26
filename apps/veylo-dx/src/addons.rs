@@ -31,7 +31,7 @@ impl Language {
         label.lines().any(|line| {
             let audio = line.find("Subs").map_or(line, |i| &line[..i]);
             if audio.contains(self.flag) { return true; }
-            let words: Vec<&str> = line.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            let words: Vec<&str> = audio.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
             words.iter().enumerate().any(|(i, w)| self.tags.iter().any(|t| w.eq_ignore_ascii_case(t))
                 && !(i > 0 && ["sub", "subs", "subbed", "subtitles"].iter().any(|s| words[i - 1].eq_ignore_ascii_case(s))))
         })

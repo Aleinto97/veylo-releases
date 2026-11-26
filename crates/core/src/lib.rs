@@ -941,7 +941,7 @@ impl Core {
                     )?;
                     if added>0 {
                         tx.execute(
-                            "UPDATE playback SET watched_ms=MIN(watched_ms+?3,MAX(duration_ms,?4)) WHERE media_key=?1 AND video_id=?2",
+                            "UPDATE playback SET watched_ms=CASE WHEN MAX(duration_ms,?4)>0 THEN MIN(watched_ms+?3,MAX(duration_ms,?4)) ELSE watched_ms+?3 END WHERE media_key=?1 AND video_id=?2",
                             params![key,video,added,duration],
                         )?;
                     }

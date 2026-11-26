@@ -501,6 +501,20 @@ impl Brain {
         self.rebuild();
         e
     }
+    /// Turn every active mood off with a single belief rebuild.
+    pub fn clear_moods(&mut self) -> Vec<Event> {
+        let on = self.moods();
+        if on.is_empty() { return Vec::new(); }
+        let at = crate::backend::now_secs();
+        let mut out = Vec::with_capacity(on.len());
+        for words in on {
+            let e = Event { at, session: self.session, signal: Signal::Unmood(mood_id(&words)) };
+            self.events.push(e.clone());
+            out.push(e);
+        }
+        self.rebuild();
+        out
+    }
     /// Moods on tonight, as their words.
     pub fn moods(&self) -> Vec<String> {
         let tonight: Vec<&Event> = self.events.iter().filter(|e| e.session == self.session).collect();
@@ -772,12 +786,17 @@ pub fn load(session: u64) -> Brain {
 /// past the cap, the log and library facts that decide which titles are kept.
 type PendingItems = (HashMap<String, Item>, Vec<Event>, Vec<Fact>);
 static PENDING_ITEMS: Mutex<Option<PendingItems>> = Mutex::new(None);
+/// Serializes background disk writes with `reset()` so a delayed persist never resurrects wiped files.
+static IO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Log an event at once; the title store is written a few seconds later, one write for a burst,
 /// and encoded there too (thousands of embeddings): a vote never waits for it.
 pub fn persist(brain: &mut Brain, event: Option<&Event>) {
     let dir = dir();
-    if let Some(e) = event { append_event(&dir, e); }
+    if let Some(e) = event {
+        let _io = IO_LOCK.lock();
+        append_event(&dir, e);
+    }
     if !brain.dirty { return; }
     brain.dirty = false;
     // Only past the cap does the encoding need the log and the library (what to keep).
@@ -787,8 +806,9 @@ pub fn persist(brain: &mut Brain, event: Option<&Event>) {
     if first {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(4));
+            let _io = IO_LOCK.lock();
             if let Some((items, events, facts)) = PENDING_ITEMS.lock().ok().and_then(|mut p| p.take()) {
-                let _ = std::fs::write(dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string());
+                let _ = crate::backend::write_private_file(&dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string().as_bytes());
             }
         });
     }
@@ -829,7 +849,9 @@ pub async fn anchors() -> Vec<(String, Vec<f32>)> {
 /// Forget everything Picks learned: the log, the titles and the earlier profile.
 pub fn reset() {
     let dir = dir();
+    let _io = IO_LOCK.lock();
     if let Ok(mut p) = PENDING_ITEMS.lock() { p.take(); }
+    if let Ok(mut l) = LOADED.lock() { l.take(); }
     for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(dir.join(f)); }
 }
 

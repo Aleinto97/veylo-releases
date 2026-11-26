@@ -153,7 +153,8 @@ impl MediaProxy {
             .no_deflate()
             .no_zstd()
             .http1_only()
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(30))
             .connect_timeout(IO_TIMEOUT)
             .build()
             .expect("rustls client initialization");
@@ -286,9 +287,14 @@ impl MediaProxy {
         let ok = matches!(status, 200 | 206)
             && !non_media
             && (playlist || bytes.is_none_or(|n| n >= PROBE_MIN_BYTES));
+        let retry_after_ms = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|secs| secs.min(30).saturating_mul(1000));
         let resolved_url = (ok && final_url.scheme() == "https").then(|| final_url.as_str());
         Ok(
-            json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist, "resolved_url": resolved_url}),
+            json!({"ok": ok, "status": status, "bytes": bytes, "debrid_status": null, "playlist": playlist, "resolved_url": resolved_url, "retry_after_ms": retry_after_ms}),
         )
     }
     /// "downloading" or "failed" when the current source turned out to be a
@@ -682,11 +688,11 @@ async fn send_error<W: AsyncWriteExt + Unpin>(writer: &mut W, status: u16) -> Re
     Ok(())
 }
 /// One upstream chunk with an idle deadline; no whole-movie deadline.
-async fn chunk(response: &mut Response, stream_timeout: Duration) -> Result<Option<Vec<u8>>> {
+/// Returns `bytes::Bytes` directly to avoid copying every chunk of large 4K streams into a fresh Vec.
+async fn chunk(response: &mut Response, stream_timeout: Duration) -> Result<Option<impl std::ops::Deref<Target = [u8]>>> {
     Ok(timeout(stream_timeout, response.chunk())
         .await
-        .context("upstream body idle timeout")??
-        .map(|b| b.to_vec()))
+        .context("upstream body idle timeout")??)
 }
 /// Buffer only formats that require complete validation before exposing bytes.
 /// Progressive binary media never enters this path.
@@ -1142,27 +1148,47 @@ async fn relay<W: AsyncWriteExt + Unpin>(
                 .iter()
                 .any(|p| sniff.starts_with(p));
         let aes_key = is_aes_key_body(&content_type, &prefix, declared_length, &headers);
+        // Binary 206 byte-range seeks into video/audio files have a ~5% chance of starting with
+        // random bytes like '0'-'9', '<', '#', or '['. When the sample is genuinely binary
+        // (not UTF-8 text) and does not begin with a real manifest/markup signature, never
+        // mistake a mid-file codec frame for a subtitle or text document.
+        let binary_media_range = status.as_u16() == 206
+            && (content_type.starts_with("video/")
+                || content_type.starts_with("audio/")
+                || content_type == "application/octet-stream")
+            && !is_text_prefix(sample)
+            && !sniff.starts_with("#EXTM3U")
+            && !sniff.starts_with("WEBVTT")
+            && !sniff.starts_with("<MPD")
+            && !sniff.starts_with("<tt")
+            && !sniff.starts_with("<?xml")
+            && !sniff.starts_with("<!DOCTYPE")
+            && !sniff.starts_with("<html")
+            && !sniff.starts_with("<HTML");
         // A complete AES key is raw key material even when a key byte happens to
         // be '<'; honouring the exemption everywhere keeps it out of the subtitle
         // and manifest classifiers (a 1-in-256 key used to fail with 502).
-        let xml_candidate = !aes_key && sniff.starts_with('<');
+        let xml_candidate = !aes_key && !binary_media_range && sniff.starts_with('<');
         let unknown_text = is_text_prefix(sample) && !sample.is_empty() && !ascii_range
             || content_type.starts_with("text/")
             || content_type.contains("xml")
             || content_type.contains("json")
             || content_type.contains("html")
             || content_type.starts_with("multipart/")
-            || sniff.starts_with(['#', '['])
-            || sample.starts_with(&[0xff, 0xfe])
-            || sample.starts_with(&[0xfe, 0xff])
-            || sample.starts_with(&[0, 0, 0xfe, 0xff])
+            || (!binary_media_range && sniff.starts_with(['#', '[']))
+            || (!binary_media_range && sample.starts_with(&[0xff, 0xfe]))
+            || (!binary_media_range && sample.starts_with(&[0xfe, 0xff]))
+            || (!binary_media_range && sample.starts_with(&[0, 0, 0xfe, 0xff]))
             || sample.starts_with(&[0x1f, 0x8b]);
         // Hints select a validation path, NEVER a pass-through exemption. Only
         // full, bounded documents can be subtitles. No scanning past ID3/garbage
         // for a <tt> root, and no 512-byte approval of an unchecked remainder.
         let subtitle_candidate = is_subtitle_resource(&content_type, &path)
             || sniff.starts_with("WEBVTT")
-            || (!aes_key && !ascii_range && sniff.starts_with(|c: char| c.is_ascii_digit()))
+            || (!aes_key
+                && !ascii_range
+                && !binary_media_range
+                && sniff.starts_with(|c: char| c.is_ascii_digit()))
             || xml_candidate;
         if sniff.starts_with("#EXTM3U") {
             kind = Some("hls");
@@ -1307,12 +1333,15 @@ async fn relay<W: AsyncWriteExt + Unpin>(
             write_bytes(writer, &prefix, lease.stream_timeout).await?;
             let mut window_bytes = 0u64;
             let mut active_read = Duration::ZERO;
+            let mut skip_after_pause = false;
+            // Measure bandwidth on all streamed binary media (direct files and HLS/DASH segments).
+            let measure_bw = is_source || content_type.starts_with("video/") || content_type.starts_with("audio/") || content_type == "application/octet-stream";
             loop {
                 let read_started = Instant::now();
                 let Some(bytes) = chunk(&mut response, lease.stream_timeout).await? else {
                     break;
                 };
-                if is_source {
+                if measure_bw && !skip_after_pause {
                     active_read += read_started.elapsed();
                     window_bytes += bytes.len() as u64;
                     if window_bytes >= BANDWIDTH_WINDOW_BYTES {
@@ -1321,6 +1350,7 @@ async fn relay<W: AsyncWriteExt + Unpin>(
                         active_read = Duration::ZERO;
                     }
                 }
+                skip_after_pause = false;
                 sent = sent
                     .checked_add(bytes.len() as u64)
                     .ok_or_else(|| anyhow!("body length overflow"))?;
@@ -1328,9 +1358,18 @@ async fn relay<W: AsyncWriteExt + Unpin>(
                     range_length.is_none_or(|n| sent <= n),
                     "oversized range body"
                 );
+                let write_started = Instant::now();
                 write_bytes(writer, &bytes, lease.stream_timeout).await?;
+                // After a player pause or slow consumer backpressure (>250 ms), the OS TCP receive
+                // buffer fills up and drains immediately on resume, which would otherwise inject a
+                // fake multi-gigabit spike into the bandwidth EWMA.
+                if write_started.elapsed() > Duration::from_millis(250) {
+                    window_bytes = 0;
+                    active_read = Duration::ZERO;
+                    skip_after_pause = true;
+                }
             }
-            if is_source && window_bytes >= BANDWIDTH_MIN_BYTES {
+            if measure_bw && window_bytes >= BANDWIDTH_MIN_BYTES {
                 lease.bandwidth.record(window_bytes, active_read);
             }
             ensure!(

@@ -379,12 +379,14 @@ pub fn Picks() -> Element {
         pair.set(next);
     };
     // A new duel when a filter or Saved-only mode changes; a restored catalog duel is kept only
-    // when entering normal mode.
+    // when entering normal mode. Wait for `watched` when Hide watched is on so completed titles never flash.
     use_effect(move || {
         let saved_only = (shell.picks_saved_only)();
-        let _ = (kind(), style(), selected_genres(), from(), to(), hide_watched(), saved_only);
+        let hide = hide_watched();
+        let watched_ready = !hide || watched.read().is_some();
+        let _ = (kind(), style(), selected_genres(), from(), to(), hide, saved_only);
         if saved_only && *slot.peek() == Some(Slot::Filters) { slot.set(None); }
-        if loading() || !brain_ready() { return; }
+        if loading() || !brain_ready() || !watched_ready { return; }
         if *restored.peek() {
             restored.set(false);
             if !saved_only { return; }
@@ -406,11 +408,12 @@ pub fn Picks() -> Element {
         backend::save_duel(&backend::DuelState { kind: kind(), style: style().as_str().to_owned(), genres: selected_genres(), from: from_text(), to: to_text(),
             night: night(), last: backend::now_secs(), round: round(), streak: streak(), shown: shown(), left, right, kept: kept(), starred: starred() });
     });
-    // The first pair, once there is something to choose from.
+    // The first pair, once there is something to choose from (and watched ids are ready if hiding watched).
     use_effect(move || {
         let n = filtered.read().len();
+        let watched_ready = !hide_watched() || watched.read().is_some();
         let (l, r) = pair.peek().clone();
-        if !loading() && brain_ready() && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
+        if !loading() && brain_ready() && watched_ready && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
     });
     // Style is an invariant of visible catalog cards, including restored cards enriched later.
     use_effect(move || {
@@ -467,12 +470,26 @@ pub fn Picks() -> Element {
         if leaving.peek().is_some() { return; }
         let saved_only = *shell.picks_saved_only.peek();
         let st = *style.peek();
-        let ready = { let (l, r) = resolved_pair.peek().clone();
-            l.zip(r).is_some_and(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())
-                && (saved_only || (rules::style_matches(&l, st) && rules::style_matches(&r, st)))) };
-        if !ready { return; }
+        let snap = {
+            let (l, r) = resolved_pair.peek().clone();
+            l.zip(r).filter(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())
+                && (saved_only || (rules::style_matches(l, st) && rules::style_matches(r, st))))
+                .map(|(l, r)| (l.key(), r.key()))
+        };
+        let Some(expected_keys) = snap else { return };
+        let expected_night = *night.peek();
         leaving.set(Some(left));
-        spawn(async move { backend::sleep(190).await; keep(left); leaving.set(None); });
+        spawn(async move {
+            backend::sleep(190).await;
+            let current_keys = {
+                let (l, r) = resolved_pair.peek().clone();
+                l.zip(r).map(|(l, r)| (l.key(), r.key()))
+            };
+            if *night.peek() == expected_night && current_keys == Some(expected_keys) {
+                keep(left);
+            }
+            leaving.set(None);
+        });
     };
 
     // A kept card waiting for an opponent gets one as soon as the catalogue offers it; if every
@@ -511,10 +528,13 @@ pub fn Picks() -> Element {
         }
         for (left, m) in [(true, l), (false, r)] {
             let Some(m) = m else { continue };
-            if verified.peek().contains(&m.key()) { continue; }
+            if verified.peek().contains(&m.key()) || checking.peek().contains(&m.key()) { continue; }
+            checking.write().insert(m.key());
             let all_watched = watched.peek().clone().unwrap_or_default();
             spawn(async move {
-                match check(&m, &all_watched).await {
+                let res = check(&m, &all_watched).await;
+                checking.write().remove(&m.key());
+                match res {
                     Check::Ready(ready) => { pool.with_mut(|p| rules::merge(p, vec![ready])); verified.write().insert(m.key()); return; }
                     Check::Reject => { rejected.write().insert(m.key()); }
                     Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
@@ -609,13 +629,13 @@ pub fn Picks() -> Element {
             mood_busy.set(false);
         });
     };
-    // Every mood off at once (each is set aside in the log; tonight is replayed without them).
+    // Every mood off at once (each is set aside in the log; tonight is replayed once).
     let mut clear_moods = move || {
-        let on = brain.peek().moods();
-        if on.is_empty() { return; }
+        let events = brain.write().clear_moods();
+        if events.is_empty() { return; }
         {
             let mut b = brain.write();
-            for words in on { let e = b.set_mood(&words, None); brain::persist(&mut b, Some(&e)); }
+            for e in &events { brain::persist(&mut b, Some(e)); }
         }
         start_duel();
     };

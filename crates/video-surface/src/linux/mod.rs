@@ -207,13 +207,32 @@ mod subsurface {
         let (display_ptr, egl_ptr) = (SendPtr(wl_display), SendPtr(egl_window.ptr() as *mut c_void));
         let egl_window = std::sync::Mutex::new(Some(egl_window));
         let egl_holder = SendEgl(egl_window);
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let thread = std::thread::Builder::new().name("veylo-video".into()).spawn(move || {
             let holder = egl_holder;
-            if let Err(e) = render_thread(&thread_shared, &thread_player, display_ptr, egl_ptr, &holder) { eprintln!("veylo: video: {e}"); }
+            if let Err(e) = render_thread(&thread_shared, &thread_player, display_ptr, egl_ptr, &holder, init_tx) { eprintln!("veylo: video: {e}"); }
             // The EGL window goes before its wl_surface (destroyed on the UI thread after join).
             drop(holder);
             drop(thread_player);
         }).map_err(|e| e.to_string())?;
+        // Wait for EGL + mpv_render_context_create so a failure triggers fallback to GlArea.
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                sub.destroy();
+                surface.destroy();
+                let _ = conn.flush();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = thread.join();
+                sub.destroy();
+                surface.destroy();
+                let _ = conn.flush();
+                return Err("render thread exited during init".into());
+            }
+        }
 
         // Follow the page's size (window resizes, full screen).
         let follow = shared.clone();
@@ -298,27 +317,38 @@ mod subsurface {
         if let Ok(mut c) = lock.lock() { c.frame = true; cv.notify_all(); }
     }
 
-    fn render_thread(shared: &Arc<Shared>, player: &Arc<dyn Player>, display: SendPtr, window: SendPtr, egl_window: &SendEgl) -> Result<(), String> {
+    fn render_thread(shared: &Arc<Shared>, player: &Arc<dyn Player>, display: SendPtr, window: SendPtr, egl_window: &SendEgl,
+                     init_tx: std::sync::mpsc::SyncSender<Result<(), String>>) -> Result<(), String> {
         unsafe {
-            let e = egl()?;
+            let e = match egl() { Ok(e) => e, Err(err) => { let _ = init_tx.send(Err(err.clone())); return Err(err); } };
             let dpy = (e.get_display)(display.0);
-            if dpy.is_null() || (e.initialize)(dpy, std::ptr::null_mut(), std::ptr::null_mut()) == 0 { return Err("EGL display".into()); }
+            if dpy.is_null() || (e.initialize)(dpy, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+                let err = "EGL display".to_owned(); let _ = init_tx.send(Err(err.clone())); return Err(err);
+            }
             (e.bind_api)(0x30A2); // EGL_OPENGL_API
             // Opaque 8-bit RGB: the compositor never blends the picture with what is behind the window.
             let attrs = [0x3033, 0x0004, 0x3040, 0x0008, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 0, 0x3038];
             let (mut config, mut n) = (std::ptr::null_mut(), 0);
-            if (e.choose_config)(dpy, attrs.as_ptr(), &mut config, 1, &mut n) == 0 || n < 1 { return Err("EGL config".into()); }
+            if (e.choose_config)(dpy, attrs.as_ptr(), &mut config, 1, &mut n) == 0 || n < 1 {
+                let err = "EGL config".to_owned(); let _ = init_tx.send(Err(err.clone())); return Err(err);
+            }
             let ctx_attrs = [0x3098, 3, 0x30FB, 2, 0x30FD, 1, 0x3038];
             let ctx = (e.create_context)(dpy, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
-            if ctx.is_null() { return Err("EGL context".into()); }
+            if ctx.is_null() {
+                let err = "EGL context".to_owned(); let _ = init_tx.send(Err(err.clone())); return Err(err);
+            }
             let surf = (e.create_window_surface)(dpy, config, window.0, std::ptr::null());
-            if surf.is_null() { (e.destroy_context)(dpy, ctx); return Err("EGL surface".into()); }
+            if surf.is_null() {
+                (e.destroy_context)(dpy, ctx);
+                let err = "EGL surface".to_owned(); let _ = init_tx.send(Err(err.clone())); return Err(err);
+            }
             (e.make_current)(dpy, surf, surf, ctx);
             // mpv paces frames itself; never block on the compositor (a hidden window would stall it).
             (e.swap_interval)(dpy, 0);
             let cb = Arc::into_raw(shared.clone()) as *mut c_void;
             let native = Some((sys::mpv_render_param_type_MPV_RENDER_PARAM_WL_DISPLAY, display.0));
             let result = create_render(&**player, native, on_update, cb);
+            let _ = init_tx.send(result.as_ref().map(|_| ()).map_err(Clone::clone));
             let mut size = (0, 0);
             if let Ok(render) = result {
                 loop {
@@ -471,7 +501,9 @@ mod glarea {
                 let mut fbo = 0;
                 (gl.get_integerv)(0x8CA6, &mut fbo); // GL_DRAW_FRAMEBUFFER_BINDING: GtkGLArea's own
                 let scale = area.scale_factor();
+                let _ = sys::mpv_render_context_update(render);
                 render_frame(render, fbo, area.allocated_width() * scale, area.allocated_height() * scale);
+                sys::mpv_render_context_report_swap(render);
             }
         });
     }

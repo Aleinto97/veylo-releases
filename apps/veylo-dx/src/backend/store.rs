@@ -104,13 +104,14 @@ pub(super) fn parse_max_bitrate(v: &Value) -> Option<u32> {
         .map(|n| n as u32)
 }
 
-pub fn load_settings() -> Settings {
-    let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
-        .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+static SETTINGS_CACHE: Mutex<Option<Settings>> = Mutex::new(None);
+
+fn parse_settings(v: &Value) -> Settings {
     Settings {
         better_posters: v["better_posters"].as_bool().unwrap_or(true),
         picks_hide_watched: v["picks_hide_watched"].as_bool().unwrap_or(true),
-        stream_language: Some(audio_language(&v)),
+        stream_language: Some(audio_language(v)),
         hdr_output: v["hdr_output"].as_bool().unwrap_or(true),
         sub_scale: v["sub_scale"].as_f64().unwrap_or(1.05).clamp(0.6, 2.0),
         sub_pos: v["sub_pos"].as_i64().unwrap_or(100).clamp(70, 100) as i32,
@@ -120,35 +121,67 @@ pub fn load_settings() -> Settings {
         audio_passthrough: v["audio_passthrough"].as_bool().unwrap_or(false),
         hwdec_mode: match v["hwdec_mode"].as_str() { Some("copy") => "copy", Some("no") => "no", _ => "auto" }.to_owned(),
         auto_next: v["auto_next"].as_bool().unwrap_or(true),
-        max_bitrate_mbps: parse_max_bitrate(&v),
+        max_bitrate_mbps: parse_max_bitrate(v),
         telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(false),
         prefetch_sources: v["prefetch_sources"].as_bool().unwrap_or(false),
     }
 }
 
-/// Write a file that may hold credentials or private user data, restricting permissions to the
-/// current user (`0600` on Unix; best-effort user-only ACL via `icacls` on Windows).
+pub fn load_settings() -> Settings {
+    if let Ok(g) = SETTINGS_CACHE.lock() {
+        if let Some(cached) = g.as_ref() { return cached.clone(); }
+    }
+    let _guard = SETTINGS_LOCK.lock();
+    if let Ok(g) = SETTINGS_CACHE.lock() {
+        if let Some(cached) = g.as_ref() { return cached.clone(); }
+    }
+    let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
+        .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let s = parse_settings(&v);
+    if let Ok(mut g) = SETTINGS_CACHE.lock() { *g = Some(s.clone()); }
+    s
+}
+
+static WRITE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write a file atomically that may hold credentials or private user data, restricting permissions
+/// to the current user (`0600` on Unix; best-effort user-only ACL via `icacls` on Windows).
 pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    let seq = WRITE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("veylo"),
+        std::process::id(),
+        seq,
+    ));
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
         let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-        f.write_all(bytes)?;
-        f.sync_all()
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        drop(f);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        std::fs::write(path, bytes)?;
+        std::fs::write(&tmp, bytes)?;
         if let Ok(user) = std::env::var("USERNAME") {
             if !user.is_empty() {
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 let grant = format!("{user}:(R,W)");
                 let _ = std::process::Command::new("icacls")
-                    .arg(path)
+                    .arg(&tmp)
                     .args(["/inheritance:r", "/grant:r", &grant])
                     .creation_flags(CREATE_NO_WINDOW)
                     .stdout(std::process::Stdio::null())
@@ -156,13 +189,20 @@ pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::i
                     .status();
             }
         }
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, bytes)?;
+        }
         Ok(())
     }
     #[cfg(all(not(unix), not(windows)))]
-    { std::fs::write(path, bytes) }
+    {
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
+    }
 }
 
-pub fn save_settings(settings: &Settings) {
+fn save_settings_unlocked(settings: &Settings) {
     let data = json!({
         "better_posters": settings.better_posters,
         "picks_hide_watched": settings.picks_hide_watched,
@@ -181,6 +221,7 @@ pub fn save_settings(settings: &Settings) {
         "prefetch_sources": settings.prefetch_sources,
     }).to_string();
     let _ = write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes());
+    if let Ok(mut g) = SETTINGS_CACHE.lock() { *g = Some(settings.clone()); }
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
     set_telemetry_enabled(settings.telemetry_enabled);
@@ -190,6 +231,12 @@ pub fn save_settings(settings: &Settings) {
     // Language or add-on preferences changed: forget cached source lists.
     forget_sources();
     sync_soon();
+}
+
+#[cfg_attr(target_os = "android", allow(dead_code))]
+pub fn save_settings(settings: &Settings) {
+    let _guard = SETTINGS_LOCK.lock();
+    save_settings_unlocked(settings);
 }
 
 // ---------------------------------------------------------------- per-title track preferences
@@ -225,21 +272,26 @@ fn write_track_prefs_json(map: &HashMap<String, TrackPref>) -> String {
     Value::Object(obj).to_string()
 }
 
+fn ensure_track_prefs_loaded() {
+    if TRACK_PREFS.lock().ok().is_some_and(|g| g.is_some()) { return; }
+    // Flush pending writes BEFORE taking TRACK_PREFS so we never nest WRITING inside TRACK_PREFS.
+    flush_writes();
+    let loaded = read_track_prefs_from(&track_prefs_path());
+    if let Ok(mut guard) = TRACK_PREFS.lock() {
+        guard.get_or_insert(loaded);
+    }
+}
+
 pub fn load_track_pref(media_key: &str) -> Option<TrackPref> {
-    let mut guard = TRACK_PREFS.lock().ok()?;
-    let map = guard.get_or_insert_with(|| {
-        flush_writes();
-        read_track_prefs_from(&track_prefs_path())
-    });
-    map.get(media_key).cloned()
+    ensure_track_prefs_loaded();
+    let guard = TRACK_PREFS.lock().ok()?;
+    guard.as_ref()?.get(media_key).cloned()
 }
 
 pub fn save_track_pref(media_key: &str, update: impl FnOnce(&mut TrackPref)) {
+    ensure_track_prefs_loaded();
     let Ok(mut guard) = TRACK_PREFS.lock() else { return };
-    let map = guard.get_or_insert_with(|| {
-        flush_writes();
-        read_track_prefs_from(&track_prefs_path())
-    });
+    let map = guard.get_or_insert_with(HashMap::new);
     let entry = map.entry(media_key.to_owned()).or_default();
     update(entry);
     // Keep the file bounded to 400 recent titles.
@@ -252,11 +304,9 @@ pub fn save_track_pref(media_key: &str, update: impl FnOnce(&mut TrackPref)) {
 }
 
 pub(super) fn export_track_prefs_value() -> Value {
-    let Ok(mut guard) = TRACK_PREFS.lock() else { return json!({}) };
-    let map = guard.get_or_insert_with(|| {
-        flush_writes();
-        read_track_prefs_from(&track_prefs_path())
-    });
+    ensure_track_prefs_loaded();
+    let Ok(guard) = TRACK_PREFS.lock() else { return json!({}) };
+    let Some(map) = guard.as_ref() else { return json!({}) };
     let obj: serde_json::Map<String, Value> = map.iter().map(|(k, p)| {
         (k.clone(), json!({"audio": p.audio_lang, "sub": p.sub_lang, "sub_off": p.sub_off}))
     }).collect();
@@ -265,21 +315,21 @@ pub(super) fn export_track_prefs_value() -> Value {
 
 pub(super) fn merge_track_prefs_value(v: &Value) {
     let Some(remote) = v.as_object() else { return };
+    ensure_track_prefs_loaded();
     let Ok(mut guard) = TRACK_PREFS.lock() else { return };
-    let map = guard.get_or_insert_with(|| {
-        flush_writes();
-        read_track_prefs_from(&track_prefs_path())
-    });
+    let map = guard.get_or_insert_with(HashMap::new);
     let mut changed = false;
     for (k, entry) in remote {
-        if map.contains_key(k) || map.len() >= 400 { continue; }
+        if !map.contains_key(k) && map.len() >= 400 { continue; }
         let pref = TrackPref {
             audio_lang: entry["audio"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
             sub_lang: entry["sub"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
             sub_off: entry["sub_off"].as_bool().unwrap_or(false),
         };
-        map.insert(k.clone(), pref);
-        changed = true;
+        if map.get(k) != Some(&pref) {
+            map.insert(k.clone(), pref);
+            changed = true;
+        }
     }
     if changed {
         write_soon(track_prefs_path(), write_track_prefs_json(map));
@@ -469,9 +519,16 @@ pub async fn import_watch_history(raw: &str) -> Result<usize> {
 
 /// Change one or more settings: read, changed, saved and applied; returns what was saved.
 pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Settings {
-    let mut settings = load_settings();
+    let _guard = SETTINGS_LOCK.lock();
+    let mut settings = if let Ok(g) = SETTINGS_CACHE.lock() {
+        g.clone()
+    } else { None }.unwrap_or_else(|| {
+        let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
+            .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        parse_settings(&v)
+    });
     change(&mut settings);
-    save_settings(&settings);
+    save_settings_unlocked(&settings);
     settings
 }
 
@@ -555,7 +612,7 @@ pub(super) fn media_json(m: &Media) -> Value {
 
 /// Files written behind the UI: each keeps only its latest content, and a later write always
 /// lands after an earlier one. For state saved often that nothing reads back at once.
-fn write_soon(path: std::path::PathBuf, text: String) {
+pub(super) fn write_soon(path: std::path::PathBuf, text: String) {
     let first = PENDING_WRITES.lock().map(|mut p| { let map = p.get_or_insert_with(HashMap::new); let first = map.is_empty(); map.insert(path, text); first }).unwrap_or(false);
     if first { std::thread::spawn(|| { std::thread::sleep(Duration::from_millis(200)); flush_writes(); }); }
 }

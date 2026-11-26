@@ -14,12 +14,19 @@ import androidx.activity.OnBackPressedCallback
  * on a TV it is always on, so Back only goes back and the remote's Home key leaves.
  */
 object VeyloBack {
+    private var ownerRef: java.lang.ref.WeakReference<Activity>? = null
     private var callback: OnBackPressedCallback? = null
 
     @JvmStatic
     fun setEnabled(activity: Activity, enabled: Boolean) {
         activity.runOnUiThread {
             val owner = activity as? ComponentActivity ?: return@runOnUiThread
+            // Re-register if Android recreated the Activity in the same process.
+            if (ownerRef?.get() !== activity) {
+                callback?.remove()
+                callback = null
+                ownerRef = java.lang.ref.WeakReference(activity)
+            }
             val cb = callback ?: object : OnBackPressedCallback(false) {
                 override fun handleOnBackPressed() {
                     findWebView(activity.window.decorView)?.evaluateJavascript(

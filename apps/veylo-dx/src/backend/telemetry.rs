@@ -135,16 +135,33 @@ pub fn report_issue_bg(kind: &'static str, summary: impl Into<String>, details: 
     });
 }
 
+static PANIC_UPLOAD_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Upload an un-sent crash backtrace from a previous run (`last-panic.txt`) once on launch.
 pub fn upload_pending_panic() {
     if !telemetry_enabled() || !accounts_available() { return; }
+    if PANIC_UPLOAD_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
     let path = backend().data_dir.join("last-panic.txt");
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     if text.trim().is_empty() { return; }
     let first = text.lines().next().unwrap_or("Application panic").to_owned();
+    let summary = format!("Crash: {first}");
+    if !should_send_auto("crash", &summary) { return; }
     let sent_path = backend().data_dir.join("last-panic-sent.txt");
-    let _ = std::fs::rename(&path, &sent_path);
-    report_issue_bg("crash", format!("Crash: {first}"), text);
+    let Some(runtime) = RUNTIME.get() else { return };
+    runtime.spawn(async move {
+        let fields = build_fields("crash", &summary, &text, now_secs());
+        match upload_fields(fields).await {
+            Ok(()) => {
+                // Only archive after upload succeeds so an offline launch retries next time.
+                let _ = std::fs::rename(&path, &sent_path);
+                dev_log("telemetry (crash): reported");
+            }
+            Err(e) => {
+                dev_log(&format!("telemetry (crash): couldn't send ({e})"));
+            }
+        }
+    });
 }
 
 /// Explicit user bug/UI/performance report from Settings, including the redacted recent log.

@@ -8,14 +8,55 @@
 use super::*;
 use std::sync::Arc;
 
-/// GET JSON from a fixed public endpoint. Wikidata asks every client to name itself; the name
-/// is the app's, nothing about the person using it.
+const OPEN_UA: &str = concat!("Veylo/", env!("CARGO_PKG_VERSION"), " (+https://github.com/Aleinto97/veylo-releases)");
+static WIKIDATA_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static TVMAZE_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static WIKIDATA_COOLDOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static TVMAZE_COOLDOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> i64 {
+    headers.get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(15)
+        .clamp(5, 60)
+}
+
+/// GET JSON from a fixed public endpoint, with Wikimedia-compliant User-Agent, per-host
+/// concurrency gating and 429 cooldowns for Wikidata and TVmaze.
 async fn get_json(url: String, query: Vec<(&'static str, String)>) -> Option<Value> {
+    let is_wikidata = url.contains("wikidata.org");
+    let is_tvmaze = url.contains("tvmaze.com");
+    if is_wikidata && now_secs() < WIKIDATA_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if is_tvmaze && now_secs() < TVMAZE_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     on_runtime(async move {
+        let _permit = if is_wikidata {
+            Some(WIKIDATA_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))).clone().acquire_owned().await.ok()?)
+        } else if is_tvmaze {
+            Some(TVMAZE_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(3))).clone().acquire_owned().await.ok()?)
+        } else {
+            None
+        };
+        if is_wikidata && now_secs() < WIKIDATA_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        if is_tvmaze && now_secs() < TVMAZE_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let response = backend().http.get(url).query(&query)
-            .header(reqwest::header::USER_AGENT, concat!("Veylo/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(12)).send().await.ok()?.error_for_status().ok()?;
-        response.json::<Value>().await.ok()
+            .header(reqwest::header::USER_AGENT, OPEN_UA)
+            .timeout(Duration::from_secs(12)).send().await.ok()?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let until = now_secs() + retry_after_secs(response.headers());
+            if is_wikidata { WIKIDATA_COOLDOWN_UNTIL.store(until, std::sync::atomic::Ordering::Relaxed); }
+            if is_tvmaze { TVMAZE_COOLDOWN_UNTIL.store(until, std::sync::atomic::Ordering::Relaxed); }
+            return None;
+        }
+        response.error_for_status().ok()?.json::<Value>().await.ok()
     }).await.ok().flatten()
 }
 
@@ -23,7 +64,7 @@ async fn get_json(url: String, query: Vec<(&'static str, String)>) -> Option<Val
 async fn post_json(url: String, body: Value) -> Option<Value> {
     on_runtime(async move {
         let response = backend().http.post(url).json(&body)
-            .header(reqwest::header::USER_AGENT, concat!("Veylo/", env!("CARGO_PKG_VERSION")))
+            .header(reqwest::header::USER_AGENT, OPEN_UA)
             .timeout(Duration::from_secs(12)).send().await.ok()?.error_for_status().ok()?;
         response.json::<Value>().await.ok()
     }).await.ok().flatten()
@@ -58,7 +99,7 @@ async fn tvmaze_show(m: &Media) -> Option<Value> {
     once(&SHOWS, imdb.clone(), async move {
         let found = get_json("https://api.tvmaze.com/lookup/shows".into(), vec![("imdb", imdb)]).await?;
         let id = found["id"].as_i64()?;
-        let embed = ["cast", "crew", "seasons", "episodes", "nextepisode", "images"].map(|e| ("embed[]", e.to_owned())).to_vec();
+        let embed = ["cast", "crew", "seasons", "episodes", "nextepisode", "images", "akas"].map(|e| ("embed[]", e.to_owned())).to_vec();
         get_json(format!("https://api.tvmaze.com/shows/{id}"), embed).await
     }).await
 }
@@ -269,12 +310,27 @@ pub(super) async fn anime_stills(m: &Media, season: i64) -> HashMap<i64, String>
     let Some(entries) = anime_arm(m).await else { return HashMap::new() };
     let season_ids = anime_season_ids(&entries);
     let Some(ids) = season_ids.get(&season) else { return HashMap::new() };
+    let target_ids: Vec<i64> = ids.iter().copied().take(3).collect();
+    let mappings = on_runtime(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, id) in target_ids.into_iter().enumerate() {
+            set.spawn(async move {
+                let m = once(&ANIZIP, id.to_string(),
+                    get_json("https://api.ani.zip/mappings".into(), vec![("anilist_id", id.to_string())])
+                ).await;
+                (idx, m)
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(item) = res { rows.push(item); }
+        }
+        rows.sort_by_key(|(idx, _)| *idx);
+        rows
+    }).await.unwrap_or_default();
     let mut out = HashMap::new();
-    // Cap at 3 cours per season to keep requests bounded.
-    for &id in ids.iter().take(3) {
-        let Some(mapping) = once(&ANIZIP, id.to_string(),
-            get_json("https://api.ani.zip/mappings".into(), vec![("anilist_id", id.to_string())])
-        ).await else { continue };
+    for (_, mapping) in mappings {
+        let Some(mapping) = mapping else { continue };
         for (ep, url) in anizip_stills_for_season(&mapping, season) {
             out.entry(ep).or_insert(url);
         }
@@ -331,15 +387,29 @@ static SCHEDULES: OnceLock<Mutex<Shared>> = OnceLock::new();
 /// sport, awards) are left out.
 pub async fn new_episodes() -> Vec<Media> {
     let today = now_secs().div_euclid(86_400);
-    let mut shows: Vec<Value> = Vec::new();
-    for day in [today, today - 1, today - 2].map(day_label) {
-        for (url, country) in [("https://api.tvmaze.com/schedule/web", None), ("https://api.tvmaze.com/schedule", Some("US"))] {
-            let mut query = vec![("date", day.clone())];
-            if let Some(c) = country { query.push(("country", c.to_owned())); }
-            let key = format!("{url}|{day}");
-            let Some(list) = once(&SCHEDULES, key, get_json(url.into(), query)).await else { continue };
-            shows.extend(list.as_array().into_iter().flatten().map(|e| if e["show"].is_object() { e["show"].clone() } else { e["_embedded"]["show"].clone() }));
+    let days = [today, today - 1, today - 2].map(day_label);
+    let lists: Vec<Value> = on_runtime(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for day in days {
+            for (url, country) in [("https://api.tvmaze.com/schedule/web", None), ("https://api.tvmaze.com/schedule", Some("US"))] {
+                let day = day.clone();
+                set.spawn(async move {
+                    let mut query = vec![("date", day.clone())];
+                    if let Some(c) = country { query.push(("country", c.to_owned())); }
+                    let key = format!("{url}|{day}");
+                    once(&SCHEDULES, key, get_json(url.into(), query)).await
+                });
+            }
         }
+        let mut out = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(list)) = res { out.push(list); }
+        }
+        out
+    }).await.unwrap_or_default();
+    let mut shows: Vec<Value> = Vec::new();
+    for list in lists {
+        shows.extend(list.as_array().into_iter().flatten().map(|e| if e["show"].is_object() { e["show"].clone() } else { e["_embedded"]["show"].clone() }));
     }
     let formats = ["Talk Show", "News", "Game Show", "Reality", "Sports", "Award Show", "Variety"];
     shows.retain(|s| s["weight"].as_i64().unwrap_or(0) >= 85 && !formats.contains(&s["type"].as_str().unwrap_or_default()));
@@ -777,7 +847,7 @@ pub async fn person_filmography(person: &Person) -> Filmography {
         if qid.is_none() { qid = wqid; out.person.wikidata_id = qid.clone(); }
     }
     // 2. Keyless Wikidata SPARQL filmography (movies & series with IMDb IDs).
-    if let Some(qid) = qid.as_deref().filter(|q| q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())) {
+    if let Some(qid) = qid.as_deref().filter(|q| q.len() > 1 && q.starts_with('Q') && q[1..].bytes().all(|b| b.is_ascii_digit())) {
         let query = format!(r#"SELECT DISTINCT ?imdb ?fLabel ?year ?isTv WHERE {{
   {{ ?f wdt:P57 wd:{qid}. }} UNION {{ ?f wdt:P161 wd:{qid}. }} UNION {{ ?f wdt:P170 wd:{qid}. }}
   ?f wdt:P345 ?imdb.
@@ -878,12 +948,24 @@ pub(super) async fn cinemeta_related(m: &Media) -> Vec<Media> {
     let kind = if m.kind == "movie" { "movie" } else { "series" };
     let animated = m.genres.iter().any(|g| g == "Animation" || g == "Anime");
     let style = if animated { Style::Animation } else { Style::Live };
-    let mut out = Vec::new();
-    for g in m.genres.iter().filter(|g| !(animated && *g == "Animation")).take(2) {
-        let page = 1 + (rand_u64() % 6) as u32;
-        out.extend(cinemeta_candidates(vec![g.clone()], Some(kind.into()), style, None, None, vec![page]).await.into_iter().take(12));
-    }
-    out
+    let genres: Vec<String> = m.genres.iter().filter(|g| !(animated && *g == "Animation")).take(2).cloned().collect();
+    let results = on_runtime(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, g) in genres.into_iter().enumerate() {
+            let page = 1 + (rand_u64() % 6) as u32;
+            set.spawn(async move {
+                let items: Vec<Media> = cinemeta_candidates(vec![g], Some(kind.into()), style, None, None, vec![page]).await.into_iter().take(12).collect();
+                (idx, items)
+            });
+        }
+        let mut parts = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(item) = res { parts.push(item); }
+        }
+        parts.sort_by_key(|(idx, _)| *idx);
+        parts.into_iter().flat_map(|(_, items)| items).collect()
+    }).await.unwrap_or_default();
+    results
 }
 
 #[cfg(test)]

@@ -53,13 +53,19 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     #[cfg(target_os = "android")]
     use_future(move || async move {
         let mut eval = document::eval(r#"(() => {
+            if (window.__veyloResize) removeEventListener('resize', window.__veyloResize);
             const send = () => dioxus.send(window.innerWidth || 800);
+            window.__veyloResize = send;
             send();
             addEventListener('resize', send);
         })();"#);
         while let Ok(w) = eval.recv::<f64>().await {
             if w > 100.0 { viewport_w.set(w); }
         }
+    });
+    #[cfg(target_os = "android")]
+    use_drop(|| {
+        let _ = document::eval("if (window.__veyloResize) { removeEventListener('resize', window.__veyloResize); window.__veyloResize = null; }");
     });
     // Touch gesture state (Android phone/tablet): double-tap seek (cumulative), vertical brightness/volume drag, long-press 2×.
     #[cfg(target_os = "android")]
@@ -201,6 +207,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             SleepTimer::EndOfEpisode => {
                 sleep_rem_secs.set(None);
                 if state().ended {
+                    up_next_dismissed.set(true);
                     sleep_live.0.set_paused(true);
                     sleep_mode.set(SleepTimer::Off);
                 }
@@ -267,12 +274,30 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     });
 
     // Keys routed from the shell.
-    // A short word on screen for what a key just did ("Fill", "Speed 1.25×").
+    // A short word on screen for what a key/gesture just did ("Fill", "Speed 1.25×"), driven by
+    // one deadline timer so continuous drag gestures never spawn a Tokio task per pixel.
     let mut osd = use_signal(|| None::<(String, u64)>);
+    let mut osd_until = use_signal(|| None::<std::time::Instant>);
+    let mut osd_timer = use_signal(|| false);
     let mut say = move |text: String| {
         let n = osd.peek().as_ref().map(|o| o.1 + 1).unwrap_or(0);
         osd.set(Some((text, n)));
-        spawn(async move { backend::sleep(1400).await; if osd.peek().as_ref().is_some_and(|o| o.1 == n) { osd.set(None); } });
+        osd_until.set(Some(std::time::Instant::now() + std::time::Duration::from_millis(1400)));
+        if !*osd_timer.peek() {
+            osd_timer.set(true);
+            spawn(async move {
+                loop {
+                    let Some(target) = *osd_until.peek() else { break };
+                    let now = std::time::Instant::now();
+                    if now >= target {
+                        osd.set(None);
+                        break;
+                    }
+                    backend::sleep((target - now).as_millis().max(40) as u64).await;
+                }
+                osd_timer.set(false);
+            });
+        }
     };
 
     // Tap a downloadable subtitle: download it, add it as a track and turn it on.
@@ -359,7 +384,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 if pref.is_none() { say(format!("No {name} audio: {name} subtitles on")); }
             }
             Fallback::Download => {
-                let want_lang = pref.as_ref().and_then(|p| p.sub_lang.clone()).or(key);
+                // Normalize remembered ISO track codes (e.g. "ita") to LANGUAGES keys ("italian")
+                // so subtitle_language_of and track_in_language match reliably.
+                let want_lang = pref.as_ref()
+                    .and_then(|p| p.sub_lang.as_deref())
+                    .map(|c| backend::language_key_of(c).map(str::to_owned).unwrap_or_else(|| c.to_owned()))
+                    .or(key);
                 let Some(lang) = want_lang else { return };
                 if fb_wanted.is_none() { return; }
                 automatic_language.set(Some(lang));
@@ -375,10 +405,18 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 automatic_language.set(None);
                 // A user's download takes precedence over automatic selection.
                 if sub_busy.peek().is_some() { return; }
-                let name = backend::subtitle_language_of(&key);
-                match list.into_iter().find(|s| backend::track_in_language(&s.code, &key) || s.language == name) {
+                let norm = backend::language_key_of(&key).unwrap_or(&key);
+                let name = backend::subtitle_language_of(norm);
+                match list.into_iter().find(|s| {
+                    backend::track_in_language(&s.code, norm)
+                        || (!name.is_empty() && s.language == name)
+                        || s.code.eq_ignore_ascii_case(&key)
+                }) {
                     Some(sub) => add_online.call((sub, false)),
-                    None => say(format!("No {name} audio or subtitles for this video")),
+                    None => {
+                        let label = if name.is_empty() { key.as_str() } else { name.as_str() };
+                        say(format!("No {label} audio or subtitles for this video"));
+                    }
                 }
             }
             Online::Failed => { automatic_language.set(None); say("Subtitles couldn’t be looked up right now".into()); }
@@ -660,7 +698,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         p { class: "dim", "Another source may play; this one can also be tried again." }
                         div { class: "player-error-actions",
                             button { class: "pill accent", onclick: { let live = lc(); move |_| live.finish(Finish::Another) }, icons::Next {} span { "Try another source" } }
-                            button { class: "pill glass", onclick: { let live = lc(); move |_| live.retry() }, icons::Refresh {} span { "Retry" } }
+                            button { class: "pill glass", onclick: { let live = lc(); move |_| { sub_added.write().clear(); live.retry(); } }, icons::Refresh {} span { "Retry" } }
                             button { class: "pill glass", onclick: { let live = lc(); move |_| live.finish(Finish::Close) }, icons::Close {} span { "Close" } }
                         }
                     }

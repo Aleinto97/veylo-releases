@@ -145,6 +145,7 @@ pub enum Finish { Close, Next, Prev, Another, OtherLanguage, SwitchSource(usize)
 
 /// A playing session, shared by the engine thread, the video surface and the controls.
 pub struct Live {
+    pub session_id: u64,
     pub mpv: Mpv,
     pub request: PlayRequest,
     /// The screen when this session started; None where it couldn't be read (Linux).
@@ -153,6 +154,8 @@ pub struct Live {
     finish: Mutex<Option<Finish>>,
     ready: (Mutex<bool>, Condvar),
 }
+
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A session handle for Dioxus props and signals (equal when it is the same session).
 #[derive(Clone)]
@@ -329,9 +332,14 @@ impl Live {
     }
     /// Reload the source where it stopped (after a network error).
     pub fn retry(&self) {
-        let at = self.state().position;
+        let pos = self.state().position;
+        let at = if pos > 0.0 { pos } else { self.request.start_ms as f64 / 1000.0 };
         self.update(|s| { s.error = None; true });
-        let _ = self.mpv.set_property("start", format!("+{at}").as_str());
+        if at > 0.0 {
+            let _ = self.mpv.set_property("start", format!("+{at}").as_str());
+        } else {
+            let _ = self.mpv.set_property("start", "none");
+        }
         let _ = self.mpv.command("loadfile", &[self.request.url.as_str(), "replace"]);
     }
     pub fn finish(&self, how: Finish) {
@@ -354,7 +362,8 @@ pub fn start(req: PlayRequest, events: UnboundedSender<PlayerEvent>, stop: Playe
         hwdec_mode: cfg.hwdec_mode.clone(), aspect_override: "auto".into(),
         ..Default::default()
     });
-    let live = Arc::new(Live { mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
+    let session_id = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let live = Arc::new(Live { session_id, mpv, request: req, screen, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
     if let Ok(mut a) = ACTIVE.lock() { *a = Some(live.clone()); }
     let _ = events.send(PlayerEvent::Attached(LiveRef(live.clone())));
     std::thread::Builder::new().name("veylo-engine".into()).spawn(move || run(live, events, stop))?;
@@ -576,9 +585,12 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 live.update(|s| { s.loaded = true; s.error = None; s.file_size = size; true });
                 skip_commentary(&live);
                 // Profile 5 carries no HDR10 layer: without a Dolby Vision panel only mpv's renderer
-                // (libplacebo's reshaping) shows its colours right.
+                // (libplacebo's reshaping) shows its colours right (both direct and mediacodec-copy
+                // drop the RPU on Android unless hwdec=no).
                 let s = live.state();
-                if s.direct && s.dv_profile == 5 && !live.screen.unwrap_or_default().dolby_vision { live.render_dolby_vision(); }
+                if s.dv_profile == 5 && !live.screen.unwrap_or_default().dolby_vision && (s.direct || (cfg!(target_os = "android") && s.hwdec != "no")) {
+                    live.render_dolby_vision();
+                }
             }
             Ok(Event::VideoReconfig) => {
                 let p = |n: &str| mpv.get_property::<i64>(n).unwrap_or(0);
@@ -592,6 +604,16 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                     s.width = w; s.height = h; s.aspect = if dw > 0 && dh > 0 { dw as f64 / dh as f64 } else { 0.0 };
                     s.transfer = transfer; s.target_transfer = target; s.codec = codec; s.hwdec = hwdec; s.fps = fps; true
                 });
+                // Android: if mediacodec_embed fell back to software decoding (unsupported codec/profile),
+                // switch to gpu-next so frames actually render instead of showing a black screen.
+                if cfg!(target_os = "android") {
+                    let s = live.state();
+                    if s.direct && !s.codec.is_empty() && (s.hwdec.is_empty() || s.hwdec == "no") {
+                        live.set_direct(false);
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                apply_windows_target_peak(&live, &live.state().target_transfer);
                 crate::video::layout(&live);
                 if fps > 10.0 && fps < 240.0 { crate::video::set_frame_rate(fps); }
                 // A subtitle chosen by default gets the same treatment as one picked by hand.
@@ -918,6 +940,15 @@ fn skip_commentary(live: &Live) {
     if let Some(t) = main { live.select(true, Some(t.id)); }
 }
 
+#[cfg(target_os = "windows")]
+fn apply_windows_target_peak(live: &Live, target: &str) {
+    let peak = crate::display::screen().filter(|s| s.hdr10).map(|s| s.peak_nits).filter(|p| (300..=10_000).contains(p));
+    match peak {
+        Some(p) if target == "pq" => { let _ = live.mpv.set_property("target-peak", p as i64); }
+        _ => { let _ = live.mpv.set_property("target-peak", "auto"); }
+    }
+}
+
 /// Read the transfer mpv renders to; true when it changed. On Windows, HDR10 output is mapped to
 /// the panel's peak (read again, the window may have moved), and SDR output goes back to mpv's own.
 fn follow_target(live: &Live) -> bool {
@@ -925,15 +956,11 @@ fn follow_target(live: &Live) -> bool {
     // macOS: mpv's render API doesn't report it; the video layer knows what it asked for.
     #[cfg(target_os = "macos")]
     let target = if target.is_empty() && live.state().loaded { crate::video::sent_transfer().to_owned() } else { target };
-    if target.is_empty() || live.state().target_transfer == target { return false; }
+    if target.is_empty() { return false; }
+    // Re-check peak nits even when target stays "pq" so dragging between HDR monitors updates peak.
     #[cfg(target_os = "windows")]
-    {
-        let peak = crate::display::screen().filter(|s| s.hdr10).map(|s| s.peak_nits).filter(|p| (300..=10_000).contains(p));
-        match peak {
-            Some(p) if target == "pq" => { let _ = live.mpv.set_property("target-peak", p as i64); }
-            _ => { let _ = live.mpv.set_property("target-peak", "auto"); }
-        }
-    }
+    apply_windows_target_peak(live, &target);
+    if live.state().target_transfer == target { return false; }
     live.update(|s| { s.target_transfer = target; true });
     true
 }
@@ -1098,7 +1125,7 @@ mod tests {
         unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()); }
         let mpv = Mpv::with_initializer(|o| { o.set_property("config", false)?; o.set_property("vo", "null")?; o.set_property("ao", "null")?; Ok(()) }).unwrap();
         let (state, _) = watch::channel(State::default());
-        let live = Arc::new(Live { mpv, request: PlayRequest::default(), screen: None, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
+        let live = Arc::new(Live { session_id: 0, mpv, request: PlayRequest::default(), screen: None, state, finish: Mutex::new(None), ready: (Mutex::new(false), Condvar::new()) });
         let stop = PlayerHandle::default();
         let live2 = live.clone();
         std::thread::spawn(move || {

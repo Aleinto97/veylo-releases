@@ -28,19 +28,20 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 
 pub fn candidates() -> &'static [Path] { crate::fallback::order("windows", false) }
 
-/// mpv's own child window ("mpv" class) directly under the app window, if it exists yet.
-fn mpv_window(top: Hwnd) -> Option<Hwnd> {
+/// All mpv child windows ("mpv" class) directly under the app window (old + new can briefly coexist
+/// during a source/episode switch).
+fn mpv_windows(top: Hwnd) -> Vec<Hwnd> {
     unsafe extern "system" fn visit(hwnd: Hwnd, data: isize) -> i32 {
         const MPV: [u16; 3] = [b'm' as u16, b'p' as u16, b'v' as u16];
-        let found = &mut *(data as *mut (Hwnd, Hwnd));
+        let found = &mut *(data as *mut (Hwnd, Vec<Hwnd>));
         let mut name = [0u16; 16];
         let n = GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32).max(0) as usize;
-        if GetParent(hwnd) == found.0 && name[..n] == MPV { found.1 = hwnd; return 0; }
+        if GetParent(hwnd) == found.0 && name[..n] == MPV { found.1.push(hwnd); }
         1
     }
-    let mut found: (Hwnd, Hwnd) = (top, 0);
+    let mut found: (Hwnd, Vec<Hwnd>) = (top, Vec::new());
     unsafe { EnumChildWindows(top, visit, &mut found as *mut _ as isize); }
-    (found.1 != 0).then_some(found.1)
+    found.1
 }
 
 pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), String> {
@@ -49,24 +50,21 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
     player.mpv().set_property("wid", top as i64).map_err(|e| format!("wid: {e}"))?;
     let session = SESSION.fetch_add(1, Ordering::SeqCst) + 1;
     // mpv creates its window on its own thread once the file opens, on top of the stack: keep
-    // sending it to the bottom (the WebView may also be re-stacked while it lives).
+    // sending every mpv child window to the bottom (the WebView may also be re-stacked while it lives).
     std::thread::Builder::new().name("veylo-video".into()).spawn(move || {
-        let mut cached: Option<Hwnd> = None;
+        let mut steady = 0u32;
         while SESSION.load(Ordering::SeqCst) == session {
-            let video = cached.filter(|&w| unsafe { IsWindow(w) != 0 }).or_else(|| {
-                let found = mpv_window(top);
-                cached = found;
-                found
-            });
-            let mut interval_ms = 50u64;
-            if let Some(video) = video {
-                if unsafe { GetWindow(video, GW_HWNDLAST) } != video {
-                    unsafe { SetWindowPos(video, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS); }
-                } else {
-                    // Already behind WebView2: back off polling to save wakeups during long playback.
-                    interval_ms = 500;
+            let videos = mpv_windows(top);
+            let mut moved = false;
+            for video in &videos {
+                if unsafe { IsWindow(*video) != 0 && GetWindow(*video, GW_HWNDLAST) != *video } {
+                    unsafe { SetWindowPos(*video, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS); }
+                    moved = true;
                 }
             }
+            if !videos.is_empty() && !moved { steady = steady.saturating_add(1); } else { steady = 0; }
+            // Once settled behind WebView2, back off polling to save wakeups during long playback.
+            let interval_ms = if steady >= 4 { 500 } else { 50 };
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     }).map_err(|e| e.to_string())?;

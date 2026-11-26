@@ -8,10 +8,12 @@ fn with_activity<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result
     let ctx = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| anyhow!("JNI: {e}"))?;
     let mut env = vm.attach_current_thread().map_err(|e| anyhow!("JNI attach: {e}"))?;
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    // The activity is a global reference the activity glue owns: a JObject never deletes its
-    // reference when dropped, so this one simply goes out of scope.
-    let result = f(&mut env, &activity);
+    // The activity is a global reference the activity glue owns; wrap each call in a bounded JNI
+    // local frame so local references (JString, JObject, JClass) are always freed before returning.
+    let result = env.with_local_frame(32, |env| {
+        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+        f(env, &activity)
+    });
     if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
     result.map_err(|e| anyhow!("JNI: {e}"))
 }
@@ -323,8 +325,10 @@ pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeSurface(env: JNIEnv, _
     }
     let Ok(global) = env.new_global_ref(&surface) else { return };
     let wid = global.as_obj().as_raw() as i64;
-    *slot = Some((global, width, height));
+    // Keep the old surface's GlobalRef alive until AFTER mpv has switched `wid` to the new surface.
+    let _old = slot.replace((global, width, height));
     if let Some(live) = &live { give_surface(live, wid, width, height); }
+    drop(_old);
 }
 
 /// VeyloVideo.nativeCommand: playback commands from AudioFocus, headphone disconnect, or MediaSession.

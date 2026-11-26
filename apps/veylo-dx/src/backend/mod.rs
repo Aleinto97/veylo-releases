@@ -119,7 +119,9 @@ pub fn init() -> Result<()> {
     }));
     let core = Core::open(&dir)?;
     let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(8))
+        .user_agent(concat!("Veylo/", env!("CARGO_PKG_VERSION"), " (+https://github.com/Aleinto97/veylo-releases)"))
         .build()?;
     let proxy = { let _inside = runtime.enter(); rustmedia_media_proxy::MediaProxy::new() };
     // The settings the backend keeps in memory, read once.
@@ -141,9 +143,13 @@ pub fn init() -> Result<()> {
 }
 
 /// Insert into an in-memory cache of answers that can be fetched again, keeping it bounded: past
-/// `cap` entries it starts over (cheaper than tracking use; the big ones fill up slowly).
-pub(super) fn cache_insert<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>, cap: usize, key: K, value: V) {
-    if map.len() >= cap && !map.contains_key(&key) { map.clear(); }
+/// `cap` entries it evicts a quarter of entries rather than wiping 100% of the cache at once.
+pub(super) fn cache_insert<K: Eq + std::hash::Hash + Clone, V>(map: &mut HashMap<K, V>, cap: usize, key: K, value: V) {
+    if map.len() >= cap && !map.contains_key(&key) {
+        let drop_n = (cap / 4).max(1);
+        let victims: Vec<K> = map.keys().take(drop_n).cloned().collect();
+        for k in victims { map.remove(&k); }
+    }
     map.insert(key, value);
 }
 
@@ -419,6 +425,7 @@ pub async fn catalog(row: CatalogRow) -> Result<Vec<Media>> {
     if row.key.starts_with(BP_ROW) {
         let mut titles = bp_get(format!("catalog/{}/{}.json", row.kind, row.id)).await.map(|v| bp_titles(&v, &row.addon_url)).unwrap_or_default();
         if !titles.is_empty() {
+            if row.ranked { titles.truncate(18); }
             if row.kind == "movie" {
                 titles = filter_home_quality(titles).await;
             }
@@ -801,15 +808,14 @@ pub struct CollectionShelf {
 /// All released installments in a movie's collection (chronological), via keyless Wikidata `P179`
 /// franchise links, falling back to `crates/core`'s curated franchise collections.
 pub async fn collection_parts(m: &Media) -> Option<CollectionShelf> {
-    if m.kind == "movie" {
-        if let Some(shelf) = wikidata_collection_parts(m).await {
-            return Some(shelf);
-        }
+    if m.kind != "movie" { return None; }
+    if let Some(shelf) = wikidata_collection_parts(m).await {
+        return Some(shelf);
     }
     // Fallback: check core's local franchise collections.
     let v = exec(json!({"op":"collections"})).await.ok()?;
     for col in v["collections"].as_array()? {
-        if col["source"].as_str() != Some("addon_curated_franchise") { continue; }
+        if col["kind"].as_str() != Some("addon_curated_franchise") { continue; }
         let items = metas(col, "");
         if items.len() >= 2 && items.iter().any(|x| x.key() == m.key() || x.id == m.id) {
             return Some(CollectionShelf { name: s(col, "name"), parts: items });
@@ -1318,14 +1324,15 @@ pub async fn accent(url: String) -> Option<String> {
     let key = url.clone();
     // 48×48 pixels are all that is read: TMDB's small size is a tenth of the download.
     let url = small_tmdb_image(&url).unwrap_or(url);
-    let computed = on_runtime(async move {
+    // Distinguish a decoded greyscale image (Ok(None) -> cacheable) from a transient network error (Err -> retry later).
+    let computed: std::result::Result<Option<String>, ()> = on_runtime(async move {
         const LIMIT: usize = 12_000_000;
-        let mut response = backend().http.get(&url).send().await.ok()?.error_for_status().ok()?;
-        if response.content_length().is_some_and(|n| n > LIMIT as u64) { return None; }
+        let mut response = backend().http.get(&url).send().await.map_err(|_| ())?.error_for_status().map_err(|_| ())?;
+        if response.content_length().is_some_and(|n| n > LIMIT as u64) { return Ok(None); }
         // Read at most LIMIT bytes whatever the server says, and decode within a memory budget.
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
-            if bytes.len() + chunk.len() > LIMIT { return None; }
+        while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+            if bytes.len() + chunk.len() > LIMIT { return Ok(None); }
             bytes.extend_from_slice(&chunk);
         }
         // Offload CPU-intensive image decoding & thumbnailing off the Tokio async I/O workers.
@@ -1338,11 +1345,15 @@ pub async fn accent(url: String) -> Option<String> {
             reader.limits(limits);
             let img = reader.decode().ok()?.thumbnail(48, 48).to_rgba8();
             let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
-            artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
-        }).await.ok().flatten()
-    }).await.ok().flatten();
-    if let Ok(mut cache) = backend().accents.lock() { cache_insert(&mut cache, 2000, key, computed.clone()); }
-    computed
+            Some(artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}")))
+        }).await.ok().flatten().ok_or(())
+    }).await.ok().unwrap_or(Err(()));
+    if let Ok(val) = computed {
+        if let Ok(mut cache) = backend().accents.lock() { cache_insert(&mut cache, 2000, key, val.clone()); }
+        val
+    } else {
+        None
+    }
 }
 
 /// The same TMDB image at 300 px wide (TMDB serves every image at that size), for reading colours.

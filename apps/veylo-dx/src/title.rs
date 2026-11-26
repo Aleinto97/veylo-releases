@@ -52,11 +52,17 @@ pub fn TitlePage(media: Media) -> Element {
     let mut dl_toast = use_signal(|| None::<(u64, String)>);
     // A title opened from a shelf, Search or Picks carries the add-on's data only: what you did
     // with it (saved, watched, liked, progress and last episode) comes from the store and also
-    // refreshes whenever playback finishes (`shell.picks_dirty`).
-    let mut touched = use_signal(|| false);
+    // refreshes whenever playback finishes (`shell.picks_dirty`). Per-field touched flags ensure
+    // editing one field doesn't freeze the others, and `store_gen` drops stale out-of-order loads.
+    let mut touched_saved = use_signal(|| false);
+    let mut touched_liked = use_signal(|| false);
+    let mut touched_watched = use_signal(|| false);
+    let mut store_gen = use_signal(|| 0u64);
     let for_store = media.clone();
     use_effect(move || {
         let _ = (shell.picks_dirty)();
+        let gen = *store_gen.peek() + 1;
+        store_gen.set(gen);
         let m_req = for_store.clone();
         spawn(async move {
             let (stored_res, w, prog) = tokio::join!(
@@ -64,25 +70,25 @@ pub fn TitlePage(media: Media) -> Element {
                 backend::watched_episodes(&m_req),
                 backend::episode_playback_map(&m_req),
             );
+            if *store_gen.peek() != gen { return; }
             seen.set(w);
             ep_progress.set(prog);
             if let Some(fresh) = stored_res {
+                let ts = *touched_saved.peek();
+                let tl = *touched_liked.peek();
+                let tw = *touched_watched.peek();
                 live_media.with_mut(|cur| {
                     cur.position_ms = fresh.position_ms;
                     cur.duration_ms = fresh.duration_ms;
                     cur.last_video_id = fresh.last_video_id.clone();
                     cur.video_watched = fresh.video_watched;
-                    if !*touched.peek() {
-                        cur.saved = fresh.saved;
-                        cur.liked = fresh.liked;
-                        cur.watched = fresh.watched;
-                    }
+                    if !ts { cur.saved = fresh.saved; }
+                    if !tl { cur.liked = fresh.liked; }
+                    if !tw { cur.watched = fresh.watched; }
                 });
-                if !*touched.peek() {
-                    saved.set(fresh.saved);
-                    liked.set(fresh.liked);
-                    if !episodic(&fresh) { watched.set(fresh.watched); }
-                }
+                if !ts { saved.set(fresh.saved); }
+                if !tl { liked.set(fresh.liked); }
+                if !tw && !episodic(&fresh) { watched.set(fresh.watched); }
                 if !*season_picked.peek() {
                     if let Some(last_v) = fresh.last_video_id.as_deref() {
                         if let Load::Ready(ref tm) = *meta.peek() {
@@ -125,17 +131,30 @@ pub fn TitlePage(media: Media) -> Element {
             allow_fallback.set(true);
         });
     });
-    let mut busy = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| None::<(String, u64)>);
+    // Backing out of PendingPlayer (Esc/Back) bumps play_ticket: clear the local Play spinner at once.
+    use_effect(move || {
+        let cur_ticket = (shell.play_ticket)();
+        let stale = busy.peek().as_ref().is_some_and(|(_, t)| *t != cur_ticket);
+        if stale { busy.set(None); }
+    });
     // Its place in today's chart (BetterPosters), shown as a fact.
     let mut rank = use_signal(|| None::<u64>);
     let for_rank = media.clone();
     use_hook(move || { spawn(async move { rank.set(backend::today_rank(&for_rank).await); }); });
-    // The backdrop dissolves through the production's own textless frames every 9 seconds.
+    // The backdrop dissolves through the production's own textless frames every 9 seconds,
+    // paused whenever there is only one frame or the player is active.
     let mut frame = use_signal(|| 0usize);
+    let mut frames_count = use_signal(|| 0usize);
     use_future(move || async move {
         let mut waited = 0;
         while !*top_ready.peek() && waited < 10_000 { backend::sleep(100).await; waited += 100; }
-        loop { backend::sleep(9000).await; *frame.write() += 1; }
+        loop {
+            backend::sleep(9000).await;
+            if *frames_count.peek() > 1 && shell.player.peek().is_none() {
+                *frame.write() += 1;
+            }
+        }
     });
 
     let for_meta = media.clone();
@@ -179,14 +198,14 @@ pub fn TitlePage(media: Media) -> Element {
             return;
         }
         let title = label.as_ref().map(|l| format!("{} {l}", media.name)).unwrap_or_else(|| media.name.clone());
-        busy.set(Some(video.clone()));
         let ticket = crate::finding(shell, title.clone());
+        busy.set(Some((video.clone(), ticket)));
         // Season packs: a labelled size covers the whole season.
         let pack = label.as_ref().map(|_| season_eps.len()).filter(|&n| n > 0);
         spawn(async move {
             let ctx = backend::autoplay_context_for_media(&media, &video, pack);
             let pick = backend::autoplay_for(&media.kind, &video, ctx).await;
-            busy.set(None);
+            if busy.peek().as_ref().is_some_and(|(_, t)| *t == ticket) { busy.set(None); }
             if !crate::still_wanted(shell, ticket) { return; }
             // Nothing played: every source can be chosen by hand.
             if !play_pick(shell, &media, &video, &title, pick, pack,
@@ -233,7 +252,7 @@ pub fn TitlePage(media: Media) -> Element {
     // Like (1) or Not for me (-1); the same again takes it back. The buttons and the L and D keys.
     let rate = use_callback(move |value: i64| {
         let media = m1.clone();
-        touched.set(true);
+        touched_liked.set(true);
         let before = *liked.peek();
         let next = if before == value { 0 } else { value };
         liked.set(next);
@@ -242,7 +261,7 @@ pub fn TitlePage(media: Media) -> Element {
     // Save to the Library (S), and the "Already watched" switch (W): the button and the key alike.
     let for_save = media.clone();
     let toggle_save = use_callback(move |_: ()| {
-        touched.set(true);
+        touched_saved.set(true);
         let next = !*saved.peek();
         saved.set(next);
         let m = for_save.clone();
@@ -250,7 +269,7 @@ pub fn TitlePage(media: Media) -> Element {
     });
     let for_watched = media.clone();
     let toggle_watched = use_callback(move |_: ()| {
-        touched.set(true);
+        touched_watched.set(true);
         let next = !*watched.peek();
         watched.set(next);
         let m = for_watched.clone();
@@ -261,7 +280,7 @@ pub fn TitlePage(media: Media) -> Element {
         if all_reg.is_empty() { return; }
         let all_done = all_reg.iter().all(|id| seen.peek().contains(id));
         let next = !all_done;
-        touched.set(true);
+        touched_watched.set(true);
         seen.with_mut(|s| for id in &all_reg { if next { s.insert(id.clone()); } else { s.remove(id); } });
         watched.set(next);
         let m = live_media.peek().clone();
@@ -345,6 +364,8 @@ pub fn TitlePage(media: Media) -> Element {
         frames.retain(|f| !f.is_empty() && !broken.contains(f));
     }
     let active_idx = if frames.is_empty() { 0 } else { frame() % frames.len() };
+    let n_frames = frames.len();
+    if *frames_count.peek() != n_frames { frames_count.set(n_frames); }
     let desired = frames.get(active_idx).cloned().unwrap_or_default();
     let preload_next = if frames.len() > 1 {
         frames.get((active_idx + 1) % frames.len()).cloned().unwrap_or_default()
@@ -368,10 +389,18 @@ pub fn TitlePage(media: Media) -> Element {
     let mut lamp = shell.lamp_source;
     let lamp_src = if has_art_backdrop { backdrop.clone() } else { ambient_fallback.clone() };
     use_effect(use_reactive!(|lamp_src| if !lamp_src.is_empty() && *lamp.peek() != lamp_src { lamp.set(lamp_src); }));
-    // Only logos that read as white idents (see backend::idents).
+    // Only logos that read as white idents (see backend::idents); generation-guarded against stale races.
     let mut idents = use_signal(Vec::<backend::Studio>::new);
+    let mut idents_gen = use_signal(|| 0u64);
     let studios = production.studios.clone();
-    use_effect(use_reactive!(|studios| { spawn(async move { idents.set(backend::idents(studios).await); }); }));
+    use_effect(use_reactive!(|studios| {
+        let gen = *idents_gen.peek() + 1;
+        idents_gen.set(gen);
+        spawn(async move {
+            let found = backend::idents(studios).await;
+            if *idents_gen.peek() == gen { idents.set(found); }
+        });
+    }));
     // Use card metadata immediately on Frame 0 so facts don't pop in after `title_meta`.
     let imdb_rating = facts.as_ref().map(|m| m.rating.clone()).filter(|r| !r.is_empty())
         .unwrap_or_else(|| backend::s(&media.raw, "imdbRating"));
@@ -555,7 +584,7 @@ pub fn TitlePage(media: Media) -> Element {
                     },
                     Load::Failed(e) => rsx! { div { class: "notice glass", span { class: "warn-icon", icons::Alert {} } span { "{e}" } } },
                     Load::Ready(m) => rsx! {
-                        if !film { Episodes { list: m.episodes.clone(), media: current_media.clone(), season: season, season_picked: season_picked, last: current_media.last_video_id.clone(), busy: busy(), seen: seen,
+                        if !film { Episodes { list: m.episodes.clone(), media: current_media.clone(), season: season, season_picked: season_picked, last: current_media.last_video_id.clone(), busy: busy().map(|(v, _)| v), seen: seen,
                             watched: watched,
                             progress: ep_progress,
                             posters: production.season_posters.clone(),
@@ -790,8 +819,10 @@ pub fn resume_now(mut shell: Shell, media: Media) {
     match media.last_video_id.clone() {
         // The last episode is finished: carry on with the one after it, not that episode again.
         Some(video) if media.video_watched => {
+            let ticket = crate::finding(shell, media.name.clone());
             spawn(async move {
                 let list = backend::title_meta(&media).await.map(|m| m.episodes).unwrap_or_default();
+                if !crate::still_wanted(shell, ticket) { return; }
                 let next = next_episode(&list, &video).map(|e| e.id).unwrap_or(video);
                 let label = backend::episode_label(&next);
                 play_next(shell, media, next, label);

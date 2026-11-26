@@ -62,6 +62,8 @@ static LOADED: OnceLock<()> = OnceLock::new();
 static LAST_SYNCED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static SYNC_KEY_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STATE_LOCK: Mutex<()> = Mutex::new(());
+static SYNC_KEY_LOCK: Mutex<()> = Mutex::new(());
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static FORGOTTEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
 fn session_path() -> PathBuf { backend().data_dir.join("account.json") }
@@ -95,6 +97,7 @@ fn save_sync_key(key: &[u8; 32]) {
 }
 
 fn ensure_sync_key() -> Result<[u8; 32]> {
+    let _guard = SYNC_KEY_LOCK.lock();
     if let Some(k) = load_sync_key() { return Ok(k); }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|_| anyhow!("Couldn't generate an encryption key"))?;
@@ -116,15 +119,22 @@ pub fn sync_key_needed() -> bool {
 /// Replace this device's local Sync Key with a Recovery Key from another device and trigger sync.
 pub async fn set_sync_recovery_code(code: &str) -> Result<(usize, usize)> {
     let key = parse_recovery_code(code)?;
-    save_sync_key(&key);
+    let _one = SYNCING.lock().await;
+    {
+        let _k = SYNC_KEY_LOCK.lock();
+        save_sync_key(&key);
+    }
     SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
-    // Reset sync cursors so encrypted cloud items and keys are re-read with the new key.
-    let mut st = load_state();
-    st.taken_until = None;
-    st.keys_hash.clear();
-    st.keys_updated = 0;
-    save_state(&st);
-    sync_now().await
+    // Reset sync cursors atomically while holding SYNCING so encrypted cloud items and keys are re-read with the new key.
+    {
+        let _guard = STATE_LOCK.lock();
+        let mut st = load_state_unlocked();
+        st.taken_until = None;
+        st.keys_hash.clear();
+        st.keys_updated = 0;
+        save_state_unlocked(&st);
+    }
+    sync_now_locked().await
 }
 
 fn load_session() {
@@ -355,8 +365,12 @@ async fn id_token() -> Result<(String, String)> {
     load_session();
     let current = SESSION.lock().ok().and_then(|x| x.clone()).context("Not signed in")?;
     if !current.id_token.is_empty() && current.expires > now_secs() { return Ok((current.id_token, current.account.uid)); }
+    let _refreshing = REFRESH_LOCK.lock().await;
+    let current = SESSION.lock().ok().and_then(|x| x.clone()).context("Not signed in")?;
+    if !current.id_token.is_empty() && current.expires > now_secs() { return Ok((current.id_token, current.account.uid)); }
     let c = config().context("Accounts aren't set up in this build")?;
     let refresh = current.refresh.clone();
+    let expected_uid = current.account.uid.clone();
     let api = c.api_key;
     let v: Result<Value> = on_runtime(async move {
         let response = backend().http.post(format!("https://securetoken.googleapis.com/v1/token?key={api}"))
@@ -368,19 +382,28 @@ async fn id_token() -> Result<(String, String)> {
     let v = match v {
         Ok(v) => v,
         Err(e) => {
-            // Refused for good (the account was deleted, or signed out everywhere): signed out here.
+            // Refused for good (the account was deleted, or signed out everywhere): signed out here,
+            // only if the session hasn't already changed to another account.
             let code = e.to_string();
-            if ["TOKEN_EXPIRED", "USER_NOT_FOUND", "INVALID_REFRESH_TOKEN", "USER_DISABLED"].iter().any(|c| code.starts_with(c)) { forget_session(); }
+            if ["TOKEN_EXPIRED", "USER_NOT_FOUND", "INVALID_REFRESH_TOKEN", "USER_DISABLED"].iter().any(|c| code.starts_with(c)) {
+                let same_session = SESSION.lock().ok().and_then(|s| s.as_ref().map(|x| x.account.uid == expected_uid && x.refresh == current.refresh)).unwrap_or(false);
+                if same_session { forget_session(); }
+            }
             anyhow::bail!(auth_error(&code));
         }
     };
-    let mut next = current;
+    let mut next = current.clone();
     next.id_token = s(&v, "id_token");
     next.refresh = Some(s(&v, "refresh_token")).filter(|r| !r.is_empty()).unwrap_or(next.refresh);
     next.expires = now_secs() + v["expires_in"].as_str().and_then(|x| x.parse().ok()).unwrap_or(3600) - 60;
     let out = (next.id_token.clone(), next.account.uid.clone());
+    // Never resurrect a session that was signed out or replaced while the refresh request was in flight.
+    let updated = if let Ok(mut slot) = SESSION.lock() {
+        let still_same = slot.as_ref().is_some_and(|s| s.account.uid == expected_uid && s.refresh == current.refresh);
+        if still_same { *slot = Some(next.clone()); true } else { false }
+    } else { false };
+    anyhow::ensure!(updated, "Not signed in");
     save_session(Some(&next));
-    if let Ok(mut slot) = SESSION.lock() { *slot = Some(next); }
     Ok(out)
 }
 
@@ -439,7 +462,9 @@ pub(super) async fn anon_delete_pub(token: &str) -> Result<Value> { identity("de
 
 async fn commit(token: &str, writes: Vec<Value>) -> Result<()> {
     let base = documents().context("Accounts aren't set up in this build")?;
-    for chunk in writes.chunks(400) {
+    // Keep batches strictly below list_items' 300-doc page size so a batch sharing one server
+    // REQUEST_TIME never spans across a GREATER_THAN pagination boundary.
+    for chunk in writes.chunks(200) {
         post(format!("https://firestore.googleapis.com/v1/{base}:commit"), json!({"writes":chunk}), Some(token.to_owned())).await?;
     }
     Ok(())
@@ -514,8 +539,7 @@ struct State {
 
 fn state_path() -> PathBuf { backend().data_dir.join("sync-state.json") }
 
-fn load_state() -> State {
-    let _guard = STATE_LOCK.lock();
+fn load_state_unlocked() -> State {
     let v: Value = std::fs::read_to_string(state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let last = v["last"].as_i64().unwrap_or(0);
     LAST_SYNCED.store(last, std::sync::atomic::Ordering::Relaxed);
@@ -531,8 +555,12 @@ fn load_state() -> State {
     }
 }
 
-fn save_state(st: &State) {
+fn load_state() -> State {
     let _guard = STATE_LOCK.lock();
+    load_state_unlocked()
+}
+
+fn save_state_unlocked(st: &State) {
     // Only the newest exchanged rows are worth remembering.
     let mut seen: Vec<(&String, &i64)> = st.seen.iter().collect();
     seen.sort_by_key(|(_, t)| std::cmp::Reverse(**t));
@@ -556,6 +584,11 @@ fn save_state(st: &State) {
         "keys_updated": st.keys_updated,
     }).to_string();
     let _ = write_private_file(&state_path(), data.as_bytes());
+}
+
+fn save_state(st: &State) {
+    let _guard = STATE_LOCK.lock();
+    save_state_unlocked(st);
 }
 
 /// The fields of a title's metadata worth syncing (the rest comes back from its add-on).
@@ -591,6 +624,10 @@ pub fn last_synced() -> i64 {
 /// Take the other devices' changes, then send this one's. Returns how many rows came and went.
 pub async fn sync_now() -> Result<(usize, usize)> {
     let _one = SYNCING.lock().await;
+    sync_now_locked().await
+}
+
+async fn sync_now_locked() -> Result<(usize, usize)> {
     let (token, uid) = id_token().await?;
     let base = documents().context("Accounts aren't set up in this build")?;
     let sync_key = ensure_sync_key()?;
@@ -624,11 +661,14 @@ pub async fn sync_now() -> Result<(usize, usize)> {
         if docs.len() < 300 { break; }
     }
     // Sync encrypted keys & add-ons before pushing so we detect a mismatched key before overwriting.
+    // On a first unverified sync (empty keys_hash), abort rather than pushing items encrypted under
+    // an unverified local key.
     if let Err(e) = sync_keys(&token, &uid, &base, &sync_key, &mut st).await {
-        if sync_key_needed() { return Err(e); }
+        if sync_key_needed() || st.keys_hash.is_empty() { return Err(e); }
         dev_log(&format!("keys: {e}"));
+    } else {
+        SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     // Send: what changed here since the last time, but not what just came from elsewhere.
     let changes = exec(json!({"op":"sync_changes","since":st.sent_until})).await?;
     let mut writes = Vec::new();
@@ -680,9 +720,13 @@ pub fn sync_forgotten(media: &Media) {
     if account().is_none() { return; }
     let entry = json!({"t":"m","type":media.kind,"id":media.id,"addon_url":media.addon_url,"updated":now_secs(),"deleted":true});
     if let Ok(mut queued) = FORGOTTEN.lock() { queued.push(entry); }
-    // Also persist immediately so a crash before the next sync keeps the tombstone.
-    let st = load_state();
-    save_state(&st);
+    // Persist immediately under STATE_LOCK so a crash before the next sync keeps the tombstone
+    // without racing against load/save_state in sync_now.
+    {
+        let _guard = STATE_LOCK.lock();
+        let st = load_state_unlocked();
+        save_state_unlocked(&st);
+    }
     sync_soon();
 }
 
@@ -694,14 +738,25 @@ pub fn sync_soon() { WANTED.store(true, std::sync::atomic::Ordering::Relaxed); }
 
 /// While signed in: sync at launch, a few seconds after each change here, and every two minutes.
 pub fn start_sync() {
-    if account().is_none() || STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
-    sync_soon();
+    if account().is_none() { return; }
     let Some(runtime) = RUNTIME.get() else { return };
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    sync_soon();
     runtime.spawn(async {
         let mut idle = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if account().is_none() { STARTED.store(false, std::sync::atomic::Ordering::Release); return; }
+            // Check session and clear STARTED atomically under SESSION lock so a sign-in racing
+            // with sign-out can never leave STARTED=true with no background loop alive.
+            let signed_in = SESSION.lock().ok().is_some_and(|slot| {
+                if slot.is_none() {
+                    STARTED.store(false, std::sync::atomic::Ordering::Release);
+                    false
+                } else {
+                    true
+                }
+            });
+            if !signed_in { return; }
             idle += 1;
             if WANTED.swap(false, std::sync::atomic::Ordering::Relaxed) || idle >= 24 {
                 idle = 0;

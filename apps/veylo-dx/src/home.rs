@@ -16,13 +16,89 @@ struct HomeSnapshot {
 }
 
 static HOME_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<HomeSnapshot>> = std::sync::OnceLock::new();
+static HOME_DISK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const HOME_TTL_SECS: i64 = 300;
+const HOME_DISK_TTL_SECS: i64 = 24 * 3600;
+const HOME_CACHE_FILE: &str = "home-cache-v1.json";
+
+fn encode_media(m: &Media) -> serde_json::Value {
+    let mut o: serde_json::Map<String, serde_json::Value> = m.raw.as_object().into_iter().flatten()
+        .filter(|(k, _)| k.as_str() != "videos").map(|(k, v)| (k.clone(), v.clone())).collect();
+    o.insert("id".into(), serde_json::json!(m.id));
+    o.insert("type".into(), serde_json::json!(m.kind));
+    o.insert("name".into(), serde_json::json!(m.name));
+    o.insert("addon_url".into(), serde_json::json!(m.addon_url));
+    o.insert("poster".into(), serde_json::json!(m.poster));
+    o.insert("background".into(), serde_json::json!(m.background));
+    o.insert("description".into(), serde_json::json!(m.description));
+    o.insert("releaseInfo".into(), serde_json::json!(m.year));
+    o.insert("genres".into(), serde_json::json!(m.genres));
+    if !m.reason.is_empty() { o.insert("reason".into(), serde_json::json!(m.reason)); }
+    o.insert("liked".into(), serde_json::json!(m.liked));
+    o.insert("watched".into(), serde_json::json!(m.watched));
+    o.insert("saved".into(), serde_json::json!(m.saved));
+    o.insert("video_watched".into(), serde_json::json!(m.video_watched));
+    o.insert("position_ms".into(), serde_json::json!(m.position_ms));
+    o.insert("duration_ms".into(), serde_json::json!(m.duration_ms));
+    if let Some(v) = &m.last_video_id { o.insert("video_id".into(), serde_json::json!(v)); }
+    serde_json::Value::Object(o)
+}
+
+fn load_home_disk() -> Option<HomeSnapshot> {
+    let path = backend::backend_data_dir().join(HOME_CACHE_FILE);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let at = v["at"].as_i64()?;
+    if backend::now_secs() - at > HOME_DISK_TTL_SECS { return None; }
+    let rows: Vec<(CatalogRow, Shelf)> = v["rows"].as_array()?.iter().filter_map(|r| {
+        let row = CatalogRow {
+            key: r["key"].as_str()?.to_owned(),
+            title: r["title"].as_str()?.to_owned(),
+            subtitle: r["subtitle"].as_str().map(str::to_owned),
+            addon_url: r["addon_url"].as_str()?.to_owned(),
+            kind: r["kind"].as_str()?.to_owned(),
+            id: r["id"].as_str()?.to_owned(),
+            extra: r["extra"].as_array().and_then(|a| Some((a.first()?.as_str()?.to_owned(), a.get(1)?.as_str()?.to_owned()))),
+            ranked: r["ranked"].as_bool().unwrap_or(false),
+        };
+        let items: Vec<Media> = r["items"].as_array()?.iter().filter_map(|m| Media::from_json(m, &row.addon_url)).collect();
+        if items.is_empty() { return None; }
+        Some((row, Shelf::Ready(items)))
+    }).collect();
+    let library: Vec<Media> = v["library"].as_array().into_iter().flatten().filter_map(|m| Media::from_json(m, "")).collect();
+    let tonight: Vec<Media> = v["tonight"].as_array().into_iter().flatten().filter_map(|m| Media::from_json(m, "")).collect();
+    if rows.is_empty() && tonight.is_empty() { return None; }
+    // Mark `at = 0` so stale-while-revalidate paints immediately on Frame 0 AND refreshes in the background.
+    Some(HomeSnapshot { rows, library, tonight, at: 0 })
+}
+
+fn save_home_disk(snap: &HomeSnapshot) {
+    let rows: Vec<serde_json::Value> = snap.rows.iter().filter_map(|(r, st)| {
+        let Shelf::Ready(items) = st else { return None };
+        if items.is_empty() { return None; }
+        Some(serde_json::json!({
+            "key": r.key, "title": r.title, "subtitle": r.subtitle, "addon_url": r.addon_url,
+            "kind": r.kind, "id": r.id, "extra": r.extra.as_ref().map(|(a, b)| [a, b]), "ranked": r.ranked,
+            "items": items.iter().take(24).map(encode_media).collect::<Vec<_>>(),
+        }))
+    }).collect();
+    if rows.is_empty() && snap.tonight.is_empty() { return; }
+    let payload = serde_json::json!({
+        "at": backend::now_secs(),
+        "rows": rows,
+        "library": snap.library.iter().filter(|m| backend::in_progress(m) || m.liked < 0).take(40).map(encode_media).collect::<Vec<_>>(),
+        "tonight": snap.tonight.iter().take(6).map(encode_media).collect::<Vec<_>>(),
+    });
+    let text = payload.to_string();
+    let path = backend::backend_data_dir().join(HOME_CACHE_FILE);
+    std::thread::spawn(move || { let _ = backend::write_private_file(&path, text.as_bytes()); });
+}
 
 /// Drop cached Home shelves (called when the user switches BetterPosters/add-on settings).
 pub fn invalidate_cache() {
     if let Some(m) = HOME_SNAPSHOT.get() {
         if let Ok(mut s) = m.lock() { *s = HomeSnapshot::default(); }
     }
+    let _ = std::fs::remove_file(backend::backend_data_dir().join(HOME_CACHE_FILE));
 }
 
 /// Remove a forgotten title from Home's cached library list so Continue watching never flashes stale rows.
@@ -33,13 +109,25 @@ pub fn forget_from_snapshot(key: &str) {
 }
 
 fn read_home_snapshot() -> Option<HomeSnapshot> {
-    let snap = HOME_SNAPSHOT.get()?.lock().ok()?.clone();
-    (!snap.rows.is_empty()).then_some(snap)
+    let lock = HOME_SNAPSHOT.get_or_init(Default::default);
+    let mut guard = lock.lock().ok()?;
+    if guard.rows.is_empty() && !HOME_DISK_LOADED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if let Some(disk) = load_home_disk() {
+            *guard = disk;
+        }
+    }
+    let snap = guard.clone();
+    (!snap.rows.is_empty() || !snap.tonight.is_empty()).then_some(snap)
 }
 
 fn write_home_snapshot(update: impl FnOnce(&mut HomeSnapshot)) {
-    if let Ok(mut s) = HOME_SNAPSHOT.get_or_init(Default::default).lock() {
+    let snapshot_to_save = if let Ok(mut s) = HOME_SNAPSHOT.get_or_init(Default::default).lock() {
         update(&mut s);
+        let ready_count = s.rows.iter().filter(|(_, st)| matches!(st, Shelf::Ready(_))).count();
+        (ready_count > 0 && ready_count == s.rows.len()).then(|| s.clone())
+    } else { None };
+    if let Some(snap) = snapshot_to_save {
+        save_home_disk(&snap);
     }
 }
 
@@ -87,55 +175,61 @@ pub fn Home() -> Element {
             loading.set(false);
             return;
         }
-        // Fetch library, catalog shelf definitions, and Picks recommendations concurrently.
-        let (lib_res, rows_res, picks_res) = tokio::join!(backend::library(), backend::home_rows(), backend::picks());
-        if let Ok(items) = lib_res {
-            // Developer option: VEYLO_DX_OPEN=<title> opens the first library title containing it.
-            if let Ok(want) = std::env::var("VEYLO_DX_OPEN") {
-                let want = want.to_lowercase();
-                if let Some(m) = items.iter().find(|m| m.name.to_lowercase().contains(&want)) { opened.set(Some(m.clone())); }
+        // Fetch library, catalog shelf definitions, and Picks independently so fast local shelves
+        // (Continue watching) and catalog rows start rendering immediately without waiting on Picks.
+        let lib_fut = async move {
+            if let Ok(items) = backend::library().await {
+                if let Ok(want) = std::env::var("VEYLO_DX_OPEN") {
+                    let want = want.to_lowercase();
+                    if let Some(m) = items.iter().find(|m| m.name.to_lowercase().contains(&want)) { opened.set(Some(m.clone())); }
+                }
+                library.set(items.clone());
+                write_home_snapshot(|s| s.library = items);
             }
-            library.set(items.clone());
-            write_home_snapshot(|s| s.library = items);
-        }
-        match rows_res {
-            Ok(list) => {
-                // Keep any already-loaded shelf items visible while refreshing so nothing blinks.
-                let prev: std::collections::HashMap<String, Shelf> = rows.peek().iter().cloned().map(|(r, st)| (r.key, st)).collect();
-                let next: Vec<(CatalogRow, Shelf)> = list.iter().cloned().map(|r| {
-                    let st = prev.get(&r.key).cloned().unwrap_or(Shelf::Loading);
-                    (r, st)
-                }).collect();
-                rows.set(next.clone());
-                write_home_snapshot(|s| { s.rows = next; s.at = backend::now_secs(); });
-                for row in list { load_row(row); }
-            }
-            Err(e) => if rows.peek().is_empty() { rows_error.set(Some(format!("{e:#}"))); },
-        }
-        // Tonight's pick: recommendations you have neither watched nor started, filtered to
-        // confirmed digital HD/4K releases for recent movies, in the order of the taste Picks learned.
-        if let Ok(p) = picks_res {
-            let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(28).collect();
-            let fresh = backend::filter_home_quality(fresh).await;
-            let known = library.peek().clone();
-            let order = fresh.clone();
-            let ranked = backend::on_runtime(async move {
-                tokio::task::spawn_blocking(move || {
-                    let mut taste = crate::brain::load(0);
-                    taste.set_facts(crate::brain::facts(&known));
-                    // The core's order breaks near-ties: it knows the catalogues' own ranking.
-                    let mut scored: Vec<(f64, Media)> = fresh.into_iter().enumerate().map(|(i, mut m)| {
-                        if let Some(r) = taste.home_reason(&m) { m.reason = r; }
-                        (taste.lasting(&m) - i as f64 * 0.02, m)
+        };
+        let rows_fut = async move {
+            match backend::home_rows().await {
+                Ok(list) => {
+                    // Keep any already-loaded shelf items visible while refreshing so nothing blinks.
+                    let prev: std::collections::HashMap<String, Shelf> = rows.peek().iter().cloned().map(|(r, st)| (r.key, st)).collect();
+                    let next: Vec<(CatalogRow, Shelf)> = list.iter().cloned().map(|r| {
+                        let st = prev.get(&r.key).cloned().unwrap_or(Shelf::Loading);
+                        (r, st)
                     }).collect();
-                    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-                    scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
-                }).await.ok()
-            }).await.ok().flatten();
-            let chosen: Vec<Media> = ranked.unwrap_or(order).into_iter().take(6).collect();
-            tonight.set(chosen.clone());
-            write_home_snapshot(|s| s.tonight = chosen);
-        }
+                    rows.set(next.clone());
+                    write_home_snapshot(|s| { s.rows = next; s.at = backend::now_secs(); });
+                    for row in list { load_row(row); }
+                }
+                Err(e) => if rows.peek().is_empty() { rows_error.set(Some(format!("{e:#}"))); },
+            }
+        };
+        let picks_fut = async move {
+            // Tonight's pick: recommendations you have neither watched nor started, filtered to
+            // confirmed digital HD/4K releases for recent movies, in the order of the taste Picks learned.
+            if let Ok(p) = backend::picks().await {
+                let fresh: Vec<Media> = p.items.into_iter().filter(|m| !m.watched && !backend::in_progress(m)).take(28).collect();
+                let fresh = backend::filter_home_quality(fresh).await;
+                let known = library.peek().clone();
+                let order = fresh.clone();
+                let ranked = backend::on_runtime(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut taste = crate::brain::load(0);
+                        taste.set_facts(crate::brain::facts(&known));
+                        // The core's order breaks near-ties: it knows the catalogues' own ranking.
+                        let mut scored: Vec<(f64, Media)> = fresh.into_iter().enumerate().map(|(i, mut m)| {
+                            if let Some(r) = taste.home_reason(&m) { m.reason = r; }
+                            (taste.lasting(&m) - i as f64 * 0.02, m)
+                        }).collect();
+                        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+                    }).await.ok()
+                }).await.ok().flatten();
+                let chosen: Vec<Media> = ranked.unwrap_or(order).into_iter().take(6).collect();
+                tonight.set(chosen.clone());
+                write_home_snapshot(|s| s.tonight = chosen);
+            }
+        };
+        tokio::join!(lib_fut, rows_fut, picks_fut);
         loading.set(false);
     });
 
@@ -289,11 +383,9 @@ fn HomeHero(
         map
     });
     // Pre-warm artwork for all switcher picks so changing hero slides is instantaneous.
-    let item_keys: Vec<String> = items.iter().map(Media::key).collect();
     let items_for_art = items.clone();
-    use_effect(use_reactive!(|item_keys| {
-        let _ = item_keys;
-        for m in items_for_art.clone() {
+    use_effect(use_reactive!(|items_for_art| {
+        for m in items_for_art {
             let key = m.key();
             if art_map.peek().contains_key(&key) { continue; }
             if let Some(cached) = backend::cached_artwork(&m) {
@@ -309,10 +401,8 @@ fn HomeHero(
     }));
 
     // Prefetch sources for the active pick so Play starts immediately.
-    let active_key = media.key();
     let active_for_prefetch = media.clone();
-    use_effect(use_reactive!(|active_key| {
-        let _ = active_key;
+    use_effect(use_reactive!(|active_for_prefetch| {
         crate::title::prefetch_resume(&active_for_prefetch);
     }));
 

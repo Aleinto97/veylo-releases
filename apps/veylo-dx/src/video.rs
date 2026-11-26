@@ -47,14 +47,7 @@ pub fn hwnd() -> Option<isize> {
 /// Safe from any thread: queries live on the Dioxus UI thread and returns the cached value off-thread.
 #[cfg(target_os = "macos")]
 pub fn potential_headroom() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CACHED: AtomicU64 = AtomicU64::new(0);
-    if dioxus::core::Runtime::try_current().is_some() {
-        let h = veylo_video_surface::potential_headroom(|| Some(imp::host()));
-        if h > 0.0 { CACHED.store(h.to_bits(), Ordering::Relaxed); }
-        return h;
-    }
-    f64::from_bits(CACHED.load(Ordering::Relaxed))
+    veylo_video_surface::potential_headroom(|| dioxus::core::Runtime::try_current().map(|_| imp::host()))
 }
 /// macOS: the self-tests of the picture's pipeline, and the transfer it goes out with ("pq" in HDR).
 #[cfg(target_os = "macos")]
@@ -154,9 +147,11 @@ mod imp {
         #[cfg(target_os = "linux")]
         pub fn acquire() {
             release();
+            // Hold stdin open to `cat`: closing stdin or dying causes `cat` (and systemd-inhibit)
+            // to exit immediately without ever orphaning a `sleep infinity` child process.
             if let Ok(child) = std::process::Command::new("systemd-inhibit")
-                .args(["--what=idle", "--who=Veylo", "--why=Playing video", "--mode=block", "sleep", "infinity"])
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .args(["--what=idle", "--who=Veylo", "--why=Playing video", "--mode=block", "cat"])
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                 .spawn()
             {
                 if let Ok(mut g) = CHILD.lock() { *g = Some(child); }
@@ -166,6 +161,7 @@ mod imp {
         pub fn release() {
             if let Ok(mut g) = CHILD.lock() {
                 if let Some(mut c) = g.take() {
+                    drop(c.stdin.take());
                     let _ = c.kill();
                     let _ = c.wait();
                 }

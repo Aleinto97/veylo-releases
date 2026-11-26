@@ -97,9 +97,14 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
         )?;
         tx.commit()?;
     }
-    // Idempotent indexes for hot sync and recommendation queries (compatible with existing DBs).
+    // Idempotent indexes for hot sync, library, playback, cache, and recommendation queries
+    // (100% compatible with existing databases; no schema version bump required).
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS media_updated ON media(updated DESC, key);
+         CREATE INDEX IF NOT EXISTS media_type_raw_id ON media(type, raw_id);
+         CREATE INDEX IF NOT EXISTS media_in_library ON media(updated DESC, key)
+           WHERE saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0;
+         CREATE INDEX IF NOT EXISTS cache_updated ON cache(updated DESC, key);
          CREATE INDEX IF NOT EXISTS playback_updated ON playback(updated);",
     )?;
     Ok(db)

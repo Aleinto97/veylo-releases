@@ -17,19 +17,32 @@ pub fn SearchOverlay() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut generation = use_signal(|| 0u64);
     let mut arm_clear_history = use_signal(|| false);
-    let ideas = use_resource(|| async {
-        let items = backend::picks().await.map(|p| p.items).unwrap_or_default();
-        if items.len() <= 1 { return items; }
-        let fallback = items.clone();
-        backend::on_runtime(async move {
-            tokio::task::spawn_blocking(move || {
-                let taste = crate::brain::load(0);
-                let mut scored: Vec<(f64, Media)> = items.into_iter().enumerate()
-                    .map(|(i, m)| (taste.lasting(&m) - (i as f64) * 0.02, m)).collect();
-                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-                scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
-            }).await.unwrap_or(fallback)
-        }).await.unwrap_or_default()
+    // Load "From your picks" ideas only when the search field is actually empty (skip when opened
+    // with a pre-filled actor/director query or remembered draft).
+    let mut ideas = use_signal(|| None::<Vec<Media>>);
+    let mut ideas_started = use_signal(|| false);
+    use_effect(move || {
+        let empty = query().trim().is_empty() && shell.search_query.peek().is_none();
+        if !empty || *ideas_started.peek() { return; }
+        ideas_started.set(true);
+        spawn(async move {
+            let items = backend::picks().await.map(|p| p.items).unwrap_or_default();
+            let ranked = if items.len() <= 1 {
+                items
+            } else {
+                let fallback = items.clone();
+                backend::on_runtime(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let taste = crate::brain::load(0);
+                        let mut scored: Vec<(f64, Media)> = items.into_iter().enumerate()
+                            .map(|(i, m)| (taste.lasting(&m) - (i as f64) * 0.02, m)).collect();
+                        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        scored.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+                    }).await.unwrap_or(fallback)
+                }).await.unwrap_or_default()
+            };
+            ideas.set(Some(ranked));
+        });
     });
 
     // Each keystroke supersedes the previous request; only the latest may write.

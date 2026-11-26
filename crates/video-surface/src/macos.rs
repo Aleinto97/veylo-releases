@@ -301,6 +301,7 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
     HDR_MODE.store(0, Ordering::Release);
     if let Ok(layer) = LAYER.lock() {
         if let Some(l) = layer.as_ref() {
+            l.0.setAsynchronous(true);
             if let Some(w) = window() { l.0.setContentsScale(w.backingScaleFactor()); }
             set_edr(&l.0, None);
         }
@@ -326,6 +327,9 @@ fn free_render() {
 
 pub fn close(_path: Path) {
     free_render();
+    if let Ok(layer) = LAYER.lock() {
+        if let Some(l) = layer.as_ref() { l.0.setAsynchronous(false); }
+    }
     VIEW.with(|v| if let Some(v) = v.borrow().as_ref() { v.setHidden(true); });
     DIRTY.store(true, Ordering::Release);
 }
@@ -345,7 +349,10 @@ pub fn layout(player: &dyn Player, hdr_output: bool) {
     let mpv = player.mpv();
     let primaries: String = mpv.get_property("video-params/primaries").unwrap_or_default();
     let gamma: String = mpv.get_property("video-params/gamma").unwrap_or_default();
-    let headroom = f64::from_bits(HEADROOM.load(Ordering::Acquire)).max(f64::from_bits(POTENTIAL.load(Ordering::Acquire)));
+    let current = f64::from_bits(HEADROOM.load(Ordering::Acquire));
+    let potential = f64::from_bits(POTENTIAL.load(Ordering::Acquire));
+    // Prefer live current headroom over potential so highlights don't clip when brightness/thermals limit EDR.
+    let headroom = if current > 0.0 { current } else { potential };
     // PQ code values fit any buffer; a 16-bit float one (when the GPU gives it) only bands less.
     let mode = match (gamma.as_str(), primaries.as_str()) {
         _ if headroom <= 1.0 || !hdr_output => 0,

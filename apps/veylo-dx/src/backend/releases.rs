@@ -11,10 +11,18 @@ const QUALITY_CACHE_FILE: &str = "home-quality-v1.json";
 static FEED_MEM: OnceLock<Mutex<(std::time::Instant, Vec<Media>)>> = OnceLock::new();
 /// Cached per-IMDb-id Home quality verdict: `(checked_at_secs, has_hd_or_4k_digital_release)`.
 static QUALITY_MEM: OnceLock<Mutex<HashMap<String, (i64, bool)>>> = OnceLock::new();
+type QualityCell = std::sync::Arc<tokio::sync::OnceCell<Option<bool>>>;
+/// Global in-flight deduplication and concurrency cap across all concurrent Home shelves.
+static QUALITY_INFLIGHT: OnceLock<Mutex<HashMap<String, QualityCell>>> = OnceLock::new();
+static QUALITY_SEM: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub(super) fn clear_quality_cache() {
     if let Some(m) = QUALITY_MEM.get() { if let Ok(mut g) = m.lock() { g.clear(); } }
     if let Some(m) = FEED_MEM.get() { if let Ok(mut g) = m.lock() { g.1.clear(); } }
+    if let Some(b) = BACKEND.get() {
+        let _ = std::fs::remove_file(b.data_dir.join(QUALITY_CACHE_FILE));
+        let _ = std::fs::remove_file(b.data_dir.join(FEED_CACHE_FILE));
+    }
 }
 
 fn current_year() -> i32 {
@@ -62,12 +70,6 @@ fn load_quality_disk() -> HashMap<String, (i64, bool)> {
     map.into_iter().filter(|(_, (at, _))| now - *at < QUALITY_TTL_SECS).collect()
 }
 
-fn save_quality_disk(map: &HashMap<String, (i64, bool)>) {
-    if let Ok(text) = serde_json::to_string(map) {
-        let _ = write_private_file(&backend().data_dir.join(QUALITY_CACHE_FILE), text.as_bytes());
-    }
-}
-
 fn quality_cache() -> &'static Mutex<HashMap<String, (i64, bool)>> {
     QUALITY_MEM.get_or_init(|| Mutex::new(load_quality_disk()))
 }
@@ -79,19 +81,41 @@ async fn head_etag(http: &reqwest::Client, url: String) -> Option<String> {
 }
 
 async fn bp_quality_check(http: &reqwest::Client, imdb: &str) -> Option<bool> {
-    let (u1, u2, u3, u4) = (
+    // Short-circuit after the first pair (2 HEADs): if poster == poster-q ETag, no quality badge
+    // exists so we skip the second pair completely (cuts HEAD traffic ~40% on in-cinema films).
+    let (u1, u2) = (
         format!("{BP_BASE}/poster/imdb/poster-default/{imdb}.jpg"),
         format!("{BP_BASE}/poster-q/imdb/poster-default/{imdb}.jpg"),
+    );
+    let (e1, e2) = tokio::join!(head_etag(http, u1), head_etag(http, u2));
+    if let Some(false) = bp_etag_has_quality(e1.as_deref(), e2.as_deref(), None, None) {
+        return Some(false);
+    }
+    let (u3, u4) = (
         format!("{BP_BASE}/poster-n/imdb/poster-default/{imdb}.jpg"),
         format!("{BP_BASE}/poster-nq/imdb/poster-default/{imdb}.jpg"),
     );
-    let (e1, e2, e3, e4) = tokio::join!(
-        head_etag(http, u1),
-        head_etag(http, u2),
-        head_etag(http, u3),
-        head_etag(http, u4),
-    );
+    let (e3, e4) = tokio::join!(head_etag(http, u3), head_etag(http, u4));
     bp_etag_has_quality(e1.as_deref(), e2.as_deref(), e3.as_deref(), e4.as_deref())
+}
+
+async fn bp_quality_check_dedup(http: reqwest::Client, imdb: String) -> Option<bool> {
+    let cell = {
+        let mut g = QUALITY_INFLIGHT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(imdb.clone()).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
+    };
+    let sem = QUALITY_SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(6))).clone();
+    let imdb_run = imdb.clone();
+    let res = *cell.get_or_init(|| async move {
+        let Ok(_permit) = sem.acquire_owned().await else { return None };
+        bp_quality_check(&http, &imdb_run).await
+    }).await;
+    if let Ok(mut g) = QUALITY_INFLIGHT.get_or_init(Default::default).lock() {
+        if g.get(&imdb).is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell)) {
+            g.remove(&imdb);
+        }
+    }
+    res
 }
 
 /// Filter a Home list of media to hide recent movies that do NOT yet have verified digital HD/4K
@@ -128,14 +152,11 @@ pub async fn filter_home_quality(items: Vec<Media>) -> Vec<Media> {
     if !to_check.is_empty() {
         let fetched: Vec<(String, bool)> = on_runtime(async move {
             let http = backend().http.clone();
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             let mut set = tokio::task::JoinSet::new();
             for imdb in to_check {
                 let http = http.clone();
-                let sem = sem.clone();
                 set.spawn(async move {
-                    let _permit = sem.acquire_owned().await.ok()?;
-                    bp_quality_check(&http, &imdb).await.map(|ok| (imdb, ok))
+                    bp_quality_check_dedup(http, imdb.clone()).await.map(|ok| (imdb, ok))
                 });
             }
             let mut out = Vec::new();
@@ -147,12 +168,18 @@ pub async fn filter_home_quality(items: Vec<Media>) -> Vec<Media> {
 
         if !fetched.is_empty() {
             let cache = quality_cache();
-            if let Ok(mut guard) = cache.lock() {
+            let snapshot = if let Ok(mut guard) = cache.lock() {
                 for (imdb, ok) in &fetched {
                     cache_insert(&mut guard, 600, imdb.clone(), (now, *ok));
                     known.insert(imdb.clone(), *ok);
                 }
-                save_quality_disk(&guard);
+                serde_json::to_string(&*guard).ok()
+            } else { None };
+            // Persist off-lock via debounced write_soon so concurrent Home shelves never block on fsync/icacls.
+            if let Some(text) = snapshot {
+                if let Some(b) = BACKEND.get() {
+                    write_soon(b.data_dir.join(QUALITY_CACHE_FILE), text);
+                }
             }
         }
     }

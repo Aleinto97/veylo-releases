@@ -39,6 +39,7 @@ import java.io.File
  * controls, display frame-rate matching, brightness/volume helpers, rotation lock, and PiP.
  */
 object VeyloVideo {
+    private var hostActivity: java.lang.ref.WeakReference<Activity>? = null
     private var frame: FrameLayout? = null
     private var surface: SurfaceView? = null
     private var aspect = 0.0
@@ -46,9 +47,10 @@ object VeyloVideo {
     private var pendingFps = 0f
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
-    private var pausedByFocus = false
+    @Volatile private var pausedByFocus = false
     private var noisyReceiver: BroadcastReceiver? = null
-    private var mediaSession: MediaSession? = null
+    @Volatile private var mediaSession: MediaSession? = null
+    private val visibilityGen = java.util.concurrent.atomic.AtomicLong(0)
 
     /** Implemented in Rust (src/android.rs). A null surface means it is going away. */
     @JvmStatic external fun nativeSurface(surface: Surface?, width: Int, height: Int)
@@ -80,7 +82,14 @@ object VeyloVideo {
 
     @JvmStatic
     fun show(activity: Activity) {
+        val gen = visibilityGen.incrementAndGet()
         activity.runOnUiThread {
+            if (visibilityGen.get() != gen) return@runOnUiThread
+            // If Android recreated the Activity in the same process, discard stale views bound to the old one.
+            if (frame != null && hostActivity?.get() !== activity) {
+                hostActivity?.get()?.let { stopMediaControls(it) }
+                frame = null; surface = null; hostActivity = null
+            }
             if (frame != null) return@runOnUiThread
             val web = findWebView(activity.window.decorView) ?: return@runOnUiThread
             val parent = web.parent as? ViewGroup ?: return@runOnUiThread
@@ -99,6 +108,7 @@ object VeyloVideo {
             box.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> relayout() }
             parent.addView(box, parent.indexOfChild(web), ViewGroup.LayoutParams(-1, -1))
             web.setBackgroundColor(Color.TRANSPARENT)
+            hostActivity = java.lang.ref.WeakReference(activity)
             frame = box; surface = view
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             immersive(activity, true)
@@ -108,7 +118,10 @@ object VeyloVideo {
 
     @JvmStatic
     fun hide(activity: Activity) {
+        val gen = visibilityGen.incrementAndGet()
         activity.runOnUiThread {
+            // A newer show() (source/episode switch) already took ownership: do not tear it down.
+            if (visibilityGen.get() != gen) return@runOnUiThread
             stopMediaControls(activity)
             // Restore system brightness & orientation when leaving the player.
             runCatching {
@@ -121,7 +134,7 @@ object VeyloVideo {
             }
             val box = frame ?: return@runOnUiThread
             (box.parent as? ViewGroup)?.removeView(box)
-            frame = null; surface = null; aspect = 0.0; fit = 0; pendingFps = 0f
+            frame = null; surface = null; hostActivity = null; aspect = 0.0; fit = 0; pendingFps = 0f
             findWebView(activity.window.decorView)?.setBackgroundColor(Color.BLACK)
             activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             immersive(activity, false)
@@ -249,11 +262,18 @@ object VeyloVideo {
             pausedByFocus = false
             val listener = AudioManager.OnAudioFocusChangeListener { change ->
                 when (change) {
-                    AudioManager.AUDIOFOCUS_LOSS,
+                    AudioManager.AUDIOFOCUS_LOSS -> {
+                        // Permanent focus loss (another media app took over): pause and do not auto-resume.
+                        pausedByFocus = false
+                        nativeCommand("pause")
+                    }
                     AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
                     AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                        pausedByFocus = true
-                        nativeCommand("pause")
+                        val playing = mediaSession?.controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+                        if (playing) {
+                            pausedByFocus = true
+                            nativeCommand("pause")
+                        }
                     }
                     AudioManager.AUDIOFOCUS_GAIN -> {
                         if (pausedByFocus) {
@@ -295,12 +315,12 @@ object VeyloVideo {
             if (mediaSession == null) {
                 val session = MediaSession(activity, "Veylo")
                 session.setCallback(object : MediaSession.Callback() {
-                    override fun onPlay() = nativeCommand("play")
-                    override fun onPause() = nativeCommand("pause")
+                    override fun onPlay() { pausedByFocus = false; nativeCommand("play") }
+                    override fun onPause() { pausedByFocus = false; nativeCommand("pause") }
                     override fun onSkipToNext() = nativeCommand("next")
                     override fun onFastForward() = nativeCommand("seek_fwd")
                     override fun onRewind() = nativeCommand("seek_back")
-                    override fun onStop() = nativeCommand("stop")
+                    override fun onStop() { pausedByFocus = false; nativeCommand("stop") }
                 })
                 session.isActive = true
                 mediaSession = session

@@ -60,6 +60,28 @@ pub fn better_posters_on() -> bool { BETTER_POSTERS.load(std::sync::atomic::Orde
 /// server isn't asked again on every screen.
 pub(super) type Answers = HashMap<String, (i64, Option<Value>)>;
 pub(super) static BP_CACHE: OnceLock<Mutex<Answers>> = OnceLock::new();
+type InflightMap<T> = OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::OnceCell<T>>>>>;
+static BP_INFLIGHT: InflightMap<Option<Value>> = OnceLock::new();
+static ELF_INFLIGHT: InflightMap<Option<Value>> = OnceLock::new();
+static JW_INFLIGHT: InflightMap<Option<Vec<String>>> = OnceLock::new();
+
+async fn dedup_inflight<T: Clone + Send + Sync + 'static>(
+    map: &'static InflightMap<T>,
+    key: &str,
+    fetch: impl Future<Output = T>,
+) -> T {
+    let cell = {
+        let mut g = map.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(key.to_owned()).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
+    };
+    let val = cell.get_or_init(|| fetch).await.clone();
+    if let Ok(mut g) = map.get_or_init(Default::default).lock() {
+        if g.get(key).is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell)) {
+            g.remove(key);
+        }
+    }
+    val
+}
 
 pub(super) async fn bp_get(path: String) -> Option<Value> {
     let cache = BP_CACHE.get_or_init(Default::default);
@@ -67,17 +89,24 @@ pub(super) async fn bp_get(path: String) -> Option<Value> {
     if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
         if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
     }
-    let url = format!("{BP_BASE}/{path}");
-    let got = on_runtime(async move {
-        let response = backend().http.get(url).timeout(Duration::from_secs(8)).send().await.ok()?.error_for_status().ok()?;
-        response.json::<Value>().await.ok()
-    }).await.ok().flatten();
-    if let Ok(mut c) = cache.lock() {
-        // Expired answers (whole charts among them) go before a new one is kept.
-        c.retain(|_, (at, hit)| now - *at < if hit.is_some() { 900 } else { 120 });
-        cache_insert(&mut c, 400, path, (now, got.clone()));
-    }
-    got
+    let key = path.clone();
+    dedup_inflight(&BP_INFLIGHT, &key, async move {
+        let now = now_secs();
+        if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
+            if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
+        }
+        let url = format!("{BP_BASE}/{path}");
+        let got = on_runtime(async move {
+            let response = backend().http.get(url).timeout(Duration::from_secs(8)).send().await.ok()?.error_for_status().ok()?;
+            response.json::<Value>().await.ok()
+        }).await.ok().flatten();
+        if let Ok(mut c) = cache.lock() {
+            // Expired answers (whole charts among them) go before a new one is kept.
+            c.retain(|_, (at, hit)| now - *at < if hit.is_some() { 900 } else { 120 });
+            cache_insert(&mut c, 400, path, (now, got.clone()));
+        }
+        got
+    }).await
 }
 
 /// A chart's titles as Cinemeta titles (`origin`): only IMDb ids, which Cinemeta also serves.
@@ -128,11 +157,22 @@ pub(super) fn merge_meta(mut meta: Value, bp: Option<&Value>) -> Value {
 }
 
 pub(super) static IDENTS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+const IDENTS_CACHE_FILE: &str = "idents-v1.json";
+
+fn idents_cache() -> &'static Mutex<HashMap<String, bool>> {
+    IDENTS.get_or_init(|| {
+        let map = BACKEND.get()
+            .and_then(|b| std::fs::read_to_string(b.data_dir.join(IDENTS_CACHE_FILE)).ok())
+            .and_then(|t| serde_json::from_str::<HashMap<String, bool>>(&t).ok())
+            .unwrap_or_default();
+        Mutex::new(map)
+    })
+}
 
 /// The studio logos that read as white idents: transparent around the mark. A logo printed on its
-/// own solid background would turn into a white box, so it is left out. Kept for the session.
+/// own solid background would turn into a white box, so it is left out. Persisted across launches.
 pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
-    let cache = IDENTS.get_or_init(Default::default);
+    let cache = idents_cache();
     let mut results: Vec<Option<Studio>> = vec![None; studios.len()];
     let mut pending = Vec::new();
     for (i, st) in studios.into_iter().enumerate() {
@@ -153,7 +193,7 @@ pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
                         .replace("/w300/", "/w92/")
                         .replace("/w185/", "/w92/")
                         .replace("?width=360", "?width=92");
-                    let ok = transparent_edges(probe).await.unwrap_or(false);
+                    let ok = transparent_edges_inner(probe).await;
                     (i, st, ok)
                 });
             }
@@ -163,11 +203,27 @@ pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
             }
             done
         }).await.unwrap_or_default();
+        let mut snapshot: Option<String> = None;
         if let Ok(mut c) = cache.lock() {
-            for (_, st, ok) in &checked { cache_insert(&mut c, 500, st.logo.clone(), *ok); }
+            let mut changed = false;
+            for (_, st, ok) in &checked {
+                // Only cache definite decode verdicts; transient network errors retry next visit.
+                if let Some(verdict) = *ok {
+                    cache_insert(&mut c, 500, st.logo.clone(), verdict);
+                    changed = true;
+                }
+            }
+            if changed {
+                snapshot = serde_json::to_string(&*c).ok();
+            }
+        }
+        if let Some(text) = snapshot {
+            if let Some(b) = BACKEND.get() {
+                write_soon(b.data_dir.join(IDENTS_CACHE_FILE), text);
+            }
         }
         for (i, st, ok) in checked {
-            if ok { results[i] = Some(st); }
+            if ok == Some(true) { results[i] = Some(st); }
         }
     }
     results.into_iter().flatten().collect()
@@ -175,19 +231,22 @@ pub async fn idents(studios: Vec<Studio>) -> Vec<Studio> {
 
 /// Whether the logo is a mark on see-through ground: a transparent corner, and ink over less than
 /// about half of it (a solid plate with rounded corners is not an ident).
-pub(super) async fn transparent_edges(url: String) -> Option<bool> {
-    let bytes = on_runtime(async move {
-        backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?.bytes().await.ok()
-    }).await.ok().flatten()?;
-    on_runtime(async move {
-        tokio::task::spawn_blocking(move || {
-            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            let (w, h) = img.dimensions();
-            if w == 0 || h == 0 { return None; }
-            let corner = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].iter().any(|&(x, y)| img.get_pixel(x, y)[3] < 128);
-            let ink = img.pixels().filter(|p| p[3] >= 128).count() as f64 / (w as f64 * h as f64);
-            Some(corner && ink < 0.55)
-        }).await.ok().flatten()
+async fn transparent_edges_inner(url: String) -> Option<bool> {
+    const MAX_LOGO_BYTES: usize = 2 * 1024 * 1024;
+    let mut resp = backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?;
+    if resp.content_length().is_some_and(|n| n > MAX_LOGO_BYTES as u64) { return Some(false); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > MAX_LOGO_BYTES { return Some(false); }
+        bytes.extend_from_slice(&chunk);
+    }
+    tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 { return None; }
+        let corner = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].iter().any(|&(x, y)| img.get_pixel(x, y)[3] < 128);
+        let ink = img.pixels().filter(|p| p[3] >= 128).count() as f64 / (w as f64 * h as f64);
+        Some(corner && ink < 0.55)
     }).await.ok().flatten()
 }
 
@@ -319,17 +378,24 @@ pub(super) async fn elfhosted_meta(kind: &str, imdb: &str) -> Option<Value> {
     if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
         if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
     }
-    let url = format!("{ELFHOSTED_BASE}/{path}");
-    let got = on_runtime(async move {
-        let response = backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?;
-        let v = response.json::<Value>().await.ok()?;
-        v.get("meta").filter(|m| m.is_object()).cloned()
-    }).await.ok().flatten();
-    if let Ok(mut c) = cache.lock() {
-        c.retain(|_, (at, hit)| now - *at < if hit.is_some() { 900 } else { 120 });
-        cache_insert(&mut c, 400, path, (now, got.clone()));
-    }
-    got
+    let key = path.clone();
+    dedup_inflight(&ELF_INFLIGHT, &key, async move {
+        let now = now_secs();
+        if let Some((at, hit)) = cache.lock().ok().and_then(|c| c.get(&path).cloned()) {
+            if now - at < if hit.is_some() { 900 } else { 120 } { return hit; }
+        }
+        let url = format!("{ELFHOSTED_BASE}/{path}");
+        let got = on_runtime(async move {
+            let response = backend().http.get(url).timeout(Duration::from_secs(6)).send().await.ok()?.error_for_status().ok()?;
+            let v = response.json::<Value>().await.ok()?;
+            v.get("meta").filter(|m| m.is_object()).cloned()
+        }).await.ok().flatten();
+        if let Ok(mut c) = cache.lock() {
+            c.retain(|_, (at, hit)| now - *at < if hit.is_some() { 900 } else { 120 });
+            cache_insert(&mut c, 400, path, (now, got.clone()));
+        }
+        got
+    }).await
 }
 
 /// Parse an ElfHosted `/meta/{kind}/{imdb}.json` object into Veylo's `Artwork` model.
@@ -460,7 +526,13 @@ pub(super) async fn justwatch_stills(m: &Media) -> Vec<String> {
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&imdb).cloned()) {
         return hit;
     }
-    let query = r#"query GetBackdrops($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter) {
+    let name = m.name.clone();
+    let key = imdb.clone();
+    let got = dedup_inflight(&JW_INFLIGHT, &key, async move {
+        if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&imdb).cloned()) {
+            return Some(hit);
+        }
+        let query = r#"query GetBackdrops($country: Country!, $language: Language!, $first: Int!, $filter: TitleFilter) {
   popularTitles(country: $country, first: $first, filter: $filter) {
     edges {
       node {
@@ -472,31 +544,31 @@ pub(super) async fn justwatch_stills(m: &Media) -> Vec<String> {
     }
   }
 }"#;
-    let body = json!({
-        "query": query,
-        "variables": {
-            "country": "US",
-            "language": "en",
-            "first": 8,
-            "filter": { "searchQuery": m.name, "objectTypes": [obj_type] }
+        let body = json!({
+            "query": query,
+            "variables": {
+                "country": "US",
+                "language": "en",
+                "first": 8,
+                "filter": { "searchQuery": name, "objectTypes": [obj_type] }
+            }
+        });
+        let imdb_match = imdb.clone();
+        let res = on_runtime(async move {
+            let resp = backend().http
+                .post(JUSTWATCH_GRAPHQL)
+                .json(&body)
+                .timeout(Duration::from_secs(4))
+                .send().await.ok()?.error_for_status().ok()?;
+            let v = resp.json::<Value>().await.ok()?;
+            Some(parse_justwatch_stills(&v, &imdb_match))
+        }).await.ok().flatten();
+        if let Some(ref stills) = res {
+            if let Ok(mut c) = cache.lock() { cache_insert(&mut c, 600, imdb, stills.clone()); }
         }
-    });
-    let imdb_match = imdb.clone();
-    let got = on_runtime(async move {
-        let resp = backend().http
-            .post(JUSTWATCH_GRAPHQL)
-            .json(&body)
-            .timeout(Duration::from_secs(4))
-            .send().await.ok()?.error_for_status().ok()?;
-        let v = resp.json::<Value>().await.ok()?;
-        Some(parse_justwatch_stills(&v, &imdb_match))
-    }).await.ok().flatten();
-    if let Some(stills) = got {
-        if let Ok(mut c) = cache.lock() { cache_insert(&mut c, 600, imdb, stills.clone()); }
-        stills
-    } else {
-        Vec::new()
-    }
+        res
+    }).await;
+    got.unwrap_or_default()
 }
 
 /// Clear session artwork caches (called when the user toggles BetterPosters).
