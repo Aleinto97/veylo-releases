@@ -53,7 +53,8 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
     // sending every mpv child window to the bottom (the WebView may also be re-stacked while it lives).
     std::thread::Builder::new().name("veylo-video".into()).spawn(move || {
         let mut steady = 0u32;
-        while SESSION.load(Ordering::SeqCst) == session {
+        // Stops with its session, or with the window itself (nothing left to keep in order).
+        while SESSION.load(Ordering::SeqCst) == session && unsafe { IsWindow(top) != 0 } {
             let videos = mpv_windows(top);
             let mut moved = false;
             for video in &videos {

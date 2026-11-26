@@ -81,26 +81,61 @@ pub struct Host;
 /// now in use, or None when there is no picture (mpv still plays the sound).
 pub fn attach(host: &Host, player: Arc<dyn Player>) -> Option<Path> {
     detach();
-    for &path in imp::candidates() {
+    let usable = |path: Path| !fallback::is_unavailable(path) && !fallback::skipped(path);
+    let candidates = imp::candidates();
+    for (i, &path) in candidates.iter().enumerate() {
         if fallback::is_unavailable(path) { continue; }
         if fallback::skipped(path) {
             eprintln!("veylo: picture path {} skipped (VEYLO_DX_SKIP_PICTURE_PATH)", path.name());
             continue;
         }
-        match imp::open(path, host, &player) {
+        // The only path left has nothing to fall back to: a failure may be a passing one (the window
+        // not realized yet, a GL context that wasn't ready), so try it once more before giving up on it.
+        let sole = !candidates[i + 1..].iter().any(|&p| usable(p));
+        let mut opened = imp::open(path, host, &player);
+        if sole {
+            if let Err(first) = &opened {
+                eprintln!("veylo: picture path {} failed: {first}; trying it once more", path.name());
+                imp::close(path);
+                opened = imp::open(path, host, &player);
+            }
+        }
+        match opened {
             Ok(()) => {
+                failures(path, false);
                 fallback::set_active(Some(path));
                 eprintln!("veylo: picture path: {}", path.name());
                 return Some(path);
             }
             Err(e) => {
-                fallback::mark_unavailable(path);
-                eprintln!("veylo: picture path {} failed: {e}; not trying it again this run", path.name());
+                imp::close(path);
+                // With another path to try, this one is dropped at once; the sole path only after it
+                // has failed on several titles in a row, so one bad moment doesn't mean no picture all run.
+                if !sole || failures(path, true) >= SOLE_PATH_FAILURES {
+                    fallback::mark_unavailable(path);
+                    eprintln!("veylo: picture path {} failed: {e}; not trying it again this run", path.name());
+                } else {
+                    eprintln!("veylo: picture path {} failed: {e}; it will be tried again with the next title", path.name());
+                }
             }
         }
     }
     eprintln!("veylo: no picture path worked; playing without a picture");
     None
+}
+
+/// How many titles in a row the sole picture path may fail on (two attempts each) before it is dropped.
+const SOLE_PATH_FAILURES: u32 = 2;
+
+/// Counts a path's consecutive failed attaches (`failed`), or forgets them after a good one.
+fn failures(path: Path, failed: bool) -> u32 {
+    static COUNTS: std::sync::Mutex<Vec<(Path, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut counts = COUNTS.lock().unwrap_or_else(|p| p.into_inner());
+    let before = counts.iter().find(|(p, _)| *p == path).map_or(0, |(_, n)| *n);
+    counts.retain(|(p, _)| *p != path);
+    if !failed { return 0; }
+    counts.push((path, before + 1));
+    before + 1
 }
 
 /// Take the picture away (UI thread).

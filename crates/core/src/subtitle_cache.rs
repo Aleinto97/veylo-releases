@@ -146,20 +146,36 @@ impl SubtitleCache {
         }
         Ok(entries)
     }
-    fn is_fresh_marker(path: &Path) -> bool {
-        let Ok(marker) = fs::read_to_string(Self::metadata_path(path)) else {
-            return false;
+    /// Marker format: `<unix expiry | never>[:http]\n<url>`. The stem is only a 64-bit hash of
+    /// the URL, so the URL itself is kept to reject a colliding one; `:http` records whether the
+    /// fetch touched plain HTTP so callers with `allow_http == false` never reuse it. Legacy
+    /// markers without a URL parse as `None`: never reusable.
+    fn parse_marker(marker: &str) -> Option<(Option<u64>, bool, &str)> {
+        let (head, url) = marker.split_once('\n')?;
+        let (when, used_http) = match head.strip_suffix(":http") {
+            Some(w) => (w, true),
+            None => (head, false),
         };
-        if marker == "never" {
-            true
+        let expires = if when == "never" {
+            None
         } else {
-            marker.parse::<u64>().ok().is_some_and(|expires| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .is_some_and(|now| now.as_secs() < expires)
-            })
-        }
+            Some(when.parse::<u64>().ok()?)
+        };
+        Some((expires, used_http, url))
+    }
+    fn is_fresh(expires: Option<u64>) -> bool {
+        expires.is_none_or(|expires| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .is_some_and(|now| now.as_secs() < expires)
+        })
+    }
+    fn is_fresh_marker(path: &Path) -> bool {
+        fs::read_to_string(Self::metadata_path(path))
+            .ok()
+            .and_then(|marker| Self::parse_marker(&marker).map(|(expires, _, _)| expires))
+            .is_some_and(Self::is_fresh)
     }
     fn prune(&self, available: u64, protected: Option<&Path>) -> Result<()> {
         let mut entries = Vec::new();
@@ -187,7 +203,11 @@ impl SubtitleCache {
         }
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn read(&self, url: &str) -> Option<(Vec<u8>, PathBuf)> {
+        self.read_with_policy(url, true)
+    }
+    pub fn read_with_policy(&self, url: &str, allow_http: bool) -> Option<(Vec<u8>, PathBuf)> {
         // No prune here: freshness is checked per file below, and the budget is
         // enforced by store()/stats(). A lookup must not scan the directory.
         let _lock = self.lock.lock().ok()?;
@@ -200,17 +220,12 @@ impl SubtitleCache {
             let Ok(marker) = fs::read_to_string(Self::metadata_path(&path)) else {
                 continue;
             };
-            let fresh = if marker == "never" {
-                true
-            } else {
-                marker.parse::<u64>().ok().is_some_and(|expires| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .is_some_and(|now| now.as_secs() < expires)
-                })
+            // The stored URL must be this URL: a hash collision is a miss, not another
+            // URL's subtitle. An entry fetched over HTTP must not satisfy an HTTPS-only caller.
+            let Some((expires, used_http, stored_url)) = Self::parse_marker(&marker) else {
+                continue;
             };
-            if !fresh {
+            if stored_url != url || (used_http && !allow_http) || !Self::is_fresh(expires) {
                 continue;
             }
             let Ok(meta) = fs::metadata(&path) else {
@@ -248,7 +263,17 @@ impl SubtitleCache {
             let _ = Self::remove_entry(&path);
         }
     }
+    #[allow(dead_code)]
     pub fn store(&self, url: &str, bytes: &[u8], expiry: Option<SystemTime>) -> Result<PathBuf> {
+        self.store_with_policy(url, bytes, expiry, false)
+    }
+    pub fn store_with_policy(
+        &self,
+        url: &str,
+        bytes: &[u8],
+        expiry: Option<SystemTime>,
+        used_http: bool,
+    ) -> Result<PathBuf> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= super::subtitle::LIMIT,
             "Subtitle file too large"
@@ -278,7 +303,7 @@ impl SubtitleCache {
         };
         let stem = Self::stem(url);
         let path = self.directory.join(format!("{stem}.{extension}"));
-        let marker = match expiry {
+        let when = match expiry {
             Some(time) => time
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -286,6 +311,8 @@ impl SubtitleCache {
                 .to_string(),
             None => "never".to_owned(),
         };
+        let scope = if used_http { ":http" } else { "" };
+        let marker = format!("{when}{scope}\n{url}");
         let needed = (bytes.len() as u64).saturating_add(marker.len() as u64);
         ensure!(needed <= self.budget, "Subtitle cache budget exceeded");
         self.prune(self.budget - needed, Some(&path))?;
@@ -349,7 +376,7 @@ mod tests {
         assert!(!root.exists());
         fs::create_dir_all(&root).unwrap();
         let mut cache = SubtitleCache::new(&root);
-        cache.budget = 35;
+        cache.budget = 80;
         cache.max_age = Duration::from_secs(30);
         (Data(root), cache)
     }
@@ -373,7 +400,11 @@ mod tests {
             .unwrap();
         assert!(cache.read("https://fixture/old").is_none());
         assert!(cache.read("https://fixture/recent").is_some());
-        assert_eq!(cache.stats().unwrap()["bytes"], 30);
+        // Each entry is its file plus its marker (`never\n<url>`).
+        assert_eq!(
+            cache.stats().unwrap()["bytes"],
+            (10 + 6 + "https://fixture/recent".len() + 10 + 6 + "https://fixture/new".len()) as u64
+        );
         fs::write(cache.directory.join("user-notes.txt"), b"keep").unwrap();
         cache.clear().unwrap();
         assert_eq!(cache.stats().unwrap()["files"], 0);
@@ -417,7 +448,7 @@ mod tests {
             )
             .unwrap();
         assert!(cache.read(url).is_some());
-        fs::write(SubtitleCache::metadata_path(&path), "1").unwrap();
+        fs::write(SubtitleCache::metadata_path(&path), format!("1\n{url}")).unwrap();
         assert!(cache.read(url).is_none());
         assert!(
             path.exists(),
@@ -430,6 +461,32 @@ mod tests {
         );
         cache.clear().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_hash_colliding_url_is_a_miss() {
+        let (_data, cache) = fixture();
+        let url = "https://fixture/real";
+        let path = cache.store(url, b"subtitle", None).unwrap();
+        assert!(cache.read(url).is_some());
+        // Simulate another URL that hashes to the same stem: same file, different stored URL.
+        fs::write(
+            SubtitleCache::metadata_path(&path),
+            "never\nhttps://fixture/other",
+        )
+        .unwrap();
+        assert!(cache.read(url).is_none());
+    }
+
+    #[test]
+    fn http_fetched_entry_is_not_reused_when_http_consent_is_off() {
+        let (_data, cache) = fixture();
+        let url = "https://fixture/redirected-to-http";
+        cache
+            .store_with_policy(url, b"subtitle", None, true)
+            .unwrap();
+        assert!(cache.read_with_policy(url, true).is_some());
+        assert!(cache.read_with_policy(url, false).is_none());
     }
 
     #[test]

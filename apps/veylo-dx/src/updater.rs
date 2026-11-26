@@ -62,7 +62,18 @@ pub fn newer(latest: &str, current: &str) -> bool {
 }
 
 const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
-static CHECKED: tokio::sync::OnceCell<Option<Release>> = tokio::sync::OnceCell::const_new();
+
+/// How the last release check ended. A definitive answer (a newer release, or none) is kept for
+/// the session; a transient failure (offline, rate limit, GitHub down) is remembered only briefly,
+/// so launching offline doesn't hide an update for the whole session.
+#[derive(Clone)]
+enum CheckState {
+    Done(Option<Release>),
+    Failed(std::time::Instant),
+}
+static CHECKED: std::sync::Mutex<Option<CheckState>> = std::sync::Mutex::new(None);
+/// A check is only repeated after a transient failure once this has passed.
+const RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn is_allowed_release_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else { return false };
@@ -70,15 +81,25 @@ fn is_allowed_release_url(url: &str) -> bool {
         return false;
     }
     let Some(host) = parsed.host_str() else { return false };
-    host.eq_ignore_ascii_case("github.com")
-        || host.eq_ignore_ascii_case("objects.githubusercontent.com")
-        || host.eq_ignore_ascii_case("release-assets.githubusercontent.com")
-        || host.to_ascii_lowercase().ends_with(".githubusercontent.com")
+    let host = host.to_ascii_lowercase();
+    // Default https port only; the dot before the suffix keeps "evilgithubusercontent.com" out.
+    parsed.port().is_none()
+        && (host == "github.com" || host == "api.github.com" || host.ends_with(".githubusercontent.com"))
+}
+
+/// Release files live on GitHub and its asset CDNs only: every redirect hop must stay on those
+/// hosts over https, so a hijacked redirect can't point the download (or the checksum fetch) elsewhere.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 { return attempt.error("too many redirects"); }
+        if is_allowed_release_url(attempt.url().as_str()) { attempt.follow() } else { attempt.stop() }
+    })
 }
 
 fn client() -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .user_agent("veylo-dx")
+        .redirect(redirect_policy())
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(30));
     #[cfg(not(test))]
@@ -87,44 +108,56 @@ fn client() -> reqwest::Client {
 }
 
 /// The latest release when it is newer than this build and has this platform's file; None offline or up to date.
-/// Cached for the session so navigating overlays never burns through GitHub's unauthenticated rate limit.
+/// A definitive answer is cached for the session so navigating overlays never burns through GitHub's
+/// unauthenticated rate limit; an offline or rate-limited check is retried after a minute.
 pub async fn check() -> Option<Release> {
     let asset = ASSET?;
     #[cfg(target_os = "android")]
     prune_old_android_apks();
-    crate::backend::on_runtime(async move {
-        CHECKED.get_or_init(|| async move {
-            let http = client();
-            let body = http.get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
-                .header("Accept", "application/vnd.github+json")
-                .send().await.ok()?.error_for_status().ok()?.bytes().await.ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-            let version = v["tag_name"].as_str()?.trim_start_matches('v').to_owned();
-            if !newer(&version, env!("CARGO_PKG_VERSION")) { return None; }
-            let assets = v["assets"].as_array()?;
-            let entry = assets.iter().find(|a| a["name"] == asset)?;
-            let url = entry["browser_download_url"].as_str()?.to_owned();
-            if !is_allowed_release_url(&url) { return None; }
-            let mut sha256 = parse_github_digest(entry["digest"].as_str());
-            if sha256.is_none() {
-                if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt")
-                    .and_then(|a| a["browser_download_url"].as_str())
-                    .filter(|u| is_allowed_release_url(u))
-                {
-                    if let Ok(resp) = http.get(sums_url).send().await {
-                        if let Ok(ok_resp) = resp.error_for_status() {
-                            if let Ok(text) = ok_resp.text().await {
-                                sha256 = parse_sha256sums(&text, asset);
-                            }
-                        }
-                    }
-                }
-            }
-            // Fail closed: never offer an update unless a valid 64-hex SHA-256 digest was verified.
-            let sha256 = sha256?;
-            Some(Release { version, url, sha256 })
-        }).await.clone()
-    }).await.ok().flatten()
+    match CHECKED.lock().ok().and_then(|g| g.clone()) {
+        Some(CheckState::Done(found)) => return found,
+        Some(CheckState::Failed(at)) if at.elapsed() < RETRY_AFTER_FAILURE => return None,
+        _ => {}
+    }
+    let outcome = crate::backend::on_runtime(async move { fetch_latest(asset).await }).await.unwrap_or(Err(()));
+    let state = match &outcome {
+        Ok(found) => CheckState::Done(found.clone()),
+        Err(()) => CheckState::Failed(std::time::Instant::now()),
+    };
+    if let Ok(mut g) = CHECKED.lock() { *g = Some(state); }
+    outcome.ok().flatten()
+}
+
+/// One release check: `Ok(Some)` a newer release with a verified checksum, `Ok(None)` up to date or
+/// not installable here (definitive), `Err` a transient failure worth retrying.
+async fn fetch_latest(asset: &str) -> std::result::Result<Option<Release>, ()> {
+    let http = client();
+    let body = http.get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .header("Accept", "application/vnd.github+json")
+        .send().await.map_err(|_| ())?
+        .error_for_status().map_err(|_| ())?
+        .bytes().await.map_err(|_| ())?;
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { return Err(()) };
+    let Some(tag) = v["tag_name"].as_str() else { return Ok(None) };
+    let version = tag.trim_start_matches('v').to_owned();
+    if !newer(&version, env!("CARGO_PKG_VERSION")) { return Ok(None); }
+    let Some(assets) = v["assets"].as_array() else { return Ok(None) };
+    let Some(entry) = assets.iter().find(|a| a["name"] == asset) else { return Ok(None) };
+    let Some(url) = entry["browser_download_url"].as_str().map(str::to_owned) else { return Ok(None) };
+    if !is_allowed_release_url(&url) { return Ok(None); }
+    let mut sha256 = parse_github_digest(entry["digest"].as_str());
+    if sha256.is_none() {
+        if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt")
+            .and_then(|a| a["browser_download_url"].as_str())
+            .filter(|u| is_allowed_release_url(u))
+        {
+            let resp = http.get(sums_url).send().await.map_err(|_| ())?.error_for_status().map_err(|_| ())?;
+            let text = resp.text().await.map_err(|_| ())?;
+            sha256 = parse_sha256sums(&text, asset);
+        }
+    }
+    // Fail closed: never offer an update unless a valid 64-hex SHA-256 digest was verified.
+    Ok(sha256.map(|sha256| Release { version, url, sha256 }))
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
@@ -163,6 +196,8 @@ async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -
     );
     let mut response = client().get(&url).send().await.and_then(|r| r.error_for_status())
         .map_err(|_| anyhow!("Couldn't download the update"))?;
+    // A redirect off GitHub's hosts stops the client at the 3xx answer, which is no update file.
+    anyhow::ensure!(!response.status().is_redirection(), "Couldn't download the update");
     if let Some(len) = response.content_length() {
         anyhow::ensure!(len <= MAX_UPDATE_BYTES, "The update file is unexpectedly large.");
     }
@@ -206,7 +241,17 @@ fn update_work_dir(version: &str) -> Result<PathBuf> {
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(|_| anyhow!("Couldn't generate an update folder name"))?;
     let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
-    let dir = crate::backend::backend_data_dir().join("updates").join(format!("veylo-{}-{suffix}", safe_version(version)));
+    let updates = crate::backend::backend_data_dir().join("updates");
+    // Staging folders kept by a failed swap (or never cleaned) go after a week.
+    if let Ok(entries) = std::fs::read_dir(&updates) {
+        let week = std::time::Duration::from_secs(7 * 24 * 3600);
+        for entry in entries.flatten() {
+            let old = entry.metadata().and_then(|m| m.modified()).ok()
+                .and_then(|t| t.elapsed().ok()).is_some_and(|age| age > week);
+            if old && entry.file_name().to_str().is_some_and(|n| n.starts_with("veylo-")) { let _ = std::fs::remove_dir_all(entry.path()); }
+        }
+    }
+    let dir = updates.join(format!("veylo-{}-{suffix}", safe_version(version)));
     std::fs::create_dir_all(&dir).context("Couldn't prepare the update folder")?;
     #[cfg(unix)]
     {
@@ -223,6 +268,14 @@ fn prune_old_android_apks() {
     let Some(asset) = ASSET else { return };
     let apk = dir.join(asset);
     let ver_file = apk.with_extension("version");
+    // A download that was interrupted (or killed mid-way) leaves its `.apk.part`: never reused, ~150 MB each.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(|n| n.ends_with(".part")) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     if let Ok(ver) = std::fs::read_to_string(&ver_file) {
         if !newer(ver.trim(), env!("CARGO_PKG_VERSION")) {
             let _ = std::fs::remove_file(&apk);
@@ -269,39 +322,101 @@ $ErrorActionPreference = 'Stop'
 $work = Split-Path -Parent $Zip
 $stage = Join-Path $work 'new'
 $backup = "$Dest.old"
+$exe = Join-Path $Dest 'veylo-dx.exe'
+$swapped = $false
+# Put the previous install back: whatever half-copied folder sits at $Dest goes, the backup returns.
+function Restore-Backup {
+    if (-not (Test-Path (Join-Path $backup 'veylo-dx.exe'))) { return $false }
+    try {
+        if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest -ErrorAction Stop }
+        Move-Item -Path $backup -Destination $Dest -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
 try {
     try { Wait-Process -Id $ProcessId -Timeout 30 -ErrorAction SilentlyContinue } catch {}
     Start-Sleep -Milliseconds 500
+    # An earlier swap was cut off after the old install moved aside: that backup IS the install.
+    if (-not (Test-Path $exe)) { [void](Restore-Backup) }
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     Expand-Archive -Force -Path $Zip -DestinationPath $stage
     if (-not (Test-Path (Join-Path $stage 'veylo-dx.exe'))) { throw 'Update archive missing veylo-dx.exe' }
-    $swapped = $false
-    for ($i = 0; $i -lt 10; $i++) {
-        try {
-            if (Test-Path $backup) { Remove-Item -Recurse -Force $backup }
-            Move-Item -Path $Dest -Destination $backup -ErrorAction Stop
-            try {
-                Move-Item -Path $stage -Destination $Dest -ErrorAction Stop
-                $swapped = $true
-                break
-            } catch {
-                if (-not (Test-Path $Dest) -and (Test-Path $backup)) {
-                    Move-Item -Path $backup -Destination $Dest -ErrorAction SilentlyContinue
-                }
-                throw
+    # Only replace the entire parent directory when it exclusively holds Veylo's own bundle.
+    # If veylo-dx.exe lives in a shared folder (e.g. Downloads), replace only Veylo's staged entries in-place.
+    $allowed = @('veylo-dx.exe', 'libmpv-2.dll', 'picks-ai', 'licenses')
+    $hasForeign = $false
+    if (Test-Path $Dest) {
+        foreach ($item in (Get-ChildItem -LiteralPath $Dest -Force)) {
+            $name = $item.Name.ToLowerInvariant()
+            if (($allowed -notcontains $name) -or (($name -eq 'licenses') -and -not (Test-Path (Join-Path $item.FullName 'THIRD_PARTY_LICENSES.md')))) {
+                $hasForeign = $true; break
             }
-        } catch {
-            Start-Sleep -Seconds 1
         }
     }
-    if ($swapped -and (Test-Path $backup)) {
-        Remove-Item -Recurse -Force $backup -ErrorAction SilentlyContinue
+    if ($hasForeign) {
+        $itemBackup = Join-Path $work 'prev-items'
+        for ($i = 0; $i -lt 10 -and -not $swapped; $i++) {
+            $backed = @()
+            try {
+                if (Test-Path $itemBackup) { Remove-Item -Recurse -Force $itemBackup }
+                New-Item -ItemType Directory -Path $itemBackup | Out-Null
+                foreach ($entry in (Get-ChildItem -LiteralPath $stage -Force)) {
+                    $dstItem = Join-Path $Dest $entry.Name
+                    if (($entry.Name -ieq 'licenses') -and (Test-Path $dstItem) -and -not (Test-Path (Join-Path $dstItem 'THIRD_PARTY_LICENSES.md'))) {
+                        continue
+                    }
+                    if (Test-Path $dstItem) {
+                        Move-Item -LiteralPath $dstItem -Destination (Join-Path $itemBackup $entry.Name) -ErrorAction Stop
+                        $backed += $entry.Name
+                    }
+                    Copy-Item -LiteralPath $entry.FullName -Destination $dstItem -Recurse -Force -ErrorAction Stop
+                }
+                if (-not (Test-Path $exe)) { throw 'New install is missing veylo-dx.exe' }
+                $swapped = $true
+            } catch {
+                foreach ($name in $backed) {
+                    $dstItem = Join-Path $Dest $name
+                    $bakItem = Join-Path $itemBackup $name
+                    if (Test-Path $bakItem) {
+                        if (Test-Path $dstItem) { Remove-Item -Recurse -Force $dstItem -ErrorAction SilentlyContinue }
+                        Move-Item -LiteralPath $bakItem -Destination $dstItem -ErrorAction SilentlyContinue
+                    }
+                }
+                Start-Sleep -Seconds 1
+            }
+        }
+    } else {
+        for ($i = 0; $i -lt 10 -and -not $swapped; $i++) {
+            $moved = $false
+            try {
+                # Only remove an existing backup that is genuinely an earlier Veylo bundle and while the current install is healthy.
+                if ((Test-Path (Join-Path $backup 'veylo-dx.exe')) -and (Test-Path $exe)) { Remove-Item -Recurse -Force $backup }
+                Move-Item -Path $Dest -Destination $backup -ErrorAction Stop
+                $moved = $true
+                Move-Item -Path $stage -Destination $Dest -ErrorAction Stop
+                if (-not (Test-Path $exe)) { throw 'New install is missing veylo-dx.exe' }
+                $swapped = $true
+            } catch {
+                if ($moved) { [void](Restore-Backup) }
+                Start-Sleep -Seconds 1
+            }
+        }
+        # The backup is deleted only once the new veylo-dx.exe is verifiably in place.
+        if ($swapped) {
+            if (Test-Path $exe) {
+                Remove-Item -Recurse -Force $backup -ErrorAction SilentlyContinue
+            } else {
+                $swapped = $false
+                [void](Restore-Backup)
+            }
+        }
     }
 } finally {
-    if (Test-Path (Join-Path $Dest 'veylo-dx.exe')) {
-        Start-Process (Join-Path $Dest 'veylo-dx.exe')
-    }
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    # Last resort: nothing runnable at $Dest but a backup exists.
+    if (-not (Test-Path $exe)) { [void](Restore-Backup) }
+    if (Test-Path $exe) { Start-Process $exe }
+    # A failed swap keeps its staging folder (the downloaded zip) for inspection or a retry.
+    if ($swapped) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
 }
 "#;
 
@@ -329,6 +444,8 @@ pub async fn install(release: Release) -> Result<Outcome> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         helper.creation_flags(CREATE_NO_WINDOW);
     }
+    // Playback progress still queued is written first: the app quits right after the helper starts.
+    crate::backend::flush_progress().await;
     crate::backend::flush_writes();
     helper.spawn().context("Couldn't start the updater")?;
     std::process::exit(0);
@@ -378,6 +495,7 @@ pub async fn install(release: Release) -> Result<Outcome> {
     let script = work.join("apply.sh");
     download(release.url.clone(), zip.clone(), release.sha256.clone()).await?;
     std::fs::write(&script, APPLY_MAC).context("Couldn't save the update")?;
+    crate::backend::flush_progress().await;
     crate::backend::flush_writes();
     std::process::Command::new("/bin/sh").arg(&script).arg(std::process::id().to_string()).arg(&zip).arg(&app)
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
@@ -446,6 +564,20 @@ mod tests {
         assert!(newer("2.40.0-beta.1", "2.38.1"));
         assert!(!newer("1.9", "1.10"));
         assert!(!newer("0.8.0-rc1", "0.8.0"));
+    }
+
+    #[test]
+    fn release_urls_stay_on_github_over_https() {
+        use super::is_allowed_release_url as ok;
+        assert!(ok("https://github.com/Aleinto97/veylo-releases/releases/download/v1/a.zip"));
+        assert!(ok("https://objects.githubusercontent.com/x"));
+        assert!(ok("https://release-assets.githubusercontent.com/x"));
+        assert!(!ok("http://github.com/x"));
+        assert!(!ok("https://evilgithubusercontent.com/x"));
+        assert!(!ok("https://github.com.evil.example/x"));
+        assert!(!ok("https://user:pw@github.com/x"));
+        assert!(!ok("https://github.com:8443/x"));
+        assert!(!ok("https://127.0.0.1/x"));
     }
 
     #[test]

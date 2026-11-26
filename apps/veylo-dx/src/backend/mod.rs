@@ -110,12 +110,18 @@ pub fn init() -> Result<()> {
     }
     // Some Android builds (Huawei) hide app logs: keep the last panic in the app's own folder.
     let panic_file = dir.join("last-panic.txt");
-    let default_hook = std::panic::take_hook();
+    // The panic message and backtrace can carry anything a failed call printed (a `reqwest::Error`
+    // names its URL, with the add-on's or a provider's key in it): the std hook is replaced, not
+    // chained, so only the redacted text is written to the file and to stderr.
+    let _ = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let raw = format!("{info}\n{}", std::backtrace::Backtrace::force_capture());
         let clean = redact_diagnostic(&raw);
         let _ = write_private_file(&panic_file, clean.as_bytes());
-        default_hook(info);
+        #[cfg(not(target_os = "android"))]
+        eprintln!("{clean}");
+        #[cfg(target_os = "android")]
+        crate::android::log(&clean);
     }));
     let core = Core::open(&dir)?;
     let http = reqwest::Client::builder()
@@ -136,6 +142,8 @@ pub fn init() -> Result<()> {
     BACKEND
         .set(Backend { core, proxy, data_dir: dir, http, accents: Mutex::new(HashMap::new()) })
         .map_err(|_| anyhow!("Backend already started"))?;
+    // Half-finished downloads nobody will resume (a week old) are swept, off the startup path.
+    if let Some(runtime) = RUNTIME.get() { runtime.spawn_blocking(downloads::sweep_stale_parts); }
     // Signed in: your devices' changes come in, and this one's go out, from launch on.
     start_sync();
     upload_pending_panic();
@@ -644,9 +652,11 @@ pub fn date_label(raw: &str) -> String {
 }
 
 fn episodes_from_meta(meta: &Value) -> Vec<Episode> {
+    // An add-on may list one episode id twice, apart from each other: the first listing is kept.
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut episodes: Vec<Episode> = meta["videos"].as_array().into_iter().flatten().filter_map(|e| {
         let id = s(e, "id");
-        (!id.is_empty()).then(|| Episode {
+        (!id.is_empty() && seen_ids.insert(id.clone())).then(|| Episode {
             id, season: e["season"].as_i64().unwrap_or(1), number: e["episode"].as_i64().unwrap_or(0),
             title: Some(s(e, "title")).filter(|t| !t.is_empty()).unwrap_or_else(|| s(e, "name")),
             thumbnail: s(e, "thumbnail"),
@@ -655,11 +665,17 @@ fn episodes_from_meta(meta: &Value) -> Vec<Episode> {
         })
     }).collect();
     episodes.sort_by_key(|e| (if e.season == 0 { i64::MAX } else { e.season }, e.number));
-    episodes.dedup_by(|a, b| a.id == b.id);
     episodes
 }
 
-static TITLE_META_CACHE: OnceLock<Mutex<HashMap<String, TitleMeta>>> = OnceLock::new();
+/// Title details kept this long: a catalog's metadata (ratings, new episodes) moves on.
+const TITLE_META_TTL: Duration = Duration::from_secs(30 * 60);
+static TITLE_META_CACHE: OnceLock<Mutex<HashMap<String, (std::time::Instant, TitleMeta)>>> = OnceLock::new();
+
+/// Forget the title details kept so far (the BetterPosters choice changed what they merge).
+pub(super) fn clear_title_meta_cache() {
+    if let Some(Ok(mut c)) = TITLE_META_CACHE.get().map(|c| c.lock()) { c.clear(); }
+}
 static TITLE_PREFETCHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Start warming `title_artwork_fast` and `title_meta` the instant a finger touches a card
@@ -687,7 +703,8 @@ pub fn prefetch_title(media: &Media) {
 /// Synchronously read cached `TitleMeta` from this session so re-opening a title renders
 /// immediately on Frame 0 with zero loading flash.
 pub fn cached_title_meta(media: &Media) -> Option<TitleMeta> {
-    TITLE_META_CACHE.get()?.lock().ok()?.get(&media.key()).cloned()
+    let cache = TITLE_META_CACHE.get()?.lock().ok()?;
+    cache.get(&media.key()).filter(|(at, _)| at.elapsed() < TITLE_META_TTL).map(|(_, meta)| meta.clone())
 }
 
 pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
@@ -749,7 +766,7 @@ pub async fn title_meta(media: &Media) -> Result<TitleMeta> {
         alt_titles,
     };
     if let Ok(mut c) = TITLE_META_CACHE.get_or_init(Default::default).lock() {
-        cache_insert(&mut c, 200, media.key(), out.clone());
+        cache_insert(&mut c, 200, media.key(), (std::time::Instant::now(), out.clone()));
     }
     Ok(out)
 }
@@ -1003,21 +1020,26 @@ pub async fn search(query: String) -> Result<SearchOutcome> {
     Ok(out)
 }
 
-/// Whether a release names this title: its file name, or a line of its torrent name, starts with
-/// Parse runtime text ("112 min", "1h 52m", "173") into seconds.
+/// Parse runtime text ("112 min", "1h 52m", "1 hr 52 min", "1:52", "173") into seconds.
 pub fn parse_runtime_seconds(raw: &str) -> Option<f64> {
+    static_re!(clock_re, r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$");
+    static_re!(part_re, r"(\d+(?:[.,]\d+)?)\s*([a-z]*)");
     let t = raw.trim().to_ascii_lowercase();
     if t.is_empty() { return None; }
-    if let Some((h_part, rest)) = t.split_once('h') {
-        let hours: f64 = h_part.trim().parse().ok()?;
-        let mins: f64 = rest.chars().take_while(|c| c.is_ascii_digit() || c.is_whitespace()).collect::<String>().trim().parse().unwrap_or(0.0);
-        let secs = hours * 3600.0 + mins * 60.0;
-        return (60.0..=12.0 * 3600.0).contains(&secs).then_some(secs);
+    let in_range = |secs: f64| (60.0..=12.0 * 3600.0).contains(&secs).then_some(secs);
+    if let Some(c) = clock_re().captures(&t) {
+        let n = |i: usize| c.get(i).and_then(|m| m.as_str().parse::<f64>().ok()).unwrap_or(0.0);
+        return in_range(n(1) * 3600.0 + n(2) * 60.0 + n(3));
     }
-    let digits: String = t.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
-    let mins: f64 = digits.parse().ok()?;
-    let secs = mins * 60.0;
-    (60.0..=12.0 * 3600.0).contains(&secs).then_some(secs)
+    let (mut secs, mut unit_seen, mut bare): (f64, bool, Option<f64>) = (0.0, false, None);
+    for c in part_re().captures_iter(&t) {
+        let Ok(value) = c[1].replace(',', ".").parse::<f64>() else { continue };
+        let unit = &c[2];
+        if unit.starts_with('h') { secs += value * 3600.0; unit_seen = true; }
+        else if unit.starts_with("min") || unit == "m" { secs += value * 60.0; unit_seen = true; }
+        else if unit.is_empty() && bare.is_none() { bare = Some(value); }
+    }
+    if unit_seen { in_range(secs) } else { in_range(bare? * 60.0) }
 }
 
 /// Map an ISO 639-1/2 code or English language name ("ja", "jpn", "Japanese", "Italian") to a
@@ -1035,11 +1057,19 @@ pub fn language_key_of(raw: &str) -> Option<&'static str> {
 /// Secondary/alternate titles (`titles[1..]`) on movies with a known `year` require an explicit
 /// matching year (±1) right after the title so a working title or short alias (e.g. "Judy" for
 /// Digger 2026) can never match a year-less release of an older film (`Judy.BDRemux.1080p.pk.mkv`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn names_title_any(s: &Source, titles: &[String], year: Option<i32>) -> bool {
+    names_title_any_for(s, titles, year, false)
+}
+
+/// `names_title_any`, for a film (`series` false) or a series: a series' `year` is its first-air
+/// year, and a release naming an earlier year is another show ("Hannibal.2001" for Hannibal 2013);
+/// later years are just a season's. A series' alternate titles don't need a year in the release.
+pub(super) fn names_title_any_for(s: &Source, titles: &[String], year: Option<i32>, series: bool) -> bool {
     if titles.is_empty() { return true; }
     titles.iter().enumerate()
         .filter(|(_, t)| !t.trim().is_empty())
-        .any(|(idx, t)| names_title_inner(s, t, year, idx > 0 && year.is_some()))
+        .any(|(idx, t)| names_title_inner(s, t, year, idx > 0 && year.is_some() && !series, series))
 }
 
 /// Build an `AutoplayContext` synchronously from everything already cached in memory for `media`
@@ -1077,22 +1107,35 @@ pub fn autoplay_context_for_media(media: &Media, video_id: &str, pack_episodes: 
         .or_else(stream_language);
 
     let episode_code = parse_video_episode(video_id);
+    let episode_title = meta.as_ref()
+        .and_then(|m| m.episodes.iter().find(|e| e.id == video_id))
+        .map(|e| e.title.clone())
+        .filter(|t| !t.trim().is_empty());
 
     AutoplayContext {
         titles,
-        year: (media.kind == "movie").then(|| media.first_year()).flatten(),
+        // A film's year, a show's first-air year: both tell same-named titles apart.
+        year: media.first_year(),
         pack_episodes,
         expected_seconds,
         preferred_language,
         original_language,
         episode_code,
+        episode_title,
         strict_title: true,
     }
 }
 
 /// Extract `(season, episode)` from a Stremio series video id such as `"tt0903747:1:2"`.
+/// Anime catalogs (`kitsu:123:5`, `mal:123:5`) number episodes absolutely in a one-season series
+/// whose first part is the show's id: that is season 1, episode 5.
 pub fn parse_video_episode(video_id: &str) -> Option<(i64, i64)> {
     let parts: Vec<&str> = video_id.split(':').collect();
+    let anime = parts.first().is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "kitsu" | "mal" | "anilist" | "anidb"));
+    if anime {
+        let e: i64 = parts.get(2)?.parse().ok()?;
+        return (e > 0).then_some((1, e));
+    }
     if parts.len() >= 3 {
         let s: i64 = parts[parts.len() - 2].parse().ok()?;
         let e: i64 = parts[parts.len() - 1].parse().ok()?;
@@ -1109,10 +1152,10 @@ pub fn parse_video_episode(video_id: &str) -> Option<(i64, i64)> {
 /// "Kód 3 - Code 3 (2024)", "Код 3 / Code 3 (2025)".
 #[cfg(test)]
 pub fn names_title(s: &Source, title: &str, year: Option<i32>) -> bool {
-    names_title_inner(s, title, year, false)
+    names_title_inner(s, title, year, false, false)
 }
 
-fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: bool) -> bool {
+fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: bool, series: bool) -> bool {
     fn words(text: &str) -> Vec<String> {
         let mut t = text.trim();
         loop {
@@ -1126,7 +1169,10 @@ fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: b
         if w.first().is_some_and(|f| f == "the") { w.remove(0); }
         w
     }
-    fn line_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool) -> bool {
+    fn year_fits(want: i32, got: i32, series: bool) -> bool {
+        if series { got + 1 >= want } else { (want - got).abs() <= 1 }
+    }
+    fn line_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool, series: bool) -> bool {
         let w = words(line);
         if w.len() <= wanted.len() || w[..wanted.len()] != wanted[..] { return false; }
         // What follows the title must not make it another one ("The Dark Knight Rises"): a year
@@ -1134,19 +1180,19 @@ fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: b
         // add-on header line is rejected), a season or episode, or a release tag.
         let next = w[wanted.len()].as_str();
         match next.parse::<i32>().ok().filter(|y| (1900..2100).contains(y)) {
-            Some(got) => w.len() > wanted.len() + 1 && year.is_none_or(|want| (want - got).abs() <= 1),
+            Some(got) => w.len() > wanted.len() + 1 && year.is_none_or(|want| year_fits(want, got, series)),
             None => !require_year && release_word().is_match(next),
         }
     }
-    fn segment_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool) -> bool {
+    fn segment_matches(line: &str, wanted: &[String], year: Option<i32>, require_year: bool, series: bool) -> bool {
         std::iter::once(line)
             .chain([" - ", " / "].into_iter().filter_map(|sep| line.split_once(sep).map(|(_, rest)| rest)))
-            .any(|seg| line_matches(seg, wanted, year, require_year))
+            .any(|seg| line_matches(seg, wanted, year, require_year, series))
     }
     let wanted = words(title);
     if wanted.is_empty() { return true; }
     let file = s.filename.rsplit(['/', '\\']).next().unwrap_or("");
-    if !file.is_empty() && segment_matches(file, &wanted, year, require_year) {
+    if !file.is_empty() && segment_matches(file, &wanted, year, require_year, series) {
         return true;
     }
     // For a movie with an explicit filename, never let a description header rescue a file that
@@ -1157,10 +1203,12 @@ fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: b
     if !file.is_empty() {
         let fw = words(file);
         if let Some(want) = year {
+            // Years before the first season/episode tag only: an episode's own title may be a year.
             let file_years: Vec<i32> = fw.iter().skip(1)
+                .take_while(|t| !is_episode_word(t))
                 .filter_map(|t| t.parse::<i32>().ok().filter(|y| (1900..2100).contains(y)))
                 .collect();
-            if !file_years.is_empty() && !file_years.iter().any(|&y| (want - y).abs() <= 1) {
+            if !file_years.is_empty() && !file_years.iter().any(|&y| year_fits(want, y, series)) {
                 return false;
             }
             // Detect a named movie file (non-generic leading word followed by a year or release tag).
@@ -1178,12 +1226,16 @@ fn names_title_inner(s: &Source, title: &str, year: Option<i32>, require_year: b
         }
     }
     s.description.lines().any(|line| {
-        if !segment_matches(line, &wanted, year, require_year) { return false; }
+        if !segment_matches(line, &wanted, year, require_year, series) { return false; }
         match &file_title_lead {
             Some(lead) => words(line).iter().any(|w| w == lead),
             None => true,
         }
     })
+}
+fn is_episode_word(word: &str) -> bool {
+    static_re!(episode_word, r"^(?:s\d{1,2}(?:e\d{1,3})?|e\d{1,3}|\d{1,2}x\d{2,3})$");
+    episode_word().is_match(word)
 }
 static_re!(release_word, r"^(?:s\d{1,2}(?:e\d{1,3})?|e\d{1,3}|\d{1,2}x\d{2,3}|season|series|complete|\d{3,4}p|4k|8k|uhd|fhd|hd|sdr|hdr\d*|hdr10plus|dv|dovi|bluray|blu|bdrip|brrip|bdremux|remux|web|webdl|webrip|dl|hdtv|imax|extended|unrated|uncut|remastered|theatrical|directors|criterion|proper|repack|hybrid|multi|dual|x264|x265|h264|h265|hevc|avc|av1|10bit|ita|eng|fre|french|ger|german|spa|spanish|latino|rus|jpn|kor|us|uk)$");
 
@@ -1321,6 +1373,9 @@ async fn finished_title(m: &Media) -> bool {
 pub async fn accent(url: String) -> Option<String> {
     if url.is_empty() { return None; }
     if let Some(hit) = backend().accents.lock().ok()?.get(&url).cloned() { return hit; }
+    // Artwork URLs come from add-ons and metadata services: only a public https address is fetched
+    // (never a loopback, private-network or link-local host an add-on could aim this at).
+    if !is_public_https_url(&url) { return None; }
     let key = url.clone();
     // 48×48 pixels are all that is read: TMDB's small size is a tenth of the download.
     let url = small_tmdb_image(&url).unwrap_or(url);
@@ -1336,23 +1391,56 @@ pub async fn accent(url: String) -> Option<String> {
             bytes.extend_from_slice(&chunk);
         }
         // Offload CPU-intensive image decoding & thumbnailing off the Tokio async I/O workers.
+        // An image that can't be decoded is a final answer (no accent), not a reason to download
+        // and fail again on every screen; only a task that died (a panic) is retried.
         tokio::task::spawn_blocking(move || {
-            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
-            let mut limits = image::Limits::default();
-            limits.max_alloc = Some(256 * 1024 * 1024);
-            limits.max_image_width = Some(12_000);
-            limits.max_image_height = Some(12_000);
-            reader.limits(limits);
-            let img = reader.decode().ok()?.thumbnail(48, 48).to_rgba8();
+            let decoded = (|| {
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(256 * 1024 * 1024);
+                limits.max_image_width = Some(12_000);
+                limits.max_image_height = Some(12_000);
+                reader.limits(limits);
+                reader.decode().ok()
+            })();
+            let decoded = decoded?;
+            let img = decoded.thumbnail(48, 48).to_rgba8();
             let pixels: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
             Some(artwork_accent(&pixels).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}")))
-        }).await.ok().flatten().ok_or(())
+        }).await.map_err(|_| ()).map(|decoded| decoded.unwrap_or(None))
     }).await.ok().unwrap_or(Err(()));
     if let Ok(val) = computed {
         if let Ok(mut cache) = backend().accents.lock() { cache_insert(&mut cache, 2000, key, val.clone()); }
         val
     } else {
         None
+    }
+}
+
+/// Whether `raw` is an https URL to a public host: not a loopback, private, link-local or
+/// carrier-grade-NAT address, not "localhost" or an internal single-label / `.local` name.
+pub(super) fn is_public_https_url(raw: &str) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    fn public_v4(ip: Ipv4Addr) -> bool {
+        let o = ip.octets();
+        !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
+            || ip.is_multicast() || ip.is_documentation() || o[0] == 0 || (o[0] == 100 && (64..128).contains(&o[1])))
+    }
+    fn public_v6(ip: Ipv6Addr) -> bool {
+        if let Some(v4) = ip.to_ipv4_mapped() { return public_v4(v4); }
+        let first = ip.segments()[0];
+        !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80)
+    }
+    let Ok(u) = url::Url::parse(raw) else { return false };
+    if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() { return false; }
+    match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d.contains('.') && d != "localhost" && !["localhost", "local", "internal", "lan", "home", "localdomain"].iter().any(|s| d.ends_with(&format!(".{s}")))
+        }
+        Some(url::Host::Ipv4(ip)) => public_v4(ip),
+        Some(url::Host::Ipv6(ip)) => public_v6(ip),
+        None => false,
     }
 }
 
@@ -1395,6 +1483,45 @@ fn luminance(r: f64, g: f64, b: f64) -> f64 {
 
 #[cfg(test)]
 mod review_tests {
+    #[test]
+    fn artwork_fetches_only_public_https_hosts() {
+        use super::is_public_https_url as ok;
+        assert!(ok("https://image.tmdb.org/t/p/w300/a.jpg"));
+        assert!(ok("https://8.8.8.8/a.jpg"));
+        assert!(!ok("http://image.tmdb.org/a.jpg"));
+        assert!(!ok("https://localhost/a.jpg"));
+        assert!(!ok("https://127.0.0.1/a.jpg"));
+        assert!(!ok("https://192.168.1.5/a.jpg"));
+        assert!(!ok("https://10.0.0.1/a.jpg"));
+        assert!(!ok("https://169.254.169.254/latest"));
+        assert!(!ok("https://100.64.0.1/a.jpg"));
+        assert!(!ok("https://[::1]/a.jpg"));
+        assert!(!ok("https://[fd00::1]/a.jpg"));
+        assert!(!ok("https://[::ffff:10.0.0.1]/a.jpg"));
+        assert!(!ok("https://nas/a.jpg"));
+        assert!(!ok("https://printer.local/a.jpg"));
+        assert!(!ok("https://user:pw@image.tmdb.org/a.jpg"));
+        assert!(!ok("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn imdb_ids_in_urls_are_always_well_formed() {
+        use super::*;
+        let mk = |id: &str, raw_imdb: Option<&str>| {
+            let mut v = json!({"id": id, "type": "movie", "name": "X"});
+            if let Some(r) = raw_imdb { v["imdb_id"] = json!(r); }
+            Media::from_json(&v, CINEMETA).unwrap()
+        };
+        assert_eq!(imdb_of(&mk("tt0133093", None)).as_deref(), Some("tt0133093"));
+        assert_eq!(imdb_of(&mk("tt0133093:1:2", None)).as_deref(), Some("tt0133093"));
+        assert_eq!(imdb_of(&mk("tt1/../admin", None)), None);
+        assert_eq!(imdb_of(&mk("tt1?key=abc", None)), None);
+        assert_eq!(imdb_of(&mk("tt", None)), None);
+        assert_eq!(imdb_of(&mk("kitsu:5", Some("tt0944947"))).as_deref(), Some("tt0944947"));
+        assert_eq!(imdb_of(&mk("kitsu:5", Some("tt9#x"))), None);
+        assert!(posters(&mk("tt1&x=y", None)).iter().all(|u| !u.contains("tt1&x=y")));
+    }
+
     #[test]
     fn accents_read_tmdb_images_small() {
         assert_eq!(super::small_tmdb_image("https://image.tmdb.org/t/p/w1280/abc.jpg").as_deref(), Some("https://image.tmdb.org/t/p/w300/abc.jpg"));

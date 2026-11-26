@@ -32,9 +32,8 @@
 .watched-switch { gap: 10px; color: var(--dust); }
 .watched-switch.on { color: var(--bone); box-shadow: inset 0 1px 0 var(--sheen), inset 0 0 0 1.5px var(--bone); }
 .episodes-block > .watched-switch { align-self: flex-start; margin: 4px 0 10px; }
-.ep-seen { color: var(--faint, rgba(255,255,255,.35)); }
+.ep-seen { color: rgba(255,255,255,.45); }
 .ep-seen.on { color: #000; }
-.ep-seen.on .icon { background: var(--bone); border-radius: 50%; padding: 3px; box-sizing: content-box; }
 
 /* Press: the control sinks and brightens, then springs back on release. Large surfaces only
    give a little; keyboard focus keeps its visible ring. */

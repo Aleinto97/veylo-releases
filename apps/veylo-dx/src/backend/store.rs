@@ -18,7 +18,7 @@ pub struct Settings {
     pub hdr_output: bool,
     /// Subtitle font scale (0.6..=2.0, default 1.05).
     pub sub_scale: f64,
-    /// Subtitle vertical position from top in percent (75..=100, default 100).
+    /// Subtitle vertical position from top in percent (70..=100, default 100).
     pub sub_pos: i32,
     /// Draw a subtle dark pill behind subtitles for legibility over bright scenes.
     pub sub_bg: bool,
@@ -202,7 +202,9 @@ pub(crate) fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::i
     }
 }
 
-fn save_settings_unlocked(settings: &Settings) {
+/// Write settings.json first; the in-memory cache and live switches change only once the file is
+/// safely on disk (a failed write leaves the running state matching what is saved).
+fn save_settings_unlocked(settings: &Settings) -> std::io::Result<()> {
     let data = json!({
         "better_posters": settings.better_posters,
         "picks_hide_watched": settings.picks_hide_watched,
@@ -220,23 +222,37 @@ fn save_settings_unlocked(settings: &Settings) {
         "telemetry_enabled": settings.telemetry_enabled,
         "prefetch_sources": settings.prefetch_sources,
     }).to_string();
-    let _ = write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes());
-    if let Ok(mut g) = SETTINGS_CACHE.lock() { *g = Some(settings.clone()); }
+    write_private_file(&backend().data_dir.join("settings.json"), data.as_bytes())?;
+    let previous = SETTINGS_CACHE.lock().ok().and_then(|mut g| g.replace(settings.clone()));
     BETTER_POSTERS.store(settings.better_posters, std::sync::atomic::Ordering::Relaxed);
     HDR_OUTPUT.store(settings.hdr_output, std::sync::atomic::Ordering::Relaxed);
     set_telemetry_enabled(settings.telemetry_enabled);
     set_prefetch_sources_enabled(settings.prefetch_sources);
     set_max_bitrate_mbps(settings.max_bitrate_mbps);
     set_stream_language(settings.stream_language.clone());
-    // Language or add-on preferences changed: forget cached source lists.
-    forget_sources();
+    // Only a change to what shapes source lists (language, bitrate cap, add-ons' prefetch, keys)
+    // drops the cached lists; a subtitle colour or a poster toggle keeps them.
+    let sources_changed = previous.as_ref().is_none_or(|p| sources_settings_changed(p, settings));
+    if sources_changed { forget_sources(); }
+    if previous.as_ref().is_some_and(|p| p.better_posters != settings.better_posters) {
+        // Cached title metadata carries the poster choice.
+        clear_title_meta_cache();
+    }
     sync_soon();
+    Ok(())
+}
+
+/// Whether a settings change can alter which sources autoplay would pick.
+fn sources_settings_changed(before: &Settings, after: &Settings) -> bool {
+    before.stream_language != after.stream_language
+        || before.max_bitrate_mbps != after.max_bitrate_mbps
+        || before.prefetch_sources != after.prefetch_sources
 }
 
 #[cfg_attr(target_os = "android", allow(dead_code))]
-pub fn save_settings(settings: &Settings) {
+pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     let _guard = SETTINGS_LOCK.lock();
-    save_settings_unlocked(settings);
+    save_settings_unlocked(settings)
 }
 
 // ---------------------------------------------------------------- per-title track preferences
@@ -286,6 +302,16 @@ pub fn load_track_pref(media_key: &str) -> Option<TrackPref> {
     ensure_track_prefs_loaded();
     let guard = TRACK_PREFS.lock().ok()?;
     guard.as_ref()?.get(media_key).cloned()
+}
+
+/// The remembered tracks for a title by its type and id, whichever add-on it was opened from
+/// (a key is "type|id|add-on"): for lookups that know the video but not the add-on.
+pub(super) fn load_track_pref_for_title(kind: &str, id: &str) -> Option<TrackPref> {
+    if id.is_empty() { return None; }
+    ensure_track_prefs_loaded();
+    let guard = TRACK_PREFS.lock().ok()?;
+    let prefix = format!("{kind}|{id}|");
+    guard.as_ref()?.iter().find(|(k, _)| k.starts_with(&prefix)).map(|(_, p)| p.clone())
 }
 
 pub fn save_track_pref(media_key: &str, update: impl FnOnce(&mut TrackPref)) {
@@ -340,19 +366,25 @@ pub(super) fn merge_track_prefs_value(v: &Value) {
 
 static DIAG_RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
 
-/// Strip URLs, API keys, tokens, emails, JWTs, recovery keys, and user home paths from diagnostic
-/// lines so logs are always safe to share.
+/// Strip URLs, API keys, tokens, cookies, signatures, emails, JWTs, recovery keys, and user home
+/// paths from diagnostic lines so logs are always safe to share.
 pub fn redact_diagnostic(line: &str) -> String {
-    static_re!(url_re, r"(?:https?|stremio|veylo|wss?|ftp)://[^\s\x22'<>]+");
+    static_re!(url_re, r"(?i)(?:https?|stremio|veylo|wss?|ftp)://[^\s\x22<>]+");
     static_re!(magnet_re, r"(?i)\bmagnet:\?[^\s\x22'<>]+");
     static_re!(jwt_re, r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b");
     static_re!(recovery_re, r"\bVEYLO-[A-Za-z0-9_-]{16,}\b");
     static_re!(email_re, r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b");
     static_re!(home_unix_re, r"/(?:home|Users)/[^/\s\x22'<>]+");
     static_re!(home_win_re, r"(?i)[A-Z]:[/\\]Users[/\\][^/\\\s\x22'<>]+");
+    // `Cookie: a=b; c=d` / `"set-cookie": "..."`: the whole value, to the end of the line or quote.
+    static_re!(cookie_re, r"(?i)[\x22']?\b(set-cookie|cookie)[\x22']?\s*[:=]\s*[\x22']?[^\r\n\x22']+");
+    // Debug-printed header tuples: ("x-api-key", "value") and ("authorization", Sensitive).
+    static_re!(tuple_re, r"(?i)\(\s*[\x22'](authorization|proxy-authorization|cookie|set-cookie|x-api-key|api[_-]?key|x-auth-token|x-token|token)[\x22']\s*,\s*(?:[\x22'][^\x22']*[\x22']|[A-Za-z_]+)");
     static_re!(auth_hdr_re, r"(?i)[\x22']?\b(authorization)[\x22']?\s*[:=]\s*[\x22']?(?:bearer|basic|token|digest)\s+[^\s&,\x22'\}]+");
     static_re!(bearer_re, r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}");
-    static_re!(secret_re, r"(?i)[\x22']?(api[_-]?key|token|secret|password|authorization|bearer|refresh[_-]?token|refresh|sync_key|rd_key|tmdb_key|realdebrid)[\x22']?\s*[:=]\s*[\x22']?[^\s&,\x22'\}]+");
+    static_re!(secret_re, r"(?i)[\x22']?(x[_-]api[_-]key|api[_-]?key|token|secret|password|authorization|bearer|refresh[_-]?token|refresh|sync_key|rd_key|tmdb_key|realdebrid|signature|sig|apikey)[\x22']?\s*[:=]\s*[\x22']?[^\s&,\x22'\}]+");
+    static_re!(hex_re, r"\b[0-9a-fA-F]{32,}\b");
+    static_re!(b64_re, r"[A-Za-z0-9+/_-]{40,}={0,2}");
     let step = url_re().replace_all(line, "[URL]");
     let step = magnet_re().replace_all(&step, "[URL]");
     let step = jwt_re().replace_all(&step, "[JWT]");
@@ -360,9 +392,19 @@ pub fn redact_diagnostic(line: &str) -> String {
     let step = email_re().replace_all(&step, "[EMAIL]");
     let step = home_unix_re().replace_all(&step, "[HOME]");
     let step = home_win_re().replace_all(&step, "[HOME]");
+    let step = cookie_re().replace_all(&step, "$1=[REDACTED]");
+    let step = tuple_re().replace_all(&step, "(\"$1\", \"[REDACTED]\"");
     let step = auth_hdr_re().replace_all(&step, "$1=[REDACTED]");
     let step = bearer_re().replace_all(&step, "$1 [REDACTED]");
-    secret_re().replace_all(&step, "$1=[REDACTED]").into_owned()
+    let step = secret_re().replace_all(&step, "$1=[REDACTED]");
+    let step = hex_re().replace_all(&step, "[HEX]");
+    // Long base64-ish runs are tokens, unless they look like a path or a plain identifier: a token
+    // mixes upper case, lower case and digits.
+    b64_re().replace_all(&step, |c: &regex::Captures| {
+        let run = &c[0];
+        let mixed = run.bytes().any(|b| b.is_ascii_uppercase()) && run.bytes().any(|b| b.is_ascii_lowercase()) && run.bytes().any(|b| b.is_ascii_digit());
+        if mixed && run.matches('/').count() < 3 { "[TOKEN]".to_owned() } else { run.to_owned() }
+    }).into_owned()
 }
 
 pub fn record_diag_line(message: &str) {
@@ -397,12 +439,20 @@ pub fn diagnostic_report() -> String {
     }
     if lines.is_empty() { out.push_str("(no recent events)\n"); }
     else { for l in lines { out.push_str(&l); out.push('\n'); } }
-    if let Ok(panic_text) = std::fs::read_to_string(backend().data_dir.join("last-panic.txt")) {
-        let snippet: String = panic_text.lines().take(25).map(redact_diagnostic).collect::<Vec<_>>().join("\n");
-        if !snippet.trim().is_empty() {
-            out.push_str("--- Last panic ---\n");
-            out.push_str(&snippet);
-            out.push('\n');
+    // A panic from a long-gone session (or one already reported) isn't news: only a recent one is
+    // attached, with its age, so a report never blames today's behaviour on an old crash.
+    let panic_path = backend().data_dir.join("last-panic.txt");
+    let panic_age = std::fs::metadata(&panic_path).and_then(|m| m.modified()).ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+    if let (Some(age), Ok(panic_text)) = (panic_age, std::fs::read_to_string(&panic_path)) {
+        if age <= Duration::from_secs(7 * 24 * 3600) {
+            let snippet: String = panic_text.lines().take(25).map(redact_diagnostic).collect::<Vec<_>>().join("\n");
+            if !snippet.trim().is_empty() {
+                let hours = age.as_secs() / 3600;
+                out.push_str(&format!("--- Last panic ({}) ---\n", if hours < 48 { format!("{hours} h ago") } else { format!("{} days ago", hours / 24) }));
+                out.push_str(&snippet);
+                out.push('\n');
+            }
         }
     }
     out
@@ -531,18 +581,33 @@ pub async fn import_watch_history(raw: &str) -> Result<usize> {
 }
 
 /// Change one or more settings: read, changed, saved and applied; returns what was saved.
+/// When the file can't be written nothing changes and the unchanged settings come back.
 pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Settings {
+    match try_update_settings(change) {
+        Ok(saved) => saved,
+        Err((unchanged, error)) => {
+            record_diag_line(&format!("settings not saved: {error}"));
+            unchanged
+        }
+    }
+}
+
+/// Like `update_settings`, but says whether the file was written (the error carries the settings in force).
+pub fn try_update_settings(change: impl FnOnce(&mut Settings)) -> std::result::Result<Settings, (Settings, std::io::Error)> {
     let _guard = SETTINGS_LOCK.lock();
-    let mut settings = if let Ok(g) = SETTINGS_CACHE.lock() {
+    let current = if let Ok(g) = SETTINGS_CACHE.lock() {
         g.clone()
     } else { None }.unwrap_or_else(|| {
         let v: Value = std::fs::read_to_string(backend().data_dir.join("settings.json")).ok()
             .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         parse_settings(&v)
     });
+    let mut settings = current.clone();
     change(&mut settings);
-    save_settings_unlocked(&settings);
-    settings
+    match save_settings_unlocked(&settings) {
+        Ok(()) => Ok(settings),
+        Err(e) => Err((current, e)),
+    }
 }
 
 // ---------------------------------------------------------------- picks duel
@@ -792,9 +857,13 @@ mod tests {
         assert_eq!(read_track_prefs_from(&path), map);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let clean = redact_diagnostic(r#"fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc {"rd_key": "QUOTED_RD", "refresh_token": "QUOTED_REF"} VEYLO-ABCDEFGHIJKLMNOPQRSTUVWX Authorization: Bearer jwt_secret_999 Bearer other_tok_777 Basic dXNlcjpwYXNz magnet:?xt=urn:btih:DEADBEEF user=alice@example.com /home/alice/file.txt C:\Users\Alice\file.txt C:/Users/Bob/file.txt"#);
-        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("QUOTED_RD") && !clean.contains("QUOTED_REF") && !clean.contains("ABCDEFGHIJKLMNOPQRSTUVWX") && !clean.contains("jwt_secret_999") && !clean.contains("other_tok_777") && !clean.contains("dXNlcjpwYXNz") && !clean.contains("DEADBEEF") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice") && !clean.contains("Users/Bob"), "{clean}");
+        let clean = redact_diagnostic(r#"fetch https://addon.example/key=SECRET/manifest.json HTTPS://addon.example/it's/UPPER_SECRET api_key=12345 token=abc {"rd_key": "QUOTED_RD", "refresh_token": "QUOTED_REF"} VEYLO-ABCDEFGHIJKLMNOPQRSTUVWX Authorization: Bearer jwt_secret_999 Bearer other_tok_777 Basic dXNlcjpwYXNz magnet:?xt=urn:btih:DEADBEEF user=alice@example.com /home/alice/file.txt C:\Users\Alice\file.txt C:/Users/Bob/file.txt"#);
+        assert!(!clean.contains("SECRET") && !clean.contains("UPPER_SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("QUOTED_RD") && !clean.contains("QUOTED_REF") && !clean.contains("ABCDEFGHIJKLMNOPQRSTUVWX") && !clean.contains("jwt_secret_999") && !clean.contains("other_tok_777") && !clean.contains("dXNlcjpwYXNz") && !clean.contains("DEADBEEF") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice") && !clean.contains("Users/Bob"), "{clean}");
         assert!(clean.contains("[URL]") && clean.contains("[KEY]") && clean.contains("[REDACTED]") && clean.contains("[EMAIL]") && clean.contains("[HOME]"), "{clean}");
+        let more = redact_diagnostic(r#"Cookie: sid=COOKIEVAL; other=2 headers {"x-api-key": "XKEYVAL"} ("x-api-key", "TUPLEVAL") ("authorization", Sensitive) sig=SIGVAL signature: SIGNATUREVAL id d41d8cd98f00b204e9800998ecf8427e blob QUJDREVGR0hJSktMTW5vcHFyc3R1dnd4eXowMTIzNDU2Nzg5QUJD ok"#);
+        for secret in ["COOKIEVAL", "XKEYVAL", "TUPLEVAL", "SIGVAL", "SIGNATUREVAL", "d41d8cd98f00b204e9800998ecf8427e", "QUJDREVGR0hJSktM"] {
+            assert!(!more.contains(secret), "{secret} leaked: {more}");
+        }
         assert!(!Settings::default().telemetry_enabled, "telemetry must be opt-in by default");
         assert!(!Settings::default().prefetch_sources, "browsing prefetch must be opt-in by default");
     }

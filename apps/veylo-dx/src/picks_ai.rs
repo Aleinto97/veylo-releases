@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ort::{session::Session, value::Tensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, VecDeque}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock, RwLock}, time::Duration};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, OnceLock, RwLock}, time::Duration};
 use tokenizers::Tokenizer;
 
 // Changing the model, input construction or normalization requires a new version.
@@ -18,27 +18,64 @@ pub const DIM: usize = 384;
 const MAX_TOKENS: usize = 256;
 const HEAD_TOKENS: usize = 32;
 const KEYWORD_TOKENS: usize = 64;
-const MAX_ENTRIES: usize = 1024;
+const MAX_ENTRIES: usize = 4096;
+/// Typed queries kept beside the pinned mood anchors.
+const MAX_QUERIES: usize = 256;
 const SAVE_EVERY: Duration = Duration::from_secs(10);
 const CACHE_FILE: &str = "picks-embeddings-v1.json";
 
-/// Bounded first-in-first-out store; `order` is persisted so eviction survives restarts.
+/// What the embedding store may hold. Titles are the bulk and are evicted by recency of use;
+/// queries (mood anchors and what was typed) live in a map of their own, so a long run of
+/// titles can never push a mood anchor out.
+struct Stored { vector: Vec<f32>, used: AtomicU64 }
+/// Logical clock for recency: higher is more recently stored or looked up.
+static CLOCK: AtomicU64 = AtomicU64::new(1);
+fn tick() -> u64 { CLOCK.fetch_add(1, Ordering::Relaxed) }
+
 #[derive(Default)]
-struct Cache { map: BTreeMap<String, Vec<f32>>, order: VecDeque<String> }
+struct Cache { map: BTreeMap<String, Stored>, queries: BTreeMap<String, Stored> }
 impl Cache {
-    fn get(&self, key: &str) -> Option<&Vec<f32>> { self.map.get(key) }
-    fn contains_key(&self, key: &str) -> bool { self.map.contains_key(key) }
+    fn is_query(key: &str) -> bool { key.contains("-q-") }
+    fn get(&self, key: &str) -> Option<&Vec<f32>> {
+        let found = if Self::is_query(key) { self.queries.get(key) } else { self.map.get(key) };
+        // A lookup counts as use: what Picks keeps asking about is what stays.
+        found.map(|s| { s.used.store(tick(), Ordering::Relaxed); &s.vector })
+    }
+    fn contains_key(&self, key: &str) -> bool { if Self::is_query(key) { self.queries.contains_key(key) } else { self.map.contains_key(key) } }
     fn insert(&mut self, key: String, vector: Vec<f32>) {
-        if self.map.insert(key.clone(), vector).is_none() { self.order.push_back(key); }
-        while self.map.len() > MAX_ENTRIES {
-            let Some(oldest) = self.order.pop_front() else { break };
-            self.map.remove(&oldest);
+        let stored = Stored { vector, used: AtomicU64::new(tick()) };
+        if Self::is_query(&key) {
+            self.queries.insert(key, stored);
+            while self.queries.len() > MAX_QUERIES {
+                // The mood words stay pinned; only other queries make way for new ones.
+                let oldest = self.queries.iter().filter(|(k, _)| !pinned(k)).min_by_key(|(_, s)| s.used.load(Ordering::Relaxed)).map(|(k, _)| k.clone());
+                let Some(oldest) = oldest else { break };
+                self.queries.remove(&oldest);
+            }
+        } else {
+            self.map.insert(key, stored);
+            while self.map.len() > MAX_ENTRIES {
+                let Some(oldest) = self.map.iter().min_by_key(|(_, s)| s.used.load(Ordering::Relaxed)).map(|(k, _)| k.clone()) else { break };
+                self.map.remove(&oldest);
+            }
         }
     }
-    fn encode(&self) -> Value {
-        let entries: BTreeMap<&String, String> = self.map.iter().map(|(k, v)| (k, pack(v))).collect();
-        json!({"version": MODEL_VERSION, "entries": entries, "order": self.order})
+    /// Keys of a store, least recently used first.
+    fn order(map: &BTreeMap<String, Stored>) -> Vec<&String> {
+        let mut keys: Vec<(&String, u64)> = map.iter().map(|(k, s)| (k, s.used.load(Ordering::Relaxed))).collect();
+        keys.sort_by_key(|(_, used)| *used);
+        keys.into_iter().map(|(k, _)| k).collect()
     }
+    fn encode(&self) -> Value {
+        let packed = |map: &BTreeMap<String, Stored>| -> BTreeMap<String, String> { map.iter().map(|(k, s)| (k.clone(), pack(&s.vector))).collect() };
+        json!({"version": MODEL_VERSION, "entries": packed(&self.map), "order": Self::order(&self.map),
+            "queries": packed(&self.queries), "query_order": Self::order(&self.queries)})
+    }
+}
+/// The mood words are pinned: the brain's anchors must survive any amount of titles and typed queries.
+fn pinned(key: &str) -> bool {
+    static MOODS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    MOODS.get_or_init(|| crate::brain::MOODS.iter().map(|(_, phrase)| query_key(phrase)).collect()).contains(key)
 }
 /// Unit vectors have components in [-1, 1]; 16 bits keep cosine error far below ranking noise.
 pub(crate) fn pack(vector: &[f32]) -> String {
@@ -69,7 +106,12 @@ fn ensure_cache() {
         #[cfg(not(test))]
         {
             let loaded = read_cache(&backend::backend_data_dir().join(CACHE_FILE));
-            if let Ok(mut c) = cache().write() { for key in loaded.order.iter() { if let Some(v) = loaded.map.get(key) { if !c.contains_key(key) { c.insert(key.clone(), v.clone()); } } } }
+            // Oldest first, so the saved recency carries over.
+            if let Ok(mut c) = cache().write() {
+                for store in [&loaded.map, &loaded.queries] {
+                    for key in Cache::order(store) { if let Some(s) = store.get(key) { if !c.contains_key(key) { c.insert(key.clone(), s.vector.clone()); } } }
+                }
+            }
         }
     });
 }
@@ -87,7 +129,7 @@ pub fn query_embedding(text: &str) -> Option<Vec<f32>> {
 /// Every title embedding kept, for fitting the brain's projection (queries left out).
 pub fn all_embeddings() -> Vec<Vec<f32>> {
     ensure_cache();
-    cache().read().map(|c| c.map.iter().filter(|(k, _)| !k.contains("-q-")).map(|(_, v)| v.clone()).collect()).unwrap_or_default()
+    cache().read().map(|c| c.map.values().map(|s| s.vector.clone()).collect()).unwrap_or_default()
 }
 
 /// The text a title is embedded from. No genres: they are separate taste features, and leaving
@@ -297,12 +339,17 @@ fn register_shutdown() {
 fn read_cache(path: &Path) -> Cache {
     let value: Value = std::fs::read_to_string(path).ok().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     if value["version"] != MODEL_VERSION { return Cache::default(); }
-    let mut entries: BTreeMap<String, Vec<f32>> = value["entries"].as_object().into_iter().flatten()
-        .filter_map(|(key, value)| Some((key.clone(), unpack(value.as_str()?)?))).collect();
+    let vectors = |field: &str| -> BTreeMap<String, Vec<f32>> { value[field].as_object().into_iter().flatten()
+        .filter_map(|(key, value)| Some((key.clone(), unpack(value.as_str()?)?))).collect() };
+    let mut entries = vectors("entries");
+    // Earlier files kept queries among the titles: they move to their own map.
+    entries.extend(vectors("queries"));
     let mut cache = Cache::default();
-    // Saved insertion order first (oldest first); entries without it follow in key order.
-    for key in value["order"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if let Some(vector) = entries.remove(key) { cache.insert(key.to_owned(), vector); }
+    // Saved recency first (least recent first); entries without it follow in key order.
+    for field in ["order", "query_order"] {
+        for key in value[field].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if let Some(vector) = entries.remove(key) { cache.insert(key.to_owned(), vector); }
+        }
     }
     for (key, vector) in entries { cache.insert(key, vector); }
     cache
@@ -453,6 +500,43 @@ mod tests {
         assert_eq!(loaded.map.len(), MAX_ENTRIES);
         loaded.insert("new".into(), vector);
         assert!(!loaded.contains_key("k00001") && loaded.contains_key("k00002"));
+    }
+    #[test]
+    fn mood_anchors_stay_pinned_while_titles_and_typed_queries_come_and_go() {
+        let vector = unit(&vec![1.0; DIM]).unwrap();
+        let mood = query_key(crate::brain::MOODS[0].1);
+        let typed = |i: usize| format!("{MODEL_VERSION}-q-typed{i:05}");
+        let mut cache = Cache::default();
+        cache.insert(mood.clone(), vector.clone());
+        for i in 0..MAX_ENTRIES + 50 { cache.insert(format!("k{i:05}"), vector.clone()); }
+        assert!(cache.contains_key(&mood), "a flood of titles must not evict a mood anchor");
+        assert_eq!(cache.map.len(), MAX_ENTRIES);
+        // Typed queries have their own bound, and never push the mood out either.
+        for i in 0..MAX_QUERIES + 20 { cache.insert(typed(i), vector.clone()); }
+        assert!(cache.contains_key(&mood) && cache.queries.len() == MAX_QUERIES);
+        assert!(!cache.contains_key(&typed(0)) && cache.contains_key(&typed(MAX_QUERIES + 19)));
+        // The anchors come back from the file with the titles.
+        let path = std::env::temp_dir().join(format!("veylo-embeddings-pinned-{}.json", std::process::id()));
+        std::fs::write(&path, cache.encode().to_string()).unwrap();
+        let loaded = read_cache(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(loaded.contains_key(&mood) && loaded.map.len() == MAX_ENTRIES && loaded.queries.len() == MAX_QUERIES);
+    }
+    #[test]
+    fn titles_looked_up_recently_outlive_older_ones() {
+        let mut cache = Cache::default();
+        let vector = unit(&vec![1.0; DIM]).unwrap();
+        for i in 0..MAX_ENTRIES { cache.insert(format!("k{i:05}"), vector.clone()); }
+        assert!(cache.get("k00000").is_some(), "a lookup counts as use");
+        cache.insert("fresh".into(), vector.clone());
+        assert!(cache.contains_key("k00000") && !cache.contains_key("k00001") && cache.contains_key("fresh"));
+        // The recency survives a save and load.
+        let path = std::env::temp_dir().join(format!("veylo-embeddings-lru-{}.json", std::process::id()));
+        std::fs::write(&path, cache.encode().to_string()).unwrap();
+        let mut loaded = read_cache(&path);
+        std::fs::remove_file(path).unwrap();
+        loaded.insert("another".into(), vector);
+        assert!(loaded.contains_key("k00000") && !loaded.contains_key("k00002"));
     }
     #[test]
     fn cache_key_depends_on_model_and_input() {

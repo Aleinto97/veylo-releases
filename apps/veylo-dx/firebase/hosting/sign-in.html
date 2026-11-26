@@ -28,7 +28,7 @@
   function start() {
     if (window.top !== window.self) { say('Open this page directly from Veylo, not inside another page.'); return; }
     const portNum = /^[1-9]\d{3,4}$/.test(port || '') ? Number(port) : 0;
-    if (portNum < 1024 || portNum > 65535 || !/^[\w-]{8,64}$/.test(state || '')) { say('Open this page from Veylo: Settings → Account → Continue with Google.'); return; }
+    if (portNum < 1024 || portNum > 65535 || !/^[\w-]{8,64}$/.test(state || '')) { say('Open this page from Veylo: Settings → Account & Sync → Google.'); return; }
     google.accounts.id.initialize({
       client_id: '__WEB_CLIENT_ID__',
       auto_select: false,

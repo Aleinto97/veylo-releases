@@ -1016,9 +1016,28 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
     let season_name = match season() { Some(0) => "Extras".to_string(), Some(n) => format!("Season {n}"), None => String::new() };
     // Where you are in this season: the episode you stopped in, else the one after the last you
     // watched, else the first you haven't seen.
-    let next_index = { let s = seen.read(); let at = last.as_ref().and_then(|l| shown.iter().position(|e| &e.id == l));
-        match at { Some(i) if !s.contains(&shown[i].id) => Some(i), Some(i) if i + 1 < shown.len() => Some(i + 1), _ => shown.iter().position(|e| !s.contains(&e.id)) } };
-    let next_id = next_index.map(|i| shown[i].id.clone());
+    // Only the series' true next episode is marked "Up next": the same one Play resumes, not the first
+    // unseen episode of whichever season is open.
+    let global_next = up_next(&list, &media, &seen.read());
+    let next_in_season = global_next.as_ref().and_then(|id| shown.iter().position(|e| &e.id == id));
+    let next_index = next_in_season.or_else(|| { let s = seen.read(); let at = last.as_ref().and_then(|l| shown.iter().position(|e| &e.id == l));
+        match at { Some(i) if !s.contains(&shown[i].id) => Some(i), Some(i) if i + 1 < shown.len() => Some(i + 1), _ => shown.iter().position(|e| !s.contains(&e.id)) } });
+    let next_id = global_next.clone();
+    // Per season: regular seasons count released regular episodes only (specials and unaired ones don't
+    // hold "Watched" back); Extras count everything in season 0.
+    let released = crate::picks_rules::regular_episodes(&list, backend::now_secs());
+    // (counted, watched, still to air, done)
+    let season_stats = |n: i64| -> (usize, usize, usize, bool) {
+        let s = seen.read();
+        let (total, watched, future) = if n > 0 {
+            let counted: Vec<&Episode> = released.iter().copied().filter(|e| e.season == n).collect();
+            let all_regular = list.iter().filter(|e| e.season == n && e.number > 0).count();
+            (counted.len(), counted.iter().filter(|e| s.contains(&e.id)).count(), all_regular.saturating_sub(counted.len()))
+        } else {
+            (list.iter().filter(|e| e.season == 0).count(), list.iter().filter(|e| e.season == 0 && s.contains(&e.id)).count(), 0)
+        };
+        (total, watched, future, total > 0 && watched == total)
+    };
     let pages = shown.len().div_ceil(EPISODE_PAGE);
     let current = match range() { Some((s, p)) if s == season() && p < pages => p, _ => next_index.map(|i| i / EPISODE_PAGE).unwrap_or(0) };
     let visible: Vec<Episode> = shown.iter().skip(current * EPISODE_PAGE).take(EPISODE_PAGE).cloned().collect();
@@ -1028,29 +1047,67 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
             if seasons.len() > 1 && seasons.iter().any(|n| posters.contains_key(n)) {
                 div { class: "season-cards", role: "radiogroup", aria_label: "Season",
                     for n in seasons.clone() {
-                        button { key: "{n}", class: if season() == Some(n) { "season-card on" } else { "season-card" },
-                            role: "radio", aria_checked: "{season() == Some(n)}", onclick: move |_| { season_picked.set(true); season.set(Some(n)); },
-                            div { class: "sp",
-                                if let Some(src) = posters.get(&n) {
-                                    crate::components::FallbackImg {
-                                        sources: vec![src.clone()],
-                                        lazy: true,
-                                        span { class: "display", if n == 0 { "Extras" } else { "{n}" } }
+                        {
+                            let (s_total, s_seen, s_future, s_done) = season_stats(n);
+                            let s_pct = if s_total > 0 { (s_seen as f64 / s_total as f64 * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+                            let sub_text = if s_done && s_future > 0 {
+                                "Caught up".to_string()
+                            } else if s_done {
+                                "Watched".to_string()
+                            } else if s_total == 0 && s_future > 0 {
+                                "Coming soon".to_string()
+                            } else if s_total == 1 {
+                                "1 episode".to_string()
+                            } else {
+                                format!("{s_total} episodes")
+                            };
+                            rsx! {
+                                button { key: "{n}", class: if season() == Some(n) { "season-card on" } else { "season-card" },
+                                    role: "radio", aria_checked: "{season() == Some(n)}", onclick: move |_| { season_picked.set(true); season.set(Some(n)); },
+                                    div { class: "sp",
+                                        if let Some(src) = posters.get(&n) {
+                                            crate::components::FallbackImg {
+                                                sources: vec![src.clone()],
+                                                lazy: true,
+                                                span { class: "display", if n == 0 { "Extras" } else { "{n}" } }
+                                            }
+                                        }
+                                        else { span { class: "display", if n == 0 { "Extras" } else { "{n}" } } }
+                                        if s_total > 0 {
+                                            span { class: if s_done { "sp-count tnum done" } else { "sp-count tnum" }, aria_hidden: "true",
+                                                if s_done { icons::Check {} span { "{s_total}" } }
+                                                else if s_seen > 0 { span { "{s_seen}/{s_total}" } }
+                                                else { span { "{s_total}" } }
+                                            }
+                                        }
+                                        if s_seen > 0 {
+                                            div { class: "sp-progress", div { style: "width: {s_pct:.1}%" } }
+                                        }
                                     }
+                                    span { class: "season-name", if n == 0 { "Extras" } else { "Season {n}" } }
+                                    if s_total > 0 || s_future > 0 { span { class: "season-sub dim tnum", "{sub_text}" } }
                                 }
-                                else { span { class: "display", if n == 0 { "Extras" } else { "{n}" } } }
                             }
-                            span { if n == 0 { "Extras" } else { "Season {n}" } }
                         }
                     }
                 }
             } else if seasons.len() > 1 {
                 div { class: "season-chips", role: "radiogroup", aria_label: "Season",
                     for n in seasons {
-                        button { class: if season() == Some(n) { "chip-btn glass on small-chip" } else { "chip-btn glass small-chip" },
-                            role: "radio", aria_checked: "{season() == Some(n)}", aria_label: if n == 0 { "Extras".to_string() } else { format!("Season {n}") },
-                            onclick: move |_| { season_picked.set(true); season.set(Some(n)); },
-                            if n == 0 { icons::Sparkles {} } else { span { class: "tnum", "S{n}" } } }
+                        {
+                            let (c_total, c_seen, c_future, c_done) = season_stats(n);
+                            let name = if n == 0 { "Extras".to_string() } else { format!("Season {n}") };
+                            let label = if c_done && c_future > 0 { format!("{name}, caught up") } else if c_done { format!("{name}, watched") }
+                                else if c_seen > 0 { format!("{name}, {c_seen} of {c_total} watched") } else { name };
+                            rsx! {
+                                button { key: "{n}", class: if season() == Some(n) { "chip-btn glass on small-chip" } else { "chip-btn glass small-chip" },
+                                    role: "radio", aria_checked: "{season() == Some(n)}", aria_label: "{label}",
+                                    onclick: move |_| { season_picked.set(true); season.set(Some(n)); },
+                                    if n == 0 { icons::Sparkles {} } else { span { class: "tnum", "S{n}" } }
+                                    if c_done { span { class: "chip-count done", aria_hidden: "true", icons::Check {} } }
+                                    else if c_seen > 0 { span { class: "chip-count tnum", aria_hidden: "true", "{c_seen}/{c_total}" } } }
+                            }
+                        }
                     }
                 }
             }
@@ -1068,7 +1125,7 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
                         {
                             let chunk = &shown[p * EPISODE_PAGE..((p + 1) * EPISODE_PAGE).min(shown.len())];
                             let (first, to) = (chunk[0].number, chunk[chunk.len() - 1].number);
-                            let here = next_index.is_some_and(|i| i / EPISODE_PAGE == p);
+                            let here = next_in_season.is_some_and(|i| i / EPISODE_PAGE == p);
                             rsx! {
                                 button { class: if p == current { "range on" } else { "range" }, role: "radio", aria_checked: "{p == current}",
                                     aria_label: "Episodes {first} to {to}", onclick: move |_| range.set(Some((season(), p))),
@@ -1088,12 +1145,36 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
                     let done = seen.read().contains(&e.id);
                     let is_last = last.as_deref() == Some(e.id.as_str());
                     let is_next = next_id.as_deref() == Some(e.id.as_str());
+                    let is_busy = busy.as_deref() == Some(e.id.as_str());
                     let ids: Vec<String> = shown.iter().filter(|x| if done { x.number >= e.number } else { x.number <= e.number }).map(|x| x.id.clone()).collect();
+                    let special = e.number == 0;
+                    let ep_num_label = if special { "SP".to_string() } else if (1..10).contains(&e.number) { format!("0{}", e.number) } else { format!("{}", e.number) };
+                    let ep_name = if special { "special".to_string() } else { format!("episode {}", e.number) };
+                    let (frac, left_label) = if done {
+                        (0.0, None)
+                    } else {
+                        progress.read().get(&e.id)
+                            .filter(|(pos, dur, w)| !*w && *pos > 5_000 && *dur > 0)
+                            .map(|(pos, dur, _)| {
+                                let f = (*pos as f64 / *dur as f64).clamp(0.0, 1.0);
+                                let left = (*dur - *pos).max(0);
+                                let mins = (left + 30_000) / 60_000;
+                                let txt = if mins >= 60 {
+                                    format!("{}h {}m left", mins / 60, mins % 60)
+                                } else if mins > 0 {
+                                    format!("{mins}m left")
+                                } else {
+                                    "< 1m left".to_string()
+                                };
+                                (f, Some(txt))
+                            })
+                            .unwrap_or((0.0, None))
+                    };
                     rsx! {
                     div { key: "{e.id}", style: "--i: {i.min(8)}",
-                        class: format!("ep-tile{}{}{}", if is_next { " next" } else { "" }, if done { " seen" } else { "" }, if is_last { " last" } else { "" }),
+                        class: format!("ep-tile{}{}{}{}", if is_next { " next" } else { "" }, if done { " seen" } else { "" }, if is_last { " last" } else { "" }, if is_busy { " busy" } else { "" }),
                         button { class: "ep-main", disabled: busy.is_some(),
-                            aria_label: "Play episode {e.number}: {e.title}",
+                            aria_label: "Play {ep_name}: {e.title}",
                             onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_play.call((id.clone(), l.clone())) },
                             div { class: "ep-still",
                                 {
@@ -1110,33 +1191,40 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
                                         candidates.push(e.thumbnail.clone());
                                     }
                                     rsx! {
-                                        crate::components::FallbackImg { sources: candidates, lazy: true }
+                                        crate::components::FallbackImg {
+                                            sources: candidates,
+                                            lazy: true,
+                                            div { class: "ep-still-empty",
+                                                span { class: "ep-still-num display tnum", "{ep_num_label}" }
+                                            }
+                                        }
                                     }
                                 }
-                                if is_next { span { class: "ep-next", "Up next" } }
-                                span { class: "ep-play", if busy.as_deref() == Some(e.id.as_str()) { span { class: "spinner" } } else { icons::Play {} } }
-                                {
-                                    let frac = if done { 0.0 } else {
-                                        progress.read().get(&e.id)
-                                            .filter(|(pos, dur, w)| !*w && *pos > 5_000 && *dur > 0)
-                                            .map(|(pos, dur, _)| (*pos as f64 / *dur as f64).clamp(0.0, 1.0))
-                                            .unwrap_or(0.0)
-                                    };
-                                    rsx! { if frac > 0.0 { div { class: "card-progress", div { style: "width: {frac * 100.0:.1}%" } } } }
+                                div { class: "ep-top",
+                                    span { class: "ep-badge tnum", aria_hidden: "true", if special { "Special" } else { "EP {ep_num_label}" } }
+                                    if is_next { span { class: "ep-next", aria_hidden: "true", "Up next" } }
+                                    else if done { span { class: "ep-done-pill", aria_hidden: "true", icons::Check {} span { "Watched" } } }
+                                }
+                                span { class: "ep-play", if is_busy { span { class: "spinner" } } else { icons::Play {} } }
+                                if let Some(left) = left_label {
+                                    span { class: "ep-left tnum", "{left}" }
+                                }
+                                if frac > 0.0 {
+                                    div { class: "card-progress ep-progress", div { style: "width: {frac * 100.0:.1}%" } }
                                 }
                             }
                             div { class: "ep-copy",
                                 div { class: "ep-head",
-                                    span { class: "tag q tnum", "E{e.number}" }
                                     span { class: "ep-name", "{e.title}" }
-                                    if is_last { span { class: "lamp", title: "Last watched", icons::History {} } }
+                                    if is_last { span { class: "ep-last-icon lamp", title: "Last watched", icons::History {} } }
                                 }
                                 if !e.overview.is_empty() { p { class: "ep-overview clamp-2", "{e.overview}" } }
                             }
                         }
                         div { class: "ep-foot",
                             span { class: "ep-date dim tnum", if !e.released.is_empty() { "{backend::date_label(&e.released)}" } }
-                            icons::IconButton { label: if done { format!("Unmark E{} watched", e.number) } else { format!("Mark E{} watched (Shift+click marks up to E{})", e.number, e.number) },
+                            // One steady name; the pressed state says whether it is on.
+                            icons::IconButton { label: if special { "Special watched".to_string() } else { format!("Episode {} watched (Shift+click marks up to episode {})", e.number, e.number) },
                                 class: if done { "small ep-seen on" } else { "small ep-seen" }, pressed: done,
                                 onclick: {
                                     let ep_id = e.id.clone();
@@ -1145,10 +1233,10 @@ fn Episodes(list: Vec<Episode>, media: Media, season: Signal<Option<i64>>, seaso
                                         else { mark.call((vec![ep_id.clone()], !done)); }
                                     }
                                 }, icons::Check {} }
-                            icons::IconButton { label: "Download episode", class: "small",
+                            icons::IconButton { label: format!("Download {ep_name}"), class: "small",
                                 onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_download.call((id.clone(), l.clone())) },
                                 icons::Download {} }
-                            icons::IconButton { label: "Choose a source", class: "small",
+                            icons::IconButton { label: format!("Choose a source for {ep_name}"), class: "small",
                                 onclick: { let (id, l) = (e.id.clone(), e.label()); move |_| on_sources.call((id.clone(), l.clone())) },
                                 icons::Layers {} }
                         }

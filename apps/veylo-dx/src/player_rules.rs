@@ -31,7 +31,19 @@ pub fn up_next_due(position: f64, duration: f64, ended: bool, segments: &[Segmen
     if !has_next || dismissed { return false; }
     if ended { return true; }
     if offer(segments, position, true).is_some_and(|g| g.kind == SegmentKind::Credits) { return true; }
-    duration > 180.0 && (duration - position) <= 25.0 && position > 0.0
+    // No credits chapter: only the last few seconds, so an epilogue or post-credits scene plays out.
+    duration > 180.0 && (duration - position) <= NO_CREDITS_WINDOW && position > 0.0
+}
+
+/// How close to the end (seconds) the card appears when the file has no credits chapter.
+const NO_CREDITS_WINDOW: f64 = 10.0;
+
+/// Seconds the "Up Next" card counts down: 5 at the end, 10 when credits begin, and without a
+/// credits chapter only what is left of the video (ending about a second before it does).
+pub fn up_next_countdown(position: f64, duration: f64, ended: bool, segments: &[Segment]) -> u8 {
+    if ended { return 5; }
+    if offer(segments, position, true).is_some_and(|g| g.kind == SegmentKind::Credits) { return 10; }
+    (((duration - position).floor() as i64) - 1).clamp(2, 10) as u8
 }
 
 pub fn skip(live: &engine::Live, g: Segment) {
@@ -215,7 +227,12 @@ mod tests {
         let credits = [Segment { kind: SegmentKind::Credits, start: 1300.0, end: 1380.0 }];
         assert!(!super::up_next_due(600.0, 1400.0, false, &credits, true, false));
         assert!(super::up_next_due(1310.0, 1400.0, false, &credits, true, false));
-        assert!(super::up_next_due(1380.0, 1400.0, false, &[], true, false));
+        assert!(super::up_next_due(1392.0, 1400.0, false, &[], true, false));
+        // Without a credits chapter an epilogue plays: no card until the last seconds.
+        assert!(!super::up_next_due(1380.0, 1400.0, false, &[], true, false));
+        assert_eq!(super::up_next_countdown(1392.0, 1400.0, false, &[]), 7);
+        assert_eq!(super::up_next_countdown(1310.0, 1400.0, false, &credits), 10);
+        assert_eq!(super::up_next_countdown(1400.0, 1400.0, true, &[]), 5);
         assert!(super::up_next_due(1400.0, 1400.0, true, &[], true, false));
         assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, false, false));
         assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, true, true));

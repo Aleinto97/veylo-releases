@@ -17,6 +17,7 @@ import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
 import android.provider.Settings
+import android.util.Log
 import android.util.Rational
 import android.view.Display
 import android.view.Gravity
@@ -25,6 +26,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
@@ -49,6 +51,14 @@ object VeyloVideo {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     @Volatile private var pausedByFocus = false
+    /** Whether this player holds audio focus now (lost for good on AUDIOFOCUS_LOSS, asked again on the next play). */
+    @Volatile private var hasFocus = false
+    private var windowFocusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
+    private var windowFocusView: View? = null
+    private var metaTitle = ""
+    private var metaSubtitle = ""
+    @Volatile private var metaDurationMs = 0L
+    @Volatile private var lastPlaying = true
     private var noisyReceiver: BroadcastReceiver? = null
     @Volatile private var mediaSession: MediaSession? = null
     private val visibilityGen = java.util.concurrent.atomic.AtomicLong(0)
@@ -95,48 +105,81 @@ object VeyloVideo {
     @JvmStatic
     fun show(activity: Activity) {
         val gen = visibilityGen.incrementAndGet()
-        activity.runOnUiThread {
-            if (visibilityGen.get() != gen) return@runOnUiThread
-            // If Android recreated the Activity in the same process, discard stale views bound to the old one.
-            if (frame != null && hostActivity?.get() !== activity) {
-                stopMediaControls(activity.applicationContext)
-                // Always detach mpv from the old Surface before removing callbacks so Rust never keeps a dead wid.
+        activity.runOnUiThread { showNow(activity, gen, false) }
+    }
+
+    private fun showNow(activity: Activity, gen: Long, retried: Boolean) {
+        if (visibilityGen.get() != gen) return
+        // If Android recreated the Activity in the same process, discard stale views bound to the old one.
+        if (frame != null && hostActivity?.get() !== activity) {
+            stopMediaControls(activity.applicationContext)
+            // Always detach mpv from the old Surface before removing callbacks so Rust never keeps a dead wid.
+            nativeSurface(null, 0, 0)
+            surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
+            surfaceCallback = null
+            dropWindowFocusListener()
+            frame = null; surface = null; hostActivity = null
+        }
+        // Already up (the player moved to the next episode and kept its picture): nothing to do.
+        if (frame != null) return
+        val web = findWebView(activity.window.decorView)
+        val parent = web?.parent as? ViewGroup
+        if (web == null || parent == null) {
+            if (!retried) {
+                // The WebView may not be in the window yet (a cold start, a recreated activity): look once more shortly.
+                activity.window.decorView.postDelayed({ showNow(activity, gen, true) }, 250)
+            } else {
+                runCatching { Log.w("veylo", "video: no WebView to put the picture under") }
+            }
+            return
+        }
+        val view = SurfaceView(activity)
+        val cb = object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                if (surface !== view) return
+                val r = holder.surfaceFrame
+                applyFrameRate(holder.surface, pendingFps)
+                nativeSurface(holder.surface, r.width(), r.height())
+            }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+                if (surface !== view) return
+                nativeSurface(holder.surface, w, h)
+            }
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                if (surface !== view) return
                 nativeSurface(null, 0, 0)
-                surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
-                surfaceCallback = null
-                frame = null; surface = null; hostActivity = null
             }
-            if (frame != null) return@runOnUiThread
-            val web = findWebView(activity.window.decorView) ?: return@runOnUiThread
-            val parent = web.parent as? ViewGroup ?: return@runOnUiThread
-            val view = SurfaceView(activity)
-            val cb = object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) {
-                    if (surface !== view) return
-                    val r = holder.surfaceFrame
-                    applyFrameRate(holder.surface, pendingFps)
-                    nativeSurface(holder.surface, r.width(), r.height())
-                }
-                override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
-                    if (surface !== view) return
-                    nativeSurface(holder.surface, w, h)
-                }
-                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                    if (surface !== view) return
-                    nativeSurface(null, 0, 0)
-                }
-            }
-            view.holder.addCallback(cb)
-            val box = FrameLayout(activity).apply { setBackgroundColor(Color.BLACK) }
-            box.addView(view, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
-            box.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> relayout() }
-            parent.addView(box, parent.indexOfChild(web), ViewGroup.LayoutParams(-1, -1))
-            web.setBackgroundColor(Color.TRANSPARENT)
-            hostActivity = java.lang.ref.WeakReference(activity)
-            frame = box; surface = view; surfaceCallback = cb
-            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            immersive(activity, true)
-            startMediaControls(activity)
+        }
+        view.holder.addCallback(cb)
+        val box = FrameLayout(activity).apply { setBackgroundColor(Color.BLACK) }
+        box.addView(view, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        box.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> relayout() }
+        parent.addView(box, parent.indexOfChild(web), ViewGroup.LayoutParams(-1, -1))
+        web.setBackgroundColor(Color.TRANSPARENT)
+        hostActivity = java.lang.ref.WeakReference(activity)
+        frame = box; surface = view; surfaceCallback = cb
+        activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        immersive(activity, true)
+        // The system bars come back after a dialog, the notification shade or Picture-in-picture:
+        // hide them again when the window has focus.
+        dropWindowFocusListener()
+        val decor = activity.window.decorView
+        val listener = ViewTreeObserver.OnWindowFocusChangeListener { focused ->
+            if (focused && frame != null) immersive(activity, true)
+        }
+        decor.viewTreeObserver.addOnWindowFocusChangeListener(listener)
+        windowFocusListener = listener
+        windowFocusView = decor
+        startMediaControls(activity)
+    }
+
+    private fun dropWindowFocusListener() {
+        val listener = windowFocusListener
+        val view = windowFocusView
+        windowFocusListener = null
+        windowFocusView = null
+        if (listener != null && view != null) {
+            runCatching { view.viewTreeObserver.takeIf { it.isAlive }?.removeOnWindowFocusChangeListener(listener) }
         }
     }
 
@@ -161,6 +204,7 @@ object VeyloVideo {
             nativeSurface(null, 0, 0)
             surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
             surfaceCallback = null
+            dropWindowFocusListener()
             (box.parent as? ViewGroup)?.removeView(box)
             frame = null; surface = null; hostActivity = null; aspect = 0.0; fit = 0; pendingFps = 0f
             findWebView(activity.window.decorView)?.setBackgroundColor(Color.BLACK)
@@ -198,21 +242,52 @@ object VeyloVideo {
     @JvmStatic
     fun setMediaMetadata(activity: Activity, title: String, subtitle: String) {
         activity.runOnUiThread {
-            runCatching {
-                val meta = MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                    .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, subtitle)
-                    .build()
-                mediaSession?.setMetadata(meta)
-            }
+            metaTitle = title
+            metaSubtitle = subtitle
+            metaDurationMs = 0L
+            publishMetadata()
+        }
+    }
+
+    /** The video's length once mpv knows it, so the notification and Bluetooth remotes get a seek bar. */
+    @JvmStatic
+    fun setMediaDuration(durationMs: Long) {
+        metaDurationMs = durationMs.coerceAtLeast(0L)
+        runCatching { mediaSession?.let { publishMetadata() } }
+    }
+
+    private fun publishMetadata() {
+        runCatching {
+            val meta = MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, metaTitle)
+                .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, metaSubtitle)
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, metaDurationMs)
+                .build()
+            mediaSession?.setMetadata(meta)
         }
     }
 
     @JvmStatic
     fun setMediaState(playing: Boolean, positionMs: Long, speed: Float) {
+        lastPlaying = playing
+        if (playing) {
+            // Play (from the controls, the remote or the notification) ends a pause that focus caused, and
+            // asks for focus again if it was lost for good. Denied: the player stays paused, and any pending
+            // pausedByFocus flag stays intact so AUDIOFOCUS_GAIN can still resume.
+            if (hasFocus || requestFocus()) {
+                pausedByFocus = false
+            } else {
+                nativeCommand("pause")
+            }
+        }
+        publishPlaybackState(playing, positionMs, speed)
+    }
+
+    private fun publishPlaybackState(playing: Boolean, positionMs: Long, speed: Float) {
         runCatching {
             val actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
-                PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_STOP
+                PlaybackState.ACTION_FAST_FORWARD or PlaybackState.ACTION_REWIND or PlaybackState.ACTION_SEEK_TO or
+                PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_STOP
             val st = if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
             val pb = PlaybackState.Builder().setActions(actions).setState(st, positionMs.coerceAtLeast(0L), if (playing) speed else 0f).build()
             mediaSession?.setPlaybackState(pb)
@@ -250,7 +325,7 @@ object VeyloVideo {
             runCatching {
                 val am = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                val target = (level.coerceIn(0f, 1f) * max).toInt().coerceIn(0, max)
+                val target = Math.round(level.coerceIn(0f, 1f) * max).coerceIn(0, max)
                 am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
             }
         }
@@ -267,7 +342,6 @@ object VeyloVideo {
 
     @JvmStatic
     fun enterPip(activity: Activity, aspectW: Int, aspectH: Int): Boolean {
-        if (Build.VERSION.SDK_INT < 26) return false
         if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) return false
         activity.runOnUiThread {
             runCatching {
@@ -283,50 +357,72 @@ object VeyloVideo {
         return true
     }
 
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Permanent focus loss (another media app took over): pause and do not auto-resume.
+                // Playing again asks for focus anew (setMediaState).
+                hasFocus = false
+                pausedByFocus = false
+                nativeCommand("pause")
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                // A call or an alarm: pause, and carry on when focus returns.
+                hasFocus = false
+                if (lastPlaying) {
+                    pausedByFocus = true
+                    nativeCommand("pause")
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // A notification sound: no pause. The request says it does not pause when ducked
+                // (setWillPauseWhenDucked(false)), so Android lowers this stream's volume itself and
+                // restores it with AUDIOFOCUS_GAIN.
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasFocus = true
+                if (pausedByFocus) {
+                    pausedByFocus = false
+                    nativeCommand("play")
+                }
+            }
+        }
+    }
+
+    /** Ask for audio focus; true when granted. */
+    private fun requestFocus(): Boolean {
+        val am = audioManager ?: return true // no audio service: nothing to hold back for
+        return runCatching {
+            val req = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                )
+                .setWillPauseWhenDucked(false)
+                .setOnAudioFocusChangeListener(focusListener)
+                .build()
+                .also { focusRequest = it }
+            val granted = am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            hasFocus = granted
+            granted
+        }.getOrDefault(true)
+    }
+
     private fun startMediaControls(activity: Activity) {
         val appCtx = activity.applicationContext
         runCatching {
-            val am = appCtx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            if (Build.VERSION.SDK_INT >= 26) {
-                focusRequest?.let { prev -> audioManager?.abandonAudioFocusRequest(prev) }
-                focusRequest = null
-            }
-            audioManager = am
+            focusRequest?.let { prev -> audioManager?.abandonAudioFocusRequest(prev) }
+            focusRequest = null
+            audioManager = appCtx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             pausedByFocus = false
-            val listener = AudioManager.OnAudioFocusChangeListener { change ->
-                when (change) {
-                    AudioManager.AUDIOFOCUS_LOSS -> {
-                        // Permanent focus loss (another media app took over): pause and do not auto-resume.
-                        pausedByFocus = false
-                        nativeCommand("pause")
-                    }
-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                        val playing = mediaSession?.controller?.playbackState?.state == PlaybackState.STATE_PLAYING
-                        if (playing) {
-                            pausedByFocus = true
-                            nativeCommand("pause")
-                        }
-                    }
-                    AudioManager.AUDIOFOCUS_GAIN -> {
-                        if (pausedByFocus) {
-                            pausedByFocus = false
-                            nativeCommand("play")
-                        }
-                    }
-                }
-            }
-            if (am != null && Build.VERSION.SDK_INT >= 26) {
-                val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                    .build()
-                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                    .setAudioAttributes(attrs)
-                    .setOnAudioFocusChangeListener(listener)
-                    .build()
-                focusRequest = req
-                am.requestAudioFocus(req)
+            hasFocus = false
+            lastPlaying = true
+            // Another app holds focus and won't share it: stay paused until it lets go (AUDIOFOCUS_GAIN).
+            if (!requestFocus()) {
+                pausedByFocus = true
+                nativeCommand("pause")
             }
         }
         runCatching {
@@ -351,13 +447,16 @@ object VeyloVideo {
                     override fun onPlay() { pausedByFocus = false; nativeCommand("play") }
                     override fun onPause() { pausedByFocus = false; nativeCommand("pause") }
                     override fun onSkipToNext() = nativeCommand("next")
+                    override fun onSkipToPrevious() = nativeCommand("prev")
+                    override fun onSeekTo(pos: Long) = nativeCommand("seek:" + pos.coerceAtLeast(0L))
                     override fun onFastForward() = nativeCommand("seek_fwd")
                     override fun onRewind() = nativeCommand("seek_back")
                     override fun onStop() { pausedByFocus = false; nativeCommand("stop") }
                 })
                 session.isActive = true
                 mediaSession = session
-                setMediaState(true, 0L, 1.0f)
+                publishMetadata()
+                publishPlaybackState(!pausedByFocus, 0L, 1.0f)
             }
         }
     }
@@ -369,7 +468,8 @@ object VeyloVideo {
         val req = focusRequest
         focusRequest = null
         pausedByFocus = false
-        if (req != null && Build.VERSION.SDK_INT >= 26) {
+        hasFocus = false
+        if (req != null) {
             runCatching { audioManager?.abandonAudioFocusRequest(req) }
         }
         val session = mediaSession

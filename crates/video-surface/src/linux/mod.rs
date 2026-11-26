@@ -145,9 +145,15 @@ mod subsurface {
         shared: Arc<Shared>,
         thread: Option<std::thread::JoinHandle<()>>,
         resize: Option<gtk::glib::SignalHandlerId>,
+        /// The page moved to a screen with another scale (no resize comes with it).
+        scale: Option<gtk::glib::SignalHandlerId>,
         web: gtk::Widget,
     }
     thread_local! { static VIDEO: RefCell<Option<Video>> = const { RefCell::new(None) }; }
+
+    /// A render thread's lock, even when another thread panicked holding it: the teardown after
+    /// the loop (freeing mpv's renderer, destroying the EGL surface and context) must still run.
+    fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|p| p.into_inner()) }
 
     struct SendPtr(*mut c_void);
     unsafe impl Send for SendPtr {}
@@ -234,22 +240,26 @@ mod subsurface {
             }
         }
 
-        // Follow the page's size (window resizes, full screen).
+        // Follow the page's size (window resizes, full screen) and its scale (a move to another screen).
         let follow = shared.clone();
         let (c2, q2, s2, sub2) = (compositor.clone(), qh.clone(), surface.clone(), sub.clone());
-        let resize = web.connect_size_allocate(move |web, _| {
+        let apply: std::rc::Rc<dyn Fn(&gtk::Widget)> = std::rc::Rc::new(move |web: &gtk::Widget| {
             let Some(top) = web.toplevel() else { return };
             let (x, y, w, h, scale) = geometry(web, &top);
             sub2.set_position(x, y);
             s2.set_buffer_scale(scale);
             set_opaque(&c2, &q2, &s2, w, h);
             let (lock, cv) = &*follow;
-            if let Ok(mut c) = lock.lock() { c.width = w * scale; c.height = h * scale; c.frame = true; cv.notify_all(); }
+            { let mut c = locked(lock); c.width = w * scale; c.height = h * scale; c.frame = true; cv.notify_all(); }
             top.queue_draw(); // the parent's next commit applies the new position
         });
+        let on_size = apply.clone();
+        let resize = web.connect_size_allocate(move |web, _| on_size(web));
+        let on_scale = apply.clone();
+        let scale_notify = web.connect_scale_factor_notify(move |web| on_scale(web));
         let _ = conn.flush();
         toplevel.queue_draw();
-        Ok(Video { conn, surface, sub, compositor, qh, shared, thread: Some(thread), resize: Some(resize), web })
+        Ok(Video { conn, surface, sub, compositor, qh, shared, thread: Some(thread), resize: Some(resize), scale: Some(scale_notify), web })
     }
 
     struct SendEgl(std::sync::Mutex<Option<wayland_egl::WlEglSurface>>);
@@ -270,9 +280,10 @@ mod subsurface {
 
     pub fn close() {
         let Some(mut v) = VIDEO.with(|s| s.borrow_mut().take()) else { return };
-        { let (lock, cv) = &*v.shared; if let Ok(mut c) = lock.lock() { c.quit = true; cv.notify_all(); } }
+        { let (lock, cv) = &*v.shared; locked(lock).quit = true; cv.notify_all(); }
         if let Some(t) = v.thread.take() { let _ = t.join(); }
         if let Some(id) = v.resize.take() { v.web.disconnect(id); }
+        if let Some(id) = v.scale.take() { v.web.disconnect(id); }
         v.sub.destroy();
         v.surface.destroy();
         let _ = (&v.compositor, &v.qh);
@@ -314,7 +325,8 @@ mod subsurface {
     unsafe extern "C" fn on_update(cb: *mut c_void) {
         let shared = &*(cb as *const Shared);
         let (lock, cv) = shared;
-        if let Ok(mut c) = lock.lock() { c.frame = true; cv.notify_all(); }
+        { locked(lock).frame = true; }
+        cv.notify_all();
     }
 
     fn render_thread(shared: &Arc<Shared>, player: &Arc<dyn Player>, display: SendPtr, window: SendPtr, egl_window: &SendEgl,
@@ -360,8 +372,8 @@ mod subsurface {
                 loop {
                     let (w, h, quit) = {
                         let (lock, cv) = &**shared;
-                        let mut c = lock.lock().map_err(|_| "lock")?;
-                        while !c.frame && !c.quit { c = cv.wait(c).map_err(|_| "lock")?; }
+                        let mut c = locked(lock);
+                        while !c.frame && !c.quit { c = cv.wait(c).unwrap_or_else(|p| p.into_inner()); }
                         c.frame = false;
                         (c.width, c.height, c.quit)
                     };
@@ -369,7 +381,7 @@ mod subsurface {
                     let resized = (w, h) != size;
                     if resized {
                         size = (w, h);
-                        if let Ok(win) = egl_window.0.lock() { if let Some(win) = win.as_ref() { win.resize(w, h, 0, 0); } }
+                        if let Some(win) = locked(&egl_window.0).as_ref() { win.resize(w, h, 0, 0); }
                     }
                     let flags = sys::mpv_render_context_update(render);
                     if resized || (flags & sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) != 0 {
@@ -385,7 +397,7 @@ mod subsurface {
             (e.make_current)(dpy, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
             (e.destroy_surface)(dpy, surf);
             (e.destroy_context)(dpy, ctx);
-            if let Ok(mut win) = egl_window.0.lock() { win.take(); }
+            locked(&egl_window.0).take();
             result.map(|_| ())
         }
     }
@@ -400,6 +412,9 @@ mod glarea {
 
     struct Video {
         area: gtk::GLArea,
+        /// The overlay holding the area and the web view, and the box it sits in (to undo `install`).
+        overlay: gtk::Overlay,
+        vbox: gtk::Box,
         /// The WebKit view over it, repainted with every frame (it has its own GDK window).
         web: gtk::Widget,
         render: *mut sys::mpv_render_context,
@@ -425,12 +440,39 @@ mod glarea {
         overlay.add_overlay(&web);
         vbox.pack_start(&overlay, true, true, 0);
         overlay.show_all();
-        VIDEO.with(|v| *v.borrow_mut() = Some(Video { area, web, render: std::ptr::null_mut(), player: None }));
+        VIDEO.with(|v| *v.borrow_mut() = Some(Video { area, overlay, vbox, web, render: std::ptr::null_mut(), player: None }));
         Ok(())
+    }
+
+    /// Undo `install`: the web view goes back into its box. A GL area that can't draw must not keep
+    /// the page trapped in an overlay above it (a blank or frozen window), and a later try starts clean.
+    fn uninstall() {
+        let Some(mut v) = VIDEO.with(|v| v.borrow_mut().take()) else { return };
+        if !v.render.is_null() {
+            v.area.make_current();
+            unsafe {
+                sys::mpv_render_context_set_update_callback(v.render, None, std::ptr::null_mut());
+                sys::mpv_render_context_free(v.render);
+            }
+            v.render = std::ptr::null_mut();
+        }
+        if let Some(player) = v.player.take() { std::thread::spawn(move || drop(player)); }
+        v.overlay.remove(&v.web);
+        v.vbox.remove(&v.overlay);
+        v.vbox.pack_start(&v.web, true, true, 0);
+        v.web.show();
+        v.vbox.queue_resize();
+        v.web.queue_draw();
     }
 
     pub fn open(host: &Host, player: &Arc<dyn Player>) -> Result<(), String> {
         install(host)?;
+        let opened = open_installed(player);
+        if opened.is_err() { uninstall(); }
+        opened
+    }
+
+    fn open_installed(player: &Arc<dyn Player>) -> Result<(), String> {
         free_render();
         VIDEO.with(|v| {
             let mut v = v.borrow_mut();

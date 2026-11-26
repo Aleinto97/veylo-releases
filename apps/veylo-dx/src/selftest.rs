@@ -104,9 +104,11 @@ fn store() -> Result<String> {
     ensure!(saved.iter().any(|m| m.id == media.id && m.saved), "a saved title didn't come back from the library");
     let before = backend::load_settings();
     let flipped = !before.picks_hide_watched;
-    backend::update_settings(|s| s.picks_hide_watched = flipped);
+    backend::try_update_settings(|s| s.picks_hide_watched = flipped)
+        .map_err(|(_, e)| anyhow!("settings couldn't be saved: {e}"))?;
     let read_back = backend::load_settings().picks_hide_watched;
-    backend::save_settings(&before);
+    // Put the viewer's own setting back before judging the round trip.
+    backend::save_settings(&before).context("settings couldn't be restored")?;
     ensure!(read_back == flipped, "settings didn't read back");
     Ok("library saved and read back; settings round-trip".into())
 }

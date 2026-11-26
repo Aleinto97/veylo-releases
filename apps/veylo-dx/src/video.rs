@@ -17,12 +17,19 @@ pub fn attach(live: &Arc<Live>) {
     ATTACHED_SESSION.store(live.session_id, Ordering::Release);
     imp::attach(live);
 }
-/// Take the picture away and give the app its opaque background back, only if `session_id` is still active.
-pub fn detach(session_id: u64) {
+/// Take the picture away and give the app its opaque background back, only if `session_id` is
+/// still active. True when this call took it away (the player's surroundings may be reset then).
+pub fn detach(session_id: u64) -> bool {
     if ATTACHED_SESSION.compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        return;
+        return false;
     }
     imp::detach();
+    true
+}
+/// Take away a picture that was kept up while the player moved to another episode or source and
+/// nothing took over (the next one failed or was cancelled). Does nothing when none is attached.
+pub fn release() {
+    if ATTACHED_SESSION.swap(0, Ordering::AcqRel) != 0 { imp::detach(); }
 }
 /// The picture's aspect or fit changed (any thread).
 pub fn layout(live: &Live) { imp::layout(live) }

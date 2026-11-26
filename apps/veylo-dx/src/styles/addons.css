@@ -118,8 +118,6 @@
   box-shadow: inset 0 1px 0 rgba(255,255,255,.25); font-family: var(--display); font-size: 19px; font-weight: 750; color: var(--bone); }
 .account-choices { display: flex; flex-wrap: wrap; gap: 8px; }
 .google-g { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 10px; background: #fff; color: #4285f4; font: 800 13px/1 system-ui, sans-serif; }
-.account-form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; padding: 16px 20px; border-radius: 18px; --glass: rgba(255,255,255,.045); }
-.account-form .key-field { width: 100%; max-width: 420px; }
 .account-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .link-panel { display: flex; flex-direction: row; align-items: center; gap: 20px; }
 .link-qr { width: 184px; height: 184px; flex: none; border-radius: 14px; background: #fff; padding: 4px; }
@@ -188,6 +186,8 @@
   background: rgba(255,255,255,.075); box-shadow: inset 0 0 0 1px rgba(255,255,255,.11);
   color: var(--bone); font: 500 14px/1 var(--ui); outline: none; -webkit-user-select: text; user-select: text; transition: background-color .14s, box-shadow .14s; }
 .lib-search input:focus { background: rgba(255,255,255,.11); box-shadow: inset 0 0 0 2px var(--bone); }
+/* The page draws its own clear button; the engine's would double it. */
+.lib-search input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; display: none; }
 .lib-empty { margin-top: 24px; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 36px 24px; border-radius: 22px; text-align: center;
   background: rgba(255,255,255,.04); box-shadow: inset 0 1px 0 rgba(255,255,255,.12), inset 0 0 0 1px var(--edge); }
 .lib-empty p { margin: 0; max-width: 44ch; }

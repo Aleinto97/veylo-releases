@@ -220,7 +220,7 @@ fn write_disk_feed(items: &[Media]) {
 pub(crate) fn filter_recent_movies(items: Vec<Media>, year: i32, limit: usize) -> Vec<Media> {
     let mut seen = HashSet::new();
     items.into_iter()
-        .filter(|m| m.kind == "movie" && m.id.starts_with("tt"))
+        .filter(|m| m.kind == "movie" && valid_imdb(&m.id))
         .filter(|m| m.first_year().is_some_and(|y| y >= year - 1 && y <= year + 1))
         .filter(|m| seen.insert(m.id.clone()))
         .take(limit)

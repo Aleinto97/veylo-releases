@@ -5,7 +5,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SourceKind { Direct, Torrent, External }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Source {
     pub addon: String,
     pub name: String,
@@ -39,6 +39,26 @@ pub struct Source {
     pub video_codec: Option<&'static str>,
 }
 
+/// A source's `url` and request `headers` carry add-on and debrid credentials: `{:?}` (panic
+/// messages, `dbg!`, assertion failures) shows only their shape, never their values.
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Source")
+            .field("addon", &self.addon)
+            .field("name", &self.name)
+            .field("filename", &self.filename)
+            .field("size_bytes", &self.size_bytes)
+            .field("pack", &self.pack)
+            .field("quality", &self.quality)
+            .field("hdr", &self.hdr)
+            .field("kind", &self.kind)
+            .field("url", &format_args!("[redacted {} bytes]", self.url.len()))
+            .field("headers", &format_args!("[redacted {} headers]", self.headers.len()))
+            .field("off_title", &self.off_title)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Full metadata and playback context passed to Autoplay so it can match localized titles,
 /// pick the right language (including per-title preference & original-language fallback), reject
 /// hidden trailers/extras by runtime, and fit the stream bitrate to the current connection.
@@ -46,7 +66,7 @@ pub struct Source {
 pub struct AutoplayContext {
     /// Display title plus original/localized alternate titles (free metadata prioritized).
     pub titles: Vec<String>,
-    /// Release year for movies (None for series).
+    /// Release year for movies, first-air year for series (None when unknown).
     pub year: Option<i32>,
     /// Episodes in the season for season-pack size splitting.
     pub pack_episodes: Option<usize>,
@@ -59,6 +79,9 @@ pub struct AutoplayContext {
     pub original_language: Option<String>,
     /// Requested `(season, episode)` for series streams.
     pub episode_code: Option<(i64, i64)>,
+    /// The requested episode's own title, when known: an episode called "Behind the Scenes" is
+    /// still the episode, not an extra.
+    pub episode_title: Option<String>,
     /// When true, autoplay never silently plays an off-title source (only exact title matches).
     pub strict_title: bool,
 }
@@ -129,6 +152,11 @@ static_re!(hevc, r"(?i)\b(?:HEVC|[HX][ ._-]?265)\b");
 static_re!(avc, r"(?i)\b(?:AVC|[HX][ ._-]?264)\b");
 static_re!(episode_mark, r"(?i)\bS\d{1,2}[ ._-]?E\d{1,3}\b|\b\d{1,2}x\d{2,3}\b|\bEP?[ ._-]?\d{2,3}\b");
 static_re!(season_pack, r"(?i)\bS\d{1,2}\b|\bSEASONS?[ ._-]?\d|\bCOMPLETE\b");
+// "The.Matrix.Complete.Edition.1999": a film's edition name, not a complete-series pack.
+static_re!(complete_edition, r"(?i)\bCOMPLETE[ ._-]+(?:EDITION|CUT|VERSION|REMASTER(?:ED)?|UNCUT|DIRECTORS?|EXTENDED|THEATRICAL|MOVIE|FILM)\b");
+// A date-stamped daily show ("Show.2024.05.12") is an episode without SxxEyy.
+static_re!(air_date, r"\b(?:19|20)\d{2}[ ._-](?:0[1-9]|1[0-2])[ ._-](?:0[1-9]|[12]\d|3[01])\b");
+static_re!(release_year, r"\b(?:19|20)\d{2}\b");
 static_re!(html_tag, "<[^>]+>");
 static_re!(multi_audio, r"(?i)\b(?:MULTI|DUAL)(?:[ ._-]?AUDIO)?\b|\bMULTi\b");
 // Release tags used by Torrentio, AIOStreams and their upstream scrapers.
@@ -145,8 +173,17 @@ pub(super) fn hdr_tier(text: &str) -> u8 {
 /// Remux (4), WEB-DL (3), WEBRip (2), unlabelled (1), HDTV/DVD/cam (0); a Blu-ray re-encode is None.
 pub(super) fn source_tier(text: &str) -> Option<u8> {
     if remux().is_match(text) { Some(4) } else if bluray().is_match(text) { None } else if web_rip().is_match(text) { Some(2) }
-    else if web_dl().is_match(text) { Some(3) } else if low_source().is_match(text) { Some(0) } else { Some(1) }
+    else if web_dl().is_match(text) { Some(3) } else if is_low_source(text) { Some(0) } else { Some(1) }
 }
+
+/// The label with container extensions (`.mkv`, `.mp4`, `.ts`...) taken out, so an MPEG-TS `.ts`
+/// file is never read as a Telesync `TS` tag.
+pub(super) fn without_video_ext(label: &str) -> std::borrow::Cow<'_, str> {
+    video_ext_suffix().replace_all(label, " ")
+}
+
+/// HDTV / DVD rip / cam style tags in the release name (extension aside).
+pub(super) fn is_low_source(label: &str) -> bool { low_source().is_match(&without_video_ext(label)) }
 pub(super) fn codec_tier(text: &str) -> u8 { if av1().is_match(text) { 3 } else if hevc().is_match(text) { 2 } else if avc().is_match(text) { 1 } else { 0 } }
 
 pub(super) fn effective_codec_tier(s: &Source) -> u8 {
@@ -159,14 +196,22 @@ pub(super) fn effective_codec_tier(s: &Source) -> u8 {
 }
 
 pub(super) fn is_cinema_copy(label: &str) -> bool {
-    let stripped = video_ext_suffix().replace_all(label, "");
-    cinema_copy().is_match(&stripped)
+    cinema_copy().is_match(&without_video_ext(label))
 }
 
 /// True when `s` is a non-feature extra (trailer, featurette, making-of, anime NCOP/NCED)
 /// and the requested title itself doesn't contain that word.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn is_extra_clip(s: &Source, titles: &[String]) -> bool {
-    extra_clip().is_match(&s.label) && !titles.iter().any(|t| extra_clip().is_match(t))
+    is_extra_clip_for(s, titles, None)
+}
+
+/// `is_extra_clip`, also exempting the requested episode's own title ("Behind the Scenes" the
+/// episode is not a bonus feature).
+pub(super) fn is_extra_clip_for(s: &Source, titles: &[String], episode_title: Option<&str>) -> bool {
+    extra_clip().is_match(&s.label)
+        && !titles.iter().any(|t| extra_clip().is_match(t))
+        && !episode_title.is_some_and(|t| extra_clip().is_match(t))
 }
 
 /// True when a stream explicitly names a different episode than `(want_s, want_e)`.
@@ -223,9 +268,11 @@ pub(super) fn source_of(addon: &str, v: &Value) -> Source {
     let declared = hints["videoSize"].as_u64().or_else(|| hints["videoSize"].as_str().and_then(|x| x.parse().ok())).filter(|b| *b > 0);
     let labelled = labelled_size(&format!("{}\n{}\n{}", s(v, "title"), s(v, "description"), s(v, "name")));
     // Add-ons write the torrent's name on its own line (the file name, if any, on another).
-    let pack = format!("{name}\n{}\n{}", s(v, "title"), s(v, "description")).lines()
+    let pack_text = complete_edition().replace_all(&format!("{name}\n{}\n{}", s(v, "title"), s(v, "description")), " ").into_owned();
+    let pack_label = complete_edition().replace_all(&label, " ");
+    let pack = pack_text.lines()
         .any(|line| season_pack().is_match(line) && !episode_mark().is_match(line))
-        || (!episode_mark().is_match(&label) && season_pack().is_match(&label));
+        || (!episode_mark().is_match(&pack_label) && season_pack().is_match(&pack_label));
     Source {
         addon: addon.to_owned(), name, description, filename,
         size: declared.map(|b| binary_size(b as f64)).or_else(|| labelled.as_ref().map(|l| l.0.clone())),
@@ -392,10 +439,29 @@ fn non_video_filename(name: &str) -> bool {
 /// What Play may choose: a direct 2D video link, not labelled under 1080p (nor an unlabelled DVD rip
 /// or TV capture), never a cinema copy / telesync / screener, and never an archive, disc image, or tiny sample clip.
 pub(super) fn playable(s: &Source) -> bool {
-    let low = match s.quality { Some(q) => quality_rank(Some(q)) > 2, None => low_source().is_match(&s.label) };
+    let low = match s.quality { Some(q) => quality_rank(Some(q)) > 2, None => is_low_source(&s.label) };
     let bad_file = !s.filename.is_empty() && non_video_filename(&s.filename);
     let tiny_sample = sample_clip().is_match(&s.label) && s.size_bytes.is_some_and(|b| b < 200_000_000);
     s.kind == SourceKind::Direct && !is_3d(&s.label) && !low && !is_cinema_copy(&s.label) && !bad_file && !tiny_sample
+}
+
+/// The language tier one source ranks in (smaller plays first), shared by the pre-probe order, the
+/// unified key and the post-probe ranker so they can never disagree:
+/// 0 = in your language (its tracks say so, or its label does, or it is untagged English);
+/// 1 = untagged / multi-language while you chose another language;
+/// 2 = only in other languages by its label, or its tracks lack yours but have the title's original;
+/// 3 = its tracks lack yours and the original language too.
+pub(super) fn lang_tier(lang: Option<&crate::addons::Language>, audio: AudioVerdict, has_original_lang: bool, label: &str) -> u8 {
+    match (lang, audio) {
+        (None, _) => 0,
+        (Some(_), Some((true, _))) => 0,
+        (Some(l), None) => {
+            if l.matches(label) { 0 }
+            else if other_language_only(label, l.key) { 2 }
+            else { u8::from(l.key != "english") }
+        }
+        (Some(_), Some((false, _))) => if has_original_lang { 2 } else { 3 },
+    }
 }
 
 pub(super) type OrderKey = (bool, u8, u8, bool, bool, bool, std::cmp::Reverse<(bool, u8, u64, i16, u8, u8)>);
@@ -513,12 +579,7 @@ pub(super) fn order_key(s: &Source, size: u64, lang: Option<&crate::addons::Lang
 }
 
 pub(super) fn order_key_for(s: &Source, size: u64, lang: Option<&crate::addons::Language>, dolby_vision_screen: bool) -> OrderKey {
-    let tier = match lang {
-        None => 0,
-        Some(l) if l.matches(&s.label) => 0,
-        Some(l) if other_language_only(&s.label, l.key) => 2,
-        Some(l) => u8::from(l.key != "english"),
-    };
+    let tier = lang_tier(lang, None, false, &s.label);
     let provider = u8::from(s.label.to_uppercase().contains("FREE TRIAL"));
     let hdr = verified_hdr_tier(s);
     // Dolby Vision alone (typically profile 5) ranks below SDR on screens without native DV,
@@ -542,7 +603,11 @@ pub(super) enum QualityOrder {
 
 /// One unified total order used for pre-probe optimism, wave early-stop, and final post-probe
 /// selection. `off_title` and connection fit can never be overridden by size.
-pub(super) type UnifiedKey = (bool, bool, u8, u8, bool, bool, bool, QualityOrder);
+/// (off_title, language tier, over budget, trial, DV-only, upscaled, unlabelled, quality). The
+/// language tier comes before the budget: an estimate of burst bitrate (VBR peaks, an assumed
+/// runtime) must never put a wrong-language file ahead of one in your language; within one
+/// language tier a file that fits the connection still beats one that doesn't.
+pub(super) type UnifiedKey = (bool, u8, bool, u8, bool, bool, bool, QualityOrder);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn unified_key(
@@ -557,24 +622,7 @@ pub(super) fn unified_key(
     remux_group_size: Option<u64>,
 ) -> UnifiedKey {
     let over = exceeds_budget(s, size, expected_seconds, budget);
-    let lang_tier = match (lang, audio) {
-        (None, _) => 0,
-        (Some(_), Some((true, _))) => 0,
-        (Some(l), None) => {
-            if l.matches(&s.label) {
-                0
-            } else if other_language_only(&s.label, l.key) {
-                2
-            } else if l.key == "english" {
-                0
-            } else {
-                1
-            }
-        }
-        (Some(_), Some((false, _))) => {
-            if has_original_lang { 2 } else { 3 }
-        }
-    };
+    let lang_tier = lang_tier(lang, audio, has_original_lang, &s.label);
     let provider = u8::from(s.label.to_uppercase().contains("FREE TRIAL"));
     let hdr = verified_hdr_tier(s);
     let dv_penalty = hdr == 1 && !dolby_vision_screen;
@@ -598,7 +646,7 @@ pub(super) fn unified_key(
             std::cmp::Reverse((eff, source_tier(&s.label).map_or(-1, i16::from), hdr_rank, effective_codec_tier(s))),
         )
     };
-    (s.off_title, over, lang_tier, provider, dv_penalty, upscaled().is_match(&s.label), s.quality.is_none(), quality)
+    (s.off_title, lang_tier, over, provider, dv_penalty, upscaled().is_match(&s.label), s.quality.is_none(), quality)
 }
 
 /// Optimistic lower-bound key for an unprobed source (assuming its audio turns out to match your
@@ -727,24 +775,55 @@ pub async fn autoplay_for(kind: &str, video_id: &str, ctx: AutoplayContext) -> P
 /// Apply title matching, episode matching, and extra-clip filtering in place.
 pub(super) fn classify_sources(list: &mut Vec<Source>, ctx: &AutoplayContext) {
     if !ctx.titles.is_empty() {
-        list.retain(|s| !is_extra_clip(s, &ctx.titles));
+        list.retain(|s| !is_extra_clip_for(s, &ctx.titles, ctx.episode_title.as_deref()));
     }
-    for s in list.iter_mut() {
-        let title_ok = ctx.titles.is_empty() || names_title_any(s, &ctx.titles, ctx.year);
-        let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
-        s.off_title = !(title_ok && ep_ok);
+    for s in list.iter_mut() { s.off_title = !fits_request(s, ctx); }
+}
+
+/// Whether a source is the requested title and, for a series, the requested episode.
+fn fits_request(s: &Source, ctx: &AutoplayContext) -> bool {
+    let title_ok = ctx.titles.is_empty() || names_title_any_for(s, &ctx.titles, ctx.year, ctx.episode_code.is_some());
+    title_ok && !wrong_episode_or_kind(s, ctx)
+}
+
+/// A release that is plainly the other kind of title, or another episode: an `S01E01` file
+/// offered for a film ("Fargo.S01E01" under the 1996 film), a bare film release ("Hannibal.2001.
+/// 1080p.BluRay") offered for a series episode, or a named different episode.
+pub(super) fn wrong_episode_or_kind(s: &Source, ctx: &AutoplayContext) -> bool {
+    match ctx.episode_code {
+        Some(ep) => wrong_episode(s, ep) || looks_like_film(s),
+        None => carries_episode_tag(s),
     }
+}
+
+/// The text a release is named by: the file name, else the first line of the add-on's text.
+fn release_name(s: &Source) -> &str {
+    if !s.filename.is_empty() { s.filename.rsplit(['/', '\\']).next().unwrap_or(&s.filename) } else { s.description.lines().next().unwrap_or("") }
+}
+
+/// The release is named as an episode (`S01E02`, `1x02`) or a whole season: not a film.
+fn carries_episode_tag(s: &Source) -> bool {
+    let name = release_name(s);
+    let title_line = s.description.lines().next().unwrap_or("");
+    [name, title_line].iter().any(|text| season_ep_tag().is_match(text) || nxnn_tag().is_match(text))
+}
+static_re!(nxnn_tag, r"(?i)\b\d{1,2}x\d{2,3}\b");
+
+/// Obviously a film for a series request: no season/episode marker anywhere in its text, not a
+/// pack, no air date, no bare anime episode number, and a release year in its file name.
+fn looks_like_film(s: &Source) -> bool {
+    if s.pack || episode_mark().is_match(&s.label) || season_pack().is_match(&s.label) { return false; }
+    let name = release_name(s);
+    let stripped = without_video_ext(name);
+    if air_date().is_match(&stripped) || anime_ep_tag().is_match(&stripped) { return false; }
+    release_year().is_match(&stripped)
 }
 
 /// Classify and sort sources for the manual Source Chooser using `ctx`: on-title direct sources
 /// always come first, while loose add-on matches for another film (e.g. "Judy" returned under
 /// "Digger") are flagged `off_title` and pushed to the bottom.
 pub(super) fn classify_manual_sources_with(list: &mut [Source], ctx: &AutoplayContext) {
-    for s in list.iter_mut() {
-        let title_ok = ctx.titles.is_empty() || names_title_any(s, &ctx.titles, ctx.year);
-        let ep_ok = ctx.episode_code.is_none_or(|ep| !wrong_episode(s, ep));
-        s.off_title = !(title_ok && ep_ok);
-    }
+    for s in list.iter_mut() { s.off_title = !fits_request(s, ctx); }
     list.sort_by_key(|x| (x.off_title, x.kind != SourceKind::Direct, quality_rank(x.quality)));
 }
 
@@ -936,11 +1015,22 @@ pub(crate) async fn selftest_autoplay_off_thread() -> Result<String> {
 }
 
 /// Verified working source ready for unified final ranking.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct VerifiedSource {
     pub source: Source,
     pub audio: AudioVerdict,
     pub has_original_lang: bool,
+}
+
+/// Debug shows the source through its redacted `Debug` (never the resolved link or its headers).
+impl std::fmt::Debug for VerifiedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedSource")
+            .field("source", &self.source)
+            .field("audio", &self.audio)
+            .field("has_original_lang", &self.has_original_lang)
+            .finish()
+    }
 }
 
 /// Aggregated failure counts across probe waves so `chose nothing` logs why candidates failed
@@ -1079,16 +1169,7 @@ pub(super) fn rank_verified(
 ) -> Vec<VerifiedSource> {
     // Compute max effective size per same-class remux group (among fitting sources with same
     // off_title, over-budget state & language tier) so an original-language remux beats a larger multi-dub remux.
-    let lang_tier_of = |w: &VerifiedSource| match (lang, w.audio) {
-        (None, _) => 0u8,
-        (Some(_), Some((true, _))) => 0,
-        (Some(l), None) => {
-            if l.matches(&w.source.label) || l.key == "english" { 0 }
-            else if other_language_only(&w.source.label, l.key) { 2 }
-            else { 1 }
-        }
-        (Some(_), Some((false, _))) => if w.has_original_lang { 2 } else { 3 },
-    };
+    let lang_tier_of = |w: &VerifiedSource| lang_tier(lang, w.audio, w.has_original_lang, &w.source.label);
     let mut remux_max: HashMap<(bool, bool, u8, RemuxClass), u64> = HashMap::new();
     for w in &working {
         if let Some(class) = remux_class(&w.source) {
@@ -1242,15 +1323,21 @@ pub(super) async fn probe_one(src: Source, allow_speed_burst: bool) -> Option<Pr
         let playlist = probe["playlist"] == true;
         let probe_resolved = probe["resolved_url"].as_str().filter(|u| u.starts_with("https://")).map(str::to_owned);
         // Header reads hit the CDN, not the add-on: run outside the per-addon semaphore gate.
+        let mut header_timed_out = false;
         let (tracks, picture, video_codec, header_resolved) = if ok && !playlist {
-            tokio::time::timeout(AUDIO_TIMEOUT, file_header(src, probe_resolved.clone(), bytes, allow_speed_burst)).await.unwrap_or_default()
+            match tokio::time::timeout(AUDIO_TIMEOUT, file_header(src, probe_resolved.clone(), bytes, allow_speed_burst)).await {
+                Ok(read) => read,
+                Err(_) => { header_timed_out = true; Default::default() }
+            }
         } else {
             (None, None, None, None)
         };
         let resolved = header_resolved.or(probe_resolved);
         let hard_fail = !ok && (debrid.is_some() || matches!(status, 404 | 410 | 403 | 200 | 206));
         let outcome = ProbeOutcome { ok, status, bytes, debrid, tracks, picture, video_codec, resolved };
-        if ok || hard_fail { Ok(outcome) } else { Err(Some(outcome)) }
+        // A link that works but whose header read timed out is answered now, yet not remembered:
+        // an empty read must not stand for five minutes as "no tracks, no picture".
+        if (ok && !header_timed_out) || hard_fail { Ok(outcome) } else { Err(Some(outcome)) }
     }).await {
         Ok(found) => Some(found.clone()),
         Err(answer) => answer,
@@ -1492,12 +1579,11 @@ pub(super) async fn probe_wave(
                     st.probed += 1;
                     let wants_burst = mirror.size_bytes.is_none_or(|b| b >= 3_000_000_000)
                         && speed_token.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    // Hands the token back if this probe doesn't measure a speed: also when the
+                    // wave aborts (deadline) and drops this task mid-probe.
+                    let burst = wants_burst.then(|| BurstToken(speed_token.clone()));
                     let outcome = probe_one(mirror.clone(), wants_burst).await;
-                    // If a pre-warmed PROBED cache hit consumed the token without measuring speed,
-                    // restore it so the next uncached mirror can still seed connection_mbps().
-                    if wants_burst && connection_mbps().is_none() {
-                        speed_token.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    drop(burst);
                     let Some(result) = outcome else {
                         st.timeout += 1;
                         continue;
@@ -1616,6 +1702,16 @@ pub(super) async fn probe_wave(
         }
         (working, debrid, wave_stats)
     }).await.unwrap_or_default()
+}
+
+/// The cold-start speed-burst token while one probe holds it: returned on drop unless a speed
+/// was measured (a pre-warmed cache hit, a failed probe, or a wave cancelled mid-probe), so the
+/// next uncached mirror can still seed `connection_mbps()`.
+struct BurstToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for BurstToken {
+    fn drop(&mut self) {
+        if connection_mbps().is_none() { self.0.store(true, std::sync::atomic::Ordering::Relaxed); }
+    }
 }
 
 /// `Pick::debrid` when the only direct links are under 1080p (Play never chooses those).
@@ -1953,6 +2049,105 @@ mod unit_tests {
         assert_ne!(probe_key(&s_a), probe_key(&s_b));
         let grouped = group_releases(&[s_a, s_b], None);
         assert_eq!(grouped[0].mirrors.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    fn mk(name: &str, bytes: u64) -> Source {
+        source_of("A", &json!({
+            "title": name, "url": format!("https://x.invalid/{}", name.len()),
+            "behaviorHints": {"filename": name, "videoSize": bytes}
+        }))
+    }
+
+    #[test]
+    fn movies_and_series_never_cross_match() {
+        // A film: an episode release of the same name is another title.
+        let film = AutoplayContext { titles: vec!["Fargo".into()], year: Some(1996), strict_title: true, ..Default::default() };
+        let mut list = vec![mk("Fargo.S01E01.1080p.WEB.mkv", 2_000_000_000), mk("Fargo.1996.1080p.BluRay.mkv", 9_000_000_000)];
+        classify_sources(&mut list, &film);
+        assert!(list[0].off_title, "an S01E01 release must not play for the film");
+        assert!(!list[1].off_title);
+
+        // A series episode: a bare film release is another title, even with the show's year.
+        let show = AutoplayContext { titles: vec!["Hannibal".into()], year: Some(2013), episode_code: Some((1, 1)), strict_title: true, ..Default::default() };
+        let mut list = vec![
+            mk("Hannibal.2001.1080p.BluRay.x264.mkv", 9_000_000_000),
+            mk("Hannibal.2013.1080p.BluRay.x264.mkv", 9_000_000_000),
+            mk("Hannibal.S01E01.1080p.WEB.mkv", 2_000_000_000),
+            mk("Hannibal.S02E01.1080p.WEB.mkv", 2_000_000_000),
+            mk("Hannibal.2013.S01E01.1080p.WEB.mkv", 2_000_000_000),
+            mk("Hannibal.S01E01.1984.1080p.WEB.mkv", 2_000_000_000),
+        ];
+        classify_sources(&mut list, &show);
+        let off: Vec<bool> = list.iter().map(|s| s.off_title).collect();
+        assert_eq!(off, [true, true, false, true, false, false]);
+
+        // A daily show's air date and an anime's bare number are episodes without SxxEyy.
+        let daily = AutoplayContext { titles: vec!["The Daily Show".into()], year: Some(1996), episode_code: Some((1, 1)), strict_title: true, ..Default::default() };
+        let mut list = vec![mk("The.Daily.Show.2024.05.12.1080p.WEB.mkv", 1_000_000_000)];
+        classify_sources(&mut list, &daily);
+        assert!(!list[0].off_title);
+    }
+
+    #[test]
+    fn parses_anime_ids_and_runtimes() {
+        assert_eq!(parse_video_episode("kitsu:123:5"), Some((1, 5)));
+        assert_eq!(parse_video_episode("mal:123:5"), Some((1, 5)));
+        assert_eq!(parse_video_episode("kitsu:123"), None);
+        assert_eq!(parse_video_episode("tt0903747:1:2"), Some((1, 2)));
+        assert_eq!(parse_video_episode("tt0903747"), None);
+        assert_eq!(parse_runtime_seconds("1 hr 52 min"), Some(6720.0));
+        assert_eq!(parse_runtime_seconds("1h 52m"), Some(6720.0));
+        assert_eq!(parse_runtime_seconds("1h52m"), Some(6720.0));
+        assert_eq!(parse_runtime_seconds("112 min"), Some(6720.0));
+        assert_eq!(parse_runtime_seconds("173"), Some(10380.0));
+        assert_eq!(parse_runtime_seconds("1:52"), Some(6720.0));
+        assert_eq!(parse_runtime_seconds("2 hours"), Some(7200.0));
+        assert_eq!(parse_runtime_seconds(""), None);
+    }
+
+    #[test]
+    fn right_language_outranks_budget_but_budget_still_orders_within_a_language() {
+        let ita = crate::addons::language("italian");
+        let budget = BandwidthBudget::from_settings(Some(15), None);
+        let big_ita = mk("Film.2025.2160p.REMUX.ITA.mkv", 70_000_000_000);
+        let small_eng = mk("Film.2025.1080p.WEB-DL.ENG.mkv", 3_000_000_000);
+        let key = |s: &Source| unified_key(s, s.size_bytes.unwrap(), None, false, ita, Some(7200.0), budget, false, None);
+        assert!(exceeds_budget(&big_ita, 70_000_000_000, Some(7200.0), budget));
+        assert!(key(&big_ita) < key(&small_eng), "an over-budget file in your language still beats a wrong-language one");
+        // Same language tier: the file that fits wins over the one that doesn't.
+        let fits = mk("Film.2025.1080p.WEB-DL.ITA.mkv", 4_000_000_000);
+        assert!(key(&fits) < key(&big_ita));
+    }
+
+    #[test]
+    fn video_extension_is_not_a_telesync_tag() {
+        assert_eq!(source_tier("Show.S01E01.1080p.x264.ts"), Some(1));
+        assert_eq!(source_tier("Film.2025.TS.x264.mkv"), Some(0));
+        assert!(!is_low_source("Film.2025.1080p.x264.ts"));
+        assert!(is_low_source("Film.2025.HDTV.x264.mkv"));
+    }
+
+    #[test]
+    fn complete_edition_films_are_not_season_packs_and_episode_titles_are_not_extras() {
+        assert!(!mk("The.Matrix.1999.Complete.Edition.1080p.BluRay.mkv", 9_000_000_000).pack);
+        assert!(source_of("A", &json!({"title": "Show.COMPLETE.1080p.WEB", "url": "https://x.invalid/p"})).pack);
+        let bts = mk("Show.S01E03.Behind.the.Scenes.1080p.WEB.mkv", 1_000_000_000);
+        assert!(is_extra_clip_for(&bts, &["Show".into()], None));
+        assert!(!is_extra_clip_for(&bts, &["Show".into()], Some("Behind the Scenes")));
+    }
+
+    #[test]
+    fn source_debug_never_shows_links_or_headers() {
+        let mut src = mk("Film.2025.1080p.mkv", 3_000_000_000);
+        src.url = "https://addon.example/KEYSECRET/stream.mkv".into();
+        src.headers.push(("Authorization".into(), "Bearer TOKENSECRET".into()));
+        let shown = format!("{src:?} {:?}", VerifiedSource { source: src.clone(), audio: None, has_original_lang: false });
+        assert!(!shown.contains("KEYSECRET") && !shown.contains("TOKENSECRET") && !shown.contains("addon.example"), "{shown}");
     }
 }
 

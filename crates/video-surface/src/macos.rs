@@ -356,11 +356,15 @@ pub fn layout(player: &dyn Player, hdr_output: bool) {
     let gamma: String = mpv.get_property("video-params/gamma").unwrap_or_default();
     let current = f64::from_bits(HEADROOM.load(Ordering::Acquire));
     let potential = f64::from_bits(POTENTIAL.load(Ordering::Acquire));
-    // Prefer live current headroom over potential so highlights don't clip when brightness/thermals limit EDR.
-    let headroom = if current > 0.0 { current } else { potential };
+    // Whether to go EDR is the screen's *potential*: `current` reads 1.0 until some layer asks for
+    // EDR content, so deciding from it would never turn EDR on in the first place.
+    let edr_possible = potential > 1.0;
+    // Once EDR runs, the live headroom (it shrinks with brightness and heat) sets the peak, so
+    // highlights don't clip; before that, the most the screen can reach.
+    let headroom = if current > 1.0 { current } else { potential };
     // PQ code values fit any buffer; a 16-bit float one (when the GPU gives it) only bands less.
     let mode = match (gamma.as_str(), primaries.as_str()) {
-        _ if headroom <= 1.0 || !hdr_output => 0,
+        _ if !edr_possible || !hdr_output => 0,
         ("pq" | "hlg", "bt.2020") => 1,
         ("pq" | "hlg", "display-p3") => 2,
         _ => 0,

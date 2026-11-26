@@ -90,6 +90,11 @@ fn main() {
 fn tv_launcher(manifest: &std::path::Path) {
     let Ok(xml) = std::fs::read_to_string(manifest) else { return };
     let mut patched = xml.clone();
+    if patched.contains("android:allowBackup=\"true\"") {
+        patched = patched.replacen("android:allowBackup=\"true\"", "android:allowBackup=\"false\"", 1);
+    } else if !patched.contains("android:allowBackup=") {
+        patched = patched.replacen("<application ", "<application android:allowBackup=\"false\" ", 1);
+    }
     if !patched.contains("android:banner=") {
         patched = patched.replacen("<application ", "<application android:banner=\"@drawable/tv_banner\" ", 1);
     }
@@ -100,10 +105,17 @@ fn tv_launcher(manifest: &std::path::Path) {
     if !patched.contains("supportsPictureInPicture") {
         patched = patched.replacen("<activity ", "<activity android:supportsPictureInPicture=\"true\" ", 1);
     }
-    if !patched.contains("smallestScreenSize") {
-        if let Some(pos) = patched.find("android:configChanges=\"") {
-            let insert_at = pos + "android:configChanges=\"".len();
-            patched.insert_str(insert_at, "smallestScreenSize|");
+    // The activity handles these changes itself (a recreate would restart the video surface and the
+    // player mid-film): the ones dx 0.7 lists, plus night mode, density, font size, keyboard, layout
+    // direction, locale and navigation. Only the missing flags are added, so a rebuild changes nothing.
+    if let Some(pos) = patched.find("android:configChanges=\"") {
+        let start = pos + "android:configChanges=\"".len();
+        if let Some(len) = patched[start..].find('"') {
+            let mut flags: Vec<String> = patched[start..start + len].split('|').map(str::trim).filter(|f| !f.is_empty()).map(str::to_owned).collect();
+            for flag in ["smallestScreenSize", "uiMode", "density", "fontScale", "keyboard", "layoutDirection", "locale", "navigation"] {
+                if !flags.iter().any(|f| f == flag) { flags.push(flag.to_owned()); }
+            }
+            patched.replace_range(start..start + len, &flags.join("|"));
         }
     }
     if !patched.contains("android:scheme=\"stremio\"") {

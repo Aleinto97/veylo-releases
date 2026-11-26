@@ -424,7 +424,7 @@ fn Forget(media: Media) -> Element {
                     },
                     icons::Trash {} span { "Remove" }
                 }
-                icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
+                icons::IconButton { label: "Keep {name}", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
             } else {
                 icons::IconButton { label: "Remove {name} from Library", class: "small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
             }
@@ -462,7 +462,7 @@ fn Unsave(media: Media) -> Element {
                     },
                     icons::Trash {} span { "Unsave" }
                 }
-                icons::IconButton { label: "Keep", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
+                icons::IconButton { label: "Keep {name}", class: "glass small", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(false) }, icons::Close {} }
             } else {
                 icons::IconButton { label: "Remove {name} from Saved", class: "small forget-btn", onclick: move |e: Event<MouseData>| { e.stop_propagation(); armed.set(true) }, icons::Trash {} }
             }

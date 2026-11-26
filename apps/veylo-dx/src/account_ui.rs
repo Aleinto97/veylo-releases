@@ -18,7 +18,17 @@ pub fn AccountBlock() -> Element {
     let mut last = use_signal(backend::last_synced);
     let mut confirm_delete = use_signal(|| false);
     let mut show_key = use_signal(|| false);
-    let mut key_copied = use_signal(|| false);
+    // Some(true) once the clipboard took the key; Some(false) when it refused.
+    let mut key_copied = use_signal(|| None::<bool>);
+    // The Recovery Key is read from its file once, off the render path, and again only when the
+    // account, the key or what sync found out about it may have changed.
+    let mut recovery_epoch = use_signal(|| 0u32);
+    let recovery = use_resource(move || async move {
+        let _ = recovery_epoch();
+        account()?;
+        if backend::sync_key_needed() { return None; }
+        backend::on_runtime(async { tokio::task::spawn_blocking(backend::sync_recovery_code).await.ok().flatten() }).await.ok().flatten()
+    });
     let mut recovery_draft = use_signal(String::new);
     let mut enter_key_open = use_signal(backend::sync_key_needed);
     let mut pending_link = use_signal(|| None::<backend::PendingLink>);
@@ -29,7 +39,7 @@ pub fn AccountBlock() -> Element {
             last_uid.set(uid);
             show_key.set(false);
             confirm_delete.set(false);
-            key_copied.set(false);
+            key_copied.set(None);
             password.set(String::new());
             recovery_draft.set(String::new());
             pending_link.set(None);
@@ -48,6 +58,8 @@ pub fn AccountBlock() -> Element {
             busy.set(None);
             account.set(backend::account());
             last.set(backend::last_synced());
+            // A sync may have found the key wrong (or right): the Recovery Key shown follows it.
+            recovery_epoch += 1;
         });
     };
     let working = busy();
@@ -70,6 +82,9 @@ pub fn AccountBlock() -> Element {
                         let display = if !a.name.is_empty() { a.name.clone() } else if !a.email.is_empty() { a.email.clone() } else { "Signed in".to_owned() };
                         let initial = display.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "V".to_owned());
                         let key_needed = backend::sync_key_needed();
+                        // Only while the key is this account's own: another device's data cannot be
+                        // opened with a fresh one, so showing or passing it on would mislead.
+                        let recovery_code: Option<String> = if key_needed { None } else { (*recovery.read()).clone().flatten() };
                         rsx! {
                             div { class: "setting-row",
                                 div { class: "account-hero",
@@ -106,23 +121,27 @@ pub fn AccountBlock() -> Element {
                                     }
                                 }
                                 div { class: "setting-controls",
-                                    if let Some(code) = backend::sync_recovery_code() {
+                                    if let Some(code) = recovery_code.clone() {
                                         button { class: "pill glass small", onclick: move |_| show_key.set(!show_key()),
                                             span { if show_key() { "Hide" } else { "Reveal" } } }
                                         button { class: "pill glass small", onclick: move |_| {
-                                            let js = format!("navigator.clipboard?.writeText({}).catch(()=>{{}})", serde_json::to_string(&code).unwrap_or_default());
-                                            let _ = document::eval(&js);
-                                            key_copied.set(true);
-                                            spawn(async move { backend::sleep(2200).await; key_copied.set(false); });
-                                        }, icons::Copy {} span { if key_copied() { "Copied" } else { "Copy" } } }
+                                            // "Copied" only once the clipboard accepted it.
+                                            let js = format!("try {{ await navigator.clipboard.writeText({}); return true; }} catch (e) {{ return false; }}", serde_json::to_string(&code).unwrap_or_default());
+                                            spawn(async move {
+                                                let ok = document::eval(&js).await.ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                                                key_copied.set(Some(ok));
+                                                backend::sleep(2200).await;
+                                                key_copied.set(None);
+                                            });
+                                        }, icons::Copy {} span { match key_copied() { Some(true) => "Copied", Some(false) => "Couldn't copy", None => "Copy" } } }
                                     }
                                     button { class: if key_needed { "pill accent small" } else { "pill glass small" },
                                         onclick: move |_| enter_key_open.set(!enter_key_open()),
                                         span { if enter_key_open() { "Close" } else { "Enter key" } } }
                                 }
                             }
-                            if show_key() {
-                                if let Some(code) = backend::sync_recovery_code() {
+                            if show_key() && !key_needed {
+                                if let Some(code) = recovery_code.clone() {
                                     div { class: "setting-drawer",
                                         span { class: "setting-about", "Your 256-bit Sync Recovery Key (never shared with Firebase):" }
                                         pre { class: "diag-log", "{code}" }
@@ -143,6 +162,7 @@ pub fn AccountBlock() -> Element {
                                                 run("unlock", Box::pin(async move {
                                                     let (took, sent) = backend::set_sync_recovery_code(&code).await?;
                                                     recovery_draft.set(String::new());
+                                                    show_key.set(false);
                                                     enter_key_open.set(false);
                                                     Ok(Some(format!("Recovery key applied ({took} in, {sent} out).")))
                                                 }));
@@ -156,10 +176,13 @@ pub fn AccountBlock() -> Element {
                                 div { class: "setting-row",
                                     div { class: "setting-copy",
                                         span { class: "setting-name", "Link a computer or TV" }
-                                        span { class: "setting-about", "Scan the QR code shown on another device, confirm the 6-digit code, then approve to transfer your session and encryption key." }
+                                        span { class: "setting-about",
+                                            if key_needed { "Enter this account's Recovery Key first: until this device can open its data, it has no working key to hand on." }
+                                            else { "Scan the QR code shown on another device, confirm the 6-digit code, then approve to transfer your session and encryption key." }
+                                        }
                                     }
                                     div { class: "setting-controls",
-                                        button { class: "pill glass small", disabled: working.is_some(),
+                                        button { class: "pill glass small", disabled: working.is_some() || key_needed,
                                             onclick: move |_| {
                                                 pending_link.set(None);
                                                 run("scan", Box::pin(async move {
@@ -171,12 +194,12 @@ pub fn AccountBlock() -> Element {
                                             icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan QR code" } } }
                                     }
                                 }
-                                if let Some(link) = pending_link() {
+                                if let Some(link) = pending_link().filter(|_| !key_needed) {
                                     div { class: "setting-drawer",
                                         span { class: "setting-name", "Approve sign-in on another device?" }
                                         span { class: "setting-about", "Check that the other screen shows verification code {link.check_code}. Approving transfers your account session and E2EE Recovery Key." }
                                         div { class: "account-actions",
-                                            button { class: "pill accent small", disabled: working.is_some(),
+                                            button { class: "pill accent small", disabled: working.is_some() || key_needed,
                                                 onclick: {
                                                     let code = link.code.clone();
                                                     move |_| {
@@ -211,7 +234,7 @@ pub fn AccountBlock() -> Element {
                                             show_key.set(false);
                                             confirm_delete.set(false);
                                             enter_key_open.set(false);
-                                            key_copied.set(false);
+                                            key_copied.set(None);
                                             password.set(String::new());
                                             recovery_draft.set(String::new());
                                             pending_link.set(None);
@@ -308,25 +331,39 @@ fn synced_label(at: i64) -> String {
 }
 
 /// The computer's QR code, renewed every ten minutes, and the wait for a phone to answer it.
+/// An offer nobody answered is taken down (its request and the passing account that waited with
+/// it) when a new code replaces it or the panel closes.
 #[component]
 fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
     let mut offer = use_signal(|| None::<backend::LinkOffer>);
     let mut problem = use_signal(|| None::<String>);
     let mut round = use_signal(|| 0u32);
+    // The offer in use, outside the signals: a closing panel can no longer read those.
+    let live = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None::<backend::LinkOffer>)));
+    use_drop({
+        let live = live.clone();
+        move || { if let Some(old) = live.borrow_mut().take() { backend::cancel_link_soon(old); } }
+    });
     use_effect(move || {
         let _ = round();
+        if let Some(old) = live.borrow_mut().take() { backend::cancel_link_soon(old); }
+        let live = live.clone();
         spawn(async move {
             offer.set(None);
             problem.set(None);
             let made = match backend::offer_link().await { Ok(o) => o, Err(e) => { problem.set(Some(format!("{e:#}"))); return } };
+            *live.borrow_mut() = Some(made.clone());
             offer.set(Some(made.clone()));
             let started = backend::now_secs();
+            let mut hiccups = 0u32;
             while backend::now_secs() - started < 600 {
                 backend::sleep(2000).await;
                 if offer.peek().as_ref() != Some(&made) { return; }
                 match backend::take_link(&made).await {
-                    Ok(Some(_)) => { on_signed_in.call(()); return; }
-                    Ok(None) => {}
+                    Ok(Some(_)) => { live.borrow_mut().take(); on_signed_in.call(()); return; }
+                    Ok(None) => { hiccups = 0; problem.set(None); }
+                    // A dropped connection or a busy service is not the end of the wait: keep asking.
+                    Err(e) if backend::is_transient(&e) && hiccups < 90 => { hiccups += 1; problem.set(Some(format!("{e:#}"))); }
                     Err(e) => { problem.set(Some(format!("{e:#}"))); return; }
                 }
             }

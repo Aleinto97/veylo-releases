@@ -102,8 +102,9 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
 .player-upnext-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 @media (max-width: 760px) { .player-upnext { right: 12px; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); } .player-upnext.lifted { bottom: calc(132px + env(safe-area-inset-bottom, 0px)); } }
 
-.player-sheet { position: absolute; right: 20px; bottom: calc(72px + env(safe-area-inset-bottom, 0px)); width: min(420px, calc(100vw - 56px)); max-height: calc(100dvh - 200px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); overflow-y: auto;
-  border-radius: 24px; z-index: 2; background: var(--glass-strong); }
+.player-sheet { position: absolute; right: 20px; bottom: calc(72px + env(safe-area-inset-bottom, 0px)); width: min(420px, calc(100vw - 56px)); max-height: calc(100vh - 200px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  max-height: calc(100dvh - 200px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); overflow-y: auto;
+  border-radius: 24px; z-index: 4; background: var(--glass-strong); }
 .player-sheet .sheet-head { position: sticky; top: 0; z-index: 2; background: rgba(18, 19, 23, .92); }
 .player-options { display: flex; flex-direction: column; padding: 6px 8px 10px; }
 .player-options-head { margin: 14px 12px 4px; font-size: 14px; font-weight: 650; color: var(--dust); }
@@ -163,6 +164,13 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
   border: 1px solid rgba(242,239,234,.22); transition: bottom .28s var(--out), transform .12s; }
 .player .player-skip.lifted { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
 @media (max-width: 760px) { .player .player-skip { right: 12px; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); } .player .player-skip.lifted { bottom: calc(128px + env(safe-area-inset-bottom, 0px)); } }
+/* Skip and Up Next can show together: Up Next sits above Skip rather than on top of it. */
+.player:has(.player-skip:not(.lifted)) .player-upnext:not(.lifted) { bottom: calc(90px + env(safe-area-inset-bottom, 0px)); }
+.player:has(.player-skip.lifted) .player-upnext.lifted { bottom: calc(142px + env(safe-area-inset-bottom, 0px)); }
+@media (max-width: 760px) {
+  .player:has(.player-skip:not(.lifted)) .player-upnext:not(.lifted) { bottom: calc(76px + env(safe-area-inset-bottom, 0px)); }
+  .player:has(.player-skip.lifted) .player-upnext.lifted { bottom: calc(188px + env(safe-area-inset-bottom, 0px)); }
+}
 
 /* Scrubber hover timestamp & chapter tooltip. */
 .scrub-tip { position: absolute; bottom: 34px; transform: translateX(-50%); padding: 4px 10px; border-radius: 10px;
@@ -181,5 +189,4 @@ html:has(.app.playing), body:has(.app.playing) { background: transparent; }
 .sub-colors { display: flex; align-items: center; gap: 8px; }
 .sub-swatch { width: 26px; height: 26px; border-radius: 50%; border: 2px solid rgba(255,255,255,.22); padding: 0; }
 .sub-swatch.on { border-color: var(--lamp); box-shadow: 0 0 0 2px rgba(242,239,234,.35); transform: scale(1.1); }
-.player-sleep-badge { font-size: 12px; font-weight: 700; color: var(--lamp); margin-left: 4px; }
 .player-unlock { position: absolute; right: 20px; top: 20px; z-index: 4; }

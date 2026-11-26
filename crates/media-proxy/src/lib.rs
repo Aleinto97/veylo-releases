@@ -29,12 +29,16 @@ const HEADER_LIMIT: usize = 8192;
 const MANIFEST_LIMIT: usize = 4 * 1024 * 1024;
 /// Connection setup, headers and error responses must be prompt.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upstream first byte: debrid/CDN origins routinely spend 10-20s resolving a cold file, and
+/// the player already waits on this request, so give it longer than a local I/O step.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Streaming body reads/writes must tolerate CDN cache misses on large files.
 /// 10s was too short for 4K remuxes and killed live playback mid-stream.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const SLOTS: usize = 8;
-/// Smallest size a probed source may have to count as a film (status clips are smaller).
-const PROBE_MIN_BYTES: u64 = 50 * 1024 * 1024;
+/// Smallest size a probed source may have to count as playable media. Debrid status clips and
+/// error videos are well under 2 MiB; the old 50 MiB floor also rejected short legitimate files.
+const PROBE_MIN_BYTES: u64 = 2 * 1024 * 1024;
 /// Pause after a transient accept() failure (EMFILE, ECONNABORTED) instead of
 /// abandoning the lease's listener for good.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -389,13 +393,26 @@ fn validate_reference(reference: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Loopback, including forms that reach this machine without saying `127.0.0.1`:
+/// `*.localhost`, the unspecified address (`0.0.0.0`, `::`) and IPv4-mapped IPv6.
 fn is_loopback(url: &Url) -> bool {
+    fn local(ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        ip.is_loopback() || ip.is_unspecified()
+    }
     match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => local(ip.into()),
+        Some(url::Host::Ipv6(ip)) => local(ip.into()),
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
         None => false,
     }
+}
+/// Length-then-XOR comparison that does not exit at the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 fn validate_url(url: &Url, allow_http: bool) -> Result<()> {
     validate_target_url(url, allow_http, true)
@@ -481,9 +498,13 @@ impl Lease {
     }
     fn target(&self, path: &str) -> Result<Url> {
         ensure!(path.starts_with('/'), "request target must be origin-form");
-        let rest = path
-            .strip_prefix(&format!("/{}/", self.token))
+        let (given, rest) = path[1..]
+            .split_once('/')
             .ok_or_else(|| anyhow!("unknown token"))?;
+        ensure!(
+            constant_time_eq(given.as_bytes(), self.token.as_bytes()),
+            "unknown token"
+        );
         let (origin, path) = rest.split_once('/').ok_or_else(|| anyhow!("bad route"))?;
         ensure!(
             origin.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -537,7 +558,7 @@ impl Lease {
                 .client
                 .request(method.clone(), url.clone())
                 .headers(headers);
-            let response = timeout(IO_TIMEOUT, req.send())
+            let response = timeout(FIRST_BYTE_TIMEOUT, req.send())
                 .await
                 .context("upstream response timeout")??;
             ensure!(
@@ -1714,5 +1735,37 @@ mod tests {
         );
         wrong_end.insert("content-length", HeaderValue::from_static("151"));
         assert_eq!(single_range_length(&wrong_end, Some(req)), None);
+    }
+
+    #[test]
+    fn loopback_covers_mapped_unspecified_and_localhost_subdomains() {
+        for u in [
+            "http://localhost/",
+            "http://App.LOCALHOST:8/",
+            "http://a.b.localhost./",
+            "http://127.0.0.2/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+        ] {
+            assert!(is_loopback(&Url::parse(u).unwrap()), "{u}");
+        }
+        for u in [
+            "https://example.com/",
+            "https://localhost.example.com/",
+            "http://[::ffff:8.8.8.8]/",
+            "http://10.0.0.1/",
+        ] {
+            assert!(!is_loopback(&Url::parse(u).unwrap()), "{u}");
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_compares_whole_values() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

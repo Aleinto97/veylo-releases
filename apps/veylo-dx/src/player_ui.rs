@@ -2,7 +2,7 @@
 //! The picture itself is under the transparent WebView (video.rs); everything here is the
 //! app's own design, lit by the title's accent. Keys arrive through the shell (Shell::player_key).
 use crate::{backend::{self, OnlineSubtitle}, engine::{self, Finish, Fit, LiveRef, SegmentKind, State}, icons, Shell};
-use crate::player_rules::{clock, details, fallback_with_pref, offer, skip, up_next_due, Fallback, ANDROID, KEYS, ONLINE_SHOWN, SPEEDS};
+use crate::player_rules::{clock, details, fallback_with_pref, offer, skip, up_next_countdown, up_next_due, Fallback, ANDROID, KEYS, ONLINE_SHOWN, SPEEDS};
 use dioxus::prelude::*;
 
 /// Subtitles the add-ons offer for this video, fetched the first time the sheet opens.
@@ -14,7 +14,7 @@ enum Online { Idle, Loading, Ready(Vec<OnlineSubtitle>), Failed }
 enum Sheet { Audio, Subtitles, Chapters, Sources, Episodes, Speed, Sleep, Picture, Info, Keys }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SleepTimer { Off, EndOfEpisode, Mins(u32) }
+pub enum SleepTimer { Off, EndOfEpisode, Mins(u32) }
 
 const SUB_COLORS: [(&str, &str); 4] = [
     ("Bone", "#F2EFEA"),
@@ -34,11 +34,13 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut last_move = use_signal(|| None::<std::time::Instant>);
     let mut sheet = use_signal(|| None::<Sheet>);
     let mut scrub = use_signal(|| None::<f64>);
-    let mut fullscreen = use_signal(|| false);
-    let mut rotation_locked = use_signal(|| false);
+    // Kept on the shell, so they carry over from one episode to the next.
+    let mut fullscreen = shell.player_fullscreen;
+    let mut rotation_locked = shell.player_rotation_locked;
     let mut touch_locked = use_signal(|| false);
     let mut stats_hud = use_signal(|| false);
-    let mut sleep_mode = use_signal(|| SleepTimer::Off);
+    let mut sleep_mode = shell.sleep_mode;
+    let mut sleep_deadline = shell.sleep_deadline;
     let mut sleep_rem_secs = use_signal(|| None::<u32>);
     let mut hover_scrub = use_signal(|| None::<(f64, f64)>); // (percent 0..100, seconds)
     let mut scrub_width = use_signal(|| 0.0f64);
@@ -78,6 +80,20 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let mut last_tap = use_signal(|| None::<(std::time::Instant, f64, i32)>); // (at, x, cumulative_secs)
     #[cfg(target_os = "android")]
     let mut suppress_click = use_signal(|| false);
+    // The click a gesture's touch-end may still send is ignored for a moment only: a long press or a
+    // drag that sends none must not swallow the viewer's next real tap.
+    #[cfg(target_os = "android")]
+    let mut suppress_gen = use_signal(|| 0u64);
+    #[cfg(target_os = "android")]
+    let mut arm_suppress = move || {
+        let g = *suppress_gen.peek() + 1;
+        suppress_gen.set(g);
+        suppress_click.set(true);
+        spawn(async move {
+            backend::sleep(250).await;
+            if *suppress_gen.peek() == g { suppress_click.set(false); }
+        });
+    };
     let mut online = use_signal(|| Online::Idle);
     let sub_query = use_signal(String::new);
     let mut automatic_language = use_signal(|| None::<String>);
@@ -143,7 +159,12 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     let attach = live.clone();
     let detach_id = live.0.session_id;
     use_hook(move || crate::video::attach(&attach.0));
-    use_drop(move || crate::video::detach(detach_id));
+    // Moving on to another episode or source keeps the picture (and full screen, rotation lock and
+    // sleep timer) up for the next player screen; the shell lets go if nothing takes over.
+    use_drop(move || {
+        if *shell.player_switching.peek() { return; }
+        if crate::video::detach(detach_id) { shell.reset_player_environment(); }
+    });
 
     // Controls fade three seconds after the last touch, key or pointer movement (one timer task,
     // never spawning per mousemove pixel).
@@ -203,13 +224,14 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     // Direct output: mpv can't draw into the picture, so text subtitles are drawn here.
     let caption = (s.direct && sub_on && !s.subtitle.trim().is_empty()).then(|| s.subtitle.clone());
     let up_next_active = auto_next_on
-        && sleep_mode() == SleepTimer::Off
+        && sleep_mode() != SleepTimer::EndOfEpisode
         && up_next_due(s.position, s.duration, s.ended, &s.skips(), req.has_next, up_next_dismissed())
         && sheet().is_none() && s.error.is_none() && scrub().is_none();
     let skippable = offer(&s.skips(), s.position, req.has_next)
         .filter(|g| sheet().is_none() && s.error.is_none() && scrub().is_none() && !(up_next_active && g.kind == SegmentKind::Credits));
 
-    // Sleep timer countdown: pauses playback (and suppresses Up Next) when expired or at EOF.
+    // Sleep timer countdown: pauses playback when it runs out. "End of episode" also suppresses Up Next and pauses at
+    // the end; a timed one lets Up Next carry on (its deadline is on the shell, so it keeps counting into the next episode).
     let sleep_live = live.clone();
     let mut sleep_gen = use_signal(|| 0u64);
     use_effect(move || {
@@ -224,22 +246,32 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 }
             }
             SleepTimer::Mins(m) => {
+                // The deadline lives on the shell: a new player screen (the next episode) picks the
+                // countdown up where the last one left it instead of starting over.
+                let saved = *sleep_deadline.peek();
+                let deadline = match saved {
+                    Some(d) => d,
+                    None => { let d = std::time::Instant::now() + std::time::Duration::from_secs(u64::from(m) * 60); sleep_deadline.set(Some(d)); d }
+                };
+                let remaining = |d: std::time::Instant| d.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
                 let g = *sleep_gen.peek() + 1;
                 sleep_gen.set(g);
-                sleep_rem_secs.set(Some(m * 60));
+                sleep_rem_secs.set(Some(remaining(deadline).ceil() as u32));
                 let live = sleep_live.0.clone();
                 spawn(async move {
                     loop {
                         backend::sleep(1000).await;
                         if *sleep_gen.peek() != g || *sleep_mode.peek() != SleepTimer::Mins(m) { break; }
-                        let Some(rem) = *sleep_rem_secs.peek() else { break };
-                        if rem <= 1 {
+                        let Some(deadline) = *sleep_deadline.peek() else { break };
+                        let left = remaining(deadline);
+                        if left <= 0.5 {
                             sleep_rem_secs.set(None);
                             sleep_mode.set(SleepTimer::Off);
+                            sleep_deadline.set(None);
                             live.set_paused(true);
                             break;
                         }
-                        sleep_rem_secs.set(Some(rem - 1));
+                        sleep_rem_secs.set(Some(left.ceil() as u32));
                     }
                 });
             }
@@ -251,15 +283,19 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     use_effect(move || {
         let s = state.read();
         let active = auto_next_on
-            && sleep_mode() == SleepTimer::Off
+            && sleep_mode() != SleepTimer::EndOfEpisode
             && up_next_due(s.position, s.duration, s.ended, &s.skips(), next_live.0.request.has_next, up_next_dismissed())
             && sheet().is_none() && s.error.is_none() && scrub().is_none();
         if !active {
             if up_next_secs.peek().is_some() { up_next_secs.set(None); }
             return;
         }
-        if !*up_next_task.peek() {
-            let start = if s.ended { 5 } else { 10 };
+        let start = up_next_countdown(s.position, s.duration, s.ended, &s.skips());
+        if *up_next_task.peek() {
+            // A sheet that opened and closed within the task's one-second tick cleared the count while
+            // the task was still alive: start it again on the same task, or the card would stall.
+            if up_next_secs.peek().is_none() { up_next_secs.set(Some(start)); }
+        } else {
             up_next_secs.set(Some(start));
             up_next_task.set(true);
             let live = next_live.0.clone();
@@ -267,6 +303,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 loop {
                     backend::sleep(1000).await;
                     let cur = *up_next_secs.peek();
+                    // The card went away (a sheet opened, a seek, Stay): this countdown is over. A later
+                    // card starts its own, so a sheet opened and closed within a second can't leave a
+                    // finished task behind that blocks the next countdown.
                     let Some(rem) = cur else { break };
                     if *up_next_dismissed.peek() { up_next_secs.set(None); break; }
                     let st = state.peek().clone();
@@ -442,6 +481,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
 
     // Keys routed from the shell; the same set as the classic Android player.
     let keys = live.clone();
+    let pref_key = media_key.clone();
     use_effect(move || {
         let Some(key) = (shell.player_key)() else { return };
         shell.player_key.set(None);
@@ -455,7 +495,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                 if let Some(g) = offer(&now.skips(), now.position, live.request.has_next) { skip(live, g); }
             }
             " " | "k" | "K" | "Enter" | "MediaPlayPause" => { live.toggle_pause(); poke(); }
-            "MediaPlay" => { if now.paused { live.toggle_pause(); } }
+            "MediaPlay" => { if now.paused { live.toggle_pause(); } poke(); }
             "MediaPause" => { if !now.paused { live.toggle_pause(); } poke(); }
             "ArrowLeft" | "j" | "J" | "MediaRewind" => { live.seek_by(-10.0); say("−10 s".into()); }
             "ArrowRight" | "l" | "L" | "MediaFastForward" => { live.seek_by(10.0); say("+10 s".into()); }
@@ -471,8 +511,24 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             }
             "m" | "M" | "AudioVolumeMute" => { live.toggle_mute(); say(if now.muted { "Sound on".into() } else { "Muted".into() }); }
             "f" | "F" if !ANDROID => { let on = !fullscreen(); fullscreen.set(on); crate::video::set_fullscreen(on); }
-            "a" | "A" => { let t = live.cycle_track(true); say(format!("Audio: {t}")); }
-            "c" | "C" => { let t = live.cycle_track(false); say(format!("Subtitles: {t}")); }
+            "a" | "A" => {
+                let (label, track) = live.cycle_track(true);
+                say(format!("Audio: {label}"));
+                // Remembered for the series like a pick in the sheet, so the next episode keeps it.
+                if let (Some(mk), Some(lang)) = (&pref_key, track.map(|t| t.lang).filter(|l| !l.is_empty())) {
+                    backend::save_track_pref(mk, |p| p.audio_lang = Some(lang));
+                }
+            }
+            "c" | "C" => {
+                let (label, track) = live.cycle_track(false);
+                say(format!("Subtitles: {label}"));
+                if let Some(mk) = &pref_key {
+                    match track {
+                        Some(t) => backend::save_track_pref(mk, |p| { p.sub_off = false; if !t.lang.is_empty() { p.sub_lang = Some(t.lang); } }),
+                        None => backend::save_track_pref(mk, |p| { p.sub_off = true; p.sub_lang = None; }),
+                    }
+                }
+            }
             "s" | "S" => sheet.set(if sheet() == Some(Sheet::Subtitles) { None } else { Some(Sheet::Subtitles) }),
             "," => { let d = now.sub_delay - 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
             "." => { let d = now.sub_delay + 0.25; live.set_sub_delay(d); say(format!("Subtitle delay {:+.2} s", d)); }
@@ -534,10 +590,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             spawn(async move {
                                 backend::sleep(450).await;
                                 let still = (*touch_start.peek()).is_some_and(|x| x.5 == seq);
-                                if still && touch_drag.peek().is_none() && sheet.peek().is_none() && !*touch_locked.peek() {
+                                // Only one boost at a time: a second one would remember 2× as the speed to return to.
+                                if still && touch_drag.peek().is_none() && touch_boost.peek().is_none() && sheet.peek().is_none() && !*touch_locked.peek() {
                                     let prev = live_lp.state().speed;
                                     touch_boost.set(Some(prev));
-                                    suppress_click.set(true);
                                     live_lp.set_speed(2.0);
                                     say_lp("2× speed".into());
                                 }
@@ -563,7 +619,6 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 let vw = (*viewport_w.peek()).max(320.0);
                                 let left = sx < vw * 0.5;
                                 touch_drag.set(Some(left));
-                                suppress_click.set(true);
                             } else {
                                 return;
                             }
@@ -593,9 +648,11 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                             say(if (prev - 1.0).abs() < 0.01 { "Normal speed".into() } else { format!("Speed {prev}×") });
                             touch_start.set(None);
                             touch_drag.set(None);
+                            arm_suppress();
                             return;
                         }
                         let dragged = touch_drag.take().is_some();
+                        if dragged { arm_suppress(); }
                         let start = touch_start.take();
                         if !dragged {
                             if let Some((sx, _, _, _, _, _)) = start {
@@ -608,14 +665,14 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                         if sx < vw * 0.36 {
                                             let next_acc = acc - 10;
                                             last_tap.set(Some((now, sx, next_acc)));
-                                            suppress_click.set(true);
+                                            arm_suppress();
                                             live_te.seek_by(-10.0);
                                             say(format!("−{} s", next_acc.abs()));
                                             return;
                                         } else if sx > vw * 0.64 {
                                             let next_acc = acc + 10;
                                             last_tap.set(Some((now, sx, next_acc)));
-                                            suppress_click.set(true);
+                                            arm_suppress();
                                             live_te.seek_by(10.0);
                                             say(format!("+{} s", next_acc));
                                             return;
@@ -714,7 +771,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                         p { class: "dim", "Another source may play; this one can also be tried again." }
                         div { class: "player-error-actions",
                             button { class: "pill accent", onclick: { let live = lc(); move |_| live.finish(Finish::Another) }, icons::Next {} span { "Try another source" } }
-                            button { class: "pill glass", onclick: { let live = lc(); move |_| { sub_added.write().clear(); live.retry(); } }, icons::Refresh {} span { "Retry" } }
+                            button { class: "pill glass", onclick: { let live = lc(); move |_| { sub_added.write().clear(); fallback_done.set(false); live.retry(); } }, icons::Refresh {} span { "Retry" } }
                             button { class: "pill glass", onclick: { let live = lc(); move |_| live.finish(Finish::Close) }, icons::Close {} span { "Close" } }
                         }
                     }
@@ -774,7 +831,9 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 #[cfg(target_os = "android")]
                                 {
                                     let st = state.peek();
-                                    let ok = crate::android::video_enter_pip(st.width as i32, st.height as i32);
+                                    // The display aspect (anamorphic and overridden pictures included), not the coded size.
+                                    let (w, h) = if st.aspect > 0.0 { ((st.aspect * 1000.0).round() as i32, 1000) } else { (st.width as i32, st.height as i32) };
+                                    let ok = crate::android::video_enter_pip(w, h);
                                     if !ok { say("Picture-in-picture isn't available".into()); }
                                 }
                             },
@@ -1075,6 +1134,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                 ] {
                                     OptionRow { key: "{label}", on: sleep_mode() == mode, label: label.to_string(), about: about.to_string(),
                                         pick: move |_| {
+                                            sleep_deadline.set(match mode {
+                                                SleepTimer::Mins(m) => Some(std::time::Instant::now() + std::time::Duration::from_secs(u64::from(m) * 60)),
+                                                _ => None,
+                                            });
                                             sleep_mode.set(mode);
                                             sheet.set(None);
                                             say(if mode == SleepTimer::Off { "Sleep timer off".into() } else { format!("Sleep timer: {label}") });
@@ -1139,7 +1202,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                             && (req.has_next || req.has_prev || k != &["N", "P"])
                                             && (!s.chapters.is_empty() || k != &["B"])
                                             && (!req.episodes.is_empty() || k != &["E"])
-                                            && (req.sources.len() > 1 || k != &["O"])
+                                            && (!req.sources.is_empty() || k != &["O"])
                                     }) { div { class: "shortcut", span { class: "caps", for c in k.iter() { kbd { class: "keycap", "{c}" } } } span { "{what}" } } }
                                 }
                             },
@@ -1254,7 +1317,7 @@ fn OnlineSubtitles(online: Online, query: Signal<String>, busy: Option<String>, 
 pub fn PendingPlayer(title: String, step: String) -> Element {
     let mut shell = use_context::<Shell>();
     rsx! {
-        div { class: "player pending", role: "dialog", aria_label: "{title}",
+        div { class: "player pending", role: "dialog", aria_modal: "true", aria_label: "{title}",
             div { class: "player-top", onkeydown: move |e: KeyboardEvent| if matches!(e.key(), Key::Enter | Key::Tab) || e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                 button { class: "bare", aria_label: "Back (Esc)", title: "Back (Esc)", onclick: move |_| crate::cancel_finding(shell), icons::ArrowLeft {} }
                 div { class: "player-heading",

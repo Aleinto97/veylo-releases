@@ -11,6 +11,9 @@ use std::{
 /// one saved/history row without bound; that row is never evicted.
 const META_BUDGET_BYTES: usize = 1 << 20;
 
+/// How far ahead of this clock a remote device's change time may be before it is clamped.
+const MAX_REMOTE_SKEW_SECS: i64 = 300;
+
 pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -253,12 +256,29 @@ pub(crate) fn media_item(db: &Connection, key: &str) -> Result<Option<Media>> {
         .query_row([key], media_row)
         .optional()?)
 }
+/// Explicit mutation (library, progress, sync, migration): the supplied source is authoritative.
 pub(crate) fn upsert_meta(
     db: &Connection,
     kind: &str,
     id: &str,
     addon: &str,
     value: &Value,
+) -> Result<String> {
+    upsert_meta_with(db, kind, id, addon, value, false)
+}
+
+const RELATIONSHIP_FIELDS: [&str; 3] = ["collection", "belongsToCollection", "franchise"];
+
+/// `passive` is catalog/search caching: it refreshes what it knows but must never
+/// re-attribute a row the user has history on to another addon, nor strip or
+/// overwrite its addon-supplied relationships.
+fn upsert_meta_with(
+    db: &Connection,
+    kind: &str,
+    id: &str,
+    addon: &str,
+    value: &Value,
+    passive: bool,
 ) -> Result<String> {
     let key = identity(kind, id, addon);
     if value.as_object().is_some_and(|object| object.is_empty()) {
@@ -278,24 +298,29 @@ pub(crate) fn upsert_meta(
         )?;
         return Ok(key);
     }
-    let old: Option<(String, String)> = db
+    let old: Option<(String, String, bool)> = db
         .query_row(
-            "SELECT meta,addon_url FROM media WHERE key=?1",
+            "SELECT meta,addon_url,(saved<>0 OR watched<>0 OR position_ms>0 OR watched_ms>0 OR liked<>0)
+             FROM media WHERE key=?1",
             [&key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let replace_source = old.as_ref().is_some_and(|(_, source)| source != addon)
+    let protected = passive && old.as_ref().is_some_and(|(_, _, history)| *history);
+    let foreign = old.as_ref().is_some_and(|(_, source, _)| source != addon);
+    let replace_source = foreign
+        && !protected
         && value
             .as_object()
             .is_some_and(|object| object.keys().any(|key| key != "id" && key != "type"));
+    let old = old.map(|(meta, source, _)| (meta, source));
     let mut merged = old
         .and_then(|(s, _)| serde_json::from_str::<Value>(&s).ok())
         .filter(Value::is_object)
         .unwrap_or(json!({}));
     if replace_source {
         // Explicit relationships belong to their supplying addon, not an ID alone.
-        for field in ["collection", "belongsToCollection", "franchise"] {
+        for field in RELATIONSHIP_FIELDS {
             merged.as_object_mut().unwrap().remove(field);
         }
     }
@@ -303,6 +328,10 @@ pub(crate) fn upsert_meta(
     if let Some(new) = value.as_object() {
         for (k, v) in new {
             if v.is_null() {
+                continue;
+            }
+            // A foreign addon's relationships never attach to a protected row's source.
+            if protected && foreign && RELATIONSHIP_FIELDS.contains(&k.as_str()) {
                 continue;
             }
             // Bound the durable row: keep the fields that fit, drop the rest.
@@ -439,6 +468,9 @@ pub(crate) fn sync_changes(db: &Connection, req: &Value) -> Result<Value> {
 pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> {
     let tx = db.transaction()?;
     let mut applied = 0;
+    // A device with a far-future clock must not lock a row or tombstone against every
+    // later honest write: remote times are clamped to a small skew allowance.
+    let horizon = now().saturating_add(MAX_REMOTE_SKEW_SECS);
     let field = |v: &Value, k: &str| {
         v[k].as_str()
             .filter(|s| !s.is_empty() && s.len() <= 2048)
@@ -452,7 +484,7 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
         ) else {
             continue;
         };
-        let Some(updated) = m["updated"].as_i64() else {
+        let Some(updated) = m["updated"].as_i64().map(|t| t.min(horizon)) else {
             continue;
         };
         let key = identity(&kind, &id, &addon);
@@ -510,7 +542,7 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
         ) else {
             continue;
         };
-        let Some(updated) = p["updated"].as_i64() else {
+        let Some(updated) = p["updated"].as_i64().map(|t| t.min(horizon)) else {
             continue;
         };
         let key = identity(&kind, &id, &addon);
@@ -552,7 +584,7 @@ pub(crate) fn cache_metas(
     for meta in listed.chain(single) {
         if let Some(id) = meta.get("id").and_then(Value::as_str) {
             let kind = meta.get("type").and_then(Value::as_str).unwrap_or(kind);
-            upsert_meta(&tx, kind, id, addon, meta)?;
+            upsert_meta_with(&tx, kind, id, addon, meta, true)?;
         }
     }
     tx.commit()?;
@@ -617,6 +649,77 @@ mod tests {
             "catalog row must count as recently seen"
         );
         assert_eq!(updated(&saved), 1, "history order must not change");
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn passive_catalog_cache_never_reattributes_or_strips_history_rows() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "target/test-data/db-passive-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = open(&dir).unwrap();
+        let a = "https://a.test/manifest.json";
+        let b = "https://b.test/manifest.json";
+        let collection = json!({"id":"c1","name":"Saga"});
+        // Saved with relationships supplied by addon A (explicit mutation).
+        let saved = upsert_meta(
+            &db,
+            "movie",
+            "tt1",
+            a,
+            &json!({"name":"Film","collection":collection}),
+        )
+        .unwrap();
+        db.execute("UPDATE media SET saved=1 WHERE key=?1", [&saved])
+            .unwrap();
+        // A history-free row from A that B's catalog also lists.
+        let seen = upsert_meta(
+            &db,
+            "movie",
+            "tt2",
+            a,
+            &json!({"name":"Seen","collection":collection}),
+        )
+        .unwrap();
+        // Another addon's catalog lists the same IMDb ids with different data.
+        let body = json!({"metas":[
+            {"id":"tt1","type":"movie","name":"Film (B)","collection":{"id":"other","name":"Other"}},
+            {"id":"tt2","type":"movie","name":"Seen (B)"}
+        ]});
+        cache_metas(&mut db, &body, "movie", b).unwrap();
+        let row = |key: &str| -> (String, Value) {
+            db.query_row(
+                "SELECT addon_url,meta FROM media WHERE key=?1",
+                [key],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let (addon, meta) = row(&saved);
+        assert_eq!(addon, a, "history row keeps its source");
+        assert_eq!(
+            meta["collection"], collection,
+            "relationships are not stripped or replaced"
+        );
+        assert_eq!(
+            meta["name"], "Film (B)",
+            "non-relationship metadata still refreshes"
+        );
+        // A row with no history is still re-attributed by a passive refresh (cache behaviour unchanged).
+        let (addon, meta) = row(&seen);
+        assert_eq!(addon, b);
+        assert!(meta.get("collection").is_none());
+        // An explicit mutation still switches the source of a history row.
+        upsert_meta(&db, "movie", "tt1", b, &json!({"name":"Film"})).unwrap();
+        assert_eq!(row(&saved).0, b);
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }

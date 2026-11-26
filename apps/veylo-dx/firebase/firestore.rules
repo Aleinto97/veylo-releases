@@ -33,7 +33,8 @@ service cloud.firestore {
       allow create, update: if isSignedInUser(uid)
         && request.resource.data.keys().hasOnly(['sealed', 'v', 'updated', 'device', 'synced'])
         && (!('sealed' in request.resource.data) || (request.resource.data.sealed is string && request.resource.data.sealed.size() <= 262144))
-        && (!('device' in request.resource.data) || (request.resource.data.device is string && request.resource.data.device.size() <= 128));
+        && (!('device' in request.resource.data) || (request.resource.data.device is string && request.resource.data.device.size() <= 128))
+        && (!('updated' in request.resource.data) || request.resource.data.updated is int);
     }
     match /users/{uid}/diagnostics/{id} {
       allow read, delete: if isSignedInUser(uid);
@@ -54,7 +55,9 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['asker', 'created'])
         && request.resource.data.asker == request.auth.uid
         && request.resource.data.created == request.time;
-      allow read, delete: if request.auth != null && resource.data.asker == request.auth.uid;
+      allow read: if request.auth != null && resource.data.asker == request.auth.uid;
+      // Taking down an offer nobody answered: deleting one that is already gone is harmless.
+      allow delete: if request.auth != null && (resource == null || resource.data.asker == request.auth.uid);
       allow update: if request.auth != null && request.auth.token.firebase.sign_in_provider != 'anonymous'
         && !('sealed' in resource.data)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sealed'])

@@ -83,10 +83,7 @@ async fn once(cache: &'static OnceLock<Mutex<Shared>>, key: String, fetch: impl 
     cell.get_or_try_init(|| async move { fetch.await.ok_or(()) }).await.ok().cloned()
 }
 
-/// An IMDb id safe to put in a query: "tt" and digits only.
-fn checked_imdb(m: &Media) -> Option<String> {
-    imdb_of(m).filter(|id| id.len() > 2 && id[2..].bytes().all(|b| b.is_ascii_digit()))
-}
+// `checked_imdb` (metadata.rs): an IMDb id safe to put in a query or URL, "tt" and digits only.
 
 // ---------------------------------------------------------------- TVmaze
 
@@ -354,7 +351,7 @@ pub async fn series_status(m: &Media) -> Option<String> {
 
 /// A TVmaze show as a Cinemeta title (by its IMDb id), so it opens and plays like any other.
 pub(super) fn tvmaze_media(s: &Value) -> Option<Media> {
-    let imdb = s["externals"]["imdb"].as_str().filter(|i| i.starts_with("tt"))?;
+    let imdb = s["externals"]["imdb"].as_str().filter(|i| valid_imdb(i))?;
     let year: i32 = s["premiered"].as_str().and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()).unwrap_or(0);
     let ended: Option<i32> = s["ended"].as_str().and_then(|d| d.get(..4)).and_then(|y| y.parse().ok());
     let summary = html_tag().replace_all(s["summary"].as_str().unwrap_or_default(), "").to_string();
@@ -563,7 +560,7 @@ pub(super) fn parse_wikidata_collection(rows: &Value, today: &str) -> Option<Col
     let mut by_imdb: HashMap<String, (String, String)> = HashMap::new();
     for r in rows.as_array().into_iter().flatten() {
         let imdb = field(r, "imdb");
-        if !imdb.starts_with("tt") { continue; }
+        if !valid_imdb(imdb) { continue; }
         let Some(part_name) = label(r, "partLabel") else { continue };
         if col_name.is_empty() {
             if let Some(c) = label(r, "colLabel") { col_name = c; }
@@ -860,7 +857,7 @@ pub async fn person_filmography(person: &Person) -> Filmography {
             let mut items = Vec::new();
             for r in rows.as_array().into_iter().flatten() {
                 let imdb = field(r, "imdb");
-                if !imdb.starts_with("tt") || !seen.insert(imdb.to_owned()) { continue; }
+                if !valid_imdb(imdb) || !seen.insert(imdb.to_owned()) { continue; }
                 let Some(name) = label(r, "fLabel") else { continue };
                 let kind = if field(r, "isTv") == "true" { "series" } else { "movie" };
                 let year = field(r, "year");

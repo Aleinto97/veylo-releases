@@ -38,6 +38,14 @@ pub(super) fn hls(lease: &Lease, base: &Url, text: &str) -> Result<String> {
             continue;
         }
         let tag = line.split(':').next().unwrap_or(line);
+        // Benign ad-marker / session metadata: playback never needs it, and SESSION-DATA can name
+        // an external URI the engine would fetch, so it is dropped instead of forwarded.
+        if matches!(
+            tag,
+            "#EXT-X-SESSION-DATA" | "#EXT-X-CUE-OUT" | "#EXT-X-CUE-OUT-CONT" | "#EXT-X-CUE-IN"
+        ) {
+            continue;
+        }
         ensure!(
             matches!(
                 tag,
@@ -233,6 +241,8 @@ fn allowed_hls_attribute(tag: &str, key: &str) -> bool {
                 | "INSTREAM-ID"
                 | "CHARACTERISTICS"
                 | "CHANNELS"
+                | "BIT-DEPTH"
+                | "SAMPLE-RATE"
                 | "STABLE-RENDITION-ID"
         ),
         "#EXT-X-STREAM-INF" | "#EXT-X-I-FRAME-STREAM-INF" => matches!(
@@ -248,6 +258,8 @@ fn allowed_hls_attribute(tag: &str, key: &str) -> bool {
                 | "SUBTITLES"
                 | "CLOSED-CAPTIONS"
                 | "VIDEO-RANGE"
+                | "SUPPLEMENTAL-CODECS"
+                | "REQ-VIDEO-LAYOUT"
                 | "SCORE"
                 | "STABLE-VARIANT-ID"
                 | "URI"
@@ -289,6 +301,19 @@ fn start(event: &BytesStart<'_>, reader: &Reader<&[u8]>) -> Result<Element> {
         let value = attr
             .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())?
             .to_string();
+        // XML Schema instance attributes (`xmlns:xsi`, `xsi:schemaLocation`) are validation hints
+        // many packagers emit. They carry no playback meaning and `schemaLocation` names a URL, so
+        // they are removed here and never reach the engine.
+        if key == "xmlns:xsi" {
+            ensure!(
+                value == "http://www.w3.org/2001/XMLSchema-instance",
+                "unsupported DASH namespace"
+            );
+            continue;
+        }
+        if key.starts_with("xsi:") {
+            continue;
+        }
         ensure!(
             !key.contains(':') || key == "xml:lang",
             "DASH namespaced attributes unsupported"
@@ -320,9 +345,15 @@ fn parse_xml(text: &str) -> Result<Element> {
     let mut root = None;
     let mut nodes = 0usize;
     loop {
-        nodes += 1;
-        ensure!(nodes <= 65536, "DASH XML node limit");
-        match reader.read_event()? {
+        let event = reader.read_event()?;
+        // Indentation between elements is not structure: pretty-printed manifests must not
+        // spend the node budget on whitespace.
+        let whitespace = matches!(&event, Event::Text(t) if t.iter().all(u8::is_ascii_whitespace));
+        if !whitespace {
+            nodes += 1;
+            ensure!(nodes <= 65536, "DASH XML node limit");
+        }
+        match event {
             Event::Start(e) => {
                 ensure!(stack.len() < 64, "DASH XML nesting limit");
                 stack.push(start(&e, &reader)?);
@@ -402,11 +433,38 @@ fn text_content(el: &Element) -> Result<String> {
     }
     Ok(text.trim().to_string())
 }
+fn count_nodes(el: &Element) -> usize {
+    let mut n = 1usize;
+    for child in &el.children {
+        n = n.saturating_add(match child {
+            Node::Text(_) => 1,
+            Node::Element(c) => count_nodes(c),
+        });
+    }
+    n
+}
+fn count_bytes(el: &Element) -> usize {
+    let mut n = el.name.len().saturating_mul(2).saturating_add(5);
+    for (k, v) in &el.attrs {
+        n = n
+            .saturating_add(k.len())
+            .saturating_add(v.len())
+            .saturating_add(4);
+    }
+    for child in &el.children {
+        n = n.saturating_add(match child {
+            Node::Text(t) => t.len(),
+            Node::Element(c) => count_bytes(c),
+        });
+    }
+    n
+}
 fn rewrite_element(
     el: &mut Element,
     lease: &Lease,
     inherited: &Url,
     budget: &mut usize,
+    node_budget: &mut usize,
 ) -> Result<()> {
     ensure!(!lease.cancel.is_cancelled(), "lease cancelled");
     let name = local(&el.name).to_string();
@@ -456,6 +514,10 @@ fn rewrite_element(
                     | "subsegmentAlignment"
                     | "subsegmentStartsWithSAP"
                     | "startsWithSAP"
+                    | "startWithSAP"
+                    | "group"
+                    | "maximumSAPPeriod"
+                    | "segmentProfiles"
                     | "bandwidth"
                     | "qualityRanking"
                     | "dependencyId"
@@ -508,9 +570,9 @@ fn rewrite_element(
                 !value.is_empty()
                     && value != "."
                     && value != ".."
-                    && value
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                    && value.bytes().all(
+                        |b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'=')
+                    ),
                 "unsafe DASH RepresentationID substitution"
             );
         }
@@ -584,6 +646,13 @@ fn rewrite_element(
             "DASH descriptor scheme required"
         );
     }
+    // Alternative BaseURLs are mirrors of the first. Only the first is honoured (and every one
+    // would be rewritten to the same local URL anyway), so the rest are dropped unvalidated.
+    let mut first_base = true;
+    el.children.retain(|n| match n {
+        Node::Element(e) if local(&e.name) == "BaseURL" => std::mem::take(&mut first_base),
+        _ => true,
+    });
     let bases = el
         .children
         .iter()
@@ -592,10 +661,6 @@ fn rewrite_element(
             _ => None,
         })
         .collect::<Vec<_>>();
-    ensure!(
-        bases.len() <= 1,
-        "multiple alternative DASH BaseURLs unsupported"
-    );
     ensure!(
         bases.is_empty()
             || matches!(
@@ -636,6 +701,17 @@ fn rewrite_element(
         if rep_has_base {
             if let Some(idx) = parent_tpl_idx {
                 if let Node::Element(parent_tpl) = el.children.remove(idx) {
+                    let tpl_nodes = count_nodes(&parent_tpl);
+                    let tpl_child_nodes = tpl_nodes.saturating_sub(1);
+                    let tpl_bytes = count_bytes(&parent_tpl);
+                    let tpl_child_bytes: usize = parent_tpl
+                        .children
+                        .iter()
+                        .map(|c| match c {
+                            Node::Text(t) => t.len(),
+                            Node::Element(e) => count_bytes(e),
+                        })
+                        .sum();
                     for child in &mut el.children {
                         if let Node::Element(rep) = child {
                             if local(&rep.name) != "Representation" {
@@ -646,13 +722,26 @@ fn rewrite_element(
                             }) {
                                 for (k, v) in &parent_tpl.attrs {
                                     if !rep_tpl.attrs.iter().any(|(rk, _)| local(rk) == local(k)) {
+                                        *budget = budget
+                                            .saturating_add(k.len())
+                                            .saturating_add(v.len())
+                                            .saturating_add(4);
+                                        ensure!(*budget <= MANIFEST_LIMIT * 4, "rewritten DASH too large");
                                         rep_tpl.attrs.push((k.clone(), v.clone()));
                                     }
                                 }
                                 if rep_tpl.children.is_empty() && !parent_tpl.children.is_empty() {
+                                    *node_budget = node_budget.saturating_add(tpl_child_nodes);
+                                    ensure!(*node_budget <= 65_536, "DASH XML node limit");
+                                    *budget = budget.saturating_add(tpl_child_bytes);
+                                    ensure!(*budget <= MANIFEST_LIMIT * 4, "rewritten DASH too large");
                                     rep_tpl.children = parent_tpl.children.clone();
                                 }
                             } else {
+                                *node_budget = node_budget.saturating_add(tpl_nodes);
+                                ensure!(*node_budget <= 65_536, "DASH XML node limit");
+                                *budget = budget.saturating_add(tpl_bytes);
+                                ensure!(*budget <= MANIFEST_LIMIT * 4, "rewritten DASH too large");
                                 rep.children.push(Node::Element(parent_tpl.clone()));
                             }
                         }
@@ -700,7 +789,7 @@ fn rewrite_element(
                     );
                 }
             } else {
-                rewrite_element(child, lease, base, budget)?;
+                rewrite_element(child, lease, base, budget, node_budget)?;
             }
         }
     }
@@ -779,7 +868,9 @@ fn emit(el: &Element, writer: &mut Writer<CappedOutput>) -> Result<()> {
 pub(super) fn dash(lease: &Lease, base: &Url, text: &str) -> Result<String> {
     let mut root = parse_xml(text)?;
     ensure!(local(&root.name) == "MPD", "unsupported XML manifest");
-    rewrite_element(&mut root, lease, base, &mut 0)?;
+    let mut budget = count_bytes(&root);
+    let mut node_budget = count_nodes(&root);
+    rewrite_element(&mut root, lease, base, &mut budget, &mut node_budget)?;
     let mut writer = Writer::new(CappedOutput(Vec::new()));
     emit(&root, &mut writer)?;
     let bytes = writer.into_inner().0;

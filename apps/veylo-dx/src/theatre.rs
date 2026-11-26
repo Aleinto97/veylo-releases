@@ -192,10 +192,10 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
                         }
                     }
                     if n > 1 {
-                        div { class: "theatre-list", role: "list", aria_label: "All videos",
+                        div { class: "theatre-list", role: "group", aria_label: "All videos",
                             onkeydown: move |e: KeyboardEvent| if e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                             for (i, c) in theatre.clips.iter().cloned().enumerate() {
-                                button { key: "{c.youtube}", class: if i == at { "theatre-clip on" } else { "theatre-clip" }, role: "listitem",
+                                button { key: "{c.youtube}", class: if i == at { "theatre-clip on" } else { "theatre-clip" },
                                     aria_current: if i == at { "true" } else { "false" }, aria_label: "{c.label()}: {c.name}", onclick: move |_| go(i),
                                     span { class: "theatre-thumb",
                                         img { src: "https://i.ytimg.com/vi/{c.youtube}/mqdefault.jpg", alt: "", loading: "lazy" }

@@ -120,9 +120,28 @@ pub struct Shell {
     pub picks_saved_only: Signal<bool>,
     /// True while a bottom sheet (`SourceSheet` / `PersonSheet`) is open on top of the Title Page.
     pub title_sheet_open: Signal<bool>,
+    /// The player's surroundings, kept here (not in the player screen) so they carry over from one
+    /// episode to the next: desktop full screen, Android's rotation lock and the sleep timer.
+    pub player_fullscreen: Signal<bool>,
+    pub player_rotation_locked: Signal<bool>,
+    pub sleep_mode: Signal<player_ui::SleepTimer>,
+    /// When a minutes-long sleep timer runs out; it keeps counting while the next episode loads.
+    pub sleep_deadline: Signal<Option<std::time::Instant>>,
+    /// The player moves on to another episode or source: the picture and its surroundings stay up
+    /// until the next playback attaches, fails or is cancelled.
+    pub player_switching: Signal<bool>,
 }
 
 impl Shell {
+    /// The player really ended (closed, failed or cancelled): its surroundings go back to normal.
+    pub fn reset_player_environment(&mut self) {
+        if *self.player_fullscreen.peek() { self.player_fullscreen.set(false); }
+        if *self.player_rotation_locked.peek() { self.player_rotation_locked.set(false); }
+        if *self.sleep_mode.peek() != player_ui::SleepTimer::Off { self.sleep_mode.set(player_ui::SleepTimer::Off); }
+        if self.sleep_deadline.peek().is_some() { self.sleep_deadline.set(None); }
+        if *self.player_switching.peek() { self.player_switching.set(false); }
+    }
+
     /// The player is up but nothing plays yet: a source is being found or opened.
     pub fn pending(&self) -> Option<String> {
         if self.player.peek().is_some() { return None; }
@@ -366,6 +385,11 @@ fn Shell_() -> Element {
         play_ticket: Signal::new(0),
         picks_saved_only: Signal::new(false),
         title_sheet_open: Signal::new(false),
+        player_fullscreen: Signal::new(false),
+        player_rotation_locked: Signal::new(false),
+        sleep_mode: Signal::new(player_ui::SleepTimer::Off),
+        sleep_deadline: Signal::new(None),
+        player_switching: Signal::new(false),
     });
     // Developer option: VEYLO_DX_PLAY_DEMO=1 (desktop) or files/dev-play.json (Android) plays at launch.
     use_hook(move || {
@@ -425,6 +449,17 @@ fn Shell_() -> Element {
             backend::sleep(FAILURE_SHOWN_MS).await;
             if matches!(&*status.peek(), Some(PlayerStatus::Failed(e)) if *e == error) { status.set(None); }
         });
+    });
+    // Moving on to another episode or source keeps the picture up (full screen, rotation lock and
+    // sleep timer with it). If nothing takes over (the search failed or was cancelled), let go.
+    let mut switching = shell.player_switching;
+    use_effect(move || {
+        if !switching() || (shell.player)().is_some() { return; }
+        if matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_))) { return; }
+        video::release();
+        let mut shell = shell;
+        shell.reset_player_environment();
+        switching.set(false);
     });
     // Written in an effect, never during render (a write there would re-render forever).
     let mut accent = use_context_provider(|| Accent(Signal::new(String::new()))).0;
@@ -536,7 +571,11 @@ fn Shell_() -> Element {
         if (e.target === document.body) { const a = document.querySelector('.app'); if (a) { a.focus(); a.dispatchEvent(new KeyboardEvent('keydown', e)); } }
     });"#); });
     // Android TV: the remote moves focus and focus lights the room (tv.js, styles/tv.css).
-    use_hook(|| if cfg!(target_os = "android") { document::eval(include_str!("tv.js")); });
+    // window.__veyloTv is set first (from the same is_tv() the shell uses), so tv.js never has to guess.
+    use_hook(|| {
+        document::eval(&format!("window.__veyloTv = {};", is_tv()));
+        if cfg!(target_os = "android") { document::eval(include_str!("tv.js")); }
+    });
     // Lightweight WebView monitor: forwards JS runtime errors and sheet/dialog horizontal layout
     // overflows to Firebase diagnostics when telemetry is enabled.
     use_future(|| async move {
@@ -1066,6 +1105,8 @@ fn follow_playback_events(mut shell: Shell, title: String, ticket: u64, mut rx: 
                 player::PlayerEvent::Attached(live) => {
                     if *shell.play_ticket.peek() == ticket {
                         mine = Some(live.clone());
+                        // The held picture (if any) is handed to the new session by its screen.
+                        if *shell.player_switching.peek() { shell.player_switching.set(false); }
                         shell.player.set(Some(live));
                     } else {
                         live.0.finish(engine::Finish::Close);
@@ -1076,20 +1117,46 @@ fn follow_playback_events(mut shell: Shell, title: String, ticket: u64, mut rx: 
                     if is_current(&mine) {
                         shell.player_status.set(Some(PlayerStatus::Failed(error)));
                     }
+                    // A failed load while moving on: the effect in Shell_ releases the held picture.
                     break;
                 }
                 player::PlayerEvent::Finished { next, prev, another, language, switch_source, switch_episode, position_ms, .. } => {
                     let current = is_current(&mine);
+                    // Next, previous, another source or a picker's choice: the player carries on, so its
+                    // picture, full screen, rotation lock and sleep timer stay until the next one takes over.
+                    let moving_on = current && (next || prev || another || switch_source.is_some() || switch_episode.is_some());
+                    if moving_on { shell.player_switching.set(true); }
                     clear(&mine);
-                    if current { shell.player_status.set(None); }
+                    if current {
+                        // Keep the "Opening" screen up (instead of the app) while progress is saved.
+                        shell.player_status.set(if moving_on { Some(PlayerStatus::Opening(title.clone())) } else { None });
+                    }
                     backend::flush_progress().await;
                     *shell.picks_dirty.write() += 1;
-                    if current {
+                    let still_current = current && *shell.play_ticket.peek() == ticket;
+                    if still_current {
                         if let Some(idx) = switch_source { if let Some(cb) = &hooks.on_switch_source { cb(shell, idx, position_ms); } }
                         else if let Some(ep) = switch_episode { if let Some(cb) = &hooks.on_switch_episode { cb(shell, ep); } }
                         else if next { if let Some(play_next) = &hooks.on_next { play_next(shell); } }
                         else if prev { if let Some(play_prev) = &hooks.on_prev { play_prev(shell); } }
                         else if another { if let Some(try_another) = &hooks.on_another { try_another(shell, position_ms, language); } }
+                        // No hook started anything: nothing is coming, so the status clears and the picture is let go.
+                        if moving_on && *shell.play_ticket.peek() == ticket
+                            && matches!(&*shell.player_status.peek(), Some(PlayerStatus::Opening(t)) if *t == title)
+                        {
+                            shell.player_status.set(None);
+                        }
+                    } else if moving_on {
+                        // Cancelled or superseded during flush: never run stale hooks, and drop
+                        // switching state if nothing new has already taken over.
+                        if shell.player.peek().is_none()
+                            && !matches!(&*shell.player_status.peek(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))
+                        {
+                            video::release();
+                            shell.reset_player_environment();
+                        } else {
+                            shell.player_switching.set(false);
+                        }
                     }
                     break;
                 }
@@ -1184,6 +1251,8 @@ mod playback_lifetime_tests {
                 lamp_source: Signal::new(String::new()), pick_command: Signal::new(None),
                 history: Signal::new(backend::History::default()), picks_dirty: Signal::new(0), addon_updates: Signal::new(0),
                 player: Signal::new(None), player_key: Signal::new(None), play_ticket: Signal::new(0), picks_saved_only: Signal::new(false), title_sheet_open: Signal::new(false),
+                player_fullscreen: Signal::new(false), player_rotation_locked: Signal::new(false), sleep_mode: Signal::new(player_ui::SleepTimer::Off),
+                sleep_deadline: Signal::new(None), player_switching: Signal::new(false),
             }
         });
         rsx! { if show() { TestSourceChooser {} } }

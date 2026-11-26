@@ -247,7 +247,8 @@ run_privacy_check "${assets[@]}"
 
 mkdir -p "$out_dir" && cp "${assets[@]}" "$stage/SHA256SUMS.txt" "$out_dir/"
 if [ "$publish" != 1 ]; then echo "Built $tag (not published): $out_dir"; exit 0; fi
-# On Actions the tag goes on the commit that was built.
-target=(); [ -n "${GITHUB_SHA:-}" ] && target=(--target "$GITHUB_SHA")
+# Tag the exact commit that was built (GITHUB_SHA on Actions, else local HEAD).
+target_sha=${GITHUB_SHA:-$(git -C "$root" rev-parse HEAD)}
+target=(--target "$target_sha")
 gh release create "$tag" "${assets[@]}" "$stage/SHA256SUMS.txt" --repo "$REPO" "${target[@]}" --title "Veylo $version" --notes "$notes"
 echo "Published $tag (Android versionCode $version_code): installs and in-app updates now get it."

@@ -23,7 +23,7 @@
 
 /* Posters: crisp, fast cascade with layout containment so siblings never reflow each other. */
 .card, .poster, .week-card { contain: layout style; }
-.poster-strip > .card, .lib-grid > .lib-item, .week-strip > .week-card { animation: lift .24s var(--out) both; }
+.poster-strip > .card, .lib-grid > .lib-item, .week-strip > .week-card { animation: lift .24s var(--out) backwards; }
 .poster-strip > .card:nth-child(2), .lib-grid > .lib-item:nth-child(2), .week-strip > .week-card:nth-child(2) { animation-delay: .018s; }
 .poster-strip > .card:nth-child(3), .lib-grid > .lib-item:nth-child(3), .week-strip > .week-card:nth-child(3) { animation-delay: .036s; }
 .poster-strip > .card:nth-child(4), .lib-grid > .lib-item:nth-child(4), .week-strip > .week-card:nth-child(4) { animation-delay: .054s; }
@@ -84,3 +84,10 @@
 @keyframes breathe { 50% { opacity: .55; } }
 .player.pending::before { content: ''; position: absolute; inset: 0; pointer-events: none;
   background: radial-gradient(ellipse at 50% 45%, color-mix(in srgb, var(--lamp) 18%, transparent), transparent 60%); animation: breathe 3.2s ease-in-out infinite; }
+
+/* ---------------------------------------------------------------- focus, last of all
+   The small orbs inside restyled rows (episode footers, Library's forget, Picks' shortlist) keep the
+   bone fill and a crisp ring in every state: no hover or resting look above may out-rank it. */
+.ep-foot .orb.small.orb:focus-visible, .forget .orb.orb:focus-visible, .short-actions .orb.orb:focus-visible {
+  outline: none; background: var(--bone); color: #000; transform: scale(1.06);
+  box-shadow: 0 0 0 2px #000, 0 0 0 4px var(--bone); }

@@ -16,15 +16,15 @@ pub fn hdr_output() -> bool { HDR_OUTPUT.load(std::sync::atomic::Ordering::Relax
 /// 4K/1080p/Dolby quality badges), then the add-on's own poster (Cinemeta for most titles),
 /// then the backdrop. A failing image moves on to the next one.
 pub fn posters(m: &Media) -> Vec<String> {
-    let imdb = Some(m.id.as_str()).filter(|id| id.starts_with("tt"))
-        .or_else(|| m.raw["imdb_id"].as_str().filter(|id| id.starts_with("tt")));
+    // Only a well-formed IMDb id ("tt" and digits) is ever put into an image URL.
+    let imdb = imdb_of(m);
     let mut out = Vec::new();
     if BETTER_POSTERS.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Some(id) = imdb { out.push(format!("https://btttr.cc/poster-q/imdb/poster-default/{id}.jpg")); }
+        if let Some(id) = &imdb { out.push(format!("https://btttr.cc/poster-q/imdb/poster-default/{id}.jpg")); }
     }
     out.push(m.poster.clone());
     // Cinemeta's image service has a poster for nearly every IMDb title; try high-res first.
-    if let Some(id) = imdb {
+    if let Some(id) = &imdb {
         out.push(format!("https://images.metahub.space/poster/large/{id}/img"));
         out.push(format!("https://images.metahub.space/poster/medium/{id}/img"));
     }
@@ -112,7 +112,7 @@ pub(super) async fn bp_get(path: String) -> Option<Value> {
 /// A chart's titles as Cinemeta titles (`origin`): only IMDb ids, which Cinemeta also serves.
 pub(super) fn bp_titles(v: &Value, origin: &str) -> Vec<Media> {
     v["metas"].as_array().into_iter().flatten()
-        .filter(|m| s(m, "id").starts_with("tt"))
+        .filter(|m| valid_imdb(&s(m, "id")))
         .filter_map(|m| Media::from_json(m, origin))
         .scan(HashSet::new(), |seen, m| Some(seen.insert(m.key()).then_some(m))).flatten().collect()
 }
@@ -326,11 +326,21 @@ pub(super) static ELF_CACHE: OnceLock<Mutex<Answers>> = OnceLock::new();
 pub(super) static JW_STILLS_CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 pub(super) static ARTWORK: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
 
-pub(super) fn imdb_of(m: &Media) -> Option<String> {
-    Some(m.id.as_str()).filter(|id| id.starts_with("tt"))
-        .or_else(|| m.raw["imdb_id"].as_str().filter(|id| id.starts_with("tt")))
-        .map(|id| id.split(':').next().unwrap_or(id).to_owned())
+/// An IMDb id safe to put in a URL path or query: "tt" and 1-10 digits, nothing else.
+pub(super) fn valid_imdb(id: &str) -> bool {
+    id.len() > 2 && id.len() <= 12 && id.starts_with("tt") && id[2..].bytes().all(|b| b.is_ascii_digit())
 }
+
+/// The title's IMDb id when it has a well-formed one (its own id, else the add-on's `imdb_id`):
+/// the only way an id reaches a URL, so a crafted id ("tt1/../x", "tt1?key=") never does.
+pub(super) fn imdb_of(m: &Media) -> Option<String> {
+    let first = |id: &str| id.split(':').next().unwrap_or(id).to_owned();
+    Some(first(&m.id)).filter(|id| valid_imdb(id))
+        .or_else(|| m.raw["imdb_id"].as_str().map(first).filter(|id| valid_imdb(id)))
+}
+
+/// Same as `imdb_of`: kept under the name the scrapers in open.rs use.
+pub(super) fn checked_imdb(m: &Media) -> Option<String> { imdb_of(m) }
 
 /// Downscale oversized `/original/` TMDB image URLs to a crisp WebView-friendly size.
 fn sized_tmdb_img(url: &str, size: &str) -> String {
@@ -371,7 +381,7 @@ pub(super) fn parse_runtime_secs(raw: &str) -> Option<f64> {
 
 /// Fetch keyless Stremio-protocol metadata from ElfHosted (`tmdb.elfhosted.com`), cached 15 min.
 pub(super) async fn elfhosted_meta(kind: &str, imdb: &str) -> Option<Value> {
-    if !matches!(kind, "movie" | "series") || !imdb.starts_with("tt") { return None; }
+    if !matches!(kind, "movie" | "series") || !valid_imdb(imdb) { return None; }
     let path = format!("meta/{kind}/{imdb}.json");
     let cache = ELF_CACHE.get_or_init(Default::default);
     let now = now_secs();
@@ -493,7 +503,17 @@ pub fn ambient_url(url: &str) -> String {
     }
 }
 
-static TITLE_ART_CACHE: OnceLock<Mutex<HashMap<String, Artwork>>> = OnceLock::new();
+/// Hero artwork kept per title: when it was made, and whether it is degraded (a source was
+/// down, or there was no backdrop yet). Complete artwork is kept 30 minutes; a degraded one
+/// only 90 seconds, so a slow or failed source is asked again soon.
+type ArtEntry = (std::time::Instant, bool, Artwork);
+static TITLE_ART_CACHE: OnceLock<Mutex<HashMap<String, ArtEntry>>> = OnceLock::new();
+const TITLE_ART_TTL: Duration = Duration::from_secs(30 * 60);
+const TITLE_ART_DEGRADED_TTL: Duration = Duration::from_secs(90);
+
+fn art_entry_fresh(entry: &ArtEntry) -> bool {
+    entry.0.elapsed() < if entry.1 { TITLE_ART_DEGRADED_TTL } else { TITLE_ART_TTL }
+}
 
 /// Parse a JustWatch GraphQL response into crisp, textless 1440px widescreen backdrops for the
 /// exact matching IMDb ID (never matching on title alone).
@@ -578,13 +598,16 @@ pub fn clear_artwork_caches() {
     if let Some(c) = BP_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
     if let Some(c) = ELF_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
     if let Some(c) = JW_STILLS_CACHE.get() { if let Ok(mut m) = c.lock() { m.clear(); } }
+    // Title details merge BetterPosters' values: they follow the toggle too.
+    clear_title_meta_cache();
     clear_quality_cache();
 }
 
 /// Synchronously read cached title hero artwork from this session so re-opening a title paints
 /// its clean backdrop, logo, tagline, and videos on Frame 0 with zero loading state.
 pub fn cached_title_artwork(m: &Media) -> Option<Artwork> {
-    TITLE_ART_CACHE.get()?.lock().ok()?.get(&m.key()).cloned()
+    let cache = TITLE_ART_CACHE.get()?.lock().ok()?;
+    cache.get(&m.key()).filter(|e| art_entry_fresh(e)).map(|(_, _, art)| art.clone())
 }
 
 /// Synchronously read cached card artwork (Home Tonight's pick, Library week cards, Picks duel)
@@ -633,6 +656,8 @@ pub async fn title_artwork_fast(m: &Media) -> Option<Artwork> {
         return Some(hit);
     }
     let (bp, elf) = tokio::join!(bp_artwork(m), elfhosted_artwork(m));
+    // One source missing (when BetterPosters is on, it is expected to answer) is a degraded answer.
+    let mut degraded = elf.is_none() || (better_posters_on() && bp.is_none());
     let mut out = match (bp, elf) {
         (Some(f), Some(e)) => Some(with_extras(f, e)),
         (Some(f), None) => Some(f),
@@ -655,8 +680,10 @@ pub async fn title_artwork_fast(m: &Media) -> Option<Artwork> {
         }
     }
     if let Some(ref art) = out {
+        degraded |= art.backdrop.is_none();
         if let Ok(mut c) = TITLE_ART_CACHE.get_or_init(Default::default).lock() {
-            cache_insert(&mut c, 400, m.key(), art.clone());
+            c.retain(|_, e| art_entry_fresh(e));
+            cache_insert(&mut c, 400, m.key(), (std::time::Instant::now(), degraded, art.clone()));
         }
     }
     out

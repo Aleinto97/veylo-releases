@@ -14,6 +14,10 @@ const CUE_LINES: usize = 65_536;
 const TTML_NS: &str = "http://www.w3.org/ns/ttml";
 const STYLING_NS: &str = "http://www.w3.org/ns/ttml#styling";
 const PARAMETER_NS: &str = "http://www.w3.org/ns/ttml#parameter";
+const METADATA_NS: &str = "http://www.w3.org/ns/ttml#metadata";
+const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+const EBU_STYLE_NS: &str = "urn:ebu:tt:style";
+const EBU_METADATA_NS: &str = "urn:ebu:tt:metadata";
 
 pub(super) struct Validated {
     pub body: Vec<u8>,
@@ -22,13 +26,30 @@ pub(super) struct Validated {
 
 pub(super) fn parse(bytes: &[u8], cancel: &CancellationToken) -> Result<Validated> {
     ensure!(bytes.len() <= LIMIT, "subtitle too large");
-    let text = std::str::from_utf8(bytes)?;
+    // Addon subtitle files are often Windows-1252 (Western European SRT). Anything that is not
+    // UTF-8 is decoded that way and handed on as UTF-8, so the player never guesses the charset.
+    let decoded;
+    let (text, legacy) = match std::str::from_utf8(bytes) {
+        Ok(text) => (text, false),
+        Err(_) => {
+            decoded = decode_windows_1252(bytes);
+            ensure!(decoded.len() <= LIMIT, "subtitle too large");
+            (decoded.as_str(), true)
+        }
+    };
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let body = || {
+        if legacy {
+            text.as_bytes().to_vec()
+        } else {
+            bytes.to_vec()
+        }
+    };
     valid_characters(text)?;
     if text.starts_with("WEBVTT") {
         webvtt(text, cancel)?;
         Ok(Validated {
-            body: bytes.to_vec(),
+            body: body(),
             content_type: "text/vtt",
         })
     } else if text.trim_start_matches(xml_space).starts_with('<') {
@@ -39,10 +60,29 @@ pub(super) fn parse(bytes: &[u8], cancel: &CancellationToken) -> Result<Validate
     } else {
         subrip(text, cancel)?;
         Ok(Validated {
-            body: bytes.to_vec(),
+            body: body(),
             content_type: "application/x-subrip",
         })
     }
+}
+
+/// Windows-1252 to UTF-8. Bytes below 0x80 and 0xA0.. map to the same code point; the five
+/// undefined slots become U+FFFD rather than C1 controls (which the validator rejects).
+fn decode_windows_1252(bytes: &[u8]) -> String {
+    const C1: [char; 32] = [
+        '\u{20ac}', '\u{fffd}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffd}',
+        '\u{017d}', '\u{fffd}', '\u{fffd}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}',
+        '\u{0153}', '\u{fffd}', '\u{017e}', '\u{0178}',
+    ];
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9f => C1[usize::from(b - 0x80)],
+            _ => char::from(b),
+        })
+        .collect()
 }
 
 fn xml_space(c: char) -> bool {
@@ -67,7 +107,7 @@ fn timestamp(text: &str, vtt: bool) -> Result<u64> {
     }
     .ok_or_else(|| anyhow!("invalid cue timestamp"))?;
     ensure!(
-        millis.len() == 3 && millis.bytes().all(|b| b.is_ascii_digit()),
+        (1..=3).contains(&millis.len()) && millis.bytes().all(|b| b.is_ascii_digit()),
         "invalid milliseconds"
     );
     let mut split = clock.split(':');
@@ -84,7 +124,7 @@ fn timestamp(text: &str, vtt: bool) -> Result<u64> {
     };
     ensure!(
         hours_str
-            .is_none_or(|h| (2..=6).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_digit()))
+            .is_none_or(|h| (1..=6).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_digit()))
             && minutes_str.len() == 2
             && minutes_str.bytes().all(|b| b.is_ascii_digit())
             && seconds_str.len() == 2
@@ -98,7 +138,9 @@ fn timestamp(text: &str, vtt: bool) -> Result<u64> {
         Some(h) => h.parse::<u64>()?,
         None => 0,
     };
-    Ok(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis.parse::<u64>()?)
+    // A short fraction is a decimal fraction of a second: ",5" is 500 ms.
+    let millis = millis.parse::<u64>()? * 10u64.pow(3 - millis.len() as u32);
+    Ok(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis)
 }
 
 fn percentage(value: &str) -> bool {
@@ -128,7 +170,10 @@ fn vtt_settings(settings: impl Iterator<Item = impl AsRef<str>>) -> Result<()> {
         ensure!(seen.insert(key.to_string()), "duplicate WebVTT setting");
         let safe = match key {
             "vertical" => matches!(value, "rl" | "lr"),
-            "align" => matches!(value, "start" | "center" | "end" | "left" | "right"),
+            "align" => matches!(
+                value,
+                "start" | "center" | "middle" | "end" | "left" | "right"
+            ),
             "size" => percentage(value),
             "region" => identifier(value),
             "position" => {
@@ -167,19 +212,66 @@ fn cue_timing(line: &str, vtt: bool) -> Result<()> {
     Ok(())
 }
 
+/// Non-fetching `<font>` attributes: presentation only, with plain scalar values.
+fn font_attributes(tag: &str) -> Result<bool> {
+    let start = BytesStart::from_content(tag, 4);
+    let mut seen = 0;
+    for attr in start.attributes() {
+        let attr = attr?;
+        seen += 1;
+        if seen > 3
+            || !matches!(attr.key.as_ref(), b"color" | b"face" | b"size")
+            || attr.value.is_empty()
+            || !attr.value.iter().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'#' | b' ' | b'-' | b'_' | b'.' | b',')
+            })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(seen > 0)
+}
+
+/// A `<` that cannot start markup (`5 < 10`, `<3`) is cue text, not a tag. Anything that could
+/// open an HTML construct (letter, `/`, `!`, `?`) must still be a complete, allowed tag.
+fn literal_less_than(after: &str) -> bool {
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || c.is_ascii_digit() || c == '=')
+}
+
 /// Restrict cue markup to non-fetching subtitle formatting, not arbitrary HTML.
 fn cue_text(text: &str, vtt: bool) -> Result<()> {
     let mut rest = text;
     while let Some((_, after)) = rest.split_once('<') {
-        let (tag, tail) = after
-            .split_once('>')
-            .ok_or_else(|| anyhow!("unterminated subtitle markup"))?;
+        // Literal `<` (`5 < 10`, `a < b`) cannot open HTML markup: advance past `<`
+        // immediately without scanning ahead for `>`, keeping repeated `<` O(n).
+        if literal_less_than(after) {
+            if vtt && after.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                if let Some(end) = after.as_bytes().iter().take(24).position(|&b| b == b'>') {
+                    if timestamp(&after[..end], true).is_ok() {
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+            }
+            rest = after;
+            continue;
+        }
+        let Some((tag, tail)) = after.split_once('>') else {
+            anyhow::bail!("unterminated subtitle markup");
+        };
         let safe = if let Some(close) = tag.strip_prefix('/') {
-            matches!(close, "b" | "i" | "u")
+            matches!(close, "b" | "i" | "u" | "s" | "sub" | "sup" | "font")
                 || (vtt && matches!(close, "c" | "v" | "lang" | "ruby" | "rt"))
-                || (!vtt && close == "font")
-        } else if matches!(tag, "b" | "i" | "u") {
+        } else if matches!(
+            tag,
+            "b" | "i" | "u" | "s" | "sub" | "sup" | "br" | "br/" | "br /"
+        ) {
             true
+        } else if tag.starts_with("font ") {
+            font_attributes(tag)?
         } else if vtt {
             matches!(tag, "c" | "ruby" | "rt")
                 || tag.strip_prefix("c.").is_some_and(|classes| {
@@ -197,17 +289,6 @@ fn cue_text(text: &str, vtt: bool) -> Result<()> {
                     !lang.is_empty() && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 })
                 || timestamp(tag, true).is_ok()
-        } else if tag.starts_with("font ") {
-            let start = BytesStart::from_content(tag, 4);
-            let mut attrs = start.attributes();
-            let attr = attrs.next().transpose()?;
-            attr.is_some_and(|a| {
-                a.key.as_ref() == b"color"
-                    && !a.value.is_empty()
-                    && a.value
-                        .iter()
-                        .all(|b| b.is_ascii_alphanumeric() || *b == b'#')
-            }) && attrs.next().is_none()
         } else {
             false
         };
@@ -254,6 +335,94 @@ fn timestamp_map(line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Plain label values of the WebVTT `Kind:` / `Language:` header lines.
+fn header_value(value: &str) -> bool {
+    let value = value.trim_matches(xml_space);
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b' '))
+}
+
+/// One `REGION` definition: space-separated `key=value` settings of numbers, percentages and
+/// anchors. No identifier is ever resolved as a path or URL.
+fn region_definition(definition: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for setting in definition.split_whitespace() {
+        let (key, value) = setting
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid WebVTT region setting"))?;
+        ensure!(seen.insert(key), "duplicate WebVTT region setting");
+        let anchor = |v: &str| {
+            v.split_once(',')
+                .is_some_and(|(x, y)| percentage(x) && percentage(y))
+        };
+        let safe = match key {
+            "id" => identifier(value),
+            "width" => percentage(value),
+            "lines" => {
+                !value.is_empty() && value.len() <= 3 && value.bytes().all(|b| b.is_ascii_digit())
+            }
+            "regionanchor" | "viewportanchor" => anchor(value),
+            "scroll" => value == "up",
+            _ => false,
+        };
+        ensure!(safe, "unsupported WebVTT region setting");
+    }
+    Ok(())
+}
+
+/// Conservative CSS for a `STYLE` block: selectors and presentation properties only. Anything that
+/// can fetch (`url()`, `@import`, `src`, image values), escape, or hide such text is refused.
+fn style_block(lines: &[&str]) -> Result<()> {
+    let css = lines.join("\n");
+    ensure!(!css.contains("-->"), "unexpected WebVTT timing in STYLE");
+    ensure!(
+        css.bytes().all(|b| b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'{'
+                    | b'}'
+                    | b':'
+                    | b';'
+                    | b'#'
+                    | b'.'
+                    | b','
+                    | b'%'
+                    | b'('
+                    | b')'
+                    | b'-'
+                    | b'_'
+                    | b'"'
+                    | b'\''
+                    | b'>'
+                    | b'['
+                    | b']'
+                    | b'='
+            )),
+        "unsupported WebVTT STYLE character"
+    );
+    let lower = css.to_ascii_lowercase();
+    ensure!(
+        ![
+            "url",
+            "image",
+            "src",
+            "import",
+            "expression",
+            "javascript",
+            "var("
+        ]
+        .iter()
+        .any(|word| lower.contains(word)),
+        "unsupported WebVTT STYLE content"
+    );
+    Ok(())
+}
+
 fn webvtt(text: &str, cancel: &CancellationToken) -> Result<()> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = normalized.lines();
@@ -263,17 +432,32 @@ fn webvtt(text: &str, cancel: &CancellationToken) -> Result<()> {
         (suffix.is_empty() || suffix.starts_with([' ', '\t'])) && !header.contains("-->"),
         "invalid WebVTT signature"
     );
-    let mut mapping_seen = false;
+    let (mut mapping_seen, mut kind_seen, mut language_seen) = (false, false, false);
+    let mut header_lines = 0;
     loop {
         match lines.next() {
             Some(line) if line.trim_matches(xml_space).is_empty() => break,
             Some(line) => {
-                ensure!(!mapping_seen, "duplicate WebVTT header metadata");
-                timestamp_map(line)?;
-                mapping_seen = true;
+                header_lines += 1;
+                ensure!(header_lines <= 256, "WebVTT header limit");
+                if let Some(value) = line.strip_prefix("Kind:") {
+                    ensure!(!kind_seen, "duplicate WebVTT header metadata");
+                    ensure!(header_value(value), "invalid WebVTT Kind header");
+                    kind_seen = true;
+                } else if let Some(value) = line.strip_prefix("Language:") {
+                    ensure!(!language_seen, "duplicate WebVTT header metadata");
+                    ensure!(header_value(value), "invalid WebVTT Language header");
+                    language_seen = true;
+                } else if let Some(definition) = line.strip_prefix("Region:") {
+                    region_definition(definition)?;
+                } else {
+                    ensure!(!mapping_seen, "duplicate WebVTT header metadata");
+                    timestamp_map(line)?;
+                    mapping_seen = true;
+                }
             }
             None => {
-                ensure!(!mapping_seen, "missing WebVTT header separator");
+                ensure!(header_lines == 0, "missing WebVTT header separator");
                 return Ok(()); // A signature-only empty WebVTT segment is valid.
             }
         }
@@ -290,13 +474,20 @@ fn webvtt(text: &str, cancel: &CancellationToken) -> Result<()> {
         if block[0] == "NOTE" || block[0].starts_with("NOTE ") || block[0].starts_with("NOTE\t") {
             continue;
         }
-        // STYLE (CSS) and REGION blocks are intentionally unsupported. In
-        // particular, no CSS url(), imports, images or fonts reach the player.
+        // STYLE blocks are CSS and are accepted only in the conservative subset of `style_block`
+        // (no url(), imports, images or fonts); REGION blocks only as numeric region settings.
+        if block[0] == "STYLE" {
+            style_block(&block[1..])?;
+            continue;
+        }
+        if block[0] == "REGION" {
+            for line in &block[1..] {
+                region_definition(line)?;
+            }
+            continue;
+        }
         let timing = if block[0].contains("-->") { 0 } else { 1 };
-        ensure!(
-            !matches!(block[0], "STYLE" | "REGION") && block.len() > timing,
-            "unsupported WebVTT block"
-        );
+        ensure!(block.len() > timing, "unsupported WebVTT block");
         cue_timing(block[timing], true)?;
         for line in &block[timing + 1..] {
             ensure!(!line.contains("-->"), "unexpected WebVTT timing in payload");
@@ -316,14 +507,16 @@ fn subrip(text: &str, cancel: &CancellationToken) -> Result<()> {
         if block.is_empty() {
             continue;
         }
+        // The numeric index is optional in the wild: a block may start straight at its timing.
+        let timing = if block[0].contains("-->") { 0 } else { 1 };
         ensure!(
-            block.len() >= 3
-                && !block[0].is_empty()
-                && block[0].bytes().all(|b| b.is_ascii_digit()),
+            block.len() > timing + 1
+                && (timing == 0
+                    || (!block[0].is_empty() && block[0].bytes().all(|b| b.is_ascii_digit()))),
             "invalid SubRip cue"
         );
-        cue_timing(block[1], false)?;
-        for line in &block[2..] {
+        cue_timing(block[timing], false)?;
+        for line in &block[timing + 1..] {
             ensure!(!line.contains("-->"), "unexpected SubRip timing in payload");
             cue_text(line, false)?;
         }
@@ -337,6 +530,27 @@ fn subrip(text: &str, cancel: &CancellationToken) -> Result<()> {
 struct Namespaces {
     styling: bool,
     parameter: bool,
+    // Declared only so their prefixed attributes and `<metadata>` can be recognised and removed.
+    metadata: bool,
+    xsi: bool,
+    ebu_style: bool,
+    ebu_metadata: bool,
+}
+
+/// `ttm:`/`xsi:`/`ebutts:` attributes are descriptive (roles, schema hints, EBU padding) and never
+/// reach the output, so they cannot carry a URL or style to the player.
+fn dropped_attribute(key: &str, ns: &Namespaces) -> bool {
+    (ns.metadata && key.starts_with("ttm:"))
+        || (ns.xsi && key.starts_with("xsi:"))
+        || (ns.ebu_style && key.starts_with("ebutts:"))
+        || (ns.ebu_metadata && key.starts_with("ebuttm:"))
+}
+
+/// Element allowed inside a skipped `<metadata>` subtree: the metadata vocabularies themselves.
+fn metadata_child(name: &str, ns: &Namespaces) -> bool {
+    name == "metadata"
+        || (ns.metadata && name.starts_with("ttm:"))
+        || (ns.ebu_metadata && name.starts_with("ebuttm:"))
 }
 
 fn ttml_child(parent: Option<&str>, name: &str) -> bool {
@@ -469,11 +683,36 @@ fn ttml_start(
                     );
                     ns.parameter = true;
                 }
+                "xmlns:ttm" => {
+                    ensure!(value == METADATA_NS, "unsupported TTML metadata namespace");
+                    ns.metadata = true;
+                    continue;
+                }
+                "xmlns:xsi" => {
+                    ensure!(value == XSI_NS, "unsupported XML Schema instance namespace");
+                    ns.xsi = true;
+                    continue;
+                }
+                "xmlns:ebutts" => {
+                    ensure!(value == EBU_STYLE_NS, "unsupported EBU-TT style namespace");
+                    ns.ebu_style = true;
+                    continue;
+                }
+                "xmlns:ebuttm" => {
+                    ensure!(
+                        value == EBU_METADATA_NS,
+                        "unsupported EBU-TT metadata namespace"
+                    );
+                    ns.ebu_metadata = true;
+                    continue;
+                }
                 _ => bail!("TTML namespace aliases/extensions unsupported"),
             }
         }
         attrs.push((key, value));
     }
+    // After the loop so that an `xsi:` attribute may precede its `xmlns:xsi` declaration.
+    attrs.retain(|(key, _)| !dropped_attribute(key, ns));
     for (key, value) in &attrs {
         ensure!(
             ttml_attribute(key, value, ns),
@@ -554,12 +793,54 @@ fn ttml(text: &str, cancel: &CancellationToken) -> Result<Vec<u8>> {
     let mut root_closed = false;
     let mut declaration_seen = false;
     let mut events = 0;
+    // Depth inside a skipped `<metadata>` subtree (0 = not skipping).
+    let mut skipping = 0usize;
     loop {
         ensure!(!cancel.is_cancelled(), "lease cancelled");
-        events += 1;
-        ensure!(events <= XML_EVENTS, "TTML XML event limit");
         let position = reader.buffer_position();
         let event = reader.read_event()?;
+        // Indentation between elements is not structure and must not spend the event budget.
+        let whitespace = matches!(&event, Event::Text(t) if t.iter().all(u8::is_ascii_whitespace));
+        if !whitespace {
+            events += 1;
+            ensure!(events <= XML_EVENTS, "TTML XML event limit");
+        }
+        if skipping > 0 {
+            match &event {
+                Event::Start(e) | Event::Empty(e) => {
+                    ensure!(
+                        stack.len() + skipping < XML_DEPTH,
+                        "multiple roots/TTML nesting limit"
+                    );
+                    ensure!(
+                        metadata_child(std::str::from_utf8(e.name().as_ref())?, &ns),
+                        "unsupported TTML metadata element"
+                    );
+                    if matches!(event, Event::Start(_)) {
+                        skipping += 1;
+                    }
+                    continue;
+                }
+                Event::End(_) => {
+                    skipping -= 1;
+                    continue;
+                }
+                Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) | Event::Comment(_) => {
+                    continue;
+                }
+                _ => {} // A declaration, DTD or processing instruction is still refused below.
+            }
+        }
+        // `<metadata>` in `<head>` is descriptive only: validated, then dropped from the output.
+        if let Event::Start(e) | Event::Empty(e) = &event {
+            if e.name().as_ref() == b"metadata" && stack.last().map(String::as_str) == Some("head")
+            {
+                if matches!(event, Event::Start(_)) {
+                    skipping = 1;
+                }
+                continue;
+            }
+        }
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 ensure!(

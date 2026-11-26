@@ -14,7 +14,10 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -25,6 +28,9 @@ const MAX_SEARCH_CATALOGS_PER_ADDON: usize = 32;
 const MAX_SEARCH_TASKS: usize = 64;
 /// Manifest id of the legacy embedded metadata addon (kept for history migration compatibility).
 const LOCAL_ADDON_ID: &str = "com.aio.metadata.rs";
+/// Cache size accounting and media eviction are whole-table scans; run them once per
+/// this many persisted responses instead of after every fetch.
+const PRUNE_EVERY: u32 = 16;
 
 /// Which loopback port the embedded metadata addon is actually serving on.
 /// `Unknown` (standalone core, tests) keeps every installed addon usable.
@@ -55,6 +61,8 @@ struct Inner {
     local_addon: Mutex<LocalAddon>,
     /// Parsed installed manifests, dropped whenever the addons table changes.
     addons: Mutex<Option<Vec<Addon>>>,
+    /// Persisted resource responses since start; paces `prune_cache`.
+    cache_writes: AtomicU32,
 }
 impl Core {
     /// Creates/migrates local storage synchronously. No network requests occur here.
@@ -69,15 +77,14 @@ impl Core {
                 subtitles: subtitle_cache::SubtitleCache::new(&data_dir),
                 local_addon: Mutex::new(LocalAddon::Unknown),
                 addons: Mutex::new(None),
+                cache_writes: AtomicU32::new(0),
             }),
         })
     }
     fn with_db<T>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> Result<T>) -> Result<T> {
-        let mut db = self
-            .inner
-            .db
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        // A panic in one request must not brick storage for the rest of the process: every
+        // statement group runs in its own transaction, so the connection itself stays consistent.
+        let mut db = self.inner.db.lock().unwrap_or_else(|p| p.into_inner());
         f(&mut db)
     }
     fn installed(&self) -> Result<Vec<Addon>> {
@@ -522,18 +529,9 @@ impl Core {
                 )?;
                 }
                 db::cache_metas(db,&persistent_body,kind,&a.url)?;
-                // Keep at most 500 resource responses and 64 MiB of raw cache bodies.
-                db.execute("DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY updated DESC,key LIMIT -1 OFFSET 500)",[])?;
-                db.execute("DELETE FROM cache WHERE key IN (
-                    SELECT key FROM (SELECT key,SUM(length(CAST(body AS BLOB))) OVER (ORDER BY updated DESC,key) AS bytes FROM cache)
-                    WHERE bytes>67108864)",[])?;
-                // Saved/history/feedback/episode-activity rows are never removed by catalog eviction.
-                db.execute("DELETE FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
-                    AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
-                    AND key IN (
-                    SELECT key FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
-                    AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
-                    ORDER BY updated DESC,key LIMIT -1 OFFSET 10000)",[])?;
+                if self.inner.cache_writes.fetch_add(1, Ordering::Relaxed) % PRUNE_EVERY == 0 {
+                    prune_cache(db)?;
+                }
             } else {
                 db.execute("DELETE FROM cache WHERE key=?1",[url])?;
             }
@@ -995,13 +993,21 @@ impl Core {
                     // so a film watched over several sessions adds up.
                     let added=nonnegative(req,"watched_add_ms",Some(0))?;
                     let video=if req.get("video_id").is_some() { text(req,"video_id")? } else { id };
+                    // A report with position 0 / unknown duration (a player that has not loaded yet)
+                    // must not erase a stored non-zero value; only an explicit `reset` may.
+                    let reset=boolean(req,"reset",false)?;
                     // Cumulative measured playback per video, never inferred from seeking.
                     tx.execute(
                         "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated) VALUES(?1,?2,?3,?4,?5,?6)
-                         ON CONFLICT(media_key,video_id) DO UPDATE SET position_ms=excluded.position_ms,duration_ms=excluded.duration_ms,
+                         ON CONFLICT(media_key,video_id) DO UPDATE SET
+                         position_ms=CASE WHEN excluded.position_ms=0 AND NOT ?7 THEN playback.position_ms ELSE excluded.position_ms END,
+                         duration_ms=CASE WHEN excluded.duration_ms=0 AND NOT ?7 THEN playback.duration_ms ELSE excluded.duration_ms END,
                          watched_ms=MAX(playback.watched_ms,excluded.watched_ms),updated=excluded.updated",
-                        params![key,video,position,duration,watched,ts],
+                        params![key,video,position,duration,watched,ts,reset],
                     )?;
+                    let (position,duration):(i64,i64)=tx.query_row(
+                        "SELECT position_ms,duration_ms FROM playback WHERE media_key=?1 AND video_id=?2",
+                        params![key,video],|r|Ok((r.get(0)?,r.get(1)?)))?;
                     if added>0 {
                         tx.execute(
                             "UPDATE playback SET watched_ms=CASE WHEN MAX(duration_ms,?4)>0 THEN MIN(watched_ms+?3,MAX(duration_ms,?4)) ELSE watched_ms+?3 END WHERE media_key=?1 AND video_id=?2",
@@ -1070,28 +1076,33 @@ impl Core {
         };
         // Parse a cache hit once; an unreadable cached file is dropped and refetched.
         // ASS/SSA subtitles are passed verbatim to libmpv, so they are cached without cue parsing.
-        let cached = self.inner.subtitles.read(&url).and_then(|(bytes, path)| {
-            if is_ass(&bytes) {
-                return Some((bytes, path, Vec::new(), true));
-            }
-            match subtitle::parse(&bytes) {
-                Ok(cues) if !cues.is_empty() => Some((bytes, path, cues, false)),
-                _ => {
-                    self.inner.subtitles.remove(&url);
-                    None
-                }
-            }
-        });
-        let from_cache = cached.is_some();
-        let (bytes, existing_path, cacheable, expiry, cues, ass) = match cached {
-            Some((bytes, path, cues, ass)) => (bytes, Some(path), true, None, cues, ass),
-            None => {
-                let (bytes, cacheable, expiry) = self.download_subtitle(&url, allow_http).await?;
+        let cached = self
+            .inner
+            .subtitles
+            .read_with_policy(&url, allow_http)
+            .and_then(|(bytes, path)| {
                 if is_ass(&bytes) {
-                    (bytes, None, cacheable, expiry, Vec::new(), true)
+                    return Some((bytes, path, Vec::new(), true));
+                }
+                match subtitle::parse(&bytes) {
+                    Ok(cues) if !cues.is_empty() => Some((bytes, path, cues, false)),
+                    _ => {
+                        self.inner.subtitles.remove(&url);
+                        None
+                    }
+                }
+            });
+        let from_cache = cached.is_some();
+        let (bytes, existing_path, cacheable, expiry, used_http, cues, ass) = match cached {
+            Some((bytes, path, cues, ass)) => (bytes, Some(path), true, None, false, cues, ass),
+            None => {
+                let (bytes, cacheable, expiry, used_http) =
+                    self.download_subtitle(&url, allow_http).await?;
+                if is_ass(&bytes) {
+                    (bytes, None, cacheable, expiry, used_http, Vec::new(), true)
                 } else {
                     let cues = subtitle::parse(&bytes)?;
-                    (bytes, None, cacheable, expiry, cues, false)
+                    (bytes, None, cacheable, expiry, used_http, cues, false)
                 }
             }
         };
@@ -1105,7 +1116,7 @@ impl Core {
             Some(
                 self.inner
                     .subtitles
-                    .store(&url, &bytes, expiry)?
+                    .store_with_policy(&url, &bytes, expiry, used_http)?
                     .to_string_lossy()
                     .into_owned(),
             )
@@ -1132,7 +1143,7 @@ impl Core {
         &self,
         url: &str,
         allow_http: bool,
-    ) -> Result<(Vec<u8>, bool, Option<std::time::SystemTime>)> {
+    ) -> Result<(Vec<u8>, bool, Option<std::time::SystemTime>, bool)> {
         let _permit = self
             .inner
             .network
@@ -1142,6 +1153,7 @@ impl Core {
         let mut target = url::Url::parse(url).context("Invalid subtitle URL")?;
         let allow_loopback = addon::is_loopback(&target);
         let mut cacheable = true;
+        let mut used_http = false;
         let mut expiry = None;
         for redirects in 0..=3 {
             // A redirect is a separate network request and must not bypass
@@ -1151,6 +1163,7 @@ impl Core {
                 allow_loopback || !addon::is_loopback(&target),
                 "Remote subtitle cannot redirect to loopback"
             );
+            used_http |= target.scheme() == "http" && !addon::is_loopback(&target);
             let sent_at = std::time::SystemTime::now();
             let mut response = self
                 .inner
@@ -1160,7 +1173,8 @@ impl Core {
                 .header(reqwest::header::ACCEPT, "*/*")
                 .send()
                 .await
-                .context("Subtitle download failed")?;
+                // The reqwest error chain carries the (token-bearing) subtitle URL; keep only its kind.
+                .map_err(|e| anyhow!("Subtitle download failed: {}", describe_http_error(&e)))?;
             let received_at = std::time::SystemTime::now();
             let (may_store, hop_expiry) =
                 subtitle_freshness(response.headers(), sent_at, received_at);
@@ -1197,11 +1211,9 @@ impl Core {
                 ensure!(length <= subtitle::LIMIT as u64, "subtitle too large");
             }
             let mut body = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .context("Subtitle download interrupted")?
-            {
+            while let Some(chunk) = response.chunk().await.map_err(|e| {
+                anyhow!("Subtitle download interrupted: {}", describe_http_error(&e))
+            })? {
                 ensure!(
                     body.len() + chunk.len() <= subtitle::LIMIT,
                     "subtitle too large"
@@ -1209,7 +1221,7 @@ impl Core {
                 body.extend_from_slice(&chunk);
             }
             ensure!(!body.is_empty(), "Empty subtitle response");
-            return Ok((body, cacheable, expiry));
+            return Ok((body, cacheable, expiry, used_http));
         }
         bail!("Too many subtitle redirects")
     }
@@ -1322,6 +1334,38 @@ fn subtitle_freshness(
             .unwrap_or(now)
     });
     (may_store, deadline)
+}
+/// Keeps at most 500 resource responses, 64 MiB of raw cache bodies and 10k catalog rows.
+/// One transaction, so a crash never leaves the three limits half applied.
+fn prune_cache(db: &mut rusqlite::Connection) -> Result<()> {
+    let tx = db.transaction()?;
+    tx.execute("DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY updated DESC,key LIMIT -1 OFFSET 500)",[])?;
+    tx.execute("DELETE FROM cache WHERE key IN (
+        SELECT key FROM (SELECT key,SUM(length(CAST(body AS BLOB))) OVER (ORDER BY updated DESC,key) AS bytes FROM cache)
+        WHERE bytes>67108864)",[])?;
+    // Saved/history/feedback/episode-activity rows are never removed by catalog eviction.
+    tx.execute("DELETE FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
+        AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
+        AND key IN (
+        SELECT key FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
+        AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
+        ORDER BY updated DESC,key LIMIT -1 OFFSET 10000)",[])?;
+    tx.commit()?;
+    Ok(())
+}
+/// A URL-free description of a transport failure; never `Display`/`source()` of the error itself.
+fn describe_http_error(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "could not connect"
+    } else if e.is_redirect() {
+        "bad redirect"
+    } else if e.is_body() || e.is_decode() {
+        "bad response body"
+    } else {
+        "request failed"
+    }
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = v

@@ -22,7 +22,9 @@ html:has(.app.playing) .tv-light { display: none; }
    Behind the glass is already a soft light, so smoked glass needs no live blur on a TV: a deeper
    tint over the glow reads the same, and scrolling costs nothing. */
 .tv *, .tv *::before, .tv *::after { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
-.tv .glass { --glass-tint: color-mix(in srgb, var(--lamp) 10%, rgba(20, 21, 26, .8)); }
+/* Without color-mix() (older WebViews) the deeper smoke comes from --glass itself; with it, the lamp tints it. */
+@supports not (background: color-mix(in srgb, #000, #fff)) { .tv { --glass: rgba(20, 21, 26, .82); } }
+@supports (background: color-mix(in srgb, #000, #fff)) { .tv .glass { --glass-tint: color-mix(in srgb, var(--lamp) 10%, rgba(20, 21, 26, .8)); } }
 .tv .topbar::before { background: linear-gradient(180deg, #000 0%, rgba(0,0,0,.86) 55%, rgba(0,0,0,0) 100%); }
 
 /* ---------------------------------------------------------------- focus
@@ -35,13 +37,18 @@ html:has(.app.playing) .tv-light { display: none; }
   transform: scale(1.04); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 22px 44px -10px rgba(0,0,0,.8); }
 .tv .forget:focus-within { opacity: 1; }
 .tv .cw-open:focus { outline: none; }
-.tv .home-hero { min-height: clamp(340px, 64vh, 430px); padding-top: 84px; padding-bottom: 22px; }
+.tv .home-hero { min-height: clamp(340px, 64vh, 430px); padding-top: 84px; padding-bottom: 22px;
+  /* A TV is 960 CSS px wide, which the narrow-window rule would stack: here the rail stays beside the copy. */
+  flex-direction: row; align-items: flex-end; justify-content: space-between; gap: 32px; }
+.tv .hero-thumb { width: 64px; }
 .tv .strip-arrow { display: none !important; }
 .tv .card:focus { outline: none; }
 /* Rows leave room for the lift, and the next poster always peeks in at the edge. */
 .tv .shelves .poster-strip { padding-top: 18px; padding-bottom: 22px; margin-top: -18px; }
 .tv .card { scroll-margin-inline: 96px; }
 .tv .pill:focus-visible, .tv .orb:focus-visible { box-shadow: 0 14px 30px -8px rgba(0,0,0,.7); }
+.tv .ep-foot .orb.small:focus-visible, .tv .forget .orb:focus-visible, .tv .short-actions .orb:focus-visible {
+  box-shadow: 0 0 0 3px #000, 0 0 0 6px var(--bone), 0 14px 30px -8px rgba(0,0,0,.7); }
 .tv .player .bare:focus-visible, .tv .player-step-btn:focus-visible, .tv .sub-lang:focus-visible {
   outline: none; background: var(--bone); color: #000; box-shadow: 0 0 0 3px var(--bone);
 }
@@ -56,6 +63,13 @@ html:has(.app.playing) .tv-light { display: none; }
 /* The people in a title: their portrait comes forward like a poster. */
 .tv .person:focus { outline: none; }
 .tv .person:focus .face { transform: scale(1.08); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 18px 36px -10px rgba(0,0,0,.8); }
+.tv .season-card:focus { outline: none; }
+.tv .season-card:focus .sp { transform: translateY(-4px) scale(1.06); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 18px 36px -10px rgba(0,0,0,.8); }
+.tv .ep-tile:has(.ep-main:focus) { transform: scale(1.03); box-shadow: 0 0 0 2px #000, 0 0 0 5px var(--bone), 0 22px 44px -10px rgba(0,0,0,.82); }
+.tv .ep-tile:has(.ep-main:focus) .ep-play { opacity: 1; background: var(--bone); color: #000; }
+.tv .ep-main:focus .ep-still { outline: 4px solid var(--bone); outline-offset: -4px; }
+/* The tile lifts and rings itself on focus: no entrance animation to hold its transform. */
+.tv .ep-grid > .ep-tile { animation: none; }
 
 /* ---------------------------------------------------------------- Picks
    A TV is wide even when its pixels are few (960 CSS px here), so Picks keeps its side-by-side
@@ -98,3 +112,17 @@ html:has(.app.playing) .tv-light { display: none; }
 .tv .shelf { content-visibility: auto; contain-intrinsic-size: auto 320px; margin-inline: calc(-1 * var(--gutter)); padding-inline: var(--gutter); }
 .tv .poster-strip > .card, .tv .cw-strip > .cw-card, .tv .lib-grid > .lib-item, .tv .week-strip > .week-card { animation: none; }
 .tv .card-art::after { display: none; }
+
+/* ---------------------------------------------------------------- read from the sofa
+   Nothing is smaller than 14px: badges, counts and sub-lines that are fine at arm's length are not. */
+.tv .ep-badge, .tv .ep-next, .tv .ep-done-pill { height: 28px; font-size: 14px; }
+.tv .ep-left, .tv .ep-foot .ep-date, .tv .season-sub, .tv .ep-overview, .tv .cw-ep, .tv .cw-meta, .tv .lp-line,
+.tv .poster-meta, .tv .person-role, .tv .video-kind, .tv .source-meta, .tv .tag, .tv .week-when, .tv .top-badge { font-size: 14px; }
+.tv .sp-count { height: 24px; font-size: 14px; }
+.tv .sp-count .icon, .tv .ep-done-pill .icon { width: 14px; height: 14px; }
+.tv .status-pill { height: 26px; font-size: 14px; }
+.tv .chip-count { font-size: 14px; }
+.tv .link-qr { width: 260px; height: 260px; }
+/* Picks' note, the update toast and the key request stack above one another on a television too. */
+.tv .app:has(.duel .toast) .keys-toast, .tv .app:has(.duel .toast) .update-toast { bottom: calc(168px + var(--bottom-inset)); }
+.tv .app:has(.duel .toast):has(.keys-toast) .update-toast { bottom: calc(240px + var(--bottom-inset)); }

@@ -27,13 +27,16 @@ pub fn SearchOverlay() -> Element {
         ideas_started.set(true);
         spawn(async move {
             let items = backend::picks().await.map(|p| p.items).unwrap_or_default();
+            // Quietly: what the library says about taste (likes, finished, saved) ranks ideas like Home's pick.
+            let known = if items.len() <= 1 { Vec::new() } else { backend::library().await.unwrap_or_default() };
             let ranked = if items.len() <= 1 {
                 items
             } else {
                 let fallback = items.clone();
                 backend::on_runtime(async move {
                     tokio::task::spawn_blocking(move || {
-                        let taste = crate::brain::load(0);
+                        let mut taste = crate::brain::load(0);
+                        taste.set_facts(crate::brain::facts(&known));
                         let mut scored: Vec<(f64, Media)> = items.into_iter().enumerate()
                             .map(|(i, m)| (taste.lasting(&m) - (i as f64) * 0.02, m)).collect();
                         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -159,6 +162,7 @@ pub fn SearchOverlay() -> Element {
                     button {
                         class: if vibe_mode() { "pill accent" } else { "pill glass" },
                         title: "On-device semantic search by mood, plot or vibe",
+                        aria_label: "Vibe search",
                         aria_pressed: "{vibe_mode()}",
                         onclick: move |_| {
                             let next = !vibe_mode();

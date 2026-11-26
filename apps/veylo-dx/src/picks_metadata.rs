@@ -68,19 +68,47 @@ pub async fn enrich(media: &Media) {
         let Some(store) = STORE.get() else { return };
         let mut entry = store.read().ok().and_then(|s| s.get(&id).cloned()).unwrap_or_default();
         let now = backend::now_secs();
-        if !entry.needs_keywords(now) { return; }
+        if !entry.needs_keywords(now) || backed_off(&id, now) { return; }
         let Ok(_permit) = GATE.acquire().await else { return };
         entry.update(backend::picks_keywords(&media).await, now);
         // Only the entry is changed under the lock (Picks reads the store all the time); the file
         // follows a few seconds later, one write for every title enriched meanwhile.
         if let Ok(mut store) = store.write() {
-            if !store.contains_key(&id) && store.len() >= LIMIT {
-                if let Some(oldest) = store.iter().min_by_key(|(_, e)| e.touched).map(|(k, _)| k.clone()) { store.remove(&oldest); }
+            let due = entry.keywords_due;
+            if !insert_bounded(&mut store, id.clone(), entry) {
+                // Not worth a place in a full store, but not worth asking again straight away either.
+                back_off(&id, due);
+                return;
             }
-            store.insert(id, entry);
         }
         save_soon();
     }).await;
+}
+
+/// Titles whose lookup found nothing and found no room in a full store: when to ask again.
+static BACKOFF: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+fn backed_off(id: &str, now: i64) -> bool {
+    BACKOFF.get().and_then(|b| b.lock().ok()).is_some_and(|b| b.get(id).is_some_and(|due| *due > now))
+}
+fn back_off(id: &str, due: i64) {
+    if let Ok(mut b) = BACKOFF.get_or_init(Default::default).lock() {
+        if b.len() >= 512 { b.clear(); }
+        b.insert(id.to_owned(), due);
+    }
+}
+
+/// Store an entry within the size limit. A title with nothing known (a lookup that failed or came
+/// back empty) never pushes out one that has keywords: it takes the place of the oldest entry
+/// that has none, and is not stored at all when every entry has some. Returns whether it was stored.
+fn insert_bounded(store: &mut Store, id: String, entry: Entry) -> bool {
+    if !store.contains_key(&id) && store.len() >= LIMIT {
+        let has_nothing = |e: &Entry| e.extra.keywords.is_empty();
+        let oldest = |only_empty: bool| store.iter().filter(|(_, e)| !only_empty || has_nothing(e)).min_by_key(|(_, e)| e.touched).map(|(k, _)| k.clone());
+        let Some(victim) = oldest(true).or_else(|| if has_nothing(&entry) { None } else { oldest(false) }) else { return false };
+        store.remove(&victim);
+    }
+    store.insert(id, entry);
+    true
 }
 
 /// Write the store once a burst of enrichment is over, encoding it under a read lock on a single
@@ -123,28 +151,38 @@ fn read_store(path: &Path) -> Store {
 }
 
 /// Remove markup and decode common named/numeric entities before classification and caching.
+/// Entities are decoded in a single pass, so "&amp;#39;" stays the text "&#39;" and is never
+/// decoded twice; a reference to NUL or another control character is dropped.
 pub fn clean(input: &str, max_chars: usize) -> String {
-    let mut plain = String::new();
-    let mut tag = false;
-    let mut chars = input.chars().take(16000).peekable();
-    while let Some(c) = chars.next() {
-        // Only "<" followed by a tag-like character opens markup; "I <3 you" stays text.
-        match c {
-            '<' if !tag && chars.peek().is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!')) => { tag = true; plain.push(' '); }
-            '>' if tag => tag = false,
-            _ if !tag => plain.push(c),
-            _ => {}
+    let chars: Vec<char> = input.chars().take(16000).collect();
+    let mut plain = String::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Only "<" followed by a tag-like character opens markup ("I <3 you" stays text), and only
+        // when the tag is closed by ">" before another "<": an unclosed "<b" never swallows the rest.
+        let opens = c == '<' && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!'));
+        if opens {
+            if let Some(end) = chars[i + 1..].iter().position(|x| matches!(x, '<' | '>')).filter(|p| chars[i + 1 + p] == '>') {
+                plain.push(' ');
+                i += end + 2;
+                continue;
+            }
         }
+        plain.push(c);
+        i += 1;
     }
-    for (a,b) in [("&nbsp;"," "),("&quot;","\""),("&apos;","'"),("&lt;","<"),("&gt;",">"),("&amp;","&")] { plain = plain.replace(a,b); }
     static ENTITY: OnceLock<regex::Regex> = OnceLock::new();
-    let numeric = ENTITY.get_or_init(|| regex::Regex::new(r"&#(x[0-9a-fA-F]+|[0-9]+);").expect("entity regex"));
-    let decoded = numeric.replace_all(&plain, |caps: &regex::Captures| {
-        let digits = &caps[1];
-        let number = if let Some(hex) = digits.strip_prefix('x') { u32::from_str_radix(hex,16).ok() } else { digits.parse::<u32>().ok() };
-        number.and_then(char::from_u32).map(|c| c.to_string()).unwrap_or_default()
+    let entity = ENTITY.get_or_init(|| regex::Regex::new(r"&(?:#([xX][0-9a-fA-F]{1,8}|[0-9]{1,10})|(nbsp|quot|apos|lt|gt|amp));").expect("entity regex"));
+    let decoded = entity.replace_all(&plain, |caps: &regex::Captures| -> String {
+        if let Some(digits) = caps.get(1).map(|d| d.as_str()) {
+            let number = match digits.strip_prefix(['x', 'X']) { Some(hex) => u32::from_str_radix(hex, 16).ok(), None => digits.parse::<u32>().ok() };
+            return number.and_then(char::from_u32).filter(|c| !c.is_control() || c.is_whitespace()).map(String::from).unwrap_or_default();
+        }
+        match &caps[2] { "nbsp" => " ", "quot" => "\"", "apos" => "'", "lt" => "<", "gt" => ">", _ => "&" }.to_owned()
     });
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max_chars).collect()
+    decoded.chars().filter(|c| !c.is_control() || c.is_whitespace()).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
@@ -179,5 +217,35 @@ mod tests {
         value["version"]=json!(99);std::fs::write(&path,value.to_string()).unwrap();
         assert!(read_store(&path).is_empty());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn entities_decode_once_and_unclosed_tags_keep_the_text() {
+        assert_eq!(clean("&amp;#39; &amp;lt;b&amp;gt; &amp;amp;", 100), "&#39; &lt;b&gt; &amp;");
+        assert_eq!(clean("A&#0;B &#x0; &#7; C", 100), "AB C");
+        assert_eq!(clean("&#xD800; &#1114112; ok", 100), "ok");
+        assert_eq!(clean("Great show <b and more text", 100), "Great show <b and more text");
+        assert_eq!(clean("a <b and c <i>text</i> end", 100), "a <b and c text end");
+        assert_eq!(clean("<p>one</p><p>two", 100), "one two");
+        assert_eq!(clean("Fish &AMP; Chips &lt;3", 100), "Fish &AMP; Chips <3");
+    }
+    #[test]
+    fn failed_lookups_never_evict_titles_that_have_keywords() {
+        let mut store = Store::new();
+        let known = |touched| { let mut e = Entry::default(); e.update(Some(vec!["dark".into()]), touched); e };
+        for i in 0..LIMIT { store.insert(format!("{i:064}"), known(1000 + i as i64)); }
+        let failed = { let mut e = Entry::default(); e.update(None, 5000); e };
+        // Every entry has keywords: the failed lookup is not stored and nothing is lost.
+        assert!(!insert_bounded(&mut store, "f".repeat(64), failed.clone()));
+        assert_eq!(store.len(), LIMIT);
+        assert!(store.contains_key(&format!("{:064}", 0)));
+        // A real answer still replaces the oldest one.
+        assert!(insert_bounded(&mut store, "a".repeat(64), known(6000)));
+        assert!(!store.contains_key(&format!("{:064}", 0)) && store.contains_key(&"a".repeat(64)) && store.len() == LIMIT);
+        // With a keyword-less entry present, a failed lookup replaces only that one.
+        let key = format!("{:064}", 1);
+        store.insert(key.clone(), failed.clone());
+        assert!(insert_bounded(&mut store, "b".repeat(64), failed));
+        assert!(!store.contains_key(&key) && store.contains_key(&"b".repeat(64)) && store.len() == LIMIT);
+        assert!(store.contains_key(&format!("{:064}", 2)));
     }
 }

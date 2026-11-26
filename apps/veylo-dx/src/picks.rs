@@ -857,7 +857,7 @@ pub fn Picks() -> Element {
                 }
                 match slot() {
                     Some(Slot::Mood) => rsx! {
-                        div { class: "popover glass mood-pop", role: "group", aria_label: "Tonight's mood",
+                        div { class: "popover glass mood-pop", role: "dialog", aria_modal: "true", aria_label: "Tonight's mood",
                             p { class: "pop-note", "Pick a mood or describe one. Picks leans toward it all night; tap again to drop it." }
                             div { class: "pop-options",
                                 for (label, phrase) in brain::MOODS {
@@ -884,7 +884,7 @@ pub fn Picks() -> Element {
                         }
                     },
                     Some(Slot::Filters) => rsx! {
-                        div { class: "popover glass filters-pop", role: "group", aria_label: "Filters",
+                        div { class: "popover glass filters-pop", role: "dialog", aria_modal: "true", aria_label: "Filters",
                             div { class: "pop-row",
                                 div { class: "segmented glass", role: "radiogroup", aria_label: "Type",
                                     i { class: "slider", aria_hidden: "true" }

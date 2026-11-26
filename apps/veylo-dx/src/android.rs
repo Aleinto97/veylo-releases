@@ -125,6 +125,19 @@ fn load_class<'a>(env: &mut JNIEnv<'a>, activity: &JObject, name: &str) -> jni::
     Ok(jni::objects::JClass::from(class))
 }
 
+/// `VeyloVideo`, looked up once: brightness and volume drags call into it on every touch move,
+/// and `ClassLoader.loadClass` each time would be a string, a lookup and a local reference per event.
+fn video_class<'a>(env: &mut JNIEnv<'a>, activity: &JObject) -> jni::errors::Result<jni::objects::JClass<'a>> {
+    static CLASS: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
+    if let Some(global) = CLASS.get() {
+        return Ok(jni::objects::JClass::from(env.new_local_ref(global.as_obj())?));
+    }
+    let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+    let global = env.new_global_ref(&class)?;
+    let _ = CLASS.set(global);
+    Ok(class)
+}
+
 /// Google sign-in through Android's account sheet (VeyloAccount.kt); the answer comes later
 /// through `account_result`.
 pub fn google_id_token(web_client: &str) -> Result<()> {
@@ -177,7 +190,7 @@ static SURFACE: Mutex<Option<(GlobalRef, i32, i32)>> = Mutex::new(None);
 
 fn video_call(name: &str, sig: &str, args: &[JValue]) -> Result<()> {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         let mut all = vec![JValue::Object(activity)];
         all.extend_from_slice(args);
         env.call_static_method(&class, name, sig, &all)?;
@@ -196,7 +209,7 @@ pub fn video_frame_rate(fps: f64) -> Result<()> {
 }
 pub fn video_media_meta(title: &str, subtitle: &str) -> Result<()> {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         let t = env.new_string(title)?;
         let s = env.new_string(subtitle)?;
         env.call_static_method(&class, "setMediaMetadata", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V",
@@ -206,15 +219,23 @@ pub fn video_media_meta(title: &str, subtitle: &str) -> Result<()> {
 }
 pub fn video_media_state(playing: bool, position_ms: i64, speed: f32) -> Result<()> {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         env.call_static_method(&class, "setMediaState", "(ZJF)V",
             &[JValue::Bool(playing.into()), JValue::Long(position_ms), JValue::Float(speed)])?;
         Ok(())
     })
 }
+/// The video's length, for the notification's seek bar and Bluetooth remotes.
+pub fn video_media_duration(duration_ms: i64) -> Result<()> {
+    with_activity(|env, activity| {
+        let class = video_class(env, activity)?;
+        env.call_static_method(&class, "setMediaDuration", "(J)V", &[JValue::Long(duration_ms)])?;
+        Ok(())
+    })
+}
 pub fn video_get_brightness() -> f32 {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         env.call_static_method(&class, "getBrightness", "(Landroid/app/Activity;)F", &[JValue::Object(activity)])?.f()
     }).unwrap_or(0.5)
 }
@@ -223,7 +244,7 @@ pub fn video_set_brightness(level: f32) -> Result<()> {
 }
 pub fn video_get_volume() -> f32 {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         env.call_static_method(&class, "getVolume", "(Landroid/app/Activity;)F", &[JValue::Object(activity)])?.f()
     }).unwrap_or(0.5)
 }
@@ -235,7 +256,7 @@ pub fn video_set_rotation_lock(locked: bool) -> Result<()> {
 }
 pub fn video_enter_pip(w: i32, h: i32) -> bool {
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         env.call_static_method(&class, "enterPip", "(Landroid/app/Activity;II)Z",
             &[JValue::Object(activity), JValue::Int(w), JValue::Int(h)])?.z()
     }).unwrap_or(false)
@@ -244,7 +265,7 @@ pub fn video_enter_pip(w: i32, h: i32) -> bool {
 /// What the panel declares (Display.HdrCapabilities).
 pub fn screen() -> Result<crate::engine::Screen> {
     let mask = with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         env.call_static_method(&class, "hdrTypes", "(Landroid/app/Activity;)I", &[JValue::Object(activity)])?.i()
     })?;
     Ok(crate::engine::Screen { hdr10: mask & 1 != 0, hlg: mask & 2 != 0, hdr10_plus: mask & 4 != 0, dolby_vision: mask & 8 != 0, peak_nits: 0 })
@@ -277,7 +298,7 @@ pub fn prepare_mpv() -> Result<String> {
         }
     });
     with_activity(|env, activity| {
-        let class = load_class(env, activity, "dev.veylo.dx.VeyloVideo")?;
+        let class = video_class(env, activity)?;
         let path = env.call_static_method(&class, "prepare", "(Landroid/app/Activity;)Ljava/lang/String;", &[JValue::Object(activity)])?.l()?;
         let path: String = env.get_string(&JString::from(path))?.into();
         Ok(path)
@@ -349,6 +370,11 @@ pub extern "system" fn Java_dev_veylo_dx_VeyloVideo_nativeCommand(mut env: JNIEn
         "seek_fwd" => live.seek_by(10.0),
         "seek_back" => live.seek_by(-10.0),
         "next" if live.request.has_next => live.finish(crate::engine::Finish::Next),
+        "prev" if live.request.has_prev => live.finish(crate::engine::Finish::Prev),
+        // A seek from the notification or a Bluetooth remote: "seek:<milliseconds>".
+        c if c.starts_with("seek:") => {
+            if let Ok(ms) = c["seek:".len()..].parse::<i64>() { live.seek_to(ms.max(0) as f64 / 1000.0); }
+        }
         "stop" => live.finish(crate::engine::Finish::Close),
         _ => {}
     }

@@ -147,11 +147,11 @@ pub async fn online_subtitles(kind: &str, video_id: &str, filename: Option<&str>
     };
     let v = exec(req).await?;
     let raw_list = v["subtitles"].as_array().cloned().unwrap_or_default();
-    let preferred = stream_language().map(|k| subtitle_language_of(&k));
+    let preferred = preferred_subtitle_language(kind, video_id);
     let mut parsed = rank_subtitles_for(raw_list.iter().filter_map(subtitle_of).collect(), preferred.as_deref(), filename);
     let want_lang = preferred.as_deref().unwrap_or("English");
-    let usable_in_lang = parsed.iter().filter(|s| s.language == want_lang).count();
-    if usable_in_lang < 3 && video_id.starts_with("tt") {
+    let usable_in_lang = parsed.iter().filter(|s| same_language(&s.language, want_lang)).count();
+    if usable_in_lang < 3 && valid_imdb(video_id.split(':').next().unwrap_or("")) {
         if let Ok(os_list) = opensubtitles(kind, video_id).await {
             parsed.extend(os_list.iter().filter_map(subtitle_of));
             parsed = rank_subtitles_for(parsed, preferred.as_deref(), filename);
@@ -163,6 +163,36 @@ pub async fn online_subtitles(kind: &str, video_id: &str, filename: Option<&str>
         anyhow::bail!("Subtitle providers could not be reached");
     }
     Ok(parsed)
+}
+
+/// The subtitle language to rank first for a video: the one remembered for this title (what the
+/// viewer last picked in the player), else the Audio-language setting's.
+fn preferred_subtitle_language(kind: &str, video_id: &str) -> Option<String> {
+    // A series' video id is "<title id>:<season>:<episode>" ("kitsu:<id>:<episode>" for anime).
+    let parts: Vec<&str> = video_id.split(':').collect();
+    let title_id = match parts.first() {
+        Some(&("kitsu" | "mal" | "anilist" | "anidb")) if parts.len() >= 2 => parts[..2].join(":"),
+        _ => parts.first().map(|p| (*p).to_owned()).unwrap_or_default(),
+    };
+    let remembered = load_track_pref_for_title(kind, &title_id)
+        .filter(|p| !p.sub_off)
+        .and_then(|p| p.sub_lang)
+        .map(|code| crate::engine::language_name(&code))
+        .filter(|l| !l.is_empty());
+    remembered.or_else(|| stream_language().map(|k| subtitle_language_of(&k)))
+}
+
+/// "Portuguese (Brazil)" is "Portuguese": the base language name, lower case, without a region.
+fn language_base(label: &str) -> String {
+    label.split('(').next().unwrap_or(label).trim().to_lowercase()
+}
+
+/// Whether a subtitle's language label is the wanted one. A wanted language without a region
+/// ("Portuguese") takes its regional variants ("Portuguese (Brazil)"); one with a region
+/// ("Spanish (Latin America)") takes only that.
+fn same_language(label: &str, wanted: &str) -> bool {
+    if label.trim().eq_ignore_ascii_case(wanted.trim()) { return true; }
+    !wanted.contains('(') && language_base(label) == language_base(wanted)
 }
 
 pub(super) async fn opensubtitles(kind: &str, video_id: &str) -> Result<Vec<Value>> {
@@ -198,9 +228,26 @@ pub fn rank_subtitles(list: Vec<OnlineSubtitle>, preferred: Option<&str>) -> Vec
     rank_subtitles_for(list, preferred, None)
 }
 
+/// File extensions a release name may end with (never part of the tags).
+const RELEASE_EXTENSIONS: [&str; 16] = ["mkv", "mp4", "m4v", "avi", "mov", "wmv", "webm", "ts", "m2ts", "mpg", "mpeg", "flv", "srt", "ass", "vtt", "sub"];
+
 fn release_tokens(name: &str) -> Vec<String> {
+    static_re!(web_dl_re, r"(?i)\bweb[ ._-]?dl\b");
+    static_re!(web_rip_re, r"(?i)\bweb[ ._-]?rip\b");
+    static_re!(blu_ray_re, r"(?i)\bblu[ ._-]?ray\b");
+    static_re!(bd_rip_re, r"(?i)\bbd[ ._-]?rip\b");
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let stem = stem.rsplit_once('.').map(|(a, _)| a).unwrap_or(stem);
+    // Only a known video or subtitle extension is cut: "Show.S01E01.DDP5.1-NTb" has none, and
+    // its ".1-NTb" is the audio layout and the release group.
+    let stem = match stem.rsplit_once('.') {
+        Some((a, ext)) if RELEASE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) => a,
+        _ => stem,
+    };
+    // "WEB-DL" is one tag, not "web" and "dl" (and likewise WEBRip, Blu-ray, BDRip).
+    let stem = web_dl_re().replace_all(stem, "webdl");
+    let stem = web_rip_re().replace_all(&stem, "webrip");
+    let stem = blu_ray_re().replace_all(&stem, "bluray");
+    let stem = bd_rip_re().replace_all(&stem, "bdrip");
     stem.to_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| t.len() >= 2)
@@ -233,8 +280,8 @@ pub fn rank_subtitles_for(mut list: Vec<OnlineSubtitle>, preferred: Option<&str>
     list.retain(|s| seen.insert(s.url.clone()));
     // A stable sort keeps the add-on's order for equal language and release-match scores.
     list.sort_by_key(|s| (
-        Some(s.language.as_str()) != preferred,
-        s.language != "English",
+        !preferred.is_some_and(|p| same_language(&s.language, p)),
+        !same_language(&s.language, "English"),
         s.language == "Unknown",
         s.language.clone(),
         std::cmp::Reverse(release_match_score(s.release.as_deref(), playing_filename)),
@@ -258,6 +305,45 @@ fn format_vtt_time(ms: i64) -> String {
     format!("{h:02}:{m:02}:{s:02}.{frac:03}")
 }
 
+static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// A staged (`no-store`) subtitle file is only needed while the player has it open.
+const STAGED_SUBTITLE_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// A private staging path unique to this request (the subtitle's URL and a counter): two videos,
+/// or two requests for one, never overwrite the file the player is reading. Staged files from
+/// earlier requests (and the old fixed `sub-ephemeral.*` names) are swept first.
+fn staged_subtitle_path(url: &str, ext: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let dir = backend_data_dir();
+    sweep_staged_subtitles(&dir, STAGED_SUBTITLE_TTL);
+    let tag: String = Sha256::digest(url.as_bytes()).iter().take(5).map(|b| format!("{b:02x}")).collect();
+    let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!("sub-ephemeral-{tag}-{:x}-{seq:x}.{ext}", std::process::id()))
+}
+
+fn sweep_staged_subtitles(dir: &std::path::Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("sub-ephemeral") || !(name.ends_with(".ass") || name.ends_with(".vtt")) { continue; }
+        let stale = entry.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok()).is_none_or(|age| age > max_age);
+        // The legacy fixed names are never in use by a player of this version.
+        if stale || name == "sub-ephemeral.ass" || name == "sub-ephemeral.vtt" { let _ = std::fs::remove_file(entry.path()); }
+    }
+}
+
+/// One cue's text made safe inside a WebVTT block: a blank line would end the cue early and
+/// `-->` would read as a timing line.
+pub(super) fn sanitize_cue_text(text: &str) -> String {
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<String> = unified.lines()
+        .map(|l| l.replace("-->", "->").trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.join("\n")
+}
+
 /// Download and validate one subtitle through core and return its local file path for the player.
 /// Never falls back to handing an unvalidated remote URL directly to libmpv.
 pub async fn fetch_subtitle(url: &str) -> Result<String> {
@@ -267,7 +353,7 @@ pub async fn fetch_subtitle(url: &str) -> Result<String> {
     }
     // Valid `Cache-Control: no-store` ASS subtitle: stage the core-validated ASS bytes ephemerally.
     if let Some(ass) = v["raw_ass"].as_str().filter(|s| !s.is_empty()) {
-        let path = backend_data_dir().join("sub-ephemeral.ass");
+        let path = staged_subtitle_path(url, "ass");
         write_private_file(&path, ass.as_bytes()).context("Couldn't stage subtitle")?;
         return Ok(path.to_string_lossy().into_owned());
     }
@@ -275,14 +361,22 @@ pub async fn fetch_subtitle(url: &str) -> Result<String> {
     // private VTT file rather than bypassing core validation with the raw remote URL.
     let cues = v["cues"].as_array().filter(|c| !c.is_empty())
         .context("Subtitle could not be cached or read")?;
+    let vtt = cues_to_vtt(cues);
+    anyhow::ensure!(vtt.len() > "WEBVTT\n\n".len(), "Subtitle could not be cached or read");
+    let path = staged_subtitle_path(url, "vtt");
+    write_private_file(&path, vtt.as_bytes()).context("Couldn't stage subtitle")?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn cues_to_vtt(cues: &[Value]) -> String {
     let mut vtt = String::from("WEBVTT\n\n");
     for cue in cues {
         let (Some(start), Some(end), Some(text)) = (cue["start_ms"].as_i64(), cue["end_ms"].as_i64(), cue["text"].as_str()) else { continue };
+        let text = sanitize_cue_text(text);
+        if text.is_empty() || end <= start { continue; }
         vtt.push_str(&format!("{} --> {}\n{}\n\n", format_vtt_time(start), format_vtt_time(end), text));
     }
-    let path = backend_data_dir().join("sub-ephemeral.vtt");
-    write_private_file(&path, vtt.as_bytes()).context("Couldn't stage subtitle")?;
-    Ok(path.to_string_lossy().into_owned())
+    vtt
 }
 
 #[cfg(test)]
@@ -296,5 +390,55 @@ mod release_sync_tests {
         ];
         let ranked = rank_subtitles_for(subs, Some("English"), Some("Movie.2024.2160p.WEB-DL.H265-NTb.mkv"));
         assert_eq!(ranked[0].id, "2");
+    }
+
+    #[test]
+    fn release_tokens_keep_group_and_join_web_dl() {
+        assert_eq!(release_tokens("Show.S01E01.DDP5.1-NTb").last().map(String::as_str), Some("ntb"));
+        assert_eq!(release_tokens("Show.S01E01.1080p.WEB-DL.H264-NTb.mkv").last().map(String::as_str), Some("ntb"));
+        assert!(release_tokens("Movie.2024.WEB-DL.x264.mkv").contains(&"webdl".to_owned()));
+        assert!(release_tokens("Movie 2024 Blu-Ray x264.mkv").contains(&"bluray".to_owned()));
+        // WEB-DL in the subtitle's release matches WEBDL in the file name.
+        assert!(release_match_score(Some("Movie.2024.WEB-DL-GRP"), Some("Movie.2024.WEBDL-GRP.mkv")) >= 8);
+    }
+
+    #[test]
+    fn regional_variants_match_the_base_language() {
+        let sub = |id: &str, lang: &str| OnlineSubtitle { id: id.into(), url: format!("https://a/{id}.srt"), code: "x".into(), language: lang.into(), release: None };
+        assert!(same_language("Portuguese (Brazil)", "Portuguese"));
+        assert!(same_language("Portuguese", "Portuguese"));
+        assert!(!same_language("Spanish", "Spanish (Latin America)"));
+        assert!(!same_language("Portuguese", "Spanish"));
+        let ranked = rank_subtitles_for(vec![sub("1", "English"), sub("2", "Portuguese (Brazil)"), sub("3", "French")], Some("Portuguese"), None);
+        assert_eq!(ranked[0].id, "2");
+        assert_eq!(ranked[1].id, "1");
+    }
+
+    #[test]
+    fn cue_text_cannot_break_out_of_its_vtt_block() {
+        assert_eq!(sanitize_cue_text("one\n\ntwo --> three\r\n  "), "one\ntwo -> three");
+        let vtt = cues_to_vtt(&[
+            json!({"start_ms": 1000, "end_ms": 2000, "text": "a\n\nb"}),
+            json!({"start_ms": 3000, "end_ms": 3500, "text": "\n\n"}),
+            json!({"start_ms": 4000, "end_ms": 3000, "text": "backwards"}),
+        ]);
+        assert_eq!(vtt, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\na\nb\n\n");
+    }
+
+    #[test]
+    fn staging_sweeps_only_old_staged_subtitles() {
+        let dir = std::env::temp_dir().join(format!("veylo-sub-stage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["sub-ephemeral.ass", "sub-ephemeral-ab-1-1.vtt", "settings.json"] { std::fs::write(dir.join(name), b"x").unwrap(); }
+        sweep_staged_subtitles(&dir, Duration::from_secs(3600));
+        // The legacy fixed name goes at once; a fresh unique one stays; other files are never touched.
+        assert!(!dir.join("sub-ephemeral.ass").exists());
+        assert!(dir.join("sub-ephemeral-ab-1-1.vtt").exists());
+        assert!(dir.join("settings.json").exists());
+        std::thread::sleep(Duration::from_millis(20));
+        sweep_staged_subtitles(&dir, Duration::from_millis(1));
+        assert!(!dir.join("sub-ephemeral-ab-1-1.vtt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

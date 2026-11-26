@@ -73,45 +73,42 @@ fn includes(values: Option<&Value>, needle: &str) -> bool {
 }
 /// Errors cross into UI and logs; configured addon URLs often carry provider
 /// tokens in the path or query. Keep only scheme + host so secrets never escape.
+/// Schemes match case-insensitively. A URL token ends only at whitespace or a
+/// quote/angle bracket, because `(`, `)`, `'` and `[` are legal in paths and
+/// stopping there would leak the tail of a secret-bearing path.
 pub(crate) fn redact(input: impl AsRef<str>) -> String {
+    const SCHEMES: [&str; 3] = ["https://", "http://", "stremio://"];
     let input = input.as_ref();
+    // ASCII lowercasing keeps byte offsets identical to `input`.
+    let lower = input.to_ascii_lowercase();
     let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.find("http") {
-        let candidate = &rest[pos..];
-        let scheme_len = if candidate.starts_with("https://") {
-            8
-        } else if candidate.starts_with("http://") {
-            7
-        } else {
-            0
-        };
-        if scheme_len == 0 {
-            let take = pos + 1;
-            out.push_str(&rest[..take]);
-            rest = &rest[take..];
-            continue;
-        }
-        let mut end = scheme_len;
-        let bytes = candidate.as_bytes();
-        while end < bytes.len() && !b" \t\r\n()[]<>\"'".contains(&bytes[end]) {
+    let mut at = 0;
+    while let Some((start, scheme_len)) = SCHEMES
+        .iter()
+        .filter_map(|s| lower[at..].find(s).map(|p| (at + p, s.len())))
+        .min_by_key(|(p, _)| *p)
+    {
+        out.push_str(&input[at..start]);
+        let bytes = input.as_bytes();
+        let mut end = start + scheme_len;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !b"<>\"`".contains(&bytes[end])
+        {
             end += 1;
         }
-        let token = &candidate[..end];
-        let trimmed = token.trim_end_matches(['.', ',', ';', ':']);
+        let token = &input[start..end];
+        let trimmed = token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'']);
         let trailing = &token[trimmed.len()..];
         let safe = match Url::parse(trimmed) {
-            Ok(u) => {
-                let host = u.host_str().unwrap_or("...");
-                format!("{}://{}/...", u.scheme(), host)
-            }
+            Ok(u) => format!("{}://{}/...", u.scheme(), u.host_str().unwrap_or("...")),
             Err(_) => "<url>".to_owned(),
         };
         out.push_str(&safe);
         out.push_str(trailing);
-        rest = &candidate[end..];
+        at = end;
     }
-    out.push_str(rest);
+    out.push_str(&input[at..]);
     out
 }
 
@@ -122,11 +119,12 @@ pub(crate) fn normalize(input: &str, allow_http: bool) -> Result<String> {
         "Invalid addon URL"
     );
     let converted;
-    let input = if let Some(rest) = input.strip_prefix("stremio://") {
-        converted = format!("https://{rest}");
-        &converted
-    } else {
-        input
+    let input = match input.get(..10) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("stremio://") => {
+            converted = format!("https://{}", &input[10..]);
+            &converted
+        }
+        _ => input,
     };
     let mut url = Url::parse(input).map_err(|_| anyhow!("Invalid addon URL"))?;
     validate_transport(&url, allow_http)?;
@@ -135,19 +133,40 @@ pub(crate) fn normalize(input: &str, allow_http: bool) -> Result<String> {
         "URL credentials are unsupported; use configured addon paths"
     );
     url.set_fragment(None);
-    if !url.path().ends_with("/manifest.json") {
-        let path = format!("{}/manifest.json", url.path().trim_end_matches('/'));
+    // `/manifest.json/` is the same manifest as `/manifest.json`.
+    let trimmed = url.path().trim_end_matches('/');
+    let path = if trimmed.ends_with("/manifest.json") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/manifest.json")
+    };
+    if path != url.path() {
         url.set_path(&path);
     }
     Ok(url.to_string())
 }
+/// Loopback, including forms that reach the local machine without saying
+/// `127.0.0.1`: `*.localhost`, the unspecified address (`0.0.0.0`, `::`) and
+/// IPv4-mapped IPv6 (`::ffff:127.0.0.1`).
 pub(crate) fn is_loopback(url: &Url) -> bool {
-    url.host_str().is_some_and(|h| {
-        h.eq_ignore_ascii_case("localhost")
-            || h.trim_matches(['[', ']'])
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    })
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost"
+                || domain.ends_with(".localhost")
+                || domain
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .is_ok_and(ip_is_local)
+        }
+        Some(url::Host::Ipv4(ip)) => ip_is_local(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => ip_is_local(IpAddr::V6(ip)),
+        None => false,
+    }
+}
+fn ip_is_local(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || ip.is_unspecified()
 }
 pub(crate) fn validate_transport(url: &Url, allow_http: bool) -> Result<()> {
     let loopback = is_loopback(url);
@@ -410,6 +429,47 @@ mod tests {
             normalize("stremio://example.com/config/manifest.json?key=a", false).unwrap(),
             "https://example.com/config/manifest.json?key=a"
         );
+        assert_eq!(
+            normalize("Stremio://example.com/config/manifest.json", false).unwrap(),
+            "https://example.com/config/manifest.json"
+        );
+        assert_eq!(
+            normalize("https://example.com/config/manifest.json/", false).unwrap(),
+            "https://example.com/config/manifest.json"
+        );
+        assert_eq!(
+            normalize("https://example.com/config/", false).unwrap(),
+            "https://example.com/config/manifest.json"
+        );
+    }
+    #[test]
+    fn loopback_detection_covers_mapped_unspecified_and_localhost_subdomains() {
+        let loopback = |u: &str| is_loopback(&Url::parse(u).unwrap());
+        for u in [
+            "http://localhost/",
+            "http://LOCALHOST:1/",
+            "http://foo.localhost/",
+            "http://API.Localhost./",
+            "http://127.0.0.1/",
+            "http://127.9.9.9/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+            "http://[::ffff:0.0.0.0]/",
+        ] {
+            assert!(loopback(u), "{u}");
+        }
+        for u in [
+            "https://example.com/",
+            "https://notlocalhost/",
+            "https://localhost.example.com/",
+            "http://8.8.8.8/",
+            "http://[2001:db8::1]/",
+            "http://[::ffff:8.8.8.8]/",
+        ] {
+            assert!(!loopback(u), "{u}");
+        }
     }
 }
 
@@ -460,5 +520,26 @@ mod redaction_tests {
     #[test]
     fn keeps_non_url_text_and_punctuation() {
         assert_eq!(redact("plain error, no url."), "plain error, no url.");
+    }
+    #[test]
+    fn handles_ipv6_hosts_and_case_insensitive_schemes() {
+        let msg = redact("failed HTTP://[2001:db8::1]:8080/tok_SECRET/manifest.json now");
+        assert_eq!(msg, "failed http://[2001:db8::1]/... now");
+        let msg = redact("bad Stremio://host.example/SECRET/manifest.json");
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert!(msg.contains("stremio://host.example/..."), "{msg}");
+        let msg = redact("HttpS://Host.Example/SECRET");
+        assert!(!msg.contains("SECRET"), "{msg}");
+    }
+    #[test]
+    fn parentheses_and_apostrophes_in_paths_do_not_leak_the_tail() {
+        let msg = redact(
+            "error sending request for url (https://h.example/a(b)c'SECRET_TAIL/x?k=SECRET2)",
+        );
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert!(msg.contains("https://h.example/..."), "{msg}");
+        let msg = redact("'https://h.example/it's_SECRET/manifest.json' failed");
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert!(msg.ends_with("failed"), "{msg}");
     }
 }

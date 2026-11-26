@@ -43,6 +43,8 @@ const PRIOR_VAR: f64 = 1.0;
 const TONIGHT_VAR: f64 = 0.6;
 /// Tonight's belief widens a little before each vote, so recent votes count more (a drifting mood).
 const DRIFT: f64 = 0.03;
+/// No weight is ever less sure than tonight's starting point.
+const MAX_VAR: f64 = PRIOR_VAR + TONIGHT_VAR;
 
 /// How much each signal teaches lasting taste and tonight.
 const KEEP: (f64, f64) = (0.3, 1.0);
@@ -141,10 +143,37 @@ impl Fact {
     }
 }
 
-/// The library titles that say something about taste.
+/// The library titles that say something about taste. A title the library holds more than once
+/// (one entry per source) is one fact, with the strongest of what each entry says: it must not
+/// count twice when taste is replayed.
 pub fn facts(library: &[Media]) -> Vec<Fact> {
-    library.iter().filter(|m| m.liked != 0 || m.watched || m.saved || m.raw["watched_ms"].as_i64().unwrap_or(0) >= 600_000).map(Fact::of).collect()
+    let mut out: Vec<Fact> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for fact in library.iter().filter(|m| m.liked != 0 || m.watched || m.saved || m.raw["watched_ms"].as_i64().unwrap_or(0) >= 600_000).map(Fact::of) {
+        match at.get(&fact.id) {
+            Some(&i) => {
+                let kept = &mut out[i];
+                if kept.liked == 0 || (fact.liked != 0 && fact.liked.abs() > kept.liked.abs()) { kept.liked = fact.liked; }
+                kept.finished |= fact.finished;
+                kept.saved |= fact.saved;
+                kept.watched_ms = kept.watched_ms.max(fact.watched_ms);
+                if kept.item.emb.is_none() { kept.item.emb = fact.item.emb; }
+                if kept.item.rating.is_none() { kept.item.rating = fact.item.rating; }
+            }
+            None => { at.insert(fact.id.clone(), out.len()); out.push(fact); }
+        }
+    }
+    out
 }
+
+/// A title's name and year as `rules::title_key` spells them, from what the brain kept of it.
+fn item_title_key(item: &Item) -> String {
+    let name: String = item.name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    format!("{name}|{}", item.year.unwrap_or(0))
+}
+/// Whether a fact is about this very title, however its source named it: the same identity, or
+/// the same name and year.
+fn same_title(fact: &Fact, id: &str, title: &str) -> bool { fact.id == id || item_title_key(&fact.item) == title }
 
 // ---------------------------------------------------------------- the embedding space
 
@@ -263,7 +292,10 @@ impl Belief {
         for i in 0..D { let si = s[i]; if si == 0.0 { continue; } let row = &mut self.cov[i * D..i * D + D]; for j in 0..D { row[j] -= shrink * si * s[j]; } }
         for i in 0..D { self.mu[i] += g / denom * s[i]; }
     }
-    fn widen(&mut self, q: f64) { for i in 0..D { self.cov[i * D + i] += q; } }
+    /// Room to move: each weight's variance grows by `q`, but never past what tonight started with
+    /// (the prior plus tonight's room), however many votes drift it. Only a non-negative amount is
+    /// ever added to a diagonal entry, so the covariance stays valid.
+    fn widen(&mut self, q: f64) { for i in 0..D { let v = &mut self.cov[i * D + i]; *v += q.min((MAX_VAR - *v).max(0.0)); } }
     /// One plausible taste drawn from the belief.
     fn sample(&self) -> Vec<f64> {
         let z: Vec<f64> = (0..D).map(|_| normal()).collect();
@@ -645,11 +677,11 @@ impl Brain {
         let x = self.features(m);
         let e = self.emb_part(&x).to_vec();
         if norm(&e) > 1e-6 {
-            let me = rules::title_key(m);
+            let (me, my_id) = (rules::title_key(m), id(m));
             let near = |x: &[f64]| cosine(&e, self.emb_part(x));
-            let best_kept = kept.iter().filter(|k| rules::title_key(k) != me).map(|k| (near(&self.features(k)), k.name.clone())).max_by(|a, b| a.0.total_cmp(&b.0));
+            let best_kept = kept.iter().filter(|k| rules::title_key(k) != me && id(k) != my_id).map(|k| (near(&self.features(k)), k.name.clone())).max_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, name)) = best_kept.filter(|(c, _)| *c > 0.5) { return Some(Why::Kept(name)); }
-            let best_liked = self.facts.iter().filter(|f| f.liked > 0 && f.item.name != m.name).map(|f| (near(&self.x(&f.item)), f.item.name.clone())).max_by(|a, b| a.0.total_cmp(&b.0));
+            let best_liked = self.facts.iter().filter(|f| f.liked > 0 && !same_title(f, &my_id, &me)).map(|f| (near(&self.x(&f.item)), f.item.name.clone())).max_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((_, name)) = best_liked.filter(|(c, _)| *c > 0.5) { return Some(Why::Liked(name)); }
             if let Some((mood, _)) = self.leaning().first() { if self.feels(m).contains(mood) { return Some(Why::Mood(mood.clone())); } }
         }
@@ -663,7 +695,8 @@ impl Brain {
         let x = self.features(m);
         let e = self.emb_part(&x).to_vec();
         if norm(&e) < 1e-6 { return None; }
-        self.facts.iter().filter(|f| (f.liked > 0 || f.finished) && f.item.name != m.name)
+        let (me, my_id) = (rules::title_key(m), id(m));
+        self.facts.iter().filter(|f| (f.liked > 0 || f.finished) && !same_title(f, &my_id, &me))
             .map(|f| (cosine(&e, self.emb_part(&self.x(&f.item))), f))
             .filter(|(c, _)| *c > 0.5).max_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, f)| if f.liked > 0 { format!("Close to {}, which you liked", f.item.name) } else { format!("Close to {}, which you watched", f.item.name) })
@@ -692,6 +725,10 @@ const EVENTS_FILE: &str = "picks-brain-events.jsonl";
 const SPACE_FILE: &str = "picks-brain-space.json";
 /// The profile of the earlier duel model: its genre, type and decade weights seed lasting taste.
 const OLD_TASTE_FILE: &str = "picks-taste.json";
+/// Everything "Start over" removes. The projection goes too: it was fitted to the titles that
+/// are being forgotten, and is fitted again from what comes next.
+const RESET_FILES: [&str; 5] = [ITEMS_FILE, EVENTS_FILE, SPACE_FILE, OLD_TASTE_FILE, "picks-duel.json"];
+fn remove_learned(dir: &Path) { for f in RESET_FILES { let _ = std::fs::remove_file(dir.join(f)); } }
 const MAX_EVENTS: usize = 3000;
 const MAX_ITEMS: usize = 4000;
 
@@ -799,21 +836,52 @@ enum PersistMsg {
 static RESET_GEN: AtomicU64 = AtomicU64::new(0);
 static WRITER: OnceLock<mpsc::Sender<PersistMsg>> = OnceLock::new();
 
+/// What the writer has not put on disk yet: the title store, and the events that mention its titles.
+/// Neither is let go before it is written, so a failed write is retried, not forgotten.
+#[derive(Default)]
+struct Pending { items: Option<(u64, PathBuf, PendingItems)>, held: Vec<(u64, PathBuf, Event)> }
+
+impl Pending {
+    fn accept(&mut self, gen: u64, dir: PathBuf, event: Option<Event>, items: Option<PendingItems>) {
+        if gen < RESET_GEN.load(Ordering::Acquire) { return; }
+        if let Some(i) = items { self.items = Some((gen, dir.clone(), i)); }
+        if let Some(e) = event {
+            self.held.push((gen, dir, e));
+            if self.held.len() > MAX_EVENTS { self.held.remove(0); }
+        }
+    }
+    fn waiting(&self) -> bool { self.items.is_some() || !self.held.is_empty() }
+    fn reset(&mut self) { self.items = None; self.held.clear(); }
+    /// Write the title store. It stays pending when the write fails.
+    fn flush_items(&mut self) -> bool {
+        let Some((gen, dir, (items, events, facts))) = &self.items else { return true };
+        if *gen < RESET_GEN.load(Ordering::Acquire) { self.items = None; return true; }
+        let written = crate::backend::write_private_file(&dir.join(ITEMS_FILE), items_value(items, events, facts).to_string().as_bytes()).is_ok();
+        if written { self.items = None; }
+        written
+    }
+    /// Persist referenced items BEFORE appending the events so exiting right after a vote never
+    /// leaves an orphan event that replay silently skips; when the items cannot be written the
+    /// events wait for the next attempt instead of being dropped.
+    fn flush(&mut self) -> bool {
+        if !self.flush_items() { return false; }
+        for (gen, dir, event) in self.held.drain(..) {
+            if gen >= RESET_GEN.load(Ordering::Acquire) { append_event(&dir, &event); }
+        }
+        true
+    }
+}
+
 fn writer() -> &'static mpsc::Sender<PersistMsg> {
     WRITER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<PersistMsg>();
         std::thread::spawn(move || {
-            let flush_items = |pending: &mut Option<(u64, PathBuf, PendingItems)>| {
-                let Some((gen, dir, (items, events, facts))) = pending.take() else { return true };
-                if gen < RESET_GEN.load(Ordering::Acquire) { return true; }
-                crate::backend::write_private_file(&dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string().as_bytes()).is_ok()
-            };
-            let mut pending: Option<(u64, PathBuf, PendingItems)> = None;
+            let mut pending = Pending::default();
             loop {
-                let msg = if pending.is_some() {
+                let msg = if pending.waiting() {
                     match rx.recv_timeout(std::time::Duration::from_secs(2)) {
                         Ok(m) => m,
-                        Err(mpsc::RecvTimeoutError::Timeout) => { flush_items(&mut pending); continue; }
+                        Err(mpsc::RecvTimeoutError::Timeout) => { pending.flush(); continue; }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
@@ -821,48 +889,28 @@ fn writer() -> &'static mpsc::Sender<PersistMsg> {
                 };
                 match msg {
                     PersistMsg::Reset { dir, done } => {
-                        pending = None;
-                        for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(dir.join(f)); }
+                        pending.reset();
+                        remove_learned(&dir);
                         let _ = done.send(());
                     }
                     PersistMsg::Write { gen, dir, event, items } => {
-                        if gen < RESET_GEN.load(Ordering::Acquire) { continue; }
-                        let mut events_batch = Vec::new();
-                        if let Some(i) = items { pending = Some((gen, dir.clone(), i)); }
-                        if let Some(e) = event { events_batch.push((gen, dir, e)); }
+                        pending.accept(gen, dir, event, items);
                         // Coalesce any already-queued writes so a burst of votes writes items once
                         // before appending every queued event in order.
                         let mut reset_after: Option<(PathBuf, mpsc::SyncSender<()>)> = None;
                         while let Ok(next) = rx.try_recv() {
                             match next {
-                                PersistMsg::Reset { dir, done } => {
-                                    pending = None;
-                                    events_batch.clear();
-                                    reset_after = Some((dir, done));
-                                    break;
-                                }
-                                PersistMsg::Write { gen, dir, event, items } => {
-                                    if gen < RESET_GEN.load(Ordering::Acquire) { continue; }
-                                    if let Some(i) = items { pending = Some((gen, dir.clone(), i)); }
-                                    if let Some(e) = event { events_batch.push((gen, dir, e)); }
-                                }
+                                PersistMsg::Reset { dir, done } => { pending.reset(); reset_after = Some((dir, done)); break; }
+                                PersistMsg::Write { gen, dir, event, items } => pending.accept(gen, dir, event, items),
                             }
                         }
                         if let Some((rdir, done)) = reset_after {
-                            for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(rdir.join(f)); }
+                            remove_learned(&rdir);
                             let _ = done.send(());
                             continue;
                         }
-                        if !events_batch.is_empty() {
-                            // Persist referenced items BEFORE appending the event so exiting right
-                            // after a vote never leaves an orphan event that replay silently skips.
-                            let items_ok = if pending.is_some() { flush_items(&mut pending) } else { true };
-                            if items_ok {
-                                for (g, d, e) in events_batch {
-                                    if g >= RESET_GEN.load(Ordering::Acquire) { append_event(&d, &e); }
-                                }
-                            }
-                        }
+                        // Items alone wait for the timeout above (one write per burst); events go now.
+                        if !pending.held.is_empty() { pending.flush(); }
                     }
                 }
             }
@@ -932,7 +980,7 @@ pub fn reset() {
             return;
         }
     }
-    for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(dir.join(f)); }
+    remove_learned(&dir);
 }
 
 #[cfg(test)]
@@ -1122,5 +1170,92 @@ mod tests {
         }
         assert_eq!(brain.opening_pair(&[a.clone(), b.clone()], &[a.key()]).0.map(|m| m.id), Some(b.id.clone()));
         assert!(brain.opening_pair(std::slice::from_ref(&a), &[]).1.is_none());
+    }
+
+    #[test]
+    fn belief_variance_never_widens_past_tonights_starting_point() {
+        let mut b = Belief::new(vec![0.0; D], PRIOR_VAR);
+        b.widen(TONIGHT_VAR);
+        assert!((b.cov[0] - MAX_VAR).abs() < 1e-12);
+        for _ in 0..10_000 { b.widen(DRIFT); }
+        assert!((0..D).all(|i| b.cov[i * D + i] <= MAX_VAR + 1e-12), "the diagonal is capped");
+        assert!(b.cov.iter().all(|v| v.is_finite()) && cholesky(&b.cov).is_some());
+        // A learned direction is still sure there, and a vote can still narrow it afterwards.
+        let mut x = vec![0.0; D];
+        x[3] = 1.0;
+        for _ in 0..20 { b.observe(&x, true, 1.0); }
+        let sure = b.var(&x);
+        b.widen(DRIFT);
+        assert!(b.var(&x) > sure && b.var(&x) < MAX_VAR);
+    }
+
+    fn library_entry(id: &str, name: &str, source: &str, liked: i64, watched: bool, saved: bool) -> Media {
+        let mut m = Media::from_json(&json!({"id": id, "type": "movie", "name": name, "releaseInfo": "2010", "genres": ["Drama"],
+            "description": format!("A library duplicate test synopsis long enough for {name}.")}), source).unwrap();
+        m.liked = liked; m.watched = watched; m.saved = saved;
+        m
+    }
+
+    #[test]
+    fn a_title_held_by_two_sources_is_one_fact_with_the_strongest_signals() {
+        let a = library_entry("tt0001001", "Twice Held", "a", 0, true, false);
+        let mut b = library_entry("tt0001001", "Twice Held", "b", 1, false, true);
+        b.raw["watched_ms"] = json!(900_000);
+        let other = library_entry("tt0001002", "Held Once", "a", 0, true, false);
+        let ignored = library_entry("tt0001003", "Nothing Said", "a", 0, false, false);
+        let facts = facts(&[a, b, other, ignored]);
+        assert_eq!(facts.len(), 2);
+        let twice = facts.iter().find(|f| f.id == "tt0001001").unwrap();
+        assert!(twice.finished && twice.saved && twice.liked == 1 && twice.watched_ms == 900_000);
+        assert_eq!(facts[1].id, "tt0001002", "order of first appearance is kept");
+    }
+
+    #[test]
+    fn reasons_never_name_the_title_itself_under_another_source_name() {
+        let own = library_entry("tt0001010", "Liked Film (Extended Cut)", "a", 1, true, false);
+        let card = library_entry("tt0001010", "Liked Film", "b", 0, false, false);
+        let neighbour = library_entry("tt0001011", "Neighbour Film", "a", 0, true, false);
+        let mut brain = Brain::new(Some(space()), HashMap::new(), Vec::new(), Vec::new(), vec![0.0; D], Vec::new(), 1);
+        for (m, side) in [(&own, 9), (&card, 9), (&neighbour, 10)] { picks_ai::cache_test_embedding(m, axis(6, side, 0.2)); }
+        brain.set_facts(facts(&[own.clone(), neighbour.clone()]));
+        // The same IMDb id is the same title, whatever each source calls it.
+        assert_eq!(brain.home_reason(&card), Some("Close to Neighbour Film, which you watched".to_owned()));
+        assert_ne!(brain.why(&card, &[]), Some(Why::Liked("Liked Film (Extended Cut)".into())));
+        assert_eq!(brain.why(&neighbour, &[]), Some(Why::Liked("Liked Film (Extended Cut)".into())));
+    }
+
+    #[test]
+    fn start_over_removes_the_learned_projection_too() {
+        let dir = std::env::temp_dir().join(format!("veylo-brain-reset-{}-{}", std::process::id(), crate::backend::rand_u64()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in RESET_FILES { std::fs::write(dir.join(f), "x").unwrap(); }
+        std::fs::write(dir.join("keep.json"), "x").unwrap();
+        assert!(RESET_FILES.contains(&SPACE_FILE));
+        remove_learned(&dir);
+        for f in RESET_FILES { assert!(!dir.join(f).exists(), "{f} should be gone"); }
+        assert!(dir.join("keep.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn events_wait_for_their_titles_and_are_kept_when_that_write_fails() {
+        let dir = std::env::temp_dir().join(format!("veylo-brain-pending-{}-{}", std::process::id(), crate::backend::rand_u64()));
+        std::fs::create_dir_all(dir.join(ITEMS_FILE)).unwrap(); // the title store cannot be written here
+        let mut brain = Brain::new(None, HashMap::new(), Vec::new(), Vec::new(), vec![0.0; D], Vec::new(), 5);
+        let a = media("pending a", "movie", "1999", &["Crime"]);
+        let event = brain.play(&a);
+        let mut pending = Pending::default();
+        let gen = RESET_GEN.load(Ordering::Acquire);
+        pending.accept(gen, dir.clone(), Some(event.clone()), Some((brain.items.clone(), Vec::new(), Vec::new())));
+        assert!(!pending.flush(), "the write fails");
+        assert!(pending.waiting() && pending.held.len() == 1 && pending.items.is_some(), "nothing is dropped");
+        assert!(!dir.join(EVENTS_FILE).exists(), "an event is never written before its titles");
+        // Once the store can be written, titles land first, then the event.
+        std::fs::remove_dir_all(dir.join(ITEMS_FILE)).unwrap();
+        assert!(pending.flush());
+        assert!(!pending.waiting());
+        assert_eq!(load_items(&dir).len(), 1);
+        assert_eq!(load_events(&dir), vec![event]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

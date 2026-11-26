@@ -456,10 +456,6 @@ async fn unsafe_or_unsupported_manifests_fail_closed() {
         ("x.m3u8", "#EXTM3U\n#EXT-X-DEFINE:NAME=\"x\",VALUE=\"y\"\n"),
         (
             "x.mpd",
-            "<MPD><BaseURL>a/</BaseURL><BaseURL>b/</BaseURL></MPD>",
-        ),
-        (
-            "x.mpd",
             "<!DOCTYPE MPD [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><MPD>&x;</MPD>",
         ),
         (
@@ -1725,8 +1721,9 @@ async fn webvtt_and_subrip_validate_every_cue_and_the_entire_body() {
             "1\n00:00:00,000 --> 00:01:00,000\n",
         ),
     ] {
+        // Not UTF-8 means Windows-1252 text now, but a NUL (as in UTF-16) is still no subtitle.
         let mut body = format!("{header}{}", "x".repeat(1024)).into_bytes();
-        body.extend_from_slice(&[0xff, 0xfe]);
+        body.extend_from_slice(&[0xff, 0xfe, 0x00]);
         assert_subtitle_rejected(path, mime, body).await;
     }
 }
@@ -2236,4 +2233,179 @@ async fn probe_accepts_only_real_film_sized_sources() {
     let busy = probe("/busy").await;
     assert_eq!(busy["ok"], false);
     assert_eq!(busy["status"], 503);
+}
+
+/// Fetches the proxied manifest body for `content` served as a DASH/HLS document.
+async fn rewritten_manifest(path: &str, mime: &str, content: &str) -> (u16, String) {
+    let (status, body) = subtitle_result(path, mime, content.as_bytes().to_vec()).await;
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn dash_tolerates_xsi_attributes_sap_hints_equals_in_ids_and_mirror_baseurls() {
+    let mpd = r#"<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 https://example.invalid/DASH-MPD.xsd"
+     type="static" mediaPresentationDuration="PT10S" minBufferTime="PT2S">
+  <BaseURL>https://a.example.invalid/video/</BaseURL>
+  <BaseURL>https://b.example.invalid/video/</BaseURL>
+  <Period>
+    <AdaptationSet group="1" segmentAlignment="true" startWithSAP="1" maximumSAPPeriod="2" segmentProfiles="dash0">
+      <Representation id="v=1080" bandwidth="1000" startsWithSAP="1">
+        <SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let (status, body) = rewritten_manifest("/manifest.mpd", "application/dash+xml", mpd).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("xsi") && !body.contains("example.invalid"),
+        "{body}"
+    );
+    assert_eq!(body.matches("<BaseURL>").count(), 1, "{body}");
+    assert!(
+        body.contains("startWithSAP=\"1\"") && body.contains("v=1080"),
+        "{body}"
+    );
+    // An unrelated schema-instance namespace is still refused.
+    let hostile = mpd.replace(
+        "http://www.w3.org/2001/XMLSchema-instance",
+        "https://example.invalid/ns",
+    );
+    assert_eq!(
+        rewritten_manifest("/manifest.mpd", "application/dash+xml", &hostile)
+            .await
+            .0,
+        502
+    );
+}
+
+#[tokio::test]
+async fn hls_accepts_supplemental_codecs_and_skips_session_data_and_cue_markers() {
+    let m3u8 = "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"com.example\",URI=\"https://example.invalid/data.json\"\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"en\",URI=\"audio.m3u8\",CHANNELS=\"2\",BIT-DEPTH=24,SAMPLE-RATE=48000\n\
+#EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"hvc1.2.4.L123.B0\",SUPPLEMENTAL-CODECS=\"dvh1.08.07/db4h\",REQ-VIDEO-LAYOUT=\"CH-STEREO\",AUDIO=\"a\"\nlow.m3u8\n\
+#EXT-X-CUE-OUT:DURATION=30\n#EXT-X-CUE-IN\n";
+    let (status, body) =
+        rewritten_manifest("/index.m3u8", "application/vnd.apple.mpegurl", m3u8).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("SUPPLEMENTAL-CODECS=") && body.contains("REQ-VIDEO-LAYOUT="),
+        "{body}"
+    );
+    assert!(
+        !body.contains("SESSION-DATA")
+            && !body.contains("CUE-")
+            && !body.contains("example.invalid"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn windows_1252_and_lenient_webvtt_subrip_and_ttml_are_accepted_safely() {
+    // cp1252 "Café – “ok”" (0x96 en dash, 0x93/0x94 quotes) is relayed as UTF-8.
+    let srt = b"1\n00:00:01,5 --> 00:00:02,25\nCaf\xe9 \x96 \x93ok\x94\n".to_vec();
+    let (status, body) = subtitle_result("/caption.srt", "application/x-subrip", srt).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "1\n00:00:01,5 --> 00:00:02,25\nCaf\u{e9} \u{2013} \u{201c}ok\u{201d}\n"
+    );
+    // No cue index, benign inline tags, and a literal `<`.
+    for (path, mime, body) in [
+        (
+            "/caption.srt",
+            "application/x-subrip",
+            "00:00:00,000 --> 00:00:01,000\n<s>gone</s> <sub>2</sub><br>next <font face='Arial' size='3' color='#fff'>x</font>\n\n2\n00:00:01,000 --> 00:00:02,000\n5 < 10 and 3<4\n",
+        ),
+        (
+            "/caption.vtt",
+            "text/vtt",
+            "WEBVTT\nKind: captions\nLanguage: en\nRegion: id=r1 width=40% lines=3 regionanchor=0%,100% viewportanchor=10%,90% scroll=up\n\nSTYLE\n::cue { color: #ff0; background-color: rgba(0,0,0,0.5) }\n\nREGION\nid=r2\nwidth=50%\n\n00:00.000 --> 00:01.000 align:middle region:r1\n<br>5 < 10\n",
+        ),
+    ] {
+        let (status, relayed) = subtitle_result(path, mime, body.as_bytes().to_vec()).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(relayed, body.as_bytes());
+    }
+    // Active content stays rejected, including inside the newly tolerated constructs.
+    for (path, mime, body) in [
+        ("/caption.srt", "application/x-subrip", "1\n00:00:00,000 --> 00:00:01,000\n<font src='https://example.invalid/f'>x</font>\n"),
+        ("/caption.srt", "application/x-subrip", "1\n00:00:00,000 --> 00:00:01,000\n<!-- x -->\n"),
+        ("/caption.srt", "application/x-subrip", "1\n00:00:00,000 --> 00:00:01,000\n<script>x</script>\n"),
+        ("/caption.vtt", "text/vtt", "WEBVTT\n\nSTYLE\n@import 'https://example.invalid/a.css';\n"),
+        ("/caption.vtt", "text/vtt", "WEBVTT\n\nSTYLE\n::cue { background: URL(https://example.invalid/i.png) }\n"),
+        ("/caption.vtt", "text/vtt", "WEBVTT\nRegion: id=a width=40% href=https://example.invalid\n\n00:00.000 --> 00:01.000\nx\n"),
+        ("/caption.vtt", "text/vtt", "WEBVTT\nKind: <b>\n\n00:00.000 --> 00:01.000\nx\n"),
+    ] {
+        assert_subtitle_rejected(path, mime, body.as_bytes().to_vec()).await;
+    }
+    // TTML: descriptive metadata, EBU namespaces and xsi hints are dropped, never relayed.
+    let ttml = "<?xml version='1.0' encoding='UTF-8'?>\n<tt xmlns='http://www.w3.org/ns/ttml' xmlns:ttm='http://www.w3.org/ns/ttml#metadata' xmlns:ebutts='urn:ebu:tt:style' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='http://www.w3.org/ns/ttml https://example.invalid/ttml.xsd' xml:lang='en'>\n  <head>\n    <metadata>\n      <ttm:title>T</ttm:title>\n      <ttm:copyright>C</ttm:copyright>\n    </metadata>\n  </head>\n  <body>\n    <div>\n      <p begin='00:00:00.000' end='00:00:01.000' ttm:role='caption' ebutts:linePadding='0.5c'>Hi</p>\n    </div>\n  </body>\n</tt>";
+    let (status, relayed) = subtitle_result(
+        "/caption.ttml",
+        "application/ttml+xml",
+        ttml.as_bytes().to_vec(),
+    )
+    .await;
+    let relayed = String::from_utf8(relayed).unwrap();
+    assert_eq!(status, 200, "{relayed}");
+    assert!(
+        relayed.contains("Hi")
+            && !relayed.contains("example.invalid")
+            && !relayed.contains("xsi")
+            && !relayed.contains("ttm:")
+            && !relayed.contains("metadata")
+            && !relayed.contains("ebutts"),
+        "{relayed}"
+    );
+    let hostile = ttml.replace(
+        "<ttm:title>T</ttm:title>",
+        "<img src='https://example.invalid/p.png'/>",
+    );
+    assert_subtitle_rejected(
+        "/caption.ttml",
+        "application/ttml+xml",
+        hostile.into_bytes(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dash_inherited_segment_template_expansion_respects_node_limit() {
+    let segments = "<S t=\"0\" d=\"10\"/>".repeat(1200);
+    let reps = (0..60)
+        .map(|i| format!("<Representation id=\"v{i}\"><BaseURL>/r{i}/</BaseURL></Representation>"))
+        .collect::<Vec<_>>()
+        .join("");
+    let mpd = format!(
+        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period><AdaptationSet><SegmentTemplate media=\"$Number$.m4s\"><SegmentTimeline>{segments}</SegmentTimeline></SegmentTemplate>{reps}</AdaptationSet></Period></MPD>"
+    );
+    let upstream =
+        fixture(move |_| reply("200 OK", "Content-Type: application/dash+xml\r\n", &mpd)).await;
+    let proxy = MediaProxy::new();
+    let p = prepare(&proxy, &format!("{}/manifest.mpd", upstream.base)).await;
+    assert_eq!(
+        client()
+            .get(p["url"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        502
+    );
+}
+
+#[tokio::test]
+async fn subtitle_cue_accepts_many_literal_less_than_signs_quickly() {
+    let repeated_lt = format!(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\n{} < 2 < <b>ok</b>\n{}1 <2 <00:00.500>hi>\n",
+        "1 < ".repeat(20_000),
+        "3 <4 ".repeat(20_000),
+    );
+    let (status, body) =
+        subtitle_result("/fast.vtt", "text/vtt", repeated_lt.as_bytes().to_vec()).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, repeated_lt.as_bytes());
 }

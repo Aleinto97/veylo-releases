@@ -236,7 +236,7 @@ pub(crate) fn collections(all: &[Media]) -> Value {
         .into_iter()
         .filter(|(_, items)| items.len() >= 2 && items.iter().any(|m| positive(m)))
         .collect::<Vec<_>>();
-    rules.sort_by_key(|((label, term), items)| {
+    rules.sort_by_cached_key(|((label, term), items)| {
         (
             std::cmp::Reverse(items.iter().filter(|m| positive(m)).count()),
             std::cmp::Reverse(items.len()),
@@ -252,9 +252,15 @@ pub(crate) fn collections(all: &[Media]) -> Value {
     for m in all {
         for field in ["collection", "belongsToCollection", "franchise"] {
             let v = &m.meta[field];
-            if let (Some(id), Some(name)) = (v["id"].as_str(), v["name"].as_str()) {
+            // Addons send collection ids as strings or as plain numbers (TMDB).
+            let id = match &v["id"] {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            };
+            if let (Some(id), Some(name)) = (id, v["name"].as_str()) {
                 franchises
-                    .entry((m.addon.clone(), m.kind.clone(), id.into(), name.into()))
+                    .entry((m.addon.clone(), m.kind.clone(), id, name.into()))
                     .or_default()
                     .push(m);
             }
@@ -306,5 +312,21 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0]["id"], "cand1");
         assert!(metas.iter().all(|m| m["id"] != "liked1"));
+    }
+
+    #[test]
+    fn numeric_collection_ids_form_curated_franchises() {
+        let mut a = mk("m1", "One", &[], 0);
+        let mut b = mk("m2", "Two", &[], 0);
+        a.meta["belongsToCollection"] = json!({"id": 10, "name": "Saga"});
+        b.meta["belongsToCollection"] = json!({"id": 10, "name": "Saga"});
+        let v = collections(&[a, b]);
+        let curated = v["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == "addon_curated_franchise")
+            .expect("numeric id franchise");
+        assert_eq!(curated["metas"].as_array().unwrap().len(), 2);
     }
 }

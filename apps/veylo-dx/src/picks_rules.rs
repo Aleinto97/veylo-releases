@@ -2,7 +2,7 @@
 //! kids' titles left out, animation as a style beside the type, series judged by the years they
 //! aired, and one entry per title however many sources list it.
 use crate::backend::Media;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Live action, animation, or both: the Style switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +20,9 @@ pub fn canonical_genre(g: &str) -> String {
         match g.trim().to_lowercase().as_str() {
             "science fiction" | "science-fiction" | "sci-fi" | "scifi" | "sci fi" => "Sci-Fi".into(),
             "children" | "kids" => "Kids".into(),
-            "reality-tv" | "reality" => "Reality".into(),
-            "talk-show" | "talk" => "Talk".into(),
-            "game-show" => "Game Show".into(),
+            "reality-tv" | "reality tv" | "reality" => "Reality".into(),
+            "talk-show" | "talk show" | "talk" => "Talk".into(),
+            "game-show" | "game show" => "Game Show".into(),
             "tv movie" => "TV Movie".into(),
             "musical" => "Musical".into(),
             "war & politics" => "War & Politics".into(),
@@ -114,26 +114,70 @@ pub fn settle_style(m: &mut Media, animated: bool) {
     m.raw["genres"] = serde_json::json!(m.genres);
 }
 
+/// Fill what a title is still missing from another source's listing of it: a synopsis, artwork
+/// and ratings. Anything already present is kept as it is.
+fn fill_missing(existing: &mut Media, later: &Media) {
+    if existing.description.trim().is_empty() && !later.description.trim().is_empty() { existing.description = later.description.clone(); }
+    if existing.poster.is_empty() && !later.poster.is_empty() { existing.poster = later.poster.clone(); }
+    if existing.background.is_empty() && !later.background.is_empty() { existing.background = later.background.clone(); }
+    for k in RATINGS {
+        let present = |m: &Media| m.raw.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.trim().is_empty()));
+        if !present(existing) && present(later) { existing.raw[k] = later.raw[k].clone(); }
+    }
+}
+/// Rating fields the sources fill in (read by the brain's features).
+const RATINGS: [&str; 3] = ["imdbRating", "tmdbRating", "tvmazeRating"];
+
 /// Add titles to the pool once each: same entry, same IMDb id or same title+kind from another source.
+/// Lookups go through indexes built once, so a big pool is not rescanned (and its titles not
+/// re-normalised) for every title added.
 pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
-    let same_kind = |a: &Media, b: &Media| (a.kind == "movie") == (b.kind == "movie");
+    let is_movie = |m: &Media| m.kind == "movie";
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut by_imdb: HashMap<String, usize> = HashMap::new();
+    // Titles by (movie or not, name and year): every entry, in pool order.
+    let mut by_title: HashMap<(bool, String), Vec<usize>> = HashMap::new();
+    let mut imdbs: Vec<Option<String>> = Vec::with_capacity(pool.len() + more.len());
+    for (i, old) in pool.iter().enumerate() {
+        by_key.entry(old.key()).or_insert(i);
+        let id = imdb(old);
+        if let Some(id) = &id { by_imdb.entry(id.clone()).or_insert(i); }
+        by_title.entry((is_movie(old), title_key(old))).or_default().push(i);
+        imdbs.push(id);
+    }
     for m in more.into_iter().map(tidy) {
-        let title = title_key(&m);
+        let title = (is_movie(&m), title_key(&m));
         let id = imdb(&m);
-        if let Some(existing) = pool.iter_mut().find(|old| {
-            if old.key() == m.key() { return true; }
-            let old_id = imdb(old);
-            if id.is_some() && old_id.is_some() { return old_id == id; }
-            same_kind(old, &m) && title_key(old) == title
-        }) {
-            // A later source can supply a missing style. Deduplication must not throw it away,
-            // unless TMDB already settled it (then only TMDB's word counts).
-            let settled = m.raw[SETTLED].as_bool().or_else(|| existing.raw[SETTLED].as_bool());
-            if settled.is_none() && is_animated(&m) && !is_animated(existing) { existing.genres.push("Animation".into()); }
-            for genre in m.genres { if !existing.genres.contains(&genre) { existing.genres.push(genre); } }
-            existing.raw["genres"] = serde_json::json!(existing.genres);
-            if let Some(animated) = settled { settle_style(existing, animated); }
-        } else { pool.push(m); }
+        // The first pool entry that matches, whichever way: same entry; both with an IMDb id and
+        // the same one; or, unless both have one, the same kind and title.
+        let mut found = by_key.get(&m.key()).copied();
+        let mut consider = |i: usize| found = Some(found.map_or(i, |f| f.min(i)));
+        if let Some(i) = id.as_ref().and_then(|id| by_imdb.get(id)) { consider(*i); }
+        if let Some(list) = by_title.get(&title) {
+            if let Some(i) = list.iter().copied().find(|i| id.is_none() || imdbs[*i].is_none()) { consider(i); }
+        }
+        let Some(i) = found else {
+            let i = pool.len();
+            by_key.entry(m.key()).or_insert(i);
+            if let Some(id) = &id { by_imdb.entry(id.clone()).or_insert(i); }
+            by_title.entry(title).or_default().push(i);
+            imdbs.push(id);
+            pool.push(m);
+            continue;
+        };
+        let existing = &mut pool[i];
+        // A later source can supply a missing style. Deduplication must not throw it away,
+        // unless TMDB already settled it (then only TMDB's word counts).
+        let settled = m.raw[SETTLED].as_bool().or_else(|| existing.raw[SETTLED].as_bool());
+        if settled.is_none() && is_animated(&m) && !is_animated(existing) { existing.genres.push("Animation".into()); }
+        fill_missing(existing, &m);
+        for genre in &m.genres { if !existing.genres.contains(genre) { existing.genres.push(genre.clone()); } }
+        existing.raw["genres"] = serde_json::json!(existing.genres);
+        if let Some(animated) = settled { settle_style(existing, animated); }
+        // An entry without an IMDb id gains the one a later source knows.
+        if imdbs[i].is_none() {
+            if let Some(id) = id { by_imdb.entry(id.clone()).or_insert(i); imdbs[i] = Some(id); }
+        }
     }
 }
 
@@ -153,12 +197,26 @@ pub fn filter_picks(items: &[Media], kind: Option<&str>, style: Style, genres: &
     }).cloned().collect()
 }
 
+/// Whether an episode's release date allows playing it on `today` ("YYYY-MM-DD"). No date at all
+/// (older episodes often carry none) counts as released; a placeholder such as "TBA" or "TBD"
+/// is an episode that has not been announced yet, so it does not.
+fn released_by(released: &str, today: &str) -> bool {
+    let released = released.trim();
+    if released.is_empty() { return true; }
+    match released.get(..10) {
+        Some(date) if date.as_bytes().iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() }) => date <= today,
+        _ => {
+            let word = released.to_lowercase();
+            !(word.starts_with("tba") || word.starts_with("tbd") || word.starts_with("to be") || word.starts_with("unannounced"))
+        }
+    }
+}
+
 /// Normal released episodes only; specials must not become a new viewer's first episode.
 pub fn regular_episodes(list: &[crate::backend::Episode], now: i64) -> Vec<&crate::backend::Episode> {
     let (y,m,d,_) = crate::backend::civil(now);
     let today = format!("{y:04}-{m:02}-{d:02}");
-    let mut out: Vec<_> = list.iter().filter(|e| e.season > 0 && e.number > 0
-        && e.released.get(..10).is_none_or(|date| date <= today.as_str())).collect();
+    let mut out: Vec<_> = list.iter().filter(|e| e.season > 0 && e.number > 0 && released_by(&e.released, &today)).collect();
     out.sort_by_key(|e| (e.season,e.number));
     out
 }
@@ -335,5 +393,63 @@ mod tests {
         let mut pool = vec![a];
         merge(&mut pool, vec![b]);
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn reality_talk_and_game_shows_keep_one_name_whichever_way_they_are_spelled() {
+        for g in ["Reality TV", "reality tv", "Reality-TV", "Reality"] { assert_eq!(canonical_genre(g), "Reality", "{g}"); }
+        for g in ["Talk Show", "talk show", "Talk-Show", "Talk"] { assert_eq!(canonical_genre(g), "Talk", "{g}"); }
+        for g in ["Game Show", "game show", "Game-Show"] { assert_eq!(canonical_genre(g), "Game Show", "{g}"); }
+        assert!(is_format(&media("tv", "series", "2020", &["Reality TV"])) && is_format(&media("tv2", "series", "2020", &["Talk Show"])));
+    }
+
+    #[test]
+    fn a_later_source_fills_in_a_missing_synopsis_and_rating_but_never_replaces_them() {
+        let mut sparse = media("tt0000010", "movie", "2020", &["Drama"]);
+        sparse.raw["imdbRating"] = json!("7.4");
+        let mut detailed = sparse.clone();
+        detailed.description = "A full synopsis.".into();
+        detailed.poster = "poster.jpg".into();
+        detailed.raw["imdbRating"] = json!("1.0");
+        detailed.raw["tmdbRating"] = json!(8.1);
+        let mut pool = vec![sparse];
+        merge(&mut pool, vec![detailed.clone()]);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].description, "A full synopsis.");
+        assert_eq!(pool[0].poster, "poster.jpg");
+        assert_eq!(pool[0].raw["imdbRating"], json!("7.4"), "a rating already there stays");
+        assert_eq!(pool[0].raw["tmdbRating"], json!(8.1));
+        // Once present, a different later synopsis does not replace it.
+        let mut other = detailed;
+        other.description = "Another synopsis.".into();
+        merge(&mut pool, vec![other]);
+        assert_eq!(pool[0].description, "A full synopsis.");
+    }
+
+    #[test]
+    fn merging_many_titles_matches_one_at_a_time_and_prefers_the_first_match() {
+        let a = media("tt1", "movie", "2001", &["Drama"]);
+        let b = media("tt2", "movie", "2002", &["Drama"]);
+        // Same title and year as `a`, but another source without an IMDb id.
+        let mut a_other = Media::from_json(&json!({"id": "tmdb:5", "type": "movie", "name": "tt1", "releaseInfo": "2001", "genres": ["Comedy"]}), "b").unwrap();
+        a_other = tidy(a_other);
+        let mut pool = vec![a.clone(), b.clone()];
+        merge(&mut pool, vec![a_other.clone(), b.clone(), a.clone(), media("tt3", "series", "2003", &[])]);
+        assert_eq!(ids(pool.clone()), ["tt1", "tt2", "tt3"]);
+        assert!(pool[0].genres.iter().any(|g| g == "Comedy"));
+        // The same batch merged one title at a time gives the same pool.
+        let mut single = vec![a.clone(), b.clone()];
+        for m in [a_other, b, a, media("tt3", "series", "2003", &[])] { merge(&mut single, vec![m]); }
+        assert_eq!(ids(single), ["tt1", "tt2", "tt3"]);
+    }
+
+    #[test]
+    fn episodes_without_a_date_count_as_out_and_placeholders_do_not() {
+        let now = 1_800_000_000;
+        let list = vec![episode(1, 1, ""), episode(1, 2, "TBA"), episode(1, 3, "2020-05-01T00:00:00.000Z"),
+            episode(1, 4, "tbd"), episode(1, 5, "2099-01-01"), episode(1, 6, "  "), episode(1, 7, "To be announced")];
+        let numbers: Vec<i64> = regular_episodes(&list, now).iter().map(|e| e.number).collect();
+        assert_eq!(numbers, [1, 3, 6]);
+        assert!(series_complete(&list, &["tt-fixture:1:1".to_owned(), "tt-fixture:1:3".to_owned(), "tt-fixture:1:6".to_owned()].into_iter().collect(), now));
     }
 }

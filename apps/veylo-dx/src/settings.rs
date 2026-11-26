@@ -34,6 +34,8 @@ pub fn SettingsPage() -> Element {
     let mut arm_remove = use_signal(|| None::<usize>);
     let mut setup_tab = use_signal(|| AddonSetupTab::Link);
     let mut custom_url = use_signal(String::new);
+    // The add-on URL stays masked unless asked for.
+    let mut show_url = use_signal(|| false);
     let mut bundle_text = use_signal(String::new);
     let mut stremio_email = use_signal(String::new);
     let mut stremio_pass = use_signal(String::new);
@@ -46,7 +48,8 @@ pub fn SettingsPage() -> Element {
     let mut data_note = use_signal(|| None::<String>);
     let mut diag_open = use_signal(|| false);
     let mut diag_text = use_signal(String::new);
-    let mut diag_copied = use_signal(|| false);
+    // None: idle; Some(true): copied; Some(false): the clipboard refused.
+    let mut diag_copied = use_signal(|| None::<bool>);
     let mut bug_open = use_signal(|| false);
     let mut bug_kind = use_signal(|| "bug".to_owned());
     let mut bug_text = use_signal(String::new);
@@ -77,6 +80,7 @@ pub fn SettingsPage() -> Element {
     };
 
     let cur = section();
+    let copy_label = match diag_copied() { Some(true) => "Copied", Some(false) => "Couldn't copy", None => "Copy" };
     let updates_count = (shell.addon_updates)();
     let key_needed = backend::sync_key_needed();
 
@@ -299,7 +303,7 @@ pub fn SettingsPage() -> Element {
                                     match setup_tab() {
                                         AddonSetupTab::Link => rsx! {
                                             div { class: "setting-input-group",
-                                                input { class: "key-field", r#type: "password", placeholder: "stremio://… or https://…/manifest.json", aria_label: "Stremio add-on URL", autocomplete: "off",
+                                                input { class: "key-field", r#type: if show_url() { "text" } else { "password" }, placeholder: "stremio://… or https://…/manifest.json", aria_label: "Stremio add-on URL", autocomplete: "off", spellcheck: "false",
                                                     value: "{custom_url}", disabled: busy().is_some(),
                                                     oninput: move |e| custom_url.set(e.value()),
                                                     onkeydown: move |e| {
@@ -316,6 +320,10 @@ pub fn SettingsPage() -> Element {
                                                             }
                                                         }
                                                     },
+                                                }
+                                                button { class: "pill glass small", aria_label: if show_url() { "Hide add-on URL" } else { "Show add-on URL" },
+                                                    onclick: move |_| show_url.set(!show_url()),
+                                                    span { if show_url() { "Hide" } else { "Show" } }
                                                 }
                                                 button { class: "pill accent small", disabled: busy().is_some() || custom_url().trim().is_empty(),
                                                     onclick: move |_| {
@@ -598,11 +606,16 @@ pub fn SettingsPage() -> Element {
                                 button { class: "pill glass small", onclick: move |_| {
                                     let report = backend::diagnostic_report();
                                     diag_text.set(report.clone());
-                                    let js = format!("navigator.clipboard?.writeText({}).catch(()=>{{}})", serde_json::to_string(&report).unwrap_or_default());
-                                    let _ = document::eval(&js);
-                                    diag_copied.set(true);
-                                    spawn(async move { backend::sleep(2200).await; diag_copied.set(false); });
-                                }, icons::Copy {} span { if diag_copied() { "Copied" } else { "Copy" } } }
+                                    // "Copied" only once the clipboard accepted it; otherwise the log opens to select by hand.
+                                    let js = format!("try {{ await navigator.clipboard.writeText({}); return true; }} catch (e) {{ return false; }}", serde_json::to_string(&report).unwrap_or_default());
+                                    spawn(async move {
+                                        let ok = document::eval(&js).await.ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                                        if !ok { diag_open.set(true); }
+                                        diag_copied.set(Some(ok));
+                                        backend::sleep(2200).await;
+                                        diag_copied.set(None);
+                                    });
+                                }, icons::Copy {} span { "{copy_label}" } }
                                 button { class: "pill glass small", onclick: move |_| bug_open.set(!bug_open()), icons::Alert {} span { if bug_open() { "Close" } else { "Report" } } }
                                 if backend::account().is_some() {
                                     button { class: "pill glass small", disabled: remote_loading(), onclick: move |_| {

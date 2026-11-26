@@ -264,7 +264,23 @@ impl Live {
         let norm = match aspect { "16:9" | "21:9" | "4:3" => aspect, _ => "auto" };
         let mpv_val = if norm == "auto" { "-1" } else { norm };
         let _ = self.mpv.set_property("video-aspect-override", mpv_val);
-        self.update(|s| { let c = s.aspect_override != norm; s.aspect_override = norm.to_owned(); c });
+        // The picture's shape follows at once (the layout reads `State.aspect`), not only once
+        // mpv reconfigures: an override on Android's SurfaceView would otherwise show no change.
+        let shown = match norm {
+            "16:9" => 16.0 / 9.0, "21:9" => 21.0 / 9.0, "4:3" => 4.0 / 3.0,
+            _ => {
+                let p = |n: &str| self.mpv.get_property::<i64>(n).unwrap_or(0);
+                let (dw, dh) = (p("video-params/dw"), p("video-params/dh"));
+                if dw > 0 && dh > 0 { dw as f64 / dh as f64 } else { self.state().aspect }
+            }
+        };
+        self.update(|s| {
+            let c = s.aspect_override != norm || (s.aspect - shown).abs() > 0.001;
+            s.aspect_override = norm.to_owned();
+            s.aspect = shown;
+            c
+        });
+        crate::video::layout(self);
     }
     pub fn frame_step(&self, forward: bool) {
         let _ = self.mpv.command(if forward { "frame-step" } else { "frame-back-step" }, &[]);
@@ -283,15 +299,16 @@ impl Live {
         self.fit_subtitles(Some(id));
         Ok(id)
     }
-    /// The next audio track, or the next subtitle track then off; returns what is on now.
-    pub fn cycle_track(&self, audio: bool) -> String {
+    /// The next audio track, or the next subtitle track then off; returns what is on now (its label,
+    /// and the track itself, None for subtitles off).
+    pub fn cycle_track(&self, audio: bool) -> (String, Option<Track>) {
         let s = self.state();
         let list: Vec<&Track> = s.tracks.iter().filter(|t| t.audio == audio).collect();
         let at = list.iter().position(|t| t.selected);
         // Subtitles cycle through "off" after the last track; audio wraps around.
         let next = match at { Some(i) if i + 1 < list.len() => Some(list[i + 1]), Some(_) if !audio => None, _ => list.first().copied() };
         self.select(audio, next.map(|t| t.id));
-        next.map(|t| t.label.clone()).unwrap_or_else(|| "Off".into())
+        (next.map(|t| t.label.clone()).unwrap_or_else(|| "Off".into()), next.cloned())
     }
     pub fn seek_percent(&self, percent: f64) {
         let d = self.state().duration;
@@ -344,11 +361,16 @@ impl Live {
     pub fn retry(&self) {
         let pos = self.state().position;
         let at = if pos > 0.0 { pos } else { self.request.start_ms as f64 / 1000.0 };
-        self.update(|s| { s.error = None; true });
+        // Loading again: the tracks (and with them the subtitle and audio choice) are read anew once the file is open.
+        self.update(|s| { s.error = None; s.loaded = false; s.ended = false; s.tracks.clear(); true });
         if at > 0.0 {
             let _ = self.mpv.set_property("start", format!("+{at}").as_str());
         } else {
             let _ = self.mpv.set_property("start", "none");
+        }
+        if !source_allowed(&self.request.url) {
+            self.update(|s| { s.error = Some("This source isn't a link the player can open.".into()); true });
+            return;
         }
         let _ = self.mpv.command("loadfile", &[self.request.url.as_str(), "replace"]);
     }
@@ -357,6 +379,20 @@ impl Live {
         self.ready.1.notify_all();
         let _ = self.mpv.command("quit", &[]);
     }
+}
+
+/// Only web links and local files reach `loadfile`: mpv would otherwise open its other
+/// protocols (`edl://`, `lavf://`, `av://`, `fd://`...) for whatever string an add-on hands over.
+fn source_allowed(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
+        || std::path::Path::new(url).is_absolute()
+}
+
+/// A stream that ends far from the duration it announced was cut off (a dropped connection),
+/// not finished: it must not count as watched or move on to the next episode.
+fn ended_early(position: f64, duration: f64) -> bool {
+    duration > 60.0 && position + 60.0 < duration && position / duration < 0.85
 }
 
 /// Start a session: mpv is created here; the file opens once the video surface is ready.
@@ -412,7 +448,9 @@ fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::R
         o.set_property("ytdl", false)?;
         o.set_property("hr-seek", "yes")?;
         o.set_property("cache", "yes")?;
-        o.set_property("demuxer-max-back-bytes", "64MiB")?;
+        // A 32-bit process (armv7 TVs and boxes) has a 4 GiB address space shared with the WebView.
+        let small = cfg!(all(target_os = "android", target_pointer_width = "32"));
+        o.set_property("demuxer-max-back-bytes", if small { "16MiB" } else { "64MiB" })?;
         // Smooth lookahead and resilient HTTP streaming over Wi-Fi / CDN resets.
         let _ = o.set_property("demuxer-readahead-secs", 60i64);
         let _ = o.set_property("network-timeout", 20.0f64);
@@ -480,7 +518,7 @@ fn create(req: &PlayRequest, direct: bool, cfg: &backend::Settings) -> anyhow::R
             o.set_property("ao", "audiotrack,opensles")?;
             o.set_property("audio-set-media-role", "yes")?;
             o.set_property("tls-ca-file", ca.as_str())?;
-            o.set_property("demuxer-max-bytes", "96MiB")?;
+            o.set_property("demuxer-max-bytes", if small { "32MiB" } else { "96MiB" })?;
             // The SurfaceView is sized to the picture (video.rs); mpv fills it exactly.
             o.set_property("keepaspect", "no")?;
         }
@@ -539,7 +577,9 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         }
         eprintln!("veylo: video surface not ready, opening anyway");
     }
-    if let Err(e) = mpv.command("loadfile", &[live.request.url.as_str(), "replace"]) {
+    if !source_allowed(&live.request.url) {
+        live.update(|s| { s.error = Some("This source isn't a link the player can open.".into()); true });
+    } else if let Err(e) = mpv.command("loadfile", &[live.request.url.as_str(), "replace"]) {
         backend::report_issue_bg("playback_error", format!("mpv loadfile failed ({e})"),
             format!("quality={:?} hdr={:?} direct={}", live.request.quality, live.request.hdr, live.state().direct));
         live.update(|s| { s.error = Some(format!("This source couldn't be opened ({e}).")); true });
@@ -625,6 +665,15 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                     s.width = w; s.height = h; s.aspect = if dw > 0 && dh > 0 { dw as f64 / dh as f64 } else { 0.0 };
                     s.transfer = transfer; s.target_transfer = target; s.codec = codec; s.hwdec = hwdec; s.fps = fps; true
                 });
+                // The colour matrix is only known now: a profile 5 stream whose track carries no
+                // Dolby Vision tag is recognised here, and gets the same renderer as at file load.
+                refresh_tracks(&live);
+                {
+                    let s = live.state();
+                    if s.dv_profile == 5 && !live.screen.unwrap_or_default().dolby_vision && (s.direct || (cfg!(target_os = "android") && s.hwdec != "no")) {
+                        live.render_dolby_vision();
+                    }
+                }
                 // Android: if mediacodec_embed fell back to software decoding (unsupported codec/profile),
                 // switch to gpu-next so frames actually render instead of showing a black screen.
                 if cfg!(target_os = "android") {
@@ -664,7 +713,13 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                         moved
                     });
                 }
-                ("duration", PropertyData::Double(v)) => { duration = v; live.update(|s| { s.duration = v; true }); mark(&chapters, duration); }
+                ("duration", PropertyData::Double(v)) => {
+                    duration = v;
+                    live.update(|s| { s.duration = v; true });
+                    mark(&chapters, duration);
+                    #[cfg(target_os = "android")]
+                    let _ = crate::android::video_media_duration((v.max(0.0) * 1000.0) as i64);
+                }
                 ("chapter-list", PropertyData::Str(j)) => { chapters = j.to_owned(); mark(&chapters, duration); }
                 ("demuxer-cache-time", PropertyData::Double(v)) => {
                     cache_end = v;
@@ -698,8 +753,20 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 ("seeking", PropertyData::Flag(v)) => {
                     seeking = v;
                     last_tick = None;
+                    // A seek moves the notification's playback position too (it extrapolates from the last report).
+                    #[cfg(target_os = "android")]
+                    if !v {
+                        let at = mpv.get_property::<f64>("time-pos").unwrap_or(position);
+                        let _ = crate::android::video_media_state(!paused, (at * 1000.0) as i64, speed as f32);
+                    }
                     let buf = paused_for_cache || seeking;
                     live.update(|s| { let c = s.buffering != buf; s.buffering = buf; c })
+                }
+                ("eof-reached", PropertyData::Flag(true)) if played && ended_early(position, duration) => {
+                    // The server cut the stream far from its end: offer a retry, never "watched".
+                    backend::report_issue_bg("playback_error", "Stream ended early (eof-reached)",
+                        format!("pos={position:.1}s duration={duration:.1}s"));
+                    live.update(|s| { s.error = Some("The stream stopped.".into()); true });
                 }
                 ("eof-reached", PropertyData::Flag(true)) if played => {
                     live.update(|s| { s.ended = true; true });
@@ -768,7 +835,9 @@ fn refresh_tracks(live: &Live) {
 fn refresh_tracks_from_json(live: &Live, json: &str) {
     let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
     let tracks = parse_tracks_list(&list);
-    let dv = dv_profile_list(&list);
+    let mut dv = dv_profile_list(&list);
+    // mpv names the colour matrix of a profile 5 stream "dolbyvision" when the track doesn't carry the tag.
+    if dv == 0 && live.mpv.get_property::<String>("video-params/colormatrix").is_ok_and(|m| m == "dolbyvision") { dv = 5; }
     live.update(|s| { let c = s.tracks != tracks || s.dv_profile != dv; s.tracks = tracks; s.dv_profile = dv; c });
 }
 

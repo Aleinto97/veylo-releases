@@ -5,7 +5,9 @@
 //  - Focus is kept: Back from a title lands on its poster again, a title opens on Play.
 // Phones and tablets never run this: html.tv scopes every TV style (styles/tv.css).
 (() => {
-    if (navigator.maxTouchPoints > 0 || document.documentElement.classList.contains('tv')) return;
+    // The app says whether this is a TV (window.__veyloTv, set by main.rs); a touch screen is the fallback tell.
+    const isTv = typeof window.__veyloTv === 'boolean' ? window.__veyloTv : !(navigator.maxTouchPoints > 0);
+    if (!isTv || document.documentElement.classList.contains('tv')) return;
     document.documentElement.classList.add('tv');
     const DIRS = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
     const FOCUSABLE = 'button, a[href], input, select, textarea, [tabindex]';
@@ -24,7 +26,14 @@
     };
     const usable = el => rectIfUsable(el) !== null;
     // An open dialog keeps focus inside it (including player sheets, error modal, and Up Next).
+    const pendingPlayer = () => {
+        const el = document.querySelector('.player.pending');
+        return el && visible(el) ? el : null;
+    };
     const scope = () => {
+        // Finding a source: the page behind is out of reach until it opens or Back stops the search.
+        const pending = pendingPlayer();
+        if (pending) return pending;
         const playerModal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
         if (playerModal && visible(playerModal)) return playerModal;
         const player = document.querySelector('.app.playing .player:not(.calm)');
@@ -40,6 +49,7 @@
     // Remembered for each place (a tab, a title, search). The page is drawn anew on the way back from
     // a title, so a control is found again by its name (and which of the controls with that name).
     const seen = new Map();
+    let nthJob = 0;
     const place = () => {
         const title = document.querySelector('.title-page');
         return document.querySelector('.search') ? 'search' : title ? 'title:' + title.getAttribute('aria-label')
@@ -51,7 +61,14 @@
         if (e.target === document.body || e.target.classList.contains('app')) return;
         const label = name(e.target);
         const ref = typeof WeakRef === 'function' ? new WeakRef(e.target) : null;
-        seen.set(place(), (ref || label) ? { ref, label } : null);
+        const entry = (ref || label) ? { ref, label, nth: 0 } : null;
+        seen.set(place(), entry);
+        // Which of the controls with this name it was (found a frame later, off the key's path).
+        if (entry && label) {
+            cancelAnimationFrame(nthJob);
+            const target = e.target;
+            nthJob = requestAnimationFrame(() => { if (target.isConnected) entry.nth = Math.max(0, named(label).indexOf(target)); });
+        }
         light();
     });
     const remembered = () => seen.get(place());
@@ -61,8 +78,12 @@
         const direct = last.ref && last.ref.deref();
         if (direct && direct.isConnected && usable(direct) && scope().contains(direct)) return direct;
         if (!last.label) return null;
-        const el = named(last.label).find(c => usable(c) && scope().contains(c));
-        return el || null;
+        // The same nth control with that name (many tiles share one label), else the first that is usable.
+        const root = scope();
+        const all = named(last.label);
+        const same = all[last.nth || 0];
+        if (same && usable(same) && root.contains(same)) return same;
+        return all.find(c => usable(c) && root.contains(c)) || null;
     };
     // Arriving somewhere puts focus in view at once: a page still filling in would cut a glide short.
     const land = (el, block = 'center') => {
@@ -77,6 +98,16 @@
     window.addEventListener('keydown', e => {
         const dir = DIRS[e.key];
         if (!dir || !e.isTrusted || e.altKey || e.ctrlKey || e.metaKey) return;
+        // While a source is being found only the player's Back is reachable: arrows must not move
+        // focus to the page hidden behind it.
+        const pending = pendingPlayer();
+        if (pending) {
+            e.preventDefault();
+            e.stopPropagation();
+            const back = pending.querySelector('.bare');
+            if (back && !pending.contains(document.activeElement) && usable(back)) back.focus({ preventScroll: true });
+            return;
+        }
         if (document.querySelector('.app.playing')) {
             const playerModal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
             const calm = document.querySelector('.app.playing .player.calm');
@@ -132,8 +163,9 @@
         }
         if (!best) return;
         best.focus({ preventScroll: true });
-        // Rows scroll to keep the focused one mid-screen; a held key jumps rather than queueing glides.
-        best.scrollIntoView({ block: dir[1] || !inside ? 'center' : 'nearest', inline: 'nearest', behavior: e.repeat ? 'auto' : 'smooth' });
+        // Rows scroll to keep the focused one mid-screen; a held key or reduced-motion preference jumps cleanly.
+        const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        best.scrollIntoView({ block: dir[1] || !inside ? 'center' : 'nearest', inline: 'nearest', behavior: (e.repeat || reduced) ? 'auto' : 'smooth' });
     }, true);
 
     // The nearest control in that direction: in line with this one first, then the nearest, then the
@@ -181,7 +213,8 @@
         const home = document.querySelector('.dock-tab.on');
         if (open || !home || home !== document.querySelector('.dock-tab')) return;
         const page = document.querySelector('.page');
-        if (page) page.scrollTo({ top: 0, behavior: 'smooth' });
+        const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (page) page.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' });
         home.focus({ preventScroll: true });
     }, true);
 
@@ -193,6 +226,14 @@
     let queued = false, waiting = 0;
     const settle = () => {
         queued = false;
+        const pending = pendingPlayer();
+        if (pending) {
+            // Back stops the search: keep focus on it rather than on the page behind.
+            const back = pending.querySelector('.bare');
+            if (back && !pending.contains(document.activeElement) && usable(back)) back.focus({ preventScroll: true });
+            waiting = 0;
+            return;
+        }
         if (document.querySelector('.app.playing')) {
             const modal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
             if (modal && visible(modal) && !modal.contains(document.activeElement)) {

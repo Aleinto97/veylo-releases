@@ -829,6 +829,59 @@ async fn curated_relationships_keep_addon_provenance_when_known_ids_merge() {
 }
 
 #[tokio::test]
+async fn progress_with_zero_position_or_duration_keeps_stored_values_unless_reset() {
+    let d = Data::new();
+    let core = d.core();
+    let a = "https://a.test/manifest.json";
+    let progress = |position: i64, duration: i64, extra: Value| {
+        let mut req = json!({"op":"progress","type":"movie","id":"tt9","addon_url":a,
+            "position_ms":position,"duration_ms":duration});
+        req.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        req
+    };
+    core.execute(progress(40_000, 100_000, json!({})))
+        .await
+        .unwrap();
+    let item = core.execute(progress(0, 0, json!({}))).await.unwrap()["item"].clone();
+    assert_eq!(item["position_ms"], 40_000);
+    assert_eq!(item["duration_ms"], 100_000);
+    let playback = core
+        .execute(json!({"op":"playback","type":"movie","id":"tt9","addon_url":a,"video_id":"tt9"}))
+        .await
+        .unwrap();
+    assert_eq!(playback["position_ms"], 40_000);
+    assert_eq!(playback["duration_ms"], 100_000);
+    // A genuine non-zero report still replaces both; an explicit reset clears the position.
+    let item = core
+        .execute(progress(10_000, 100_000, json!({})))
+        .await
+        .unwrap()["item"]
+        .clone();
+    assert_eq!(item["position_ms"], 10_000);
+    let item = core
+        .execute(progress(0, 100_000, json!({"reset":true})))
+        .await
+        .unwrap()["item"]
+        .clone();
+    assert_eq!(item["position_ms"], 0);
+}
+
+#[tokio::test]
+async fn subtitle_download_errors_never_carry_the_url() {
+    let d = Data::new();
+    let core = d.core();
+    let err = core
+        .execute(json!({"op":"subtitle_file","url":"http://127.0.0.1:1/TOKEN_SECRET/sub.srt?key=KEY_SECRET"}))
+        .await
+        .unwrap_err();
+    for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+    }
+}
+
+#[tokio::test]
 async fn playback_lookup_is_episode_type_and_opaque_addon_scoped() {
     let d = Data::new();
     let core = d.core();

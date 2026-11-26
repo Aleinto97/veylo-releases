@@ -82,11 +82,56 @@ async fn the_newer_change_wins_and_a_forgotten_title_goes() {
     assert_eq!(item(&b, "movie", "tt1").await["liked"], json!(-1));
     assert_eq!(item(&b, "movie", "tt1").await["library"], json!(true));
     // A newer "forgotten" removes it.
-    let gone = json!([{"type":"movie","id":"tt1","addon_url":CINEMETA,"updated":i64::MAX / 2,"deleted":true}]);
+    let gone = json!([{"type":"movie","id":"tt1","addon_url":CINEMETA,"updated":first["now"].as_i64().unwrap() + 60,"deleted":true}]);
     b.execute(json!({"op":"sync_apply","media":gone,"playback":[]}))
         .await
         .unwrap();
     assert_eq!(item(&b, "movie", "tt1").await, Value::Null);
+}
+
+#[tokio::test]
+async fn far_future_remote_clocks_are_clamped_so_they_cannot_lock_rows_or_tombstones() {
+    let data = Data::new();
+    let core = data.core();
+    let before = unix_now();
+    let far = i64::MAX / 2;
+    core.execute(json!({"op":"sync_apply","media":[
+        {"type":"movie","id":"tt1","addon_url":CINEMETA,"saved":true,"updated":far,"meta":{"name":"Film"}},
+        {"type":"movie","id":"tt2","addon_url":CINEMETA,"updated":far,"deleted":true}
+    ],"playback":[
+        {"type":"series","id":"tt3","addon_url":CINEMETA,"video_id":"tt3:1:1","position_ms":5,"duration_ms":10,"watched_ms":5,"watched":false,"updated":far}
+    ]}))
+    .await
+    .unwrap();
+    let conn = rusqlite::Connection::open(data.0.join("core.sqlite3")).unwrap();
+    let ceiling = unix_now() + 300;
+    let media: i64 = conn
+        .query_row("SELECT MAX(updated) FROM media", [], |r| r.get(0))
+        .unwrap();
+    let tombstone: i64 = conn
+        .query_row("SELECT deleted_at FROM deleted_media", [], |r| r.get(0))
+        .unwrap();
+    let playback: i64 = conn
+        .query_row("SELECT updated FROM playback", [], |r| r.get(0))
+        .unwrap();
+    for stored in [media, tombstone, playback] {
+        assert!(
+            (before..=ceiling).contains(&stored),
+            "stored {stored} not clamped into {before}..={ceiling}"
+        );
+    }
+    // The row is not locked: a later honest local write still succeeds and wins.
+    core.execute(json!({"op":"set_library","type":"movie","id":"tt1","addon_url":CINEMETA,"saved":false,"meta":{"name":"Film"}}))
+        .await
+        .unwrap();
+    assert_eq!(item(&core, "movie", "tt1").await["library"], json!(false));
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[tokio::test]
