@@ -118,7 +118,35 @@ build_android() {
     find "$project/app/src/main/jniLibs" -mindepth 1 -maxdepth 1 -type d ! -name "$abi" -exec rm -rf {} +
     # dx always writes versionCode 1; Android only updates to a higher one.
     sed -i "s/versionCode = [0-9]*/versionCode = $version_code/; s/versionName = \"[^\"]*\"/versionName = \"$version\"/" "$project/app/build.gradle.kts"
-    (cd "$project" && ./gradlew assembleRelease -q)
+    # Route Maven Central through Google's official GCS mirror first so GitHub runners don't hit
+    # repo.maven.apache.org HTTP 429 rate limits; fall back to stock repositories on retry.
+    local gradle_init="$work/maven-mirror.gradle"
+    cat > "$gradle_init" <<'GRADLE'
+def mirrorUrl = "https://maven-central.storage-download.googleapis.com/maven2/"
+def redirectMavenCentral = { repos ->
+    repos.withType(org.gradle.api.artifacts.repositories.MavenArtifactRepository).configureEach { repo ->
+        if (repo.url != null && repo.url.toString().startsWith("https://repo.maven.apache.org/maven2")) {
+            repo.setUrl(mirrorUrl)
+        }
+    }
+}
+settingsEvaluated { settings ->
+    redirectMavenCentral(settings.pluginManagement.repositories)
+    redirectMavenCentral(settings.dependencyResolutionManagement.repositories)
+}
+allprojects {
+    redirectMavenCentral(buildscript.repositories)
+    redirectMavenCentral(repositories)
+}
+GRADLE
+    (
+        cd "$project"
+        ./gradlew --init-script "$gradle_init" assembleRelease -q || {
+            echo "Gradle assembleRelease failed with mirror; retrying against default repositories in 10s..." >&2
+            sleep 10
+            ./gradlew assembleRelease -q
+        }
+    )
     local unsigned="$project/app/build/outputs/apk/release/app-release-unsigned.apk"
     [ -f "$unsigned" ] || unsigned="$project/app/build/outputs/apk/release/app-release.apk"
     # Sign the release APK with Veylo's own key (never debuggable).
