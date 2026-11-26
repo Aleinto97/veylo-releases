@@ -147,7 +147,7 @@ pub async fn filter_home_quality(items: Vec<Media>) -> Vec<Media> {
             }
         }
     }
-    // Cap per-shelf probes so large catalogs stay snappy; anything beyond still loads normally.
+    // Cap per-shelf probes and total shelf wait time so degraded connections never stall Home.
     to_check.truncate(40);
     if !to_check.is_empty() {
         let fetched: Vec<(String, bool)> = on_runtime(async move {
@@ -159,9 +159,14 @@ pub async fn filter_home_quality(items: Vec<Media>) -> Vec<Media> {
                     bp_quality_check_dedup(http, imdb.clone()).await.map(|ok| (imdb, ok))
                 });
             }
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
             let mut out = Vec::new();
-            while let Some(res) = set.join_next().await {
-                if let Ok(Some(pair)) = res { out.push(pair); }
+            loop {
+                match tokio::time::timeout_at(deadline, set.join_next()).await {
+                    Ok(Some(Ok(Some(pair)))) => out.push(pair),
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
             }
             out
         }).await.unwrap_or_default();

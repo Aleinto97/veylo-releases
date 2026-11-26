@@ -106,6 +106,17 @@ pub fn fallback_with_pref(tracks: &[engine::Track], global_key: Option<&str>, pr
     }
 }
 
+/// Whether the file has fully tagged main audio tracks and NONE of them match `global_key`
+/// (independent of whether subtitles are already selected).
+pub fn missing_audio_language(tracks: &[engine::Track], global_key: Option<&str>) -> bool {
+    let Some(key) = global_key else { return false };
+    let audio_tracks: Vec<&engine::Track> = tracks.iter().filter(|t| t.audio && !engine::extra_audio(t)).collect();
+    if audio_tracks.is_empty() || audio_tracks.iter().any(|t| t.lang.is_empty()) {
+        return false;
+    }
+    !audio_tracks.iter().any(|t| backend::track_in_language(&t.lang, key))
+}
+
 fn lang_matches(track_lang: &str, wanted: &str) -> bool {
     if track_lang.is_empty() || wanted.is_empty() { return false; }
     if track_lang.eq_ignore_ascii_case(wanted) { return true; }
@@ -208,5 +219,19 @@ mod tests {
         assert!(super::up_next_due(1400.0, 1400.0, true, &[], true, false));
         assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, false, false));
         assert!(!super::up_next_due(1310.0, 1400.0, false, &credits, true, true));
+    }
+
+    #[test]
+    fn missing_audio_language_ignores_selected_subtitles() {
+        let it = Some("italian");
+        // English audio + already-selected Italian subtitle: fallback is Nothing,
+        // yet audio is still missing Italian so OtherLanguage retry still triggers.
+        let tracks = [track(1, true, "eng"), Track { selected: true, ..track(2, false, "ita") }];
+        assert_eq!(fallback(&tracks, it), Fallback::Nothing);
+        assert!(super::missing_audio_language(&tracks, it));
+        // Matching main audio or untagged audio or "Any language" => not missing.
+        assert!(!super::missing_audio_language(&[track(1, true, "eng"), track(2, true, "ita")], it));
+        assert!(!super::missing_audio_language(&[track(1, true, "")], it));
+        assert!(!super::missing_audio_language(&tracks, None));
     }
 }

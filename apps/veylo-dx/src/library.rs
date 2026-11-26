@@ -231,7 +231,12 @@ pub fn Library() -> Element {
                                         span { class: "dim tnum addon-offers", "{entry.subtitle} · {backend::file_size_label(entry.bytes)}" }
                                         span { class: "topbar-spacer" }
                                         button { class: "pill accent small", onclick: move |_| crate::title::play_offline(shell, play_entry.clone()), icons::Play {} span { "Play" } }
-                                        button { class: "pill glass small", aria_label: "Delete download", onclick: move |_| { let _ = backend::remove_download(&del_key); downloads.set(backend::list_downloads()); }, icons::Trash {} }
+                                        button { class: "pill glass small", aria_label: "Delete download", onclick: move |_| {
+                                            if let Err(e) = backend::remove_download(&del_key) {
+                                                backend::dev_log(&format!("downloads: {e}"));
+                                            }
+                                            downloads.set(backend::list_downloads());
+                                        }, icons::Trash {} }
                                     }
                                 }
                             }

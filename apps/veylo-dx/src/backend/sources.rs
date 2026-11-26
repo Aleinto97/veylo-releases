@@ -1390,22 +1390,26 @@ pub(super) async fn file_header_with_client_full(
             for (k, v) in &src.headers { treq = treq.header(k.as_str(), v.as_str()); }
         }
         if let Ok(Ok(mut resp)) = tokio::time::timeout(Duration::from_millis(600), treq.send()).await {
-            let range_ok = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-                && resp.headers().get("content-range").and_then(|v| v.to_str().ok()).is_some_and(|cr| {
-                    cr.strip_prefix("bytes ")
-                        .and_then(|s| s.split_once('/'))
-                        .and_then(|(span, _)| span.split_once('-'))
-                        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
-                        .is_some_and(|(a, b)| b >= a && (b - a + 1) <= TAIL_CAP as u64)
-                });
-            if range_ok {
+            let expected_len = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                resp.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(|cr| {
+                    let (span, total_s) = cr.strip_prefix("bytes ")?.split_once('/')?;
+                    let (a_s, b_s) = span.split_once('-')?;
+                    let (a, b, total) = (a_s.parse::<u64>().ok()?, b_s.parse::<u64>().ok()?, total_s.parse::<u64>().ok()?);
+                    let len = b.checked_sub(a)?.checked_add(1)?;
+                    let expected_start = total.saturating_sub(TAIL_CAP as u64);
+                    (total > b && b.checked_add(1) == Some(total) && a == expected_start && len <= TAIL_CAP as u64).then_some(len)
+                })
+            } else {
+                None
+            };
+            if let Some(expected_len) = expected_len {
                 let mut tail = Vec::with_capacity(65536);
                 let deadline = std::time::Instant::now() + Duration::from_millis(600);
                 let mut ok = true;
                 while let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) {
                     match tokio::time::timeout(rem, resp.chunk()).await {
                         Ok(Ok(Some(chunk))) => {
-                            if tail.len().saturating_add(chunk.len()) > TAIL_CAP {
+                            if tail.len().saturating_add(chunk.len()) > expected_len as usize {
                                 ok = false;
                                 break;
                             }
@@ -1415,7 +1419,7 @@ pub(super) async fn file_header_with_client_full(
                         _ => { ok = false; break; }
                     }
                 }
-                if ok && !tail.is_empty() {
+                if ok && tail.len() as u64 == expected_len {
                     let (t_tracks, t_pic, t_codec) = crate::tracks::parse_mp4_tail(&tail);
                     return (t_tracks, t_pic, t_codec.or(codec), resolved, speed_sample);
                 }

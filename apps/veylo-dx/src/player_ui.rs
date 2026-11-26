@@ -376,9 +376,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         let name = key.as_deref().map(backend::subtitle_language_of).unwrap_or_default();
         let mut say = say;
         let (pref_audio, found) = fallback_with_pref(&s.tracks, key.as_deref(), pref.as_ref());
+        let no_audio_lang = crate::player_rules::missing_audio_language(&s.tracks, key.as_deref());
         let langs: Vec<&str> = s.tracks.iter().filter(|t| t.audio).map(|t| if t.lang.is_empty() { "?" } else { t.lang.as_str() }).collect();
-        backend::dev_log(&format!("audio tracks [{}]{}", langs.join(" "), if matches!(found, Fallback::Embedded(_) | Fallback::Download) { ": none in your language" } else { "" }));
-        if pref.is_none() && matches!(found, Fallback::Embedded(_) | Fallback::Download) && fb_live.0.request.language_check && s.position < 120.0 {
+        backend::dev_log(&format!("audio tracks [{}]{}", langs.join(" "), if no_audio_lang { ": none in your language" } else { "" }));
+        if pref.is_none() && no_audio_lang && fb_live.0.request.language_check && s.position < 120.0 {
             say(format!("No {name} audio in this file: trying another source"));
             fb_live.0.finish(Finish::OtherLanguage);
             return;

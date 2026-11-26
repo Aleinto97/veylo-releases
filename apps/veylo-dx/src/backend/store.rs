@@ -348,12 +348,16 @@ pub fn redact_diagnostic(line: &str) -> String {
     static_re!(email_re, r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b");
     static_re!(home_unix_re, r"/(?:home|Users)/[^/\s\x22'<>]+");
     static_re!(home_win_re, r"(?i)[A-Z]:\\Users\\[^\\\s\x22'<>]+");
+    static_re!(auth_hdr_re, r"(?i)\b(authorization)\s*[:=]\s*(?:bearer|basic|token|digest)\s+[^\s&,\x22']+");
+    static_re!(bearer_re, r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}");
     static_re!(secret_re, r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|refresh|sync_key|rd_key|tmdb_key|realdebrid)\s*[:=]\s*[^\s&,\x22']+");
     let step = url_re().replace_all(line, "[URL]");
     let step = jwt_re().replace_all(&step, "[JWT]");
     let step = email_re().replace_all(&step, "[EMAIL]");
     let step = home_unix_re().replace_all(&step, "[HOME]");
     let step = home_win_re().replace_all(&step, "[HOME]");
+    let step = auth_hdr_re().replace_all(&step, "$1=[REDACTED]");
+    let step = bearer_re().replace_all(&step, "$1 [REDACTED]");
     secret_re().replace_all(&step, "$1=[REDACTED]").into_owned()
 }
 
@@ -500,6 +504,7 @@ pub async fn import_watch_history(raw: &str) -> Result<usize> {
     let parsed = parse_watch_history_import(raw);
     anyhow::ensure!(!parsed.is_empty(), "No titles found. Paste a Trakt watched JSON, Veylo export JSON, or IMDb CSV.");
     let mut count = 0usize;
+    let mut failed = 0usize;
     for item in parsed {
         let meta = json!({
             "id": item.id,
@@ -508,12 +513,16 @@ pub async fn import_watch_history(raw: &str) -> Result<usize> {
             "releaseInfo": item.year,
         });
         let Some(media) = Media::from_json(&meta, CINEMETA) else { continue };
-        if item.watched { let _ = set_watched(&media, true).await; }
-        if item.saved { let _ = set_saved(&media, true).await; }
-        if item.liked != 0 { let _ = feedback(&media, item.liked).await; }
-        count += 1;
+        let mut ok = true;
+        if item.watched && set_watched(&media, true).await.is_err() { ok = false; }
+        if item.saved && set_saved(&media, true).await.is_err() { ok = false; }
+        if item.liked != 0 && feedback(&media, item.liked).await.is_err() { ok = false; }
+        if ok { count += 1; } else { failed += 1; }
     }
     sync_soon();
+    if count == 0 && failed > 0 {
+        anyhow::bail!("Couldn't save the imported titles to your local library.");
+    }
     Ok(count)
 }
 
@@ -779,8 +788,8 @@ mod tests {
         assert_eq!(read_track_prefs_from(&path), map);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let clean = redact_diagnostic("fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc user=alice@example.com /home/alice/file.txt C:\\Users\\Alice\\file.txt");
-        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice"), "{clean}");
+        let clean = redact_diagnostic("fetch https://addon.example/key=SECRET/manifest.json api_key=12345 token=abc Authorization: Bearer jwt_secret_999 Bearer other_tok_777 Authorization: Basic dXNlcjpwYXNz user=alice@example.com /home/alice/file.txt C:\\Users\\Alice\\file.txt");
+        assert!(!clean.contains("SECRET") && !clean.contains("12345") && !clean.contains("abc") && !clean.contains("jwt_secret_999") && !clean.contains("other_tok_777") && !clean.contains("dXNlcjpwYXNz") && !clean.contains("alice@example.com") && !clean.contains("/home/alice") && !clean.contains("Users\\Alice"), "{clean}");
         assert!(clean.contains("[URL]") && clean.contains("[REDACTED]") && clean.contains("[EMAIL]") && clean.contains("[HOME]"), "{clean}");
         assert!(!Settings::default().telemetry_enabled, "telemetry must be opt-in by default");
         assert!(!Settings::default().prefetch_sources, "browsing prefetch must be opt-in by default");

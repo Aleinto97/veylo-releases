@@ -21,6 +21,7 @@ pub fn AccountBlock() -> Element {
     let mut key_copied = use_signal(|| false);
     let mut recovery_draft = use_signal(String::new);
     let mut enter_key_open = use_signal(backend::sync_key_needed);
+    let mut pending_link = use_signal(|| None::<backend::PendingLink>);
     let mut last_uid = use_signal(|| account.peek().as_ref().map(|a| a.uid.clone()));
     use_effect(move || {
         let uid = account().map(|a| a.uid);
@@ -31,6 +32,7 @@ pub fn AccountBlock() -> Element {
             key_copied.set(false);
             password.set(String::new());
             recovery_draft.set(String::new());
+            pending_link.set(None);
             enter_key_open.set(backend::sync_key_needed());
         }
     });
@@ -154,12 +156,40 @@ pub fn AccountBlock() -> Element {
                                 div { class: "setting-row",
                                     div { class: "setting-copy",
                                         span { class: "setting-name", "Link a computer or TV" }
-                                        span { class: "setting-about", "Scan the QR code shown on another device to transfer your session and encryption key securely." }
+                                        span { class: "setting-about", "Scan the QR code shown on another device, confirm the 6-digit code, then approve to transfer your session and encryption key." }
                                     }
                                     div { class: "setting-controls",
                                         button { class: "pill glass small", disabled: working.is_some(),
-                                            onclick: move |_| run("scan", Box::pin(async { scan().await?; Ok(Some("The device is signed in.".into())) })),
+                                            onclick: move |_| run("scan", Box::pin(async move {
+                                                let scanned = scan().await?;
+                                                pending_link.set(Some(scanned));
+                                                Ok(None)
+                                            })),
                                             icons::Camera {} span { if working == Some("scan") { "Scanning…" } else { "Scan QR code" } } }
+                                    }
+                                }
+                                if let Some(link) = pending_link() {
+                                    div { class: "setting-drawer",
+                                        span { class: "setting-name", "Approve sign-in on another device?" }
+                                        span { class: "setting-about", "Check that the other screen shows verification code {link.check_code}. Approving transfers your account session and E2EE Recovery Key." }
+                                        div { class: "account-actions",
+                                            button { class: "pill accent small", disabled: working.is_some(),
+                                                onclick: {
+                                                    let code = link.code.clone();
+                                                    move |_| {
+                                                        let code = code.clone();
+                                                        run("link", Box::pin(async move {
+                                                            backend::answer_link(&code).await?;
+                                                            pending_link.set(None);
+                                                            Ok(Some("The device is signed in.".into()))
+                                                        }));
+                                                    }
+                                                },
+                                                icons::Check {} span { if working == Some("link") { "Approving…" } else { "Approve & link" } } }
+                                            button { class: "pill glass small", disabled: working.is_some(),
+                                                onclick: move |_| pending_link.set(None),
+                                                span { "Cancel" } }
+                                        }
                                     }
                                 }
                             }
@@ -181,6 +211,7 @@ pub fn AccountBlock() -> Element {
                                             key_copied.set(false);
                                             password.set(String::new());
                                             recovery_draft.set(String::new());
+                                            pending_link.set(None);
                                         },
                                         span { "Sign out" } }
                                     if confirm_delete() {
@@ -263,9 +294,9 @@ pub fn AccountBlock() -> Element {
 }
 
 #[cfg(target_os = "android")]
-async fn scan() -> anyhow::Result<()> { backend::scan_and_link().await }
+async fn scan() -> anyhow::Result<backend::PendingLink> { backend::scan_link_code().await }
 #[cfg(not(target_os = "android"))]
-async fn scan() -> anyhow::Result<()> { anyhow::bail!("Scanning is on phones and tablets.") }
+async fn scan() -> anyhow::Result<backend::PendingLink> { anyhow::bail!("Scanning is on phones and tablets.") }
 
 fn synced_label(at: i64) -> String {
     if at == 0 { return "Not synced yet".into(); }
@@ -299,6 +330,7 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
             round += 1;
         });
     });
+    let check_code = offer().map(|o| o.check_code());
     let qr = offer().and_then(|o| backend::qr_svg(&o.code));
     rsx! {
         div { class: "link-panel",
@@ -308,7 +340,10 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
             }
             div { class: "setting-copy",
                 span { class: "setting-name", "Scan with Veylo on your phone or tablet" }
-                span { class: "setting-about", "Open Settings → Account → Scan QR code. Transfers your account and E2EE key in one scan." }
+                span { class: "setting-about", "Open Settings → Account → Scan QR code, verify the code below matches, and approve to transfer your account and E2EE key." }
+                if let Some(code) = check_code {
+                    span { class: "status-pill ok tnum", "Verification code: {code}" }
+                }
                 if let Some(p) = problem() { span { class: "addon-problem", icons::Alert {} span { "{p}" } } }
                 div { class: "account-actions",
                     button { class: "pill glass small", onclick: move |_| round += 1, icons::Refresh {} span { "New code" } }

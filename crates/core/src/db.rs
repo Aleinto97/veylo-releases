@@ -107,6 +107,9 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS cache_updated ON cache(updated DESC, key);
          CREATE INDEX IF NOT EXISTS playback_updated ON playback(updated);",
     )?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deleted_media(key TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);",
+    )?;
     Ok(db)
 }
 
@@ -337,42 +340,102 @@ pub(crate) fn upsert_meta(
     Ok(key)
 }
 /// Sync between devices: titles changed after `since` (seconds) and the per-video records changed
-/// after it. A title with no history left (unsaved, unrated, its progress gone) is listed too,
-/// flagged, without its metadata: the caller sends it only where the other side knows it.
-pub(crate) fn sync_changes(db: &Connection, since: i64) -> Result<Value> {
-    let mut stmt = db.prepare_cached(
-        "SELECT key,type,raw_id,addon_url,meta,saved,watched,position_ms,duration_ms,watched_ms,liked,video_id,updated,
-           (saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0)
-         FROM media WHERE updated>?1 ORDER BY updated,key LIMIT 5000",
-    )?;
-    let media = stmt
-        .query_map([since], |r| {
-            let history: bool = r.get(13)?;
-            let meta = if history { serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(json!({})) } else { json!({}) };
-            Ok(json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
-                "meta":meta,"saved":r.get::<_,bool>(5)?,"watched":r.get::<_,bool>(6)?,"position_ms":r.get::<_,i64>(7)?,
-                "duration_ms":r.get::<_,i64>(8)?,"watched_ms":r.get::<_,i64>(9)?,"liked":r.get::<_,i64>(10)?,
-                "video_id":r.get::<_,Option<String>>(11)?,"updated":r.get::<_,i64>(12)?,"history":history}))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut stmt = db.prepare_cached(
-        "SELECT p.media_key,m.type,m.raw_id,m.addon_url,p.video_id,p.position_ms,p.duration_ms,p.watched_ms,p.watched,p.updated
-         FROM playback p JOIN media m ON m.key=p.media_key WHERE p.updated>?1 ORDER BY p.updated LIMIT 20000",
-    )?;
-    let playback = stmt
-        .query_map([since], |r| {
-            Ok(json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
-                "video_id":r.get::<_,String>(4)?,"position_ms":r.get::<_,i64>(5)?,"duration_ms":r.get::<_,i64>(6)?,
-                "watched_ms":r.get::<_,i64>(7)?,"watched":r.get::<_,bool>(8)?,"updated":r.get::<_,i64>(9)?}))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({"media":media,"playback":playback,"now":now()}))
+/// Every row changed after the caller's per-table cursors, oldest first, so the app can upload
+/// independently paged batches without a newer playback row skipping unread media rows.
+pub(crate) fn sync_changes(db: &Connection, req: &Value) -> Result<Value> {
+    let since = req["since"].as_i64().unwrap_or(0);
+    let media_since = req["media_since"].as_i64().unwrap_or(since);
+    let media_after_key = req["media_after_key"].as_str();
+    let playback_since = req["playback_since"].as_i64().unwrap_or(since);
+    let playback_after_media = req["playback_after_media"].as_str();
+    let playback_after_video = req["playback_after_video"].as_str();
+
+    const MEDIA_LIMIT: usize = 5000;
+    const PLAYBACK_LIMIT: usize = 20000;
+
+    let map_media = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        let history: bool = r.get(13)?;
+        let meta = if history {
+            serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(json!({}))
+        } else {
+            json!({})
+        };
+        Ok(
+            json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
+            "meta":meta,"saved":r.get::<_,bool>(5)?,"watched":r.get::<_,bool>(6)?,"position_ms":r.get::<_,i64>(7)?,
+            "duration_ms":r.get::<_,i64>(8)?,"watched_ms":r.get::<_,i64>(9)?,"liked":r.get::<_,i64>(10)?,
+            "video_id":r.get::<_,Option<String>>(11)?,"updated":r.get::<_,i64>(12)?,"history":history}),
+        )
+    };
+    let media = if let Some(after_key) = media_after_key {
+        let mut stmt = db.prepare_cached(
+            "SELECT key,type,raw_id,addon_url,meta,saved,watched,position_ms,duration_ms,watched_ms,liked,video_id,updated,
+               (saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0)
+             FROM media WHERE updated>?1 OR (updated=?1 AND key>?2) ORDER BY updated,key LIMIT 5000",
+        )?;
+        let rows = stmt
+            .query_map(params![media_since, after_key], map_media)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        let mut stmt = db.prepare_cached(
+            "SELECT key,type,raw_id,addon_url,meta,saved,watched,position_ms,duration_ms,watched_ms,liked,video_id,updated,
+               (saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0)
+             FROM media WHERE updated>?1 ORDER BY updated,key LIMIT 5000",
+        )?;
+        let rows = stmt
+            .query_map([media_since], map_media)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let map_playback = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        Ok(
+            json!({"key":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"id":r.get::<_,String>(2)?,"addon_url":r.get::<_,String>(3)?,
+            "video_id":r.get::<_,String>(4)?,"position_ms":r.get::<_,i64>(5)?,"duration_ms":r.get::<_,i64>(6)?,
+            "watched_ms":r.get::<_,i64>(7)?,"watched":r.get::<_,bool>(8)?,"updated":r.get::<_,i64>(9)?}),
+        )
+    };
+    let playback = if let (Some(after_m), Some(after_v)) =
+        (playback_after_media, playback_after_video)
+    {
+        let mut stmt = db.prepare_cached(
+            "SELECT p.media_key,m.type,m.raw_id,m.addon_url,p.video_id,p.position_ms,p.duration_ms,p.watched_ms,p.watched,p.updated
+             FROM playback p JOIN media m ON m.key=p.media_key
+             WHERE p.updated>?1 OR (p.updated=?1 AND (p.media_key>?2 OR (p.media_key=?2 AND p.video_id>?3)))
+             ORDER BY p.updated,p.media_key,p.video_id LIMIT 20000",
+        )?;
+        let rows = stmt
+            .query_map(params![playback_since, after_m, after_v], map_playback)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    } else {
+        let mut stmt = db.prepare_cached(
+            "SELECT p.media_key,m.type,m.raw_id,m.addon_url,p.video_id,p.position_ms,p.duration_ms,p.watched_ms,p.watched,p.updated
+             FROM playback p JOIN media m ON m.key=p.media_key
+             WHERE p.updated>?1 ORDER BY p.updated,p.media_key,p.video_id LIMIT 20000",
+        )?;
+        let rows = stmt
+            .query_map([playback_since], map_playback)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let media_more = media.len() == MEDIA_LIMIT;
+    let playback_more = playback.len() == PLAYBACK_LIMIT;
+    Ok(json!({
+        "media": media,
+        "playback": playback,
+        "media_more": media_more,
+        "playback_more": playback_more,
+        "now": now(),
+    }))
 }
 
 /// Another device's changes (as `sync_changes` lists them, `deleted` for a title it forgot): each
 /// title and per-video record replaces this one's only when it is newer, and keeps its own time
-/// so it isn't listed again as a change of this device's. A title known here only as catalogue
-/// metadata (no history) always takes the other device's history.
+/// so it isn't listed again as a change of this device's. Per-title deletion tombstones block older
+/// playback records from resurrecting forgotten titles across page boundaries.
 pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> {
     let tx = db.transaction()?;
     let mut applied = 0;
@@ -393,6 +456,13 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
             continue;
         };
         let key = identity(&kind, &id, &addon);
+        let deleted_at: Option<i64> = tx
+            .query_row(
+                "SELECT deleted_at FROM deleted_media WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
         let local: Option<(i64, bool)> = tx
             .query_row(
                 "SELECT updated,(saved<>0 OR watched<>0 OR position_ms>0 OR liked<>0 OR watched_ms>0) FROM media WHERE key=?1",
@@ -404,10 +474,21 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
             continue;
         }
         if m["deleted"] == true {
+            tx.execute(
+                "INSERT INTO deleted_media(key,deleted_at) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET deleted_at=MAX(deleted_media.deleted_at,excluded.deleted_at)",
+                params![key, updated],
+            )?;
             tx.execute("DELETE FROM playback WHERE media_key=?1", [&key])?;
             tx.execute("DELETE FROM media WHERE key=?1", [&key])?;
             applied += 1;
             continue;
+        }
+        if deleted_at.is_some_and(|t| t >= updated) {
+            continue;
+        }
+        if deleted_at.is_some() {
+            tx.execute("DELETE FROM deleted_media WHERE key=?1", [&key])?;
         }
         let meta = if m["meta"].is_object() {
             m["meta"].clone()
@@ -435,6 +516,20 @@ pub(crate) fn sync_apply(db: &mut Connection, request: &Value) -> Result<Value> 
         let Some(updated) = p["updated"].as_i64() else {
             continue;
         };
+        let key = identity(&kind, &id, &addon);
+        let deleted_at: Option<i64> = tx
+            .query_row(
+                "SELECT deleted_at FROM deleted_media WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if deleted_at.is_some_and(|t| t >= updated) {
+            continue;
+        }
+        if deleted_at.is_some() {
+            tx.execute("DELETE FROM deleted_media WHERE key=?1", [&key])?;
+        }
         let key = upsert_meta(&tx, &kind, &id, &addon, &json!({}))?;
         applied += tx.execute(
             "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,watched,updated) VALUES(?1,?2,?3,?4,?5,?6,?7)

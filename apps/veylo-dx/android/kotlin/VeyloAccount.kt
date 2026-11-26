@@ -15,6 +15,8 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Account sign-in on Android, all inside the app (src/backend/account.rs):
@@ -24,15 +26,21 @@ import java.util.concurrent.Executor
  * "cancel:" or "error:…".
  */
 object VeyloAccount {
-    @Volatile private var result: String? = null
+    private val result = AtomicReference<String?>(null)
+    private val opSeq = AtomicLong(0)
 
-    /** The last answer, once. */
+    /** The last answer, atomically read and cleared so concurrent callbacks are never lost. */
     @JvmStatic
-    fun take(): String? { val r = result; result = null; return r }
+    fun take(): String? = result.getAndSet(null)
+
+    private fun publish(seq: Long, value: String) {
+        if (opSeq.get() == seq) result.set(value)
+    }
 
     @JvmStatic
     fun signInWithGoogle(activity: Activity, webClientId: String) {
-        result = null
+        val seq = opSeq.incrementAndGet()
+        result.set(null)
         val option = GetGoogleIdOption.Builder()
             .setServerClientId(webClientId)
             .setFilterByAuthorizedAccounts(false)
@@ -45,12 +53,12 @@ object VeyloAccount {
                 object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
                     override fun onResult(response: GetCredentialResponse) {
                         val c = response.credential
-                        result = if (c is CustomCredential && c.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                        publish(seq, if (c is CustomCredential && c.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                             "token:" + GoogleIdTokenCredential.createFrom(c.data).idToken
-                        } else "error:Google gave no account"
+                        } else "error:Google gave no account")
                     }
                     override fun onError(e: GetCredentialException) {
-                        result = if (e is GetCredentialCancellationException) "cancel:" else "error:" + (e.message ?: e.type)
+                        publish(seq, if (e is GetCredentialCancellationException) "cancel:" else "error:" + (e.message ?: e.type))
                     }
                 })
         }
@@ -58,13 +66,14 @@ object VeyloAccount {
 
     @JvmStatic
     fun scanCode(activity: Activity) {
-        result = null
+        val seq = opSeq.incrementAndGet()
+        result.set(null)
         val options = GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
         activity.runOnUiThread {
             GmsBarcodeScanning.getClient(activity, options).startScan()
-                .addOnSuccessListener { result = "code:" + (it.rawValue ?: "") }
-                .addOnCanceledListener { result = "cancel:" }
-                .addOnFailureListener { result = "error:" + (it.message ?: "scanner unavailable") }
+                .addOnSuccessListener { publish(seq, "code:" + (it.rawValue ?: "")) }
+                .addOnCanceledListener { publish(seq, "cancel:") }
+                .addOnFailureListener { publish(seq, "error:" + (it.message ?: "scanner unavailable")) }
         }
     }
 }

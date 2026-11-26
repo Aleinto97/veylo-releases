@@ -1,7 +1,7 @@
 //! Offline downloads: stream a direct video source into the app's private `downloads/` folder
 //! so movies and episodes play smoothly on flights or trains without network access.
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DownloadEntry {
@@ -32,8 +32,7 @@ pub struct DownloadProgress {
 
 struct ActiveJob {
     progress: DownloadProgress,
-    cancel: std::sync::Arc<AtomicBool>,
-    cancel_notify: std::sync::Arc<tokio::sync::Notify>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
     spec: DownloadSpec,
 }
 
@@ -84,21 +83,83 @@ fn part_filename(key: &str, url: &str) -> String {
     format!("{khex}-{uhex}.part")
 }
 
-/// Parse an HTTP `Content-Range: bytes <start>-<end>/<total|*>` header into `(start, total)`.
-fn parse_content_range(header: &str) -> Option<(u64, Option<u64>)> {
+/// Parse an HTTP `Content-Range: bytes <start>-<end>/<total|*>` header into `(start, end, total)`.
+fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = header.trim().strip_prefix("bytes ")?;
     let (range, total_s) = rest.split_once('/')?;
-    let (start_s, _end_s) = range.split_once('-')?;
+    let (start_s, end_s) = range.split_once('-')?;
     let start = start_s.trim().parse::<u64>().ok()?;
-    let total = if total_s.trim() == "*" { None } else { total_s.trim().parse::<u64>().ok() };
-    Some((start, total))
+    let end = end_s.trim().parse::<u64>().ok()?;
+    if end < start { return None; }
+    let total = if total_s.trim() == "*" {
+        None
+    } else {
+        let t = total_s.trim().parse::<u64>().ok()?;
+        if t <= end { return None; }
+        Some(t)
+    };
+    Some((start, end, total))
 }
 
-fn read_index(path: &std::path::Path) -> Vec<DownloadEntry> {
+fn part_meta_path(part_path: &std::path::Path) -> PathBuf {
+    let mut os = part_path.as_os_str().to_os_string();
+    os.push(".meta");
+    PathBuf::from(os)
+}
+
+fn read_part_validator(part_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(part_meta_path(part_path)).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["validator"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+fn write_part_validator(part_path: &std::path::Path, validator: Option<&str>) {
+    let meta = part_meta_path(part_path);
+    match validator {
+        Some(val) if !val.trim().is_empty() => {
+            let _ = write_private_file(&meta, json!({"validator": val.trim()}).to_string().as_bytes());
+        }
+        _ => { let _ = std::fs::remove_file(&meta); }
+    }
+}
+
+fn extract_strong_validator(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    if let Some(etag) = headers.get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::trim) {
+        if !etag.is_empty() && !etag.starts_with("W/") && !etag.starts_with("w/") {
+            return Some(etag.to_owned());
+        }
+    }
+    headers.get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Validate that a stored download path resolves to a regular (non-symlink) file directly inside `dir`.
+fn safe_managed_path(dir: &std::path::Path, stored: &str) -> Option<PathBuf> {
+    let raw = std::path::Path::new(stored);
+    let candidate = if raw.components().count() == 1 {
+        let name = raw.file_name()?;
+        dir.join(name)
+    } else {
+        // Legacy entries store the full path; require exact parent containment with no traversal.
+        if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) { return None; }
+        let canon_dir = std::fs::canonicalize(dir).ok()?;
+        let parent = raw.parent()?;
+        let canon_parent = std::fs::canonicalize(parent).ok()?;
+        if canon_parent != canon_dir { return None; }
+        dir.join(raw.file_name()?)
+    };
+    let meta = std::fs::symlink_metadata(&candidate).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() { return None; }
+    Some(candidate)
+}
+
+fn read_index(path: &std::path::Path, dir: &std::path::Path) -> Vec<DownloadEntry> {
     let v: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     v.as_array().into_iter().flatten().filter_map(|e| {
-        let file = PathBuf::from(s(e, "path"));
-        if !file.is_file() { return None; }
+        let file = safe_managed_path(dir, &s(e, "path"))?;
         let media = Media::from_json(&e["media"], "")?;
         let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or_else(|_| e["bytes"].as_u64().unwrap_or(0));
         Some(DownloadEntry {
@@ -115,31 +176,35 @@ fn read_index(path: &std::path::Path) -> Vec<DownloadEntry> {
 }
 
 fn write_index(path: &std::path::Path, entries: &[DownloadEntry]) -> std::io::Result<()> {
-    let arr: Vec<Value> = entries.iter().map(|e| json!({
-        "key": e.key,
-        "media": media_json(&e.media),
-        "video_id": e.video_id,
-        "title": e.title,
-        "subtitle": e.subtitle,
-        "path": e.path.to_string_lossy(),
-        "bytes": e.bytes,
-        "downloaded_at": e.downloaded_at,
-    })).collect();
+    let arr: Vec<Value> = entries.iter().map(|e| {
+        let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| e.path.to_string_lossy().into_owned());
+        json!({
+            "key": e.key,
+            "media": media_json(&e.media),
+            "video_id": e.video_id,
+            "title": e.title,
+            "subtitle": e.subtitle,
+            "path": name,
+            "bytes": e.bytes,
+            "downloaded_at": e.downloaded_at,
+        })
+    }).collect();
     write_private_file(path, Value::Array(arr).to_string().as_bytes())
 }
 
 pub fn list_downloads() -> Vec<DownloadEntry> {
     let _g = DOWNLOADS_LOCK.lock();
+    let dir = downloads_dir();
     if let Ok(mut cache) = DOWNLOADS_CACHE.lock() {
         if let Some(cached) = cache.as_ref() {
             return cached.iter().filter(|e| e.path.is_file()).cloned().collect();
         }
-        let mut list = read_index(&downloads_index_path());
+        let mut list = read_index(&downloads_index_path(), &dir);
         list.sort_by_key(|e| std::cmp::Reverse(e.downloaded_at));
         *cache = Some(list.clone());
         return list;
     }
-    let mut list = read_index(&downloads_index_path());
+    let mut list = read_index(&downloads_index_path(), &dir);
     list.sort_by_key(|e| std::cmp::Reverse(e.downloaded_at));
     list
 }
@@ -160,8 +225,7 @@ pub fn cancel_download(key: &str) {
     if let Ok(mut g) = ACTIVE_DOWNLOADS.lock() {
         if let Some(map) = g.as_mut() {
             if let Some(job) = map.get(key) {
-                job.cancel.store(true, Ordering::Relaxed);
-                job.cancel_notify.notify_waiters();
+                let _ = job.cancel_tx.send(true);
                 if matches!(job.progress.state, DownloadState::Failed(_)) {
                     part_to_clean = Some(downloads_dir().join(part_filename(key, &job.spec.url)));
                 }
@@ -171,7 +235,10 @@ pub fn cancel_download(key: &str) {
             }
         }
     }
-    if let Some(p) = part_to_clean { let _ = std::fs::remove_file(p); }
+    if let Some(p) = part_to_clean {
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(part_meta_path(&p));
+    }
 }
 
 /// Retry a failed download, resuming cleanly from its existing `.part` file via HTTP Range.
@@ -185,12 +252,17 @@ pub fn retry_download(key: &str) -> Result<()> {
 
 pub fn remove_download(key: &str) -> Result<()> {
     let _g = DOWNLOADS_LOCK.lock();
-    let mut list = read_index(&downloads_index_path());
-    let mut removed = None;
-    list.retain(|e| {
-        if e.key == key { removed = Some(e.path.clone()); false } else { true }
-    });
-    if let Some(p) = removed { let _ = std::fs::remove_file(p); }
+    let dir = downloads_dir();
+    let mut list = read_index(&downloads_index_path(), &dir);
+    let target = list.iter().find(|e| e.key == key).map(|e| e.path.clone());
+    if let Some(p) = target {
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).context("Couldn't delete the downloaded file");
+            }
+        }
+    }
+    list.retain(|e| e.key != key);
     write_index(&downloads_index_path(), &list)?;
     list.sort_by_key(|e| std::cmp::Reverse(e.downloaded_at));
     if let Ok(mut cache) = DOWNLOADS_CACHE.lock() { *cache = Some(list); }
@@ -199,7 +271,7 @@ pub fn remove_download(key: &str) -> Result<()> {
 }
 
 /// Start an offline download in the background on the backend Tokio runtime (max 2 concurrent,
-/// resumable via HTTP Range, with automatic preferred-language subtitle caching).
+/// resumable via HTTP Range + If-Range validator, with automatic preferred-language subtitle caching).
 pub fn start_download(
     media: Media,
     video_id: String,
@@ -210,8 +282,7 @@ pub fn start_download(
     filename: Option<String>,
 ) -> Result<()> {
     let key = download_key(&media.key(), &video_id);
-    let cancel = std::sync::Arc::new(AtomicBool::new(false));
-    let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
     let spec = DownloadSpec { key: key.clone(), media, video_id, title: title.clone(), subtitle, url, headers, filename };
     {
         let mut g = ACTIVE_DOWNLOADS.lock().map_err(|_| anyhow!("download state busy"))?;
@@ -227,8 +298,7 @@ pub fn start_download(
                 total: None,
                 state: DownloadState::Running,
             },
-            cancel: cancel.clone(),
-            cancel_notify: cancel_notify.clone(),
+            cancel_tx,
             spec: spec.clone(),
         });
     }
@@ -239,16 +309,16 @@ pub fn start_download(
     runtime.spawn(async move {
         let permit = tokio::select! {
             biased;
-            _ = cancel_notify.notified(), if cancel.load(Ordering::Relaxed) => None,
+            _ = cancel_rx.wait_for(|&c| c) => None,
             p = slots.acquire_owned() => p.ok(),
         };
-        let res = if cancel.load(Ordering::Relaxed) {
+        let res = if *cancel_rx.borrow() {
             Err(anyhow!("Cancelled"))
         } else {
             let sub_kind = spec.media.kind.clone();
             let sub_video = spec.video_id.clone();
             let sub_fname = spec.filename.clone();
-            let res = run_download_to(&dir, &idx, spec, cancel.clone(), cancel_notify.clone()).await;
+            let res = run_download_to(&dir, &idx, spec, cancel_rx.clone()).await;
             // Release the download slot before best-effort subtitle fetching so queued videos start immediately.
             drop(permit);
             if res.is_ok() {
@@ -266,7 +336,7 @@ pub fn start_download(
                     Ok(()) => { map.remove(&key); }
                     Err(e) => {
                         if let Some(job) = map.get_mut(&key) {
-                            if job.cancel.load(Ordering::Relaxed) { map.remove(&key); }
+                            if *job.cancel_tx.borrow() { map.remove(&key); }
                             else { job.progress.state = DownloadState::Failed(format!("{e}")); }
                         }
                     }
@@ -299,6 +369,7 @@ async fn send_download_request(
     url: &str,
     headers: &[(String, String)],
     resume_from: u64,
+    if_range: Option<&str>,
 ) -> Result<reqwest::Response> {
     let origin = url::Url::parse(url).context("Invalid download URL")?;
     let mut current = origin.clone();
@@ -309,6 +380,9 @@ async fn send_download_request(
         }
         if resume_from > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+            if let Some(val) = if_range {
+                req = req.header(reqwest::header::IF_RANGE, val);
+            }
         }
         let resp = req.send().await.map_err(|_| anyhow!("Could not reach download source"))?;
         if resp.status().is_redirection() {
@@ -326,14 +400,19 @@ async fn run_download_to(
     dir: &std::path::Path,
     index_path: &std::path::Path,
     spec: DownloadSpec,
-    cancel: std::sync::Arc<AtomicBool>,
-    cancel_notify: std::sync::Arc<tokio::sync::Notify>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let DownloadSpec { key, media, video_id, title, subtitle, url, headers, .. } = spec;
     std::fs::create_dir_all(dir)?;
     let final_path = dir.join(safe_filename(&key, &url));
     let part_path = dir.join(part_filename(&key, &url));
-    let existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    let stored_validator = read_part_validator(&part_path);
+    // Only attempt resume when we have BOTH an existing partial file AND a stored strong validator.
+    let existing = if stored_validator.is_some() {
+        std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(30))
@@ -341,38 +420,52 @@ async fn run_download_to(
         .build()?;
     let mut resp = tokio::select! {
         biased;
-        _ = cancel_notify.notified(), if cancel.load(Ordering::Relaxed) => anyhow::bail!("Cancelled"),
-        r = send_download_request(&client, &url, &headers, existing) => r?,
+        _ = cancel_rx.wait_for(|&c| c) => anyhow::bail!("Cancelled"),
+        r = send_download_request(&client, &url, &headers, existing, stored_validator.as_deref()) => r?,
     };
-    // Verify Content-Range starts at `existing` on 206 so a server ignoring Range never corrupts `.part`.
+    // Verify Content-Range starts at `existing` and covers through EOF on 206 so a server returning
+    // a different object or partial slice never corrupts `.part`.
     let content_range = resp.headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range);
     let (resumed, mut written, range_total) = if existing > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        match content_range {
-            Some((start, total)) if start == existing => (true, existing, total),
-            _ => {
-                // Server returned a mismatched range start; restart cleanly from byte 0.
-                resp = tokio::select! {
-                    biased;
-                    _ = cancel_notify.notified(), if cancel.load(Ordering::Relaxed) => anyhow::bail!("Cancelled"),
-                    r = send_download_request(&client, &url, &headers, 0) => r?,
-                };
-                (false, 0u64, None)
-            }
+        let valid_resume = match content_range {
+            Some((start, end, Some(total))) => start == existing && end.checked_add(1) == Some(total),
+            Some((start, _end, None)) => start == existing,
+            None => false,
+        };
+        if valid_resume {
+            let total = content_range.and_then(|(_, _, t)| t);
+            (true, existing, total)
+        } else {
+            // Mismatched range or partial slice; restart cleanly from byte 0.
+            resp = tokio::select! {
+                biased;
+                _ = cancel_rx.wait_for(|&c| c) => anyhow::bail!("Cancelled"),
+                r = send_download_request(&client, &url, &headers, 0, None) => r?,
+            };
+            (false, 0u64, None)
         }
     } else if existing > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         resp = tokio::select! {
             biased;
-            _ = cancel_notify.notified(), if cancel.load(Ordering::Relaxed) => anyhow::bail!("Cancelled"),
-            r = send_download_request(&client, &url, &headers, 0) => r?,
+            _ = cancel_rx.wait_for(|&c| c) => anyhow::bail!("Cancelled"),
+            r = send_download_request(&client, &url, &headers, 0, None) => r?,
         };
         (false, 0u64, None)
     } else {
         (false, 0u64, None)
     };
     let mut resp = resp.error_for_status().map_err(|e| anyhow!("Download failed (HTTP {})", e.status().map(|s| s.as_u16()).unwrap_or(0)))?;
+    // Fresh requests must receive a full 200 OK body, never a partial 206 slice.
+    if !resumed && resp.status() != reqwest::StatusCode::OK {
+        anyhow::bail!("Download source returned partial or unexpected status (HTTP {})", resp.status().as_u16());
+    }
+    let validator = extract_strong_validator(resp.headers());
+    if !resumed {
+        write_part_validator(&part_path, validator.as_deref());
+    }
     let total = range_total.or_else(|| resp.content_length().map(|len| if resumed { len.saturating_add(existing) } else { len }));
     if let Ok(mut g) = ACTIVE_DOWNLOADS.lock() {
         if let Some(job) = g.as_mut().and_then(|m| m.get_mut(&key)) {
@@ -388,26 +481,19 @@ async fn run_download_to(
     use tokio::io::AsyncWriteExt;
     let mut last_update = std::time::Instant::now();
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = std::fs::remove_file(&part_path);
-            anyhow::bail!("Cancelled");
-        }
         let next = tokio::select! {
             biased;
-            _ = cancel_notify.notified() => {
-                if cancel.load(Ordering::Relaxed) {
-                    drop(file);
-                    let _ = std::fs::remove_file(&part_path);
-                    anyhow::bail!("Cancelled");
-                }
-                continue;
+            _ = cancel_rx.wait_for(|&c| c) => {
+                drop(file);
+                let _ = std::fs::remove_file(&part_path);
+                let _ = std::fs::remove_file(part_meta_path(&part_path));
+                anyhow::bail!("Cancelled");
             }
             c = resp.chunk() => c.map_err(|_| anyhow!("Connection interrupted"))?,
         };
         let Some(chunk) = next else { break };
         file.write_all(&chunk).await?;
-        written += chunk.len() as u64;
+        written = written.saturating_add(chunk.len() as u64);
         if last_update.elapsed() >= Duration::from_millis(250) {
             last_update = std::time::Instant::now();
             if let Ok(mut g) = ACTIVE_DOWNLOADS.lock() {
@@ -417,13 +503,19 @@ async fn run_download_to(
     }
     file.flush().await?;
     drop(file);
+    if *cancel_rx.borrow() {
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(part_meta_path(&part_path));
+        anyhow::bail!("Cancelled");
+    }
     anyhow::ensure!(written > 0, "Download returned no data");
     if let Some(expected) = total {
-        anyhow::ensure!(written >= expected, "Download ended early ({written}/{expected} bytes)");
+        anyhow::ensure!(written == expected, "Download size mismatch ({written}/{expected} bytes)");
     }
-    std::fs::rename(&part_path, &final_path)?;
     let _g = DOWNLOADS_LOCK.lock();
-    let mut list = read_index(index_path);
+    let mut list = read_index(index_path, dir);
+    let old_path = list.iter().find(|e| e.key == key).map(|e| e.path.clone());
+    std::fs::rename(&part_path, &final_path)?;
     list.retain(|e| e.key != key);
     list.push(DownloadEntry {
         key,
@@ -431,11 +523,20 @@ async fn run_download_to(
         video_id,
         title,
         subtitle,
-        path: final_path,
+        path: final_path.clone(),
         bytes: written,
         downloaded_at: now_secs(),
     });
-    write_index(index_path, &list)?;
+    if let Err(e) = write_index(index_path, &list) {
+        let _ = std::fs::rename(&final_path, &part_path);
+        return Err(e).context("Couldn't save the downloads index");
+    }
+    let _ = std::fs::remove_file(part_meta_path(&part_path));
+    if let Some(old) = old_path {
+        if old != final_path {
+            let _ = std::fs::remove_file(old);
+        }
+    }
     if BACKEND.get().is_some() && index_path == downloads_index_path() {
         list.sort_by_key(|e| std::cmp::Reverse(e.downloaded_at));
         if let Ok(mut cache) = DOWNLOADS_CACHE.lock() { *cache = Some(list); }
@@ -459,18 +560,20 @@ mod tests {
             let (mut sock, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = sock.read(&mut buf);
-            let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
+            let hdr = format!("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
             let _ = sock.write_all(hdr.as_bytes());
             let _ = sock.write_all(&payload);
         });
         let dir = std::env::temp_dir().join(format!("veylo-dl-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let files_dir = dir.join("files");
         let idx = dir.join("downloads.json");
         let media = Media::from_json(&json!({"id":"tt1375666","type":"movie","name":"Inception"}), CINEMETA).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
             run_download_to(
-                &dir.join("files"),
+                &files_dir,
                 &idx,
                 DownloadSpec {
                     key: download_key(&media.key(), "tt1375666"),
@@ -482,16 +585,19 @@ mod tests {
                     headers: vec![],
                     filename: Some("Inception.2010.1080p.mkv".into()),
                 },
-                std::sync::Arc::new(AtomicBool::new(false)),
-                std::sync::Arc::new(tokio::sync::Notify::new()),
+                rx,
             ).await.unwrap();
         });
         let _ = srv.join();
-        let list = read_index(&idx);
+        let list = read_index(&idx, &files_dir);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "Inception");
         assert_eq!(list[0].bytes, 32_768);
         assert_eq!(std::fs::read(&list[0].path).unwrap(), expected);
+        // Paths outside the managed directory must be rejected by read_index.
+        let outside = dir.join("outside.mkv");
+        std::fs::write(&outside, b"secret").unwrap();
+        assert!(safe_managed_path(&files_dir, &outside.to_string_lossy()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -507,9 +613,10 @@ mod tests {
             let n = sock.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             assert!(req.contains("range: bytes=4096-") || req.contains("Range: bytes=4096-"), "expected Range header: {req}");
+            assert!(req.to_ascii_lowercase().contains("if-range: \"etag-v1\""), "expected If-Range header: {req}");
             let rest = &payload[4096..];
             let hdr = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4096-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nETag: \"etag-v1\"\r\nContent-Range: bytes 4096-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len() - 1, payload.len(), rest.len()
             );
             let _ = sock.write_all(hdr.as_bytes());
@@ -525,8 +632,10 @@ mod tests {
         let url = format!("http://{addr}/inception.mkv");
         let part_path = files_dir.join(part_filename(&key, &url));
         std::fs::write(&part_path, &expected[..4096]).unwrap();
+        write_part_validator(&part_path, Some("\"etag-v1\""));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
             run_download_to(
                 &files_dir,
                 &idx,
@@ -540,12 +649,11 @@ mod tests {
                     headers: vec![],
                     filename: None,
                 },
-                std::sync::Arc::new(AtomicBool::new(false)),
-                std::sync::Arc::new(tokio::sync::Notify::new()),
+                rx,
             ).await.unwrap();
         });
         let _ = srv.join();
-        let list = read_index(&idx);
+        let list = read_index(&idx, &files_dir);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].bytes, expected.len() as u64);
         assert_eq!(std::fs::read(&list[0].path).unwrap(), expected);

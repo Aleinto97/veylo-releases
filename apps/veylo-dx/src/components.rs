@@ -79,18 +79,27 @@ pub fn use_artwork(media: &Media) -> Signal<Option<backend::Artwork>> {
 /// All three initialize synchronously from session caches so revisited titles paint on Frame 0.
 pub fn use_title_artwork(media: &Media) -> Memo<Option<backend::Artwork>> {
     let init_hero = backend::cached_title_artwork(media);
+    let init_stills = backend::cached_title_stills(media);
     let init_series = backend::cached_series_free(media);
     let init_wiki = backend::cached_wikidata(media);
     let need_hero = init_hero.is_none();
+    let need_stills = init_stills.is_none();
     let need_series = init_series.is_none() && media.kind != "movie";
     let need_wiki = init_wiki.is_none();
     let mut hero = use_signal(move || init_hero);
+    let mut stills = use_signal(move || init_stills.unwrap_or_default());
     let mut series = use_signal(move || init_series);
     let mut wiki = use_signal(move || init_wiki);
-    let (m1, m2, m3) = (media.clone(), media.clone(), media.clone());
+    let (m1, m2, m3, m4) = (media.clone(), media.clone(), media.clone(), media.clone());
     use_hook(move || {
         if need_hero {
             spawn(async move { if let Some(x) = backend::title_artwork_fast(&m1).await { hero.set(Some(x)); } });
+        }
+        if need_stills {
+            spawn(async move {
+                let extra = backend::title_stills(&m4).await;
+                if !extra.is_empty() { stills.set(extra); }
+            });
         }
         if need_series {
             spawn(async move { if let Some(x) = backend::open_series_free(&m2).await { series.set(Some(x)); } });
@@ -100,9 +109,10 @@ pub fn use_title_artwork(media: &Media) -> Memo<Option<backend::Artwork>> {
         }
     });
     use_memo(move || {
+        let hero_art = backend::merge_title_stills(hero(), &stills());
         // Free-first merge: TVmaze/AniList season posters & billing-order cast win over TMDB,
         // while verified clean textless hero backdrop & logo from `hero` always win over TVmaze.
-        let combined = match (series(), hero()) {
+        let combined = match (series(), hero_art) {
             (Some(s), Some(h)) => {
                 // Keep hero's backdrop/logo/tagline/videos/stills primary, free series' season_posters/cast/crew primary.
                 let mut free_first = backend::with_extras(s, h.clone());

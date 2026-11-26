@@ -595,35 +595,55 @@ pub fn cached_artwork(m: &Media) -> Option<Artwork> {
     ARTWORK.get()?.lock().ok()?.get(&imdb).cloned()
 }
 
-/// Fast title hero artwork (~90-200ms): runs BetterPosters + keyless ElfHosted + keyless JustWatch
-/// multi-frame backdrops in parallel (never blocked by slower TVmaze/AniList/Wikidata calls).
+/// Synchronously read cached JustWatch stills for a title (if already fetched in this session).
+pub fn cached_title_stills(m: &Media) -> Option<Vec<String>> {
+    let imdb = imdb_of(m)?;
+    JW_STILLS_CACHE.get()?.lock().ok()?.get(&imdb).cloned()
+}
+
+/// Optional keyless multi-frame backdrops from JustWatch, fetched independently so slow
+/// responses never delay the primary hero backdrop.
+pub async fn title_stills(m: &Media) -> Vec<String> {
+    justwatch_stills(m).await
+}
+
+/// Merge JustWatch stills into hero artwork without displacing an existing primary backdrop.
+pub fn merge_title_stills(art: Option<Artwork>, stills: &[String]) -> Option<Artwork> {
+    if stills.is_empty() {
+        return art;
+    }
+    let mut out = art.unwrap_or_default();
+    let mut iter = stills.iter().cloned();
+    if out.backdrop.is_none() {
+        out.backdrop = iter.next();
+    }
+    for s in iter {
+        if out.stills.len() >= 4 { break; }
+        if Some(s.as_str()) != out.backdrop.as_deref() && !out.stills.contains(&s) {
+            out.stills.push(s);
+        }
+    }
+    Some(out)
+}
+
+/// Fast title hero artwork (~90-200ms): runs BetterPosters + keyless ElfHosted in parallel
+/// without waiting on optional JustWatch stills or slower TVmaze/AniList/Wikidata calls.
 pub async fn title_artwork_fast(m: &Media) -> Option<Artwork> {
     if let Some(hit) = cached_title_artwork(m) {
         return Some(hit);
     }
-    let (bp, elf, jw_stills) = tokio::join!(bp_artwork(m), elfhosted_artwork(m), justwatch_stills(m));
+    let (bp, elf) = tokio::join!(bp_artwork(m), elfhosted_artwork(m));
     let mut out = match (bp, elf) {
         (Some(f), Some(e)) => Some(with_extras(f, e)),
         (Some(f), None) => Some(f),
         (None, Some(e)) => Some(e),
         (None, None) => None,
     };
-    if !jw_stills.is_empty() {
-        let mut art = out.unwrap_or_default();
-        let mut iter = jw_stills.into_iter();
-        if art.backdrop.is_none() {
-            art.backdrop = iter.next();
-        }
-        for s in iter {
-            if art.stills.len() >= 4 { break; }
-            if Some(s.as_str()) != art.backdrop.as_deref() && !art.stills.contains(&s) {
-                art.stills.push(s);
-            }
-        }
-        out = Some(art);
+    if let Some(cached_stills) = cached_title_stills(m) {
+        out = merge_title_stills(out, &cached_stills);
     }
     // Fallback second frame via Metahub (usually a distinct textless backdrop from BetterPosters)
-    // when JustWatch had no stills for this IMDb title.
+    // when no stills are cached yet for this IMDb title.
     if let Some(ref mut art) = out {
         if art.stills.is_empty() && art.backdrop.is_some() {
             if let Some(imdb) = imdb_of(m) {

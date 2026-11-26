@@ -4,14 +4,15 @@
 //! length) to rank files by what they are, as labels written by add-ons and scrapers are often
 //! wrong.
 
-/// One audio track: its language tag as the file has it ("eng", "it", "" when untagged or "und")
-/// and its name ("English commentary").
+/// One audio track: its language tag as the file has it ("eng", "it", "" when untagged or "und"),
+/// its name ("English commentary"), and whether the container flagged it as commentary.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AudioTrack { pub lang: String, pub name: String }
+pub struct AudioTrack { pub lang: String, pub name: String, pub commentary: bool }
 
 impl AudioTrack {
     /// Commentary or audio description: not the film's own sound (as `engine::extra_audio`).
     pub fn extra(&self) -> bool {
+        if self.commentary { return true; }
         let n = self.name.to_lowercase();
         n.contains("commentary")
             || n.contains("description")
@@ -110,25 +111,30 @@ pub fn mp4_moov_at_end(head: &[u8]) -> bool {
 /// Parse audio tracks, picture, and video codec from the tail bytes of a non-fast-start MP4 file.
 pub fn parse_mp4_tail(tail: &[u8]) -> (Option<Vec<AudioTrack>>, Option<Picture>, Option<&'static str>) {
     // Scan for a plausible top-level `moov` box header (`[size: u32 BE] "moov"`) whose declared
-    // size fits inside the remainder of `tail`.
+    // size fits inside the remainder of `tail`. Parse ONLY the declared box extent and require
+    // real track metadata so an accidental `moov` signature inside media payload never short-circuits.
+    let mut inspected = 0usize;
     for i in 4..tail.len().saturating_sub(4) {
         if &tail[i..i + 4] != b"moov" { continue; }
         let start = i - 4;
         let size = u32::from_be_bytes(tail[start..i].try_into().unwrap()) as usize;
-        let valid = if size == 1 && start + 16 <= tail.len() {
+        let end = if size == 1 && start + 16 <= tail.len() {
             let sz64 = u64::from_be_bytes(tail[start + 8..start + 16].try_into().unwrap());
-            usize::try_from(sz64).ok().is_some_and(|n| n >= 24 && start.checked_add(n).is_some_and(|end| end <= tail.len()))
+            usize::try_from(sz64).ok().filter(|&n| n >= 24).and_then(|n| start.checked_add(n)).filter(|&e| e <= tail.len())
+        } else if size >= 16 {
+            start.checked_add(size).filter(|&e| e <= tail.len())
         } else {
-            size >= 16 && start.checked_add(size).is_some_and(|end| end <= tail.len())
+            None
         };
-        if valid {
-            let slice = &tail[start..];
-            let tracks = mp4(slice);
-            let pic = mp4_picture(slice).filter(|p| p.width > 0 && p.height > 0);
-            let codec = mp4_video_codec(slice);
-            if tracks.is_some() || pic.is_some() || codec.is_some() {
-                return (tracks, pic, codec);
-            }
+        let Some(end) = end else { continue };
+        inspected += 1;
+        if inspected > 32 { break; }
+        let slice = &tail[start..end];
+        let tracks = mp4(slice).filter(|t| !t.is_empty());
+        let pic = mp4_picture(slice).filter(|p| p.width > 0 && p.height > 0);
+        let codec = mp4_video_codec(slice);
+        if tracks.is_some() || pic.is_some() || codec.is_some() {
+            return (tracks, pic, codec);
         }
     }
     (None, None, None)
@@ -156,7 +162,7 @@ fn matroska_video_codec(head: &[u8]) -> Option<&'static str> {
         if id != TRACKS { continue; }
         if !whole { return None; }
         let tracks = &segment[start..end];
-        for (_, s, e, _) in elements(tracks).into_iter().filter(|e| e.0 == 0xAE && e.3) {
+        for (_, s, e, _) in elements(tracks).filter(|e| e.0 == 0xAE && e.3) {
             let entry = &tracks[s..e];
             let mut video = false;
             let mut codec_id = None;
@@ -221,40 +227,47 @@ fn vint(b: &[u8], keep_marker: bool) -> Option<(u64, usize)> {
     Some((v, len))
 }
 
-/// The elements in `b`: (id, payload start, payload end, whole); an unknown size runs to the
-/// end, and an element cut by the end of `b` is not whole.
-fn elements(b: &[u8]) -> Vec<(u64, usize, usize, bool)> {
-    let mut out = Vec::new();
-    let mut at = 0;
-    while at < b.len() {
-        let Some((id, il)) = vint(&b[at..], true) else { break };
-        let Some((size, sl)) = vint(&b[at + il..], false) else { break };
-        let start = at + il + sl;
+/// Lazily walk sibling EBML elements without allocating a Vec (capped to bound hostile headers).
+struct EbmlIter<'a> { b: &'a [u8], at: usize, left: usize, done: bool }
+impl Iterator for EbmlIter<'_> {
+    type Item = (u64, usize, usize, bool);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.left == 0 || self.at >= self.b.len() { return None; }
+        self.left -= 1;
+        let (id, il) = vint(&self.b[self.at..], true)?;
+        let (size, sl) = vint(&self.b[self.at + il..], false)?;
+        let start = self.at + il + sl;
         let unknown = size == (1u64 << (7 * sl)) - 1;
         let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
-        let end = if unknown { b.len() } else { start.saturating_add(size_usize) };
-        if end > b.len() && !unknown { out.push((id, start.min(b.len()), b.len(), false)); break; }
-        out.push((id, start, end, true));
-        if unknown { break; }
-        at = end;
+        let end = if unknown { self.b.len() } else { start.saturating_add(size_usize) };
+        if end > self.b.len() && !unknown {
+            self.done = true;
+            return Some((id, start.min(self.b.len()), self.b.len(), false));
+        }
+        if unknown { self.done = true; } else { self.at = end; }
+        Some((id, start, end, true))
     }
-    out
+}
+
+fn elements(b: &[u8]) -> EbmlIter<'_> {
+    EbmlIter { b, at: 0, left: 4096, done: false }
 }
 
 fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
     const SEGMENT: u64 = 0x1853_8067;
     const TRACKS: u64 = 0x1654_AE6B;
     const CLUSTER: u64 = 0x1F43_B675;
-    let (_, seg_start, seg_end, _) = elements(head).into_iter().find(|e| e.0 == SEGMENT)?;
+    let (_, seg_start, seg_end, _) = elements(head).find(|e| e.0 == SEGMENT)?;
     let segment = &head[seg_start..seg_end];
     for (id, start, end, whole) in elements(segment) {
         if id == CLUSTER { return None; }
         if id != TRACKS { continue; }
         // A cut Tracks element would hide tracks.
         if !whole { return None; }
-        return Some(elements(&segment[start..end]).into_iter().filter(|e| e.0 == 0xAE && e.3).filter_map(|(_, s, e, _)| {
+        return Some(elements(&segment[start..end]).filter(|e| e.0 == 0xAE && e.3).filter_map(|(_, s, e, _)| {
             let entry = &segment[start + s..start + e];
             let mut audio = false;
+            let mut commentary = false;
             let (mut lang, mut bcp47, mut name) = (None::<String>, None::<String>, String::new());
             for (id, s, e, _) in elements(entry) {
                 let v = &entry[s..e];
@@ -263,14 +276,20 @@ fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
                     0x22B59C => lang = Some(text(v)),
                     0x22B59D => bcp47 = Some(text(v)),
                     0x536E => name = text(v),
+                    0x55EE => commentary = uint(v) != 0,
                     _ => {}
                 }
             }
-            // Matroska's default language is English; ignore empty/"und" BCP-47 so legacy language still applies.
-            let lang = bcp47.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("und"))
+            // RFC 9559: LanguageBCP47 takes precedence when present (even if "und"); only absent
+            // language elements default to English.
+            let lang = bcp47.filter(|l| !l.is_empty())
                 .or_else(|| lang.filter(|l| !l.is_empty()))
                 .unwrap_or_else(|| "eng".into());
-            audio.then(|| AudioTrack { lang: if lang.eq_ignore_ascii_case("und") { String::new() } else { lang }, name })
+            audio.then(|| AudioTrack {
+                lang: if lang.eq_ignore_ascii_case("und") { String::new() } else { lang },
+                name,
+                commentary,
+            })
         }).collect());
     }
     None
@@ -310,7 +329,7 @@ fn matroska_picture(head: &[u8]) -> Option<Picture> {
         if id != TRACKS || found.is_some() { continue; }
         if !whole { return None; }
         let tracks = &segment[start..end];
-        for (_, s, e, _) in elements(tracks).into_iter().filter(|e| e.0 == 0xAE && e.3) {
+        for (_, s, e, _) in elements(tracks).filter(|e| e.0 == 0xAE && e.3) {
             let entry = &tracks[s..e];
             let mut picture = Picture { seconds, ..Picture::default() };
             let mut video = false;
@@ -330,10 +349,17 @@ fn matroska_picture(head: &[u8]) -> Option<Picture> {
                     },
                     // BlockAdditionMapping: a Dolby Vision configuration ("dvcC", "dvvC").
                     0x41E4 => {
-                        let mapping = elements(v);
-                        let kind = mapping.iter().find(|m| m.0 == 0x41E7).map(|m| uint(&v[m.1..m.2]));
+                        let mut kind = None;
+                        let mut profile = None;
+                        for (mid, ms, me, _) in elements(v) {
+                            match mid {
+                                0x41E7 => kind = Some(uint(&v[ms..me])),
+                                0x41ED => profile = dv_profile(&v[ms..me]),
+                                _ => {}
+                            }
+                        }
                         if matches!(kind, Some(0x6476_6343 | 0x6476_7643)) {
-                            picture.dolby_vision = mapping.iter().find(|m| m.0 == 0x41ED).and_then(|m| dv_profile(&v[m.1..m.2]));
+                            picture.dolby_vision = profile;
                         }
                     }
                     _ => {}
@@ -399,7 +425,11 @@ fn mp4(head: &[u8]) -> Option<Vec<AudioTrack>> {
         let lang = elng.filter(|l| !l.is_empty()).or_else(|| packed.map(|p| (0..3).rev().map(|i| (((p >> (5 * i)) & 0x1F) as u8 + 0x60) as char).collect()))
             .unwrap_or_default();
         // Allow BCP-47 numeric region subtags such as `es-419` (Latin-American Spanish).
-        Some(AudioTrack { lang: if lang.eq_ignore_ascii_case("und") || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { String::new() } else { lang }, name })
+        Some(AudioTrack {
+            lang: if lang.eq_ignore_ascii_case("und") || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { String::new() } else { lang },
+            name,
+            commentary: false,
+        })
     }).collect())
 }
 
@@ -480,9 +510,9 @@ mod tests {
     fn matroska_audio_tracks() {
         let file = mkv(&[(1, None, ""), (2, Some("kor"), ""), (2, None, "English commentary"), (2, Some("und"), ""), (17, Some("eng"), "")]);
         assert_eq!(audio_tracks(&file).unwrap(), [
-            AudioTrack { lang: "kor".into(), name: "".into() },
-            AudioTrack { lang: "eng".into(), name: "English commentary".into() },
-            AudioTrack { lang: "".into(), name: "".into() },
+            AudioTrack { lang: "kor".into(), name: "".into(), commentary: false },
+            AudioTrack { lang: "eng".into(), name: "English commentary".into(), commentary: false },
+            AudioTrack { lang: "".into(), name: "".into(), commentary: false },
         ]);
         // Cut before the tracks end: unknown, not "no audio".
         assert_eq!(audio_tracks(&file[..60]), None);
@@ -514,7 +544,7 @@ mod tests {
 
     #[test]
     fn language_from_the_tracks() {
-        let t = |lang: &str, name: &str| AudioTrack { lang: lang.into(), name: name.into() };
+        let t = |lang: &str, name: &str| AudioTrack { lang: lang.into(), name: name.into(), commentary: false };
         assert_eq!(in_language(&[t("kor", ""), t("fre", "")], "english"), Some(false));
         assert_eq!(in_language(&[t("kor", ""), t("eng", "Director's commentary")], "english"), Some(false));
         assert_eq!(in_language(&[t("kor", ""), t("en", "")], "english"), Some(true));
@@ -590,7 +620,7 @@ mod tests {
         let mut file = bx(b"ftyp", b"isomiso2");
         file.extend(bx(b"moov", &moov));
         file.extend(bx(b"mdat", &[0; 32]));
-        assert_eq!(audio_tracks(&file).unwrap(), [AudioTrack { lang: "eng".into(), name: "Stereo".into() }, AudioTrack { lang: "ita".into(), name: "".into() }]);
+        assert_eq!(audio_tracks(&file).unwrap(), [AudioTrack { lang: "eng".into(), name: "Stereo".into(), commentary: false }, AudioTrack { lang: "ita".into(), name: "".into(), commentary: false }]);
         // The index at the end (not fast-start): unknown.
         let mut late = bx(b"ftyp", b"isomiso2");
         late.extend(bx(b"mdat", &[0; 32]));
@@ -659,5 +689,57 @@ mod tests {
         let mp4_lat = [bx(b"ftyp", b"isom"), bx(b"moov", &moov_lat)].concat();
         let lat_tracks = audio_tracks(&mp4_lat).expect("latino mp4 parsed");
         assert_eq!(lat_tracks[0].lang, "es-419");
+    }
+
+    #[test]
+    fn matroska_commentary_flag_and_bcp47_und_override() {
+        // Track 1: main Japanese audio.
+        let mut t1 = el(&[0x83], &[2]);
+        t1.extend(el(&[0x22, 0xB5, 0x9C], b"jpn"));
+        // Track 2: English audio flagged as commentary via FlagCommentary (0x55EE = 1), no "commentary" in Name.
+        let mut t2 = el(&[0x83], &[2]);
+        t2.extend(el(&[0x22, 0xB5, 0x9C], b"eng"));
+        t2.extend(el(&[0x55, 0xEE], &[1]));
+        // Track 3: legacy Language=eng overridden by LanguageBCP47=und (unknown language).
+        let mut t3 = el(&[0x83], &[2]);
+        t3.extend(el(&[0x22, 0xB5, 0x9C], b"eng"));
+        t3.extend(el(&[0x22, 0xB5, 0x9D], b"und"));
+
+        let mut tracks = Vec::new();
+        for t in [t1, t2, t3] {
+            tracks.extend(el(&[0xAE], &t));
+        }
+        let mut segment = el(&[0x16, 0x54, 0xAE, 0x6B], &tracks);
+        segment.extend(el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]));
+        let mut file = el(&[0x1A, 0x45, 0xDF, 0xA3], b"header");
+        file.extend(el(&[0x18, 0x53, 0x80, 0x67], &segment));
+
+        let parsed = audio_tracks(&file).expect("mkv parsed");
+        assert_eq!(parsed.len(), 3);
+        assert!(!parsed[0].commentary);
+        assert!(parsed[1].commentary && parsed[1].extra());
+        assert_eq!(parsed[2].lang, "");
+        // Commentary-only English + untagged track => unknown rather than false English match.
+        assert_eq!(in_language(&parsed[..2], "english"), Some(false));
+        assert_eq!(in_language(&parsed, "english"), None);
+    }
+
+    #[test]
+    fn mp4_tail_skips_false_moov_signature_in_payload() {
+        let mut real_moov = trak(b"vide", "und", "Video");
+        real_moov.extend(trak(b"soun", "ita", "Main"));
+        let real_box = bx(b"moov", &real_moov);
+
+        // Decoy payload containing a size-plausible `moov` header with random junk inside.
+        let decoy = bx(b"moov", &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let mut tail = vec![0xAAu8; 16];
+        tail.extend_from_slice(&decoy);
+        tail.extend_from_slice(&[0xBBu8; 12]);
+        tail.extend_from_slice(&real_box);
+
+        let (tracks, _pic, _codec) = parse_mp4_tail(&tail);
+        let tracks = tracks.expect("real tail moov found past decoy");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].lang, "ita");
     }
 }

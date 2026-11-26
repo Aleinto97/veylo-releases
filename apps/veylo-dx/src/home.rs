@@ -71,6 +71,9 @@ fn load_home_disk() -> Option<HomeSnapshot> {
     Some(HomeSnapshot { rows, library, tonight, at: 0 })
 }
 
+static HOME_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOME_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn save_home_disk(snap: &HomeSnapshot) {
     let rows: Vec<serde_json::Value> = snap.rows.iter().filter_map(|(r, st)| {
         let Shelf::Ready(items) = st else { return None };
@@ -82,6 +85,7 @@ fn save_home_disk(snap: &HomeSnapshot) {
         }))
     }).collect();
     if rows.is_empty() && snap.tonight.is_empty() { return; }
+    let gen = HOME_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire);
     let payload = serde_json::json!({
         "at": backend::now_secs(),
         "rows": rows,
@@ -90,11 +94,17 @@ fn save_home_disk(snap: &HomeSnapshot) {
     });
     let text = payload.to_string();
     let path = backend::backend_data_dir().join(HOME_CACHE_FILE);
-    std::thread::spawn(move || { let _ = backend::write_private_file(&path, text.as_bytes()); });
+    std::thread::spawn(move || {
+        let _io = HOME_SAVE_LOCK.lock();
+        if HOME_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire) != gen { return; }
+        let _ = backend::write_private_file(&path, text.as_bytes());
+    });
 }
 
 /// Drop cached Home shelves (called when the user switches BetterPosters/add-on settings).
 pub fn invalidate_cache() {
+    HOME_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _io = HOME_SAVE_LOCK.lock();
     if let Some(m) = HOME_SNAPSHOT.get() {
         if let Ok(mut s) = m.lock() { *s = HomeSnapshot::default(); }
     }

@@ -581,6 +581,8 @@ fn doc_id(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes()
 #[derive(Default)]
 struct State {
     sent_until: i64,
+    media_sent_until: i64,
+    playback_sent_until: i64,
     taken_until: Option<String>,
     taken_doc: Option<String>,
     seen: BTreeMap<String, i64>,
@@ -598,9 +600,12 @@ fn load_state_unlocked() -> State {
     let v: Value = std::fs::read_to_string(state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let last = v["last"].as_i64().unwrap_or(0);
     let keys_hash = s(&v, "keys_hash");
+    let sent_until = v["sent_until"].as_i64().unwrap_or(0);
     LAST_SYNCED.store(last, std::sync::atomic::Ordering::Relaxed);
     State {
-        sent_until: v["sent_until"].as_i64().unwrap_or(0),
+        sent_until,
+        media_sent_until: v["media_sent_until"].as_i64().unwrap_or(sent_until),
+        playback_sent_until: v["playback_sent_until"].as_i64().unwrap_or(sent_until),
         taken_until: v["taken_until"].as_str().map(str::to_owned),
         taken_doc: v["taken_doc"].as_str().map(str::to_owned),
         seen: v["seen"].as_object().map(|o| o.iter().filter_map(|(k, t)| Some((k.clone(), t.as_i64()?))).collect()).unwrap_or_default(),
@@ -632,7 +637,9 @@ fn save_state_unlocked(st: &State) {
     }
     LAST_SYNCED.store(st.last, std::sync::atomic::Ordering::Relaxed);
     let data = json!({
-        "sent_until": st.sent_until,
+        "sent_until": st.media_sent_until.min(st.playback_sent_until),
+        "media_sent_until": st.media_sent_until,
+        "playback_sent_until": st.playback_sent_until,
         "taken_until": st.taken_until,
         "taken_doc": st.taken_doc,
         "seen": seen,
@@ -737,50 +744,120 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
         st.key_verified = true;
         SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    // Send: what changed here since the last time, but not what just came from elsewhere.
-    let changes = exec(json!({"op":"sync_changes","since":st.sent_until})).await?;
-    let mut writes = Vec::new();
-    let mut newest = st.sent_until;
-    for row in changes["media"].as_array().into_iter().flatten().chain(changes["playback"].as_array().into_iter().flatten()) {
-        let key = row_key(row);
-        let updated = row["updated"].as_i64().unwrap_or(0);
-        newest = newest.max(updated);
-        if st.seen.get(&key) == Some(&updated) { continue; }
-        // A catalogue row with no history goes only where the account has it (it was unsaved).
-        if row["history"] == false && !st.known.contains(&key) { continue; }
-        let mut data = row.clone();
-        if let Some(o) = data.as_object_mut() { o.remove("key"); o.remove("history"); }
-        data["t"] = json!(if key.starts_with("p|") { "p" } else { "m" });
-        if data.get("meta").is_some() { data["meta"] = slim_meta(&row["meta"]); }
-        writes.push(item_write(&base, &uid, &doc_id(&key), &data, &sync_key)?);
-        st.seen.insert(key.clone(), updated);
-        st.known.insert(key);
-    }
-    // Drain both persisted and concurrently queued tombstones; restore on commit failure.
-    let mut pending_forgotten = std::mem::take(&mut st.forgotten);
-    if let Ok(mut queued) = FORGOTTEN.lock() {
-        for item in queued.drain(..) {
-            if !pending_forgotten.contains(&item) { pending_forgotten.push(item); }
+    // Send: page media and playback independently with (updated, key) cursors so a newer
+    // playback row can never advance the cursor past unread media rows.
+    let mut total_sent = 0usize;
+    let mut media_cursor = (st.media_sent_until, None::<String>);
+    let mut playback_cursor = (st.playback_sent_until, None::<(String, String)>);
+    let mut media_done = false;
+    let mut playback_done = false;
+    let mut newest_media = st.media_sent_until;
+    let mut newest_playback = st.playback_sent_until;
+    let mut first_page = true;
+    loop {
+        let mut req = json!({
+            "op": "sync_changes",
+            "media_since": if media_done { i64::MAX - 1 } else { media_cursor.0 },
+            "playback_since": if playback_done { i64::MAX - 1 } else { playback_cursor.0 },
+        });
+        if !media_done {
+            if let Some(k) = &media_cursor.1 { req["media_after_key"] = json!(k); }
         }
-    }
-    for gone in &pending_forgotten {
-        let key = row_key(gone);
-        writes.push(item_write(&base, &uid, &doc_id(&key), gone, &sync_key)?);
-    }
-    let sent = writes.len();
-    if let Err(e) = commit(&token, writes).await {
-        if let Ok(mut queued) = FORGOTTEN.lock() {
-            for item in pending_forgotten {
-                if !queued.contains(&item) { queued.push(item); }
+        if !playback_done {
+            if let Some((mk, vk)) = &playback_cursor.1 {
+                req["playback_after_media"] = json!(mk);
+                req["playback_after_video"] = json!(vk);
             }
         }
-        return Err(e);
+        let changes = exec(req).await?;
+        let media_rows = changes["media"].as_array().cloned().unwrap_or_default();
+        let playback_rows = changes["playback"].as_array().cloned().unwrap_or_default();
+        let media_more = changes["media_more"].as_bool().unwrap_or(false);
+        let playback_more = changes["playback_more"].as_bool().unwrap_or(false);
+        let mut writes = Vec::new();
+        for row in &media_rows {
+            let key = row_key(row);
+            let updated = row["updated"].as_i64().unwrap_or(0);
+            newest_media = newest_media.max(updated);
+            if st.seen.get(&key) == Some(&updated) { continue; }
+            if row["history"] == false && !st.known.contains(&key) { continue; }
+            let mut data = row.clone();
+            if let Some(o) = data.as_object_mut() { o.remove("key"); o.remove("history"); }
+            data["t"] = json!("m");
+            if data.get("meta").is_some() { data["meta"] = slim_meta(&row["meta"]); }
+            writes.push(item_write(&base, &uid, &doc_id(&key), &data, &sync_key)?);
+            st.seen.insert(key.clone(), updated);
+            st.known.insert(key);
+        }
+        for row in &playback_rows {
+            let key = row_key(row);
+            let updated = row["updated"].as_i64().unwrap_or(0);
+            newest_playback = newest_playback.max(updated);
+            if st.seen.get(&key) == Some(&updated) { continue; }
+            let mut data = row.clone();
+            if let Some(o) = data.as_object_mut() { o.remove("key"); o.remove("history"); }
+            data["t"] = json!("p");
+            writes.push(item_write(&base, &uid, &doc_id(&key), &data, &sync_key)?);
+            st.seen.insert(key.clone(), updated);
+            st.known.insert(key);
+        }
+        // Drain both persisted and concurrently queued tombstones on the first page; restore on commit failure.
+        let pending_forgotten = if first_page {
+            let mut pf = std::mem::take(&mut st.forgotten);
+            if let Ok(mut queued) = FORGOTTEN.lock() {
+                for item in queued.drain(..) {
+                    if !pf.contains(&item) { pf.push(item); }
+                }
+            }
+            for gone in &pf {
+                let key = row_key(gone);
+                writes.push(item_write(&base, &uid, &doc_id(&key), gone, &sync_key)?);
+            }
+            pf
+        } else {
+            Vec::new()
+        };
+        first_page = false;
+        let page_sent = writes.len();
+        if let Err(e) = commit(&token, writes).await {
+            if !pending_forgotten.is_empty() {
+                if let Ok(mut queued) = FORGOTTEN.lock() {
+                    for item in pending_forgotten {
+                        if !queued.contains(&item) { queued.push(item); }
+                    }
+                }
+            }
+            return Err(e);
+        }
+        total_sent += page_sent;
+        if media_more {
+            if let Some(last) = media_rows.last() {
+                media_cursor = (last["updated"].as_i64().unwrap_or(media_cursor.0), last["key"].as_str().map(str::to_owned));
+            } else {
+                media_done = true;
+            }
+        } else {
+            media_done = true;
+        }
+        if playback_more {
+            if let Some(last) = playback_rows.last() {
+                let pair = last["key"].as_str().zip(last["video_id"].as_str()).map(|(m, v)| (m.to_owned(), v.to_owned()));
+                playback_cursor = (last["updated"].as_i64().unwrap_or(playback_cursor.0), pair);
+            } else {
+                playback_done = true;
+            }
+        } else {
+            playback_done = true;
+        }
+        if media_done && playback_done { break; }
     }
     // A second's changes may still be coming: the next sync looks at that second again.
-    st.sent_until = (newest - 1).max(st.sent_until);
+    st.media_sent_until = (newest_media - 1).max(st.media_sent_until);
+    st.playback_sent_until = (newest_playback - 1).max(st.playback_sent_until);
+    st.sent_until = st.media_sent_until.min(st.playback_sent_until);
     st.last = now_secs();
     save_state(&st);
-    Ok((taken, sent))
+    Ok((taken, total_sent))
 }
 
 /// A title forgotten here is forgotten on the other devices too.
@@ -1119,6 +1196,45 @@ async fn adopt_keys(v: &Value) {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkOffer { pub code: String, link: String, key: Vec<u8>, token: String }
 
+impl LinkOffer {
+    /// Short 6-digit visual pairing code (`XXX-XXX`) shown on both devices so the phone user can
+    /// confirm they are approving their own screen before transferring the session and E2EE key.
+    pub fn check_code(&self) -> String { link_sas(&self.link, &self.key) }
+}
+
+/// A scanned QR link awaiting explicit confirmation on the phone before credentials are sent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingLink {
+    pub code: String,
+    pub check_code: String,
+}
+
+fn link_sas(link: &str, key: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"veylo-link-sas-v1\0");
+    h.update(link.as_bytes());
+    h.update(b"\0");
+    h.update(key);
+    let digest = h.finalize();
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03}-{:03}", n / 1000, n % 1000)
+}
+
+fn parse_link_code(code: &str) -> Result<(String, Vec<u8>)> {
+    let parts: Vec<&str> = code.trim().split(':').collect();
+    let ["veylo-link", "1", link, key] = parts[..] else { anyhow::bail!("That isn't a Veylo sign-in code.") };
+    anyhow::ensure!(link.len() <= 64 && link.bytes().all(|b| b.is_ascii_alphanumeric()), "That isn't a Veylo sign-in code.");
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(key).ok().filter(|k| k.len() == 32).context("That isn't a Veylo sign-in code.")?;
+    Ok((link.to_owned(), key))
+}
+
+/// Validate a scanned Veylo link code and compute its 6-digit visual confirmation code.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn parse_pending_link(code: &str) -> Result<PendingLink> {
+    let (link, key) = parse_link_code(code)?;
+    Ok(PendingLink { code: code.trim().to_owned(), check_code: link_sas(&link, &key) })
+}
+
 /// Show a QR code to scan with a signed-in phone or tablet: this computer signs in for a moment
 /// without an account and leaves a request only it (and the phone holding the code) can answer.
 pub async fn offer_link() -> Result<LinkOffer> {
@@ -1168,14 +1284,10 @@ pub async fn take_link(offer: &LinkOffer) -> Result<Option<Account>> {
     Ok(Some(account))
 }
 
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 /// The phone's half: answer a computer's QR code with this account's session and E2EE Sync Key,
 /// sealed with the code's ephemeral key (only that computer can open it).
 pub async fn answer_link(code: &str) -> Result<()> {
-    let parts: Vec<&str> = code.trim().split(':').collect();
-    let ["veylo-link", "1", link, key] = parts[..] else { anyhow::bail!("That isn't a Veylo sign-in code.") };
-    anyhow::ensure!(link.len() <= 64 && link.bytes().all(|b| b.is_ascii_alphanumeric()), "That isn't a Veylo sign-in code.");
-    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(key).ok().filter(|k| k.len() == 32).context("That isn't a Veylo sign-in code.")?;
+    let (link, key) = parse_link_code(code)?;
     let (token, _) = id_token().await?;
     let session = SESSION.lock().ok().and_then(|x| x.clone()).context("Not signed in")?;
     let sync_key = ensure_sync_key()?;
@@ -1198,9 +1310,10 @@ pub async fn answer_link(code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Android: scan a computer's QR code with Google's scanner and answer it.
+/// Android: scan a computer's QR code and validate it locally without sending credentials yet;
+/// the caller confirms the 6-digit verification code before calling `answer_link`.
 #[cfg(target_os = "android")]
-pub async fn scan_and_link() -> Result<()> {
+pub async fn scan_link_code() -> Result<PendingLink> {
     crate::android::scan_code()?;
     let mut found = None;
     for _ in 0..1200 {
@@ -1213,7 +1326,7 @@ pub async fn scan_and_link() -> Result<()> {
         }
     }
     let code = found.context("Scan took too long. Try again.")?;
-    answer_link(&code).await
+    parse_pending_link(&code)
 }
 
 fn seal(key: &[u8], plain: &[u8]) -> Result<String> {
@@ -1421,6 +1534,19 @@ mod tests {
 
         let legacy = items_query(Some("2026-01-01T00:00:00Z"), None, 300);
         assert_eq!(legacy["where"]["fieldFilter"]["op"], "GREATER_THAN");
+    }
+
+    #[test]
+    fn link_confirmation_code_is_deterministic_and_rejects_malformed() {
+        let key = vec![7u8; 32];
+        let code = format!("veylo-link:1:abc123XYZ:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key));
+        let pending = parse_pending_link(&code).unwrap();
+        let offer = LinkOffer { code: code.clone(), link: "abc123XYZ".into(), key, token: String::new() };
+        assert_eq!(pending.check_code, offer.check_code());
+        assert_eq!(pending.check_code.len(), 7);
+        assert_eq!(pending.check_code.as_bytes()[3], b'-');
+        assert!(parse_pending_link("https://evil.example/qr").is_err());
+        assert!(parse_pending_link("veylo-link:1:bad-id:AAAA").is_err());
     }
 
     /// A computer's Google sign-in through the browser page, with your own account: it signs in,

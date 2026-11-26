@@ -32,7 +32,9 @@ pub(crate) struct Cue {
 struct Pending {
     start_ms: u64,
     end_ms: u64,
-    lines: Vec<String>,
+    lines: Vec<(String, bool)>,
+    chars: usize,
+    capped: bool,
 }
 
 /// Parses subtitle bytes as SRT, WebVTT, or a tolerant mixture of both.
@@ -72,9 +74,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Cue>> {
                     // identifier here without a blank separator. Preserve
                     // ordinary text: it can be the previous cue's final line.
                     if previous.lines.len() > 1
-                        && previous.lines.last().is_some_and(|line| {
-                            !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())
-                        })
+                        && previous.lines.last().is_some_and(|(_, numeric)| *numeric)
                     {
                         previous.lines.pop();
                     }
@@ -84,6 +84,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Cue>> {
                     start_ms,
                     end_ms,
                     lines: Vec::new(),
+                    chars: 0,
+                    capped: false,
                 });
                 continue;
             }
@@ -91,7 +93,26 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Cue>> {
             // cue; outside a cue it is ignored like any other marker line.
         }
         if let Some(p) = pending.as_mut() {
-            p.lines.push(line.to_string());
+            if p.capped {
+                continue;
+            }
+            let numeric = !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit());
+            for part in sanitize_line(line).split('\n') {
+                let trimmed = part.trim();
+                let n = trimmed.chars().count();
+                if p.chars + n > MAX_TEXT_CHARS {
+                    let take = MAX_TEXT_CHARS.saturating_sub(p.chars);
+                    if take > 0 {
+                        p.lines.push((trimmed.chars().take(take).collect(), false));
+                        p.chars = MAX_TEXT_CHARS;
+                    }
+                    p.capped = true;
+                    break;
+                }
+                let sep = usize::from(!p.lines.is_empty());
+                p.lines.push((trimmed.to_owned(), numeric));
+                p.chars += n + sep;
+            }
         }
     }
 
@@ -110,19 +131,17 @@ fn push_cue(cues: &mut Vec<Cue>, pending: Pending) {
     if cues.len() >= MAX_CUES || pending.end_ms <= pending.start_ms {
         return;
     }
-    let mut lines: Vec<String> = Vec::new();
-    for line in &pending.lines {
-        for part in sanitize_line(line).split('\n') {
-            lines.push(part.trim().to_string());
-        }
-    }
-    let Some(first) = lines.iter().position(|line| !line.is_empty()) else {
+    let Some(first) = pending.lines.iter().position(|(line, _)| !line.is_empty()) else {
         return;
     };
-    let Some(last) = lines.iter().rposition(|line| !line.is_empty()) else {
+    let Some(last) = pending.lines.iter().rposition(|(line, _)| !line.is_empty()) else {
         return;
     };
-    let mut text = lines[first..=last].join("\n");
+    let mut text = pending.lines[first..=last]
+        .iter()
+        .map(|(l, _)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if text.chars().count() > MAX_TEXT_CHARS {
         text = text.chars().take(MAX_TEXT_CHARS).collect();
     }

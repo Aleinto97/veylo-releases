@@ -29,7 +29,8 @@ object VeyloBack {
             }
             val cb = callback ?: object : OnBackPressedCallback(false) {
                 override fun handleOnBackPressed() {
-                    findWebView(activity.window.decorView)?.evaluateJavascript(
+                    val host = ownerRef?.get() ?: return
+                    findWebView(host.window.decorView)?.evaluateJavascript(
                         "document.querySelector('.app')?.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))",
                         null,
                     )

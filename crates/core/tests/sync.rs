@@ -158,3 +158,146 @@ async fn sqlite_indexes_cover_hot_sync_and_recommendation_queries() {
         "expected playback_updated index, got: {playback_plan}"
     );
 }
+
+#[tokio::test]
+async fn forgotten_title_tombstone_blocks_older_playback_resurrection() {
+    let data = Data::new();
+    let core = data.core();
+    // Apply a page that contains BOTH a deletion tombstone (t=1000) and an older playback row (t=900).
+    core.execute(json!({
+        "op": "sync_apply",
+        "media": [{"type": "series", "id": "tt0903747", "addon_url": CINEMETA, "updated": 1000, "deleted": true}],
+        "playback": [{
+            "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+            "video_id": "tt0903747:1:1", "position_ms": 500000, "duration_ms": 3000000,
+            "watched_ms": 500000, "watched": false, "updated": 900
+        }]
+    }))
+    .await
+    .unwrap();
+    assert_eq!(item(&core, "series", "tt0903747").await, Value::Null);
+    let watched = core
+        .execute(json!({"op": "playback_all", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+        .await
+        .unwrap();
+    assert!(watched["entries"].as_array().unwrap().is_empty());
+
+    // Even in a subsequent sync page, playback at or before t=1000 must still be ignored.
+    core.execute(json!({
+        "op": "sync_apply",
+        "media": [],
+        "playback": [{
+            "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+            "video_id": "tt0903747:1:2", "position_ms": 600000, "duration_ms": 3000000,
+            "watched_ms": 600000, "watched": true, "updated": 1000
+        }]
+    }))
+    .await
+    .unwrap();
+    assert_eq!(item(&core, "series", "tt0903747").await, Value::Null);
+
+    // A genuinely newer playback event (t=1001) after the deletion DOES restore the title.
+    core.execute(json!({
+        "op": "sync_apply",
+        "media": [],
+        "playback": [{
+            "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+            "video_id": "tt0903747:1:3", "position_ms": 700000, "duration_ms": 3000000,
+            "watched_ms": 700000, "watched": false, "updated": 1001
+        }]
+    }))
+    .await
+    .unwrap();
+    let restored = item(&core, "series", "tt0903747").await;
+    assert_ne!(restored, Value::Null);
+    let pb = core
+        .execute(json!({"op": "playback_all", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+        .await
+        .unwrap();
+    assert_eq!(pb["entries"][0]["video_id"], json!("tt0903747:1:3"));
+}
+
+#[tokio::test]
+async fn unmarking_film_and_episode_syncs_and_hides_cleared_history() {
+    let (a_data, b_data) = (Data::new(), Data::new());
+    let (a, b) = (a_data.core(), b_data.core());
+    // Watch both a film and a series episode on A, then sync to B.
+    a.execute(json!({
+        "op": "progress", "type": "movie", "id": "tt1375666", "addon_url": CINEMETA,
+        "position_ms": 5000000, "duration_ms": 5400000, "watched_add_ms": 5000000,
+        "meta": {"name": "Inception"}
+    }))
+    .await
+    .unwrap();
+    a.execute(json!({
+        "op": "mark_videos", "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+        "video_ids": ["tt0903747:1:1"], "watched": true, "meta": {"name": "Breaking Bad"}
+    }))
+    .await
+    .unwrap();
+    let first = changes(&a, 0).await;
+    b.execute(json!({"op": "sync_apply", "media": first["media"], "playback": first["playback"]}))
+        .await
+        .unwrap();
+    assert_eq!(item(&b, "movie", "tt1375666").await["watched"], json!(true));
+    assert_eq!(
+        b.execute(json!({"op": "watched_videos", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+            .await
+            .unwrap()["video_ids"],
+        json!(["tt0903747:1:1"])
+    );
+
+    // Unmark both on A strictly after B's synced copy (age both DBs back 5s before unmarking on A).
+    for dir in [&a_data.0, &b_data.0] {
+        let conn = rusqlite::Connection::open(dir.join("core.sqlite3")).unwrap();
+        conn.execute("UPDATE media SET updated = updated - 5", [])
+            .unwrap();
+        conn.execute("UPDATE playback SET updated = updated - 5", [])
+            .unwrap();
+    }
+    a.execute(json!({
+        "op": "mark_watched", "type": "movie", "id": "tt1375666", "addon_url": CINEMETA, "watched": false
+    }))
+    .await
+    .unwrap();
+    a.execute(json!({
+        "op": "mark_videos", "type": "series", "id": "tt0903747", "addon_url": CINEMETA,
+        "video_ids": ["tt0903747:1:1"], "watched": false
+    }))
+    .await
+    .unwrap();
+
+    // Cleared episode should not keep Breaking Bad in history or playback_all.
+    let hist = a.execute(json!({"op": "history"})).await.unwrap();
+    assert!(
+        !hist["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == "tt0903747"),
+        "unmarked episode should not stay in history: {hist}"
+    );
+    let pb_all = a
+        .execute(json!({"op": "playback_all", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+        .await
+        .unwrap();
+    assert!(pb_all["entries"].as_array().unwrap().is_empty());
+
+    // Sync the unmarks to B: both film and episode must become unwatched on B too.
+    let second = changes(&a, 0).await;
+    b.execute(
+        json!({"op": "sync_apply", "media": second["media"], "playback": second["playback"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        item(&b, "movie", "tt1375666").await["watched"],
+        json!(false)
+    );
+    assert_eq!(
+        b.execute(json!({"op": "watched_videos", "type": "series", "id": "tt0903747", "addon_url": CINEMETA}))
+            .await
+            .unwrap()["video_ids"],
+        json!([])
+    );
+}

@@ -553,7 +553,7 @@ pub async fn forget(media: &Media) -> Result<()> {
 
 /// Episodes of a series you watched: marked, or played through.
 pub async fn watched_episodes(media: &Media) -> HashSet<String> {
-    exec(json!({"op":"watched_videos","type":media.kind,"id":media.id})).await.ok()
+    exec(json!({"op":"watched_videos","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await.ok()
         .and_then(|v| v["video_ids"].as_array().map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_owned).collect()))
         .unwrap_or_default()
 }
@@ -776,7 +776,7 @@ pub async fn clear_subtitle_cache() -> Result<()> {
 
 /// Per-episode playback map for one series: `video_id -> (position_ms, duration_ms, watched)`.
 pub async fn episode_playback_map(media: &Media) -> HashMap<String, (i64, i64, bool)> {
-    let Ok(v) = exec(json!({"op":"playback_all","type":media.kind,"id":media.id})).await else { return HashMap::new() };
+    let Ok(v) = exec(json!({"op":"playback_all","type":media.kind,"id":media.id,"addon_url":media.addon_url})).await else { return HashMap::new() };
     v["entries"].as_array().into_iter().flatten().filter_map(|e| {
         let vid = e["video_id"].as_str()?.to_owned();
         let pos = e["position_ms"].as_i64().unwrap_or(0);

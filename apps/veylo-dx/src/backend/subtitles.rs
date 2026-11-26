@@ -265,7 +265,13 @@ pub async fn fetch_subtitle(url: &str) -> Result<String> {
     if let Some(path) = v["cache_path"].as_str().filter(|p| !p.is_empty()) {
         return Ok(path.to_owned());
     }
-    // Valid `Cache-Control: no-store` subtitle: render the core-validated cues into an ephemeral
+    // Valid `Cache-Control: no-store` ASS subtitle: stage the core-validated ASS bytes ephemerally.
+    if let Some(ass) = v["raw_ass"].as_str().filter(|s| !s.is_empty()) {
+        let path = backend_data_dir().join("sub-ephemeral.ass");
+        write_private_file(&path, ass.as_bytes()).context("Couldn't stage subtitle")?;
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    // Valid `Cache-Control: no-store` SRT/VTT subtitle: render the core-validated cues into an ephemeral
     // private VTT file rather than bypassing core validation with the raw remote URL.
     let cues = v["cues"].as_array().filter(|c| !c.is_empty())
         .context("Subtitle could not be cached or read")?;

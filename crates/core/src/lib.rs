@@ -349,10 +349,7 @@ impl Core {
                 self.mutate(&request)
             }
             // Sync between a person's devices (the app's account): what changed here, and another's changes.
-            "sync_changes" => {
-                let since = request["since"].as_i64().unwrap_or(0);
-                self.with_db(|db| db::sync_changes(db, since))
-            }
+            "sync_changes" => self.with_db(|db| db::sync_changes(db, &request)),
             "sync_apply" => self.with_db(|db| db::sync_apply(db, &request)),
             "recommendations" => Ok(recommendations::recommend(
                 &self.with_db(|db| db::personal_media(db))?,
@@ -530,9 +527,12 @@ impl Core {
                 db.execute("DELETE FROM cache WHERE key IN (
                     SELECT key FROM (SELECT key,SUM(length(CAST(body AS BLOB))) OVER (ORDER BY updated DESC,key) AS bytes FROM cache)
                     WHERE bytes>67108864)",[])?;
-                // Saved/history/feedback rows are never removed by catalog eviction.
-                db.execute("DELETE FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0 AND key IN (
+                // Saved/history/feedback/episode-activity rows are never removed by catalog eviction.
+                db.execute("DELETE FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
+                    AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
+                    AND key IN (
                     SELECT key FROM media WHERE saved=0 AND watched=0 AND position_ms=0 AND watched_ms=0 AND liked=0
+                    AND NOT EXISTS (SELECT 1 FROM playback p WHERE p.media_key=media.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
                     ORDER BY updated DESC,key LIMIT -1 OFFSET 10000)",[])?;
             } else {
                 db.execute("DELETE FROM cache WHERE key=?1",[url])?;
@@ -799,42 +799,81 @@ impl Core {
             Ok(json!({"video_id":video,"position_ms":position,"duration_ms":duration,"watched_ms":watched_ms,"watched":watched}))
         })
     }
-    /// All per-episode playback entries for one title (under any addon), for episode progress bars.
+    /// All per-episode playback entries for one title (scoped by addon_url when provided).
     fn playback_all(&self, req: &Value) -> Result<Value> {
         let kind = text(req, "type")?.to_owned();
         let id = text(req, "id")?.to_owned();
+        let scoped_key = match req
+            .get("addon_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            Some(url) => Some(db::identity(&kind, &id, &addon::normalize(url, true)?)),
+            None => None,
+        };
         self.with_db(|db| {
-            let mut q = db.prepare(
-                "SELECT p.video_id, p.position_ms, p.duration_ms, p.watched_ms, p.watched
-                 FROM playback p JOIN media m ON m.key=p.media_key
-                 WHERE m.type=?1 AND m.raw_id=?2",
-            )?;
-            let entries = q
-                .query_map(params![kind, id], |r| {
-                    Ok(json!({
-                        "video_id": r.get::<_, String>(0)?,
-                        "position_ms": r.get::<_, i64>(1)?,
-                        "duration_ms": r.get::<_, i64>(2)?,
-                        "watched_ms": r.get::<_, i64>(3)?,
-                        "watched": r.get::<_, i64>(4)? != 0,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let map_row = |r: &rusqlite::Row<'_>| {
+                Ok(json!({
+                    "video_id": r.get::<_, String>(0)?,
+                    "position_ms": r.get::<_, i64>(1)?,
+                    "duration_ms": r.get::<_, i64>(2)?,
+                    "watched_ms": r.get::<_, i64>(3)?,
+                    "watched": r.get::<_, i64>(4)? != 0,
+                }))
+            };
+            let entries = if let Some(key) = scoped_key {
+                let mut q = db.prepare(
+                    "SELECT video_id, position_ms, duration_ms, watched_ms, watched
+                     FROM playback WHERE media_key=?1 AND (watched<>0 OR position_ms>0 OR watched_ms>0)",
+                )?;
+                let rows = q
+                    .query_map([key], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            } else {
+                let mut q = db.prepare(
+                    "SELECT p.video_id, p.position_ms, p.duration_ms, p.watched_ms, p.watched
+                     FROM playback p JOIN media m ON m.key=p.media_key
+                     WHERE m.type=?1 AND m.raw_id=?2 AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0)",
+                )?;
+                let rows = q
+                    .query_map(params![kind, id], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
             Ok(json!({ "entries": entries }))
         })
     }
-    /// Videos of a title marked watched (by hand, or by measured playback), under any addon.
+    /// Videos of a title marked watched (by hand, or by measured playback), scoped by addon_url when provided.
     fn watched_videos(&self, req: &Value) -> Result<Value> {
         let kind = text(req, "type")?.to_owned();
         let id = text(req, "id")?.to_owned();
+        let scoped_key = match req
+            .get("addon_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            Some(url) => Some(db::identity(&kind, &id, &addon::normalize(url, true)?)),
+            None => None,
+        };
         self.with_db(|db| {
-            let mut q = db.prepare(
-                "SELECT p.video_id FROM playback p JOIN media m ON m.key=p.media_key
-                 WHERE m.type=?1 AND m.raw_id=?2 AND p.watched<>0",
-            )?;
-            let ids = q
-                .query_map(params![kind, id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let ids = if let Some(key) = scoped_key {
+                let mut q =
+                    db.prepare("SELECT video_id FROM playback WHERE media_key=?1 AND watched<>0")?;
+                let rows = q
+                    .query_map([key], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            } else {
+                let mut q = db.prepare(
+                    "SELECT p.video_id FROM playback p JOIN media m ON m.key=p.media_key
+                     WHERE m.type=?1 AND m.raw_id=?2 AND p.watched<>0",
+                )?;
+                let rows = q
+                    .query_map(params![kind, id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
             Ok(json!({ "video_ids": ids }))
         })
     }
@@ -844,9 +883,10 @@ impl Core {
         self.with_db(|db| {
             let mut q = db.prepare(
                 "SELECT m.type,m.raw_id,m.addon_url,m.meta,m.watched,m.position_ms,m.duration_ms,m.video_id,m.saved,m.liked,
-                        COALESCE((SELECT MAX(p.updated) FROM playback p WHERE p.media_key=m.key),m.updated) AS seen
+                        COALESCE((SELECT MAX(p.updated) FROM playback p WHERE p.media_key=m.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0)),m.updated) AS seen
                  FROM media m
-                 WHERE m.watched<>0 OR m.position_ms>0 OR m.watched_ms>0 OR EXISTS (SELECT 1 FROM playback p WHERE p.media_key=m.key)
+                 WHERE m.watched<>0 OR m.position_ms>0 OR m.watched_ms>0
+                    OR EXISTS (SELECT 1 FROM playback p WHERE p.media_key=m.key AND (p.watched<>0 OR p.position_ms>0 OR p.watched_ms>0))
                  ORDER BY seen DESC LIMIT ?1",
             )?;
             let rows = q.query_map([limit], |r| {
@@ -886,17 +926,21 @@ impl Core {
         self.with_db(|db| {
             let tx=db.transaction()?;
             let key=db::upsert_meta(&tx,kind,id,&addon,meta)?;
+            if op != "forget" {
+                tx.execute("DELETE FROM deleted_media WHERE key=?1", params![key])?;
+            }
             match op {
                 "set_library"=>{
                     tx.execute("UPDATE media SET saved=?2,updated=?3 WHERE key=?1",params![key,boolean(req,"saved",false)?,db::now()])?;
                 },
                 "mark_watched"=>{
                     let watched=boolean(req,"watched",true)?;
-                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,db::now()])?;
+                    let now=db::now();
+                    tx.execute("UPDATE media SET watched=?2,updated=?3 WHERE key=?1",params![key,watched,now])?;
                     if !watched {
-                        // A film watched through is unmarked to watch again: its own playback record
-                        // starts over too, or the next report would mark it watched straight away.
-                        tx.execute("UPDATE playback SET watched=0,watched_ms=0 WHERE media_key=?1 AND video_id=?2",params![key,id])?;
+                        // A film watched through is unmarked to watch again: timestamp the reset so
+                        // other devices receive the unmark in sync_changes.
+                        tx.execute("UPDATE playback SET watched=0,watched_ms=0,updated=?3 WHERE media_key=?1 AND video_id=?2",params![key,id,now])?;
                         tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1) WHERE key=?1",params![key])?;
                     }
                 },
@@ -915,16 +959,25 @@ impl Core {
                                 params![key,v,now],
                             )?;
                         } else {
-                            tx.execute("UPDATE playback SET watched=0,watched_ms=0,updated=?3 WHERE media_key=?1 AND video_id=?2",params![key,v,now])?;
-                            // A row that only said "watched" goes entirely.
-                            tx.execute("DELETE FROM playback WHERE media_key=?1 AND video_id=?2 AND position_ms=0",params![key,v])?;
+                            // Keep a timestamped cleared row so sync_changes propagates episode unmarks to other devices.
+                            tx.execute(
+                                "INSERT INTO playback(media_key,video_id,position_ms,duration_ms,watched_ms,updated,watched) VALUES(?1,?2,0,0,0,?3,0)
+                                 ON CONFLICT(media_key,video_id) DO UPDATE SET watched=0,watched_ms=0,updated=excluded.updated",
+                                params![key,v,now],
+                            )?;
                         }
                     }
                     // The title's measured total follows its episodes.
                     tx.execute("UPDATE media SET watched_ms=(SELECT COALESCE(SUM(watched_ms),0) FROM playback WHERE media_key=?1),updated=?2 WHERE key=?1",params![key,now])?;
                 },
                 "forget"=>{
-                    // Stop tracking a title: its history, progress, marks and rating all go.
+                    // Stop tracking a title: record a tombstone so older playback from another device cannot resurrect it.
+                    let now=db::now();
+                    tx.execute(
+                        "INSERT INTO deleted_media(key,deleted_at) VALUES(?1,?2)
+                         ON CONFLICT(key) DO UPDATE SET deleted_at=MAX(deleted_media.deleted_at,excluded.deleted_at)",
+                        params![key,now],
+                    )?;
                     tx.execute("DELETE FROM playback WHERE media_key=?1",params![key])?;
                     tx.execute("DELETE FROM media WHERE key=?1",params![key])?;
                 },
@@ -1059,11 +1112,13 @@ impl Core {
             self.inner.subtitles.remove(&url);
             None
         };
+        let raw_ass = (ass && path.is_none()).then(|| String::from_utf8_lossy(&bytes).into_owned());
         Ok(json!({
             "url": url,
             "count": cues.len(),
             "cached": from_cache,
             "cache_path": path,
+            "raw_ass": raw_ass,
             "cues": cues.iter().map(|cue| json!({
                 "start_ms": cue.start_ms,
                 "end_ms": cue.end_ms,
