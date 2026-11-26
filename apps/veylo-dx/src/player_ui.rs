@@ -116,7 +116,17 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
         let Some(video) = episode.clone() else { return };
         looked_up.set(true);
         let live = ask.0.clone();
-        spawn(async move { live.set_online_segments(backend::online_segments(&video, duration).await); });
+        spawn(async move {
+            match backend::online_segments(&video, duration).await {
+                Some(segs) => live.set_online_segments(segs),
+                None => {
+                    backend::sleep(10_000).await;
+                    if let Some(segs) = backend::online_segments(&video, duration).await {
+                        live.set_online_segments(segs);
+                    }
+                }
+            }
+        });
     });
 
     // The engine publishes its state; the controls follow it.
@@ -306,7 +316,7 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
     // `tapped`: chosen in the sheet (which then closes), not added on its own by the fallback.
     let add_online = use_callback(move |(sub, tapped): (OnlineSubtitle, bool)| {
         let live = get.0.clone();
-        if let Some(id) = sub_added.peek().get(&sub.id).copied() {
+        if let Some(id) = sub_added.peek().get(&sub.url).copied() {
             live.select(false, Some(id));
             if tapped {
                 if let Some(mk) = &dl_key {
@@ -318,18 +328,22 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             return;
         }
         if sub_busy.peek().is_some() { return; }
-        sub_busy.set(Some(sub.id.clone()));
+        sub_busy.set(Some(sub.url.clone()));
         let mut say = say;
         let mk_save = dl_key.clone();
         spawn(async move {
-            let file = backend::fetch_subtitle(&sub.url).await;
+            let Ok(file) = backend::fetch_subtitle(&sub.url).await else {
+                sub_busy.set(None);
+                say("Those subtitles couldn’t be loaded".into());
+                return;
+            };
             let (title, code) = (sub.language.clone(), sub.code.clone());
             let code_for_pref = code.clone();
             let added = backend::on_runtime(async move { tokio::task::spawn_blocking(move || live.add_subtitle(&file, &title, &code)).await }).await;
             sub_busy.set(None);
             match added {
                 Ok(Ok(Ok(id))) => {
-                    sub_added.write().insert(sub.id.clone(), id);
+                    sub_added.write().insert(sub.url.clone(), id);
                     if tapped {
                         if let Some(mk) = &mk_save {
                             backend::save_track_pref(mk, |p| { p.sub_lang = Some(code_for_pref); p.sub_off = false; });
@@ -1209,11 +1223,11 @@ fn OnlineSubtitles(online: Online, query: Signal<String>, busy: Option<String>, 
                 if rows.is_empty() { p { class: "dim player-empty", "No subtitles in “{q}”." } }
                 for (sub, n) in rows {
                     {
-                        let track = added.get(&sub.id).copied();
-                        let loading = busy.as_deref() == Some(sub.id.as_str());
+                        let track = added.get(&sub.url).copied();
+                        let loading = busy.as_deref() == Some(sub.url.as_str());
                         let about = if loading { "Downloading…".to_string() } else if track.is_some() { "Downloaded".to_string() } else { sub.release.clone().unwrap_or_else(|| sub.code.clone()) };
                         rsx! {
-                            button { key: "{sub.id}", class: if track.is_some() && track == selected { "player-option on" } else { "player-option" },
+                            button { key: "{sub.url}", class: if track.is_some() && track == selected { "player-option on" } else { "player-option" },
                                 role: "menuitemradio", aria_checked: "{track.is_some() && track == selected}", disabled: busy.is_some() && !loading,
                                 onclick: { let sub = sub.clone(); move |_| pick.call(sub.clone()) },
                                 span { class: "player-option-text",

@@ -141,6 +141,7 @@ pub fn Picks() -> Element {
     // The library teaches lasting taste: likes and dislikes, finishes, saves, long watches. Its
     // liked and finished titles are embedded once so their story counts, not just their genres.
     let mut facts_tick = use_signal(|| 0u32);
+    let mut embed_tick = use_signal(|| 0u32);
     use_effect(move || {
         let _ = facts_tick();
         let Some(items) = library.read().clone() else { return };
@@ -160,6 +161,7 @@ pub fn Picks() -> Element {
         spawn(async move {
             for m in todo { if crate::picks_ai::failed() { break; } let _ = crate::picks_ai::enrich_and_embed(&m).await; }
             facts_tick += 1;
+            embed_tick += 1;
         });
     });
     let disliked = use_memo(move || library.read().as_ref().map(|l| l.iter().filter(|m| m.liked < 0).map(brain::id).collect::<HashSet<_>>()).unwrap_or_default());
@@ -180,11 +182,10 @@ pub fn Picks() -> Element {
         let saved_only = (shell.picks_saved_only)();
         if saved_only {
             let lib = library.read().clone().unwrap_or_default();
-            let gone = rejected.read();
             let not_for_me = disliked.read();
             let seen = if hide_watched() { watched.read().clone().unwrap_or_default() } else { HashSet::new() };
             return lib.into_iter()
-                .filter(|m| m.saved && !gone.contains(&m.key()) && !finished(&seen, m) && !not_for_me.contains(&brain::id(m)))
+                .filter(|m| m.saved && !finished(&seen, m) && !not_for_me.contains(&brain::id(m)))
                 .collect::<Vec<_>>();
         }
         let this_year = backend::civil(backend::now_secs()).0 as i32;
@@ -212,19 +213,27 @@ pub fn Picks() -> Element {
                     for media in batch { tasks.spawn(async move { let _ = crate::picks_ai::enrich_and_embed(&media).await; }); }
                     while tasks.join_next().await.is_some() {}
                 }).await;
+                embed_tick += 1;
             }
         }
     });
     // The projection follows the catalogue: fitted once enough titles are embedded, refitted as
     // it grows (the brain replays everything into the new space).
-    let mut space_bucket = use_signal(|| 0usize);
+    let mut space_attempted = use_signal(|| 0usize);
+    let mut space_busy = use_signal(|| false);
     use_effect(move || {
-        let n = verified.read().len();
-        if !brain_ready() { return; }
-        let bucket = n / 40 + 1;
-        if *space_bucket.peek() >= bucket { return; }
-        space_bucket.set(bucket);
-        let (current, items) = { let b = brain.peek(); (b.space.clone(), b.item_embeddings()) };
+        let _ = (verified.read().len(), embed_tick());
+        if !brain_ready() || *space_busy.peek() { return; }
+        let (current, items_n) = { let b = brain.peek(); (b.space.clone(), b.item_embedding_count()) };
+        let n = crate::picks_ai::embedding_count() + items_n;
+        let attempted = *space_attempted.peek();
+        let due = match &current {
+            None => n >= 16 && n > attempted,
+            Some(s) => n >= s.count + 40 && n * 2 >= s.count * 3 && n >= attempted + 40,
+        };
+        if !due { return; }
+        space_busy.set(true);
+        let items = brain.peek().item_embeddings();
         spawn(async move {
             if let Some(space) = brain::refresh_space(current, items).await {
                 let list = pool.peek().clone();
@@ -233,37 +242,94 @@ pub fn Picks() -> Element {
                 b.refresh_items(&list);
                 brain::persist(&mut b, None);
             }
+            space_attempted.set(n);
+            space_busy.set(false);
         });
     });
     // The verified part of a list, when it still offers a choice beyond `exclude`.
     let prefer = move |list: &[Media], exclude: &[String]| -> Vec<Media> {
+        if *shell.picks_saved_only.peek() { return list.to_vec(); }
         let ok = verified.peek();
         let skip: HashSet<&str> = exclude.iter().map(String::as_str).collect();
         let ready: Vec<Media> = list.iter().filter(|m| ok.contains(&m.key())).cloned().collect();
         if ready.iter().filter(|m| !brain::excluded(m, &skip)).count() >= 2 { ready } else { list.to_vec() }
     };
+    // Never offered again in this run as a new card: what was shown, kept or starred, under any
+    // of its names (another source can list the same title under another key). Only a reshuffle,
+    // once every title for these filters was shown, or a new night brings them back.
+    let avoid = move || -> Vec<String> {
+        let mut ex = shown.peek().clone();
+        ex.extend(kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities));
+        ex
+    };
+    let shortlisted = move || -> Vec<String> { kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities).collect() };
+    let mut mark_shown = move |m: &Option<Media>| {
+        let Some(m) = m else { return };
+        let mut list = shown.write();
+        for name in brain::identities(m) { if !list.contains(&name) { list.push(name); } }
+    };
+    // Single reconciliation path for both background and visible card checks: if a title is
+    // rejected or swapped while sitting in either visible slot, replace that slot immediately.
+    let mut finish_check = move |m: Media, res: Check| {
+        let key = m.key();
+        checking.write().remove(&key);
+        match res {
+            Check::Ready(ready) => {
+                pool.with_mut(|p| rules::merge(p, vec![ready]));
+                verified.write().insert(key);
+                embed_tick += 1;
+                return;
+            }
+            Check::Reject => { rejected.write().insert(key.clone()); }
+            Check::Instead(first) => {
+                rejected.write().insert(key.clone());
+                pool.with_mut(|p| rules::merge(p, vec![first]));
+            }
+        }
+        if *shell.picks_saved_only.peek() { return; }
+        let (l, r) = pair.peek().clone();
+        let side = if l.as_ref().is_some_and(|x| x.key() == key) { Some(true) }
+            else if r.as_ref().is_some_and(|x| x.key() == key) { Some(false) }
+            else { None };
+        let Some(left) = side else { return };
+        let ex = avoid();
+        let list: Vec<Media> = filtered.peek().iter().filter(|x| x.key() != key).cloned().collect();
+        let opponent = if left { r } else { l };
+        let next = match &opponent {
+            Some(o) => brain.peek().challenger(&prefer(&list, &ex), &ex, o),
+            None => brain.peek().opening_pair(&prefer(&list, &ex), &ex).0,
+        };
+        // Nothing else to offer: show it anyway rather than an empty side.
+        let Some(c) = next else { verified.write().insert(key); return };
+        mark_shown(&Some(c.clone()));
+        pair.with_mut(|p| if left { p.0 = Some(c) } else { p.1 = Some(c) });
+    };
     // Check the candidates ahead of the duel, at most a dozen at a time: a finished check frees a
     // place (the effect follows `checking`), it doesn't add a dozen more.
-    // In Saved-only mode, saved titles are always eligible without requiring a trailer or swapping sequels.
+    // In Saved-only mode, saved titles are always eligible without touching catalog `verified`.
+    let mut saved_embedded = use_signal(HashSet::<String>::new);
     use_effect(move || {
         let saved_only = (shell.picks_saved_only)();
         if saved_only {
             let list = filtered.read().clone();
             let missing: Vec<Media> = {
-                let ok = verified.peek();
-                list.into_iter().filter(|m| !ok.contains(&m.key())).collect()
+                let done = saved_embedded.peek();
+                list.into_iter().filter(|m| !done.contains(&m.key()) && crate::picks_ai::embedding(m).is_none()).take(24).collect()
             };
             if !missing.is_empty() {
-                verified.with_mut(|v| for m in &missing { v.insert(m.key()); });
+                saved_embedded.with_mut(|s| for m in &missing { s.insert(m.key()); });
                 spawn(async move {
-                    for m in missing.into_iter().take(24) {
+                    for m in missing {
                         if crate::picks_ai::failed() { break; }
                         let _ = crate::picks_ai::embed(&m).await;
                     }
+                    embed_tick += 1;
                 });
             }
             return;
         }
+        // Wait for `watched` so sequel predecessor checks (`earlier_part`) never run against an empty set.
+        let Some(all_watched) = watched.read().clone() else { return };
         let in_flight = checking.read().len();
         let room = CHECKS_AT_ONCE.saturating_sub(in_flight);
         if room == 0 { return; }
@@ -274,14 +340,10 @@ pub fn Picks() -> Element {
         };
         for m in todo {
             checking.write().insert(m.key());
-            let all_watched = watched.peek().clone().unwrap_or_default();
+            let all_watched = all_watched.clone();
             spawn(async move {
-                match check(&m, &all_watched).await {
-                    Check::Ready(ready) => { pool.with_mut(|p| rules::merge(p, vec![ready])); verified.write().insert(m.key()); }
-                    Check::Reject => { rejected.write().insert(m.key()); }
-                    Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
-                }
-                checking.write().remove(&m.key());
+                let res = check(&m, &all_watched).await;
+                finish_check(m, res);
             });
         }
     });
@@ -343,21 +405,6 @@ pub fn Picks() -> Element {
         expanded.write().insert(id);
         spawn(async move { let more = backend::related(&m).await; if !more.is_empty() { pool.with_mut(|p| rules::merge(p, more)); } });
     };
-    // Never offered again in this run as a new card: what was shown, kept or starred, under any
-    // of its names (another source can list the same title under another key). Only a reshuffle,
-    // once every title for these filters was shown, or a new night brings them back.
-    let avoid = move || -> Vec<String> {
-        let mut ex = shown.peek().clone();
-        ex.extend(kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities));
-        ex
-    };
-    let shortlisted = move || -> Vec<String> { kept.peek().iter().chain(starred.peek().iter()).flat_map(brain::identities).collect() };
-    let mut mark_shown = move |m: &Option<Media>| {
-        let Some(m) = m else { return };
-        let mut list = shown.write();
-        for name in brain::identities(m) { if !list.contains(&name) { list.push(name); } }
-    };
-
     // Two fresh cards, each the favourite of one plausible taste. When every title for these
     // filters was shown tonight, another lap begins (the shortlist stays out of it).
     let mut start_duel = move || {
@@ -378,15 +425,18 @@ pub fn Picks() -> Element {
         streak.set(0);
         pair.set(next);
     };
+    // Initial readiness gate for Hide watched: flips false -> true once so later `watched`
+    // refreshes (e.g. after rating a card) don't reset the active duel or wipe the streak.
+    let watched_ready = use_memo(move || !hide_watched() || watched.read().is_some());
     // A new duel when a filter or Saved-only mode changes; a restored catalog duel is kept only
     // when entering normal mode. Wait for `watched` when Hide watched is on so completed titles never flash.
     use_effect(move || {
         let saved_only = (shell.picks_saved_only)();
         let hide = hide_watched();
-        let watched_ready = !hide || watched.read().is_some();
+        let ready = watched_ready();
         let _ = (kind(), style(), selected_genres(), from(), to(), hide, saved_only);
         if saved_only && *slot.peek() == Some(Slot::Filters) { slot.set(None); }
-        if loading() || !brain_ready() || !watched_ready { return; }
+        if loading() || !brain_ready() || !ready { return; }
         if *restored.peek() {
             restored.set(false);
             if !saved_only { return; }
@@ -411,9 +461,9 @@ pub fn Picks() -> Element {
     // The first pair, once there is something to choose from (and watched ids are ready if hiding watched).
     use_effect(move || {
         let n = filtered.read().len();
-        let watched_ready = !hide_watched() || watched.read().is_some();
+        let ready = watched_ready();
         let (l, r) = pair.peek().clone();
-        if !loading() && brain_ready() && watched_ready && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
+        if !loading() && brain_ready() && ready && n >= 1 && l.is_none() && r.is_none() { start_duel(); }
     });
     // Style is an invariant of visible catalog cards, including restored cards enriched later.
     use_effect(move || {
@@ -442,8 +492,8 @@ pub fn Picks() -> Element {
         let (l, r) = resolved_pair.peek().clone();
         let (Some(won), Some(lost)) = (if left { (l.clone(), r.clone()) } else { (r.clone(), l.clone()) }) else { return };
         let saved_only = *shell.picks_saved_only.peek();
-        if !verified.peek().contains(&won.key()) || !verified.peek().contains(&lost.key())
-            || (!saved_only && (!rules::style_matches(&won, *style.peek()) || !rules::style_matches(&lost, *style.peek()))) { return; }
+        if !saved_only && (!verified.peek().contains(&won.key()) || !verified.peek().contains(&lost.key())
+            || !rules::style_matches(&won, *style.peek()) || !rules::style_matches(&lost, *style.peek())) { return; }
         { let mut b = brain.write(); let e = b.keep(&won, &lost); brain::persist(&mut b, Some(&e)); }
         *round.write() += 1;
         let wins = if kept.peek().first().is_some_and(|k| k.key() == won.key()) { *streak.peek() + 1 } else { 1 };
@@ -472,8 +522,8 @@ pub fn Picks() -> Element {
         let st = *style.peek();
         let snap = {
             let (l, r) = resolved_pair.peek().clone();
-            l.zip(r).filter(|(l, r)| verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())
-                && (saved_only || (rules::style_matches(l, st) && rules::style_matches(r, st))))
+            l.zip(r).filter(|(l, r)| saved_only || (verified.peek().contains(&l.key()) && verified.peek().contains(&r.key())
+                && rules::style_matches(l, st) && rules::style_matches(r, st)))
                 .map(|(l, r)| (l.key(), r.key()))
         };
         let Some(expected_keys) = snap else { return };
@@ -520,39 +570,15 @@ pub fn Picks() -> Element {
     // (not a round). Saved-only cards stay eligible regardless of trailer availability.
     use_effect(move || {
         let (l, r) = pair();
-        if (shell.picks_saved_only)() {
-            for m in [l, r].into_iter().flatten() {
-                if !verified.peek().contains(&m.key()) { verified.write().insert(m.key()); }
-            }
-            return;
-        }
-        for (left, m) in [(true, l), (false, r)] {
-            let Some(m) = m else { continue };
+        if (shell.picks_saved_only)() { return; }
+        let Some(all_watched) = watched.read().clone() else { return };
+        for m in [l, r].into_iter().flatten() {
             if verified.peek().contains(&m.key()) || checking.peek().contains(&m.key()) { continue; }
             checking.write().insert(m.key());
-            let all_watched = watched.peek().clone().unwrap_or_default();
+            let all_watched = all_watched.clone();
             spawn(async move {
                 let res = check(&m, &all_watched).await;
-                checking.write().remove(&m.key());
-                match res {
-                    Check::Ready(ready) => { pool.with_mut(|p| rules::merge(p, vec![ready])); verified.write().insert(m.key()); return; }
-                    Check::Reject => { rejected.write().insert(m.key()); }
-                    Check::Instead(first) => { rejected.write().insert(m.key()); pool.with_mut(|p| rules::merge(p, vec![first])); }
-                }
-                let (l, r) = pair.peek().clone();
-                let on_screen = if left { l.clone() } else { r.clone() };
-                if on_screen.map(|x| x.key()) != Some(m.key()) { return; }
-                let ex = avoid();
-                let list = filtered.peek().clone();
-                let opponent = if left { r } else { l };
-                let next = match &opponent {
-                    Some(o) => brain.peek().challenger(&prefer(&list, &ex), &ex, o),
-                    None => brain.peek().opening_pair(&prefer(&list, &ex), &ex).0,
-                };
-                // Nothing else to offer: show it anyway rather than an empty side.
-                let Some(c) = next else { verified.write().insert(m.key()); return };
-                mark_shown(&Some(c.clone()));
-                pair.with_mut(|p| if left { p.0 = Some(c) } else { p.1 = Some(c) });
+                finish_check(m, res);
             });
         }
     });
@@ -561,8 +587,9 @@ pub fn Picks() -> Element {
     // lesson for tonight only), then two other cards.
     let mut change_pair = move |neither: bool| {
         if loading() || !brain_ready() || leaving.peek().is_some() { return; }
+        let saved_only = *shell.picks_saved_only.peek();
         let (l, r) = resolved_pair.peek().clone();
-        if l.iter().chain(r.iter()).any(|m| !verified.peek().contains(&m.key())) { return; }
+        if !saved_only && l.iter().chain(r.iter()).any(|m| !verified.peek().contains(&m.key())) { return; }
         if neither { if let (Some(a), Some(b)) = (&l, &r) { let mut br = brain.write(); let e = br.neither(a, b); brain::persist(&mut br, Some(&e)); } }
         start_duel();
     };
@@ -716,12 +743,14 @@ pub fn Picks() -> Element {
         let st = style();
         leaving().is_none()
             && l.as_ref().zip(r.as_ref()).is_some_and(|(l, r)| {
-                verified.read().contains(&l.key())
-                    && verified.read().contains(&r.key())
-                    && (saved_only || (rules::style_matches(l, st) && rules::style_matches(r, st)))
+                saved_only
+                    || (verified.read().contains(&l.key())
+                        && verified.read().contains(&r.key())
+                        && rules::style_matches(l, st)
+                        && rules::style_matches(r, st))
             })
     };
-    let ai_failed = !verified.read().is_empty() && crate::picks_ai::failed();
+    let ai_failed = (!verified.read().is_empty() || saved_only) && crate::picks_ai::failed();
 
     // What the brain says (each title's features cost a hash and a projection) is worked out
     // only when the brain, the candidates, the cards or tonight's picks change: not on every
@@ -1009,7 +1038,7 @@ struct CardInfo { matching: Option<u8>, why: Option<String>, feels: Vec<String>,
 fn side(m: Option<Media>, info: Option<CardInfo>, side: &'static str, verified: &HashSet<String>, style: Style, saved_only: bool, growing: bool,
     on_keep: EventHandler<()>, on_play: EventHandler<Media>, on_rate: EventHandler<(Media, i64)>, on_save: EventHandler<(Media, bool)>) -> Element {
     match m {
-        Some(m) if verified.contains(&m.key()) && (saved_only || rules::style_matches(&m, style)) => rsx! {
+        Some(m) if saved_only || (verified.contains(&m.key()) && rules::style_matches(&m, style)) => rsx! {
             for m in [m] { DuelCard { key: "{m.key()}", media: m.clone(), side, info: info.clone().unwrap_or_default(), on_keep, on_play, on_rate, on_save } }
         },
         None if saved_only || !growing => rsx! {

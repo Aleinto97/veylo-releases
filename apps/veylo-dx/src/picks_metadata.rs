@@ -83,16 +83,27 @@ pub async fn enrich(media: &Media) {
     }).await;
 }
 
-/// Write the store once a burst of enrichment is over, encoding it under a read lock on a thread
-/// of its own (one save at a time: the next waits for the next burst).
+/// Write the store once a burst of enrichment is over, encoding it under a read lock on a single
+/// background thread and writing atomically.
 fn save_soon() {
-    static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    DIRTY.store(true, Ordering::Release);
+    if RUNNING.swap(true, Ordering::AcqRel) { return; }
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        PENDING.store(false, std::sync::atomic::Ordering::Release);
-        let Some(text) = STORE.get().and_then(|s| s.read().ok().map(|s| encode_store(&s).to_string())) else { return };
-        let _ = std::fs::write(backend::backend_data_dir().join("picks-metadata-v1.json"), text);
+        let path = backend::backend_data_dir().join("picks-metadata-v1.json");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            DIRTY.store(false, Ordering::Release);
+            if let Some(text) = STORE.get().and_then(|s| s.read().ok().map(|s| encode_store(&s).to_string())) {
+                let _ = backend::write_private_file(&path, text.as_bytes());
+            }
+            if !DIRTY.load(Ordering::Acquire) {
+                RUNNING.store(false, Ordering::Release);
+                if !DIRTY.load(Ordering::Acquire) || RUNNING.swap(true, Ordering::AcqRel) { break; }
+            }
+        }
     });
 }
 

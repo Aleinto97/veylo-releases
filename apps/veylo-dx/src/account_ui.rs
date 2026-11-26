@@ -21,6 +21,19 @@ pub fn AccountBlock() -> Element {
     let mut key_copied = use_signal(|| false);
     let mut recovery_draft = use_signal(String::new);
     let mut enter_key_open = use_signal(backend::sync_key_needed);
+    let mut last_uid = use_signal(|| account.peek().as_ref().map(|a| a.uid.clone()));
+    use_effect(move || {
+        let uid = account().map(|a| a.uid);
+        if *last_uid.peek() != uid {
+            last_uid.set(uid);
+            show_key.set(false);
+            confirm_delete.set(false);
+            key_copied.set(false);
+            password.set(String::new());
+            recovery_draft.set(String::new());
+            enter_key_open.set(backend::sync_key_needed());
+        }
+    });
     if !backend::accounts_available() { return rsx! {}; }
 
     let mut run = move |label: &'static str, job: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>>>>| {
@@ -157,7 +170,18 @@ pub fn AccountBlock() -> Element {
                                 }
                                 div { class: "setting-controls",
                                     button { class: "pill glass small", disabled: working.is_some(),
-                                        onclick: move |_| { backend::sign_out(); account.set(None); note.set(None); },
+                                        onclick: move |_| {
+                                            backend::sign_out();
+                                            account.set(None);
+                                            note.set(None);
+                                            problem.set(None);
+                                            show_key.set(false);
+                                            confirm_delete.set(false);
+                                            enter_key_open.set(false);
+                                            key_copied.set(false);
+                                            password.set(String::new());
+                                            recovery_draft.set(String::new());
+                                        },
                                         span { "Sign out" } }
                                     if confirm_delete() {
                                         span { class: "confirm", role: "group", aria_label: "Delete the account?",
@@ -297,19 +321,27 @@ fn LinkPanel(on_signed_in: EventHandler<()>) -> Element {
 /// Confirmation toast when your synced settings and add-ons arrive automatically on this device.
 #[component]
 pub fn KeysPrompt() -> Element {
-    let mut arrived = use_signal(|| None::<String>);
+    let mut arrived = use_signal(|| None::<(u64, String)>);
     use_future(move || async move {
+        let mut seq = 0u64;
         loop {
             if let Some(from) = backend::take_keys_arrived() {
-                arrived.set(Some(from));
-                spawn(async move { backend::sleep(7000).await; arrived.set(None); });
+                seq = seq.wrapping_add(1);
+                let id = seq;
+                arrived.set(Some((id, from)));
+                spawn(async move {
+                    backend::sleep(7000).await;
+                    if arrived.peek().as_ref().map(|t| t.0) == Some(id) {
+                        arrived.set(None);
+                    }
+                });
             }
             backend::sleep(2000).await;
         }
     });
     rsx! {
-        if let Some(from) = arrived() {
-            div { class: "toast glass", role: "status",
+        if let Some((_, from)) = arrived() {
+            div { class: "toast glass keys-toast", role: "status",
                 span { class: "lamp", icons::Check {} }
                 span { class: "toast-title",
                     if from.is_empty() { "Your settings and add-ons synced to this device" }

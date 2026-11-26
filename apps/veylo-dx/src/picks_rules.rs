@@ -114,12 +114,18 @@ pub fn settle_style(m: &mut Media, animated: bool) {
     m.raw["genres"] = serde_json::json!(m.genres);
 }
 
-/// Add titles to the pool once each: same entry, same IMDb id or same title from another source.
+/// Add titles to the pool once each: same entry, same IMDb id or same title+kind from another source.
 pub fn merge(pool: &mut Vec<Media>, more: Vec<Media>) {
+    let same_kind = |a: &Media, b: &Media| (a.kind == "movie") == (b.kind == "movie");
     for m in more.into_iter().map(tidy) {
         let title = title_key(&m);
         let id = imdb(&m);
-        if let Some(existing) = pool.iter_mut().find(|old| old.key() == m.key() || title_key(old) == title || (id.is_some() && imdb(old) == id)) {
+        if let Some(existing) = pool.iter_mut().find(|old| {
+            if old.key() == m.key() { return true; }
+            let old_id = imdb(old);
+            if id.is_some() && old_id.is_some() { return old_id == id; }
+            same_kind(old, &m) && title_key(old) == title
+        }) {
             // A later source can supply a missing style. Deduplication must not throw it away,
             // unless TMDB already settled it (then only TMDB's word counts).
             let settled = m.raw[SETTLED].as_bool().or_else(|| existing.raw[SETTLED].as_bool());
@@ -301,6 +307,21 @@ mod tests {
         assert_eq!(ids(filter_picks(&c, None, Style::Both, &[], Some(2020), None, 2026)), ["c"]);
         assert_eq!(ids(filter_picks(&c, Some("movie"), Style::Both, &[], None, None, 2026)), ["a", "d"]);
         assert!(filter_picks(&c, None, Style::Both, &[], Some(2021), Some(2000), 2026).is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_conflicting_imdb_ids_and_different_kinds_separate() {
+        let m1 = Media::from_json(&json!({"id": "tt0000001", "type": "movie", "name": "Crash", "releaseInfo": "2004"}), "a").unwrap();
+        let m2 = Media::from_json(&json!({"id": "tt0000002", "type": "movie", "name": "Crash", "releaseInfo": "2004"}), "b").unwrap();
+        let mut pool = vec![m1];
+        merge(&mut pool, vec![m2]);
+        assert_eq!(pool.len(), 2, "different IMDb ids must never merge even with equal title/year");
+
+        let film = Media::from_json(&json!({"id": "tmdb:100", "type": "movie", "name": "Fargo", "releaseInfo": "2014"}), "a").unwrap();
+        let show = Media::from_json(&json!({"id": "tvmaze:100", "type": "series", "name": "Fargo", "releaseInfo": "2014"}), "b").unwrap();
+        let mut pool2 = vec![film];
+        merge(&mut pool2, vec![show]);
+        assert_eq!(pool2.len(), 2, "movie and series must not merge by title_key alone");
     }
 
     #[test]

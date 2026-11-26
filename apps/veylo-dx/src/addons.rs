@@ -73,7 +73,7 @@ pub const LANGUAGES: &[Language] = &[
 
 pub fn language(key: &str) -> Option<&'static Language> { LANGUAGES.iter().find(|l| l.key == key) }
 
-fn host_of(url: &str) -> String { url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default() }
+pub fn host_of(url: &str) -> String { url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default() }
 
 fn is_cinemeta(url: &str) -> bool { url.contains("v3-cinemeta.strem.io") }
 
@@ -136,12 +136,14 @@ impl Row {
     }
 }
 
-/// Derive a Stremio add-on's `/configure` URL from its manifest URL.
+/// Derive a Stremio add-on's `/configure` URL from its manifest URL, preserving query parameters.
 pub fn derive_configure_url(manifest_url: &str) -> Option<String> {
-    let parsed = url::Url::parse(manifest_url).ok()?;
+    let mut parsed = url::Url::parse(manifest_url).ok()?;
     if parsed.scheme() != "https" { return None; }
-    let trimmed = manifest_url.strip_suffix("/manifest.json").unwrap_or(manifest_url.trim_end_matches('/'));
-    Some(format!("{trimmed}/configure"))
+    let path = parsed.path().to_owned();
+    let trimmed = path.strip_suffix("/manifest.json").unwrap_or(path.trim_end_matches('/'));
+    parsed.set_path(&format!("{trimmed}/configure"));
+    Some(parsed.into())
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -255,17 +257,16 @@ pub fn normalize_custom_addon_url(raw: &str) -> Result<String> {
     } else {
         trimmed.to_owned()
     };
-    let parsed = url::Url::parse(&normalized).map_err(|_| anyhow::anyhow!("That doesn't look like a valid add-on URL."))?;
+    let mut parsed = url::Url::parse(&normalized).map_err(|_| anyhow::anyhow!("That doesn't look like a valid add-on URL."))?;
     let host = parsed.host_str().unwrap_or_default();
     let is_local = matches!(host, "localhost" | "127.0.0.1" | "::1");
     ensure!(parsed.scheme() == "https" || (parsed.scheme() == "http" && is_local),
         "Add-on links must start with https:// (or stremio://).");
-    let mut url = normalized;
     if !parsed.path().ends_with("/manifest.json") {
-        let base = url.trim_end_matches('/');
-        url = format!("{base}/manifest.json");
+        let base = parsed.path().trim_end_matches('/').to_owned();
+        parsed.set_path(&format!("{base}/manifest.json"));
     }
-    Ok(url)
+    Ok(parsed.into())
 }
 
 /// Fetch basic public metadata (name, description, version, resources) of a manifest URL before
@@ -280,18 +281,52 @@ pub struct ManifestPreview {
     pub offers: String,
 }
 
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
 pub async fn preview_manifest(raw: &str) -> Result<ManifestPreview> {
     let url = normalize_custom_addon_url(raw)?;
     let host = host_of(&url);
     let fetch_url = url.clone();
     let v: Value = on_runtime(async move {
-        let resp = backend::backend_http()
-            .get(&fetch_url)
+        let client = reqwest::Client::builder()
+            .user_agent("veylo-dx")
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .connect_timeout(std::time::Duration::from_secs(8))
             .timeout(std::time::Duration::from_secs(12))
-            .send().await
-            .map_err(|_| anyhow::anyhow!("Couldn't reach that add-on server."))?;
+            .build()
+            .map_err(|_| anyhow::anyhow!("Couldn't prepare the add-on check."))?;
+        let mut current = url::Url::parse(&fetch_url).map_err(|_| anyhow::anyhow!("That doesn't look like a valid add-on URL."))?;
+        let mut resp = None;
+        for hop in 0..=3 {
+            let h = current.host_str().unwrap_or_default();
+            let local = matches!(h, "localhost" | "127.0.0.1" | "::1");
+            ensure!(current.scheme() == "https" || (current.scheme() == "http" && local),
+                "Add-on links must stay on https://.");
+            let r = client.get(current.clone()).send().await
+                .map_err(|_| anyhow::anyhow!("Couldn't reach that add-on server."))?;
+            if r.status().is_redirection() {
+                ensure!(hop < 3, "That add-on link redirected too many times.");
+                let loc = r.headers().get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("That add-on server sent an invalid redirect."))?;
+                current = current.join(loc).map_err(|_| anyhow::anyhow!("That add-on server sent an invalid redirect."))?;
+                continue;
+            }
+            resp = Some(r);
+            break;
+        }
+        let mut resp = resp.ok_or_else(|| anyhow::anyhow!("Couldn't reach that add-on server."))?;
         ensure!(resp.status().is_success(), "That add-on server didn't return a manifest.");
-        resp.json::<Value>().await.map_err(|_| anyhow::anyhow!("That link didn't return a valid Stremio manifest."))
+        if let Some(len) = resp.content_length() {
+            ensure!(len as usize <= MAX_MANIFEST_BYTES, "That add-on manifest is unexpectedly large.");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|_| anyhow::anyhow!("Couldn't finish reading that add-on manifest."))? {
+            ensure!(body.len().saturating_add(chunk.len()) <= MAX_MANIFEST_BYTES, "That add-on manifest is unexpectedly large.");
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice::<Value>(&body).map_err(|_| anyhow::anyhow!("That link didn't return a valid Stremio manifest."))
     }).await??;
     let name = s(&v, "name");
     ensure!(!name.is_empty(), "That link didn't return a valid Stremio manifest.");
@@ -559,6 +594,14 @@ mod tests {
         assert!(!it.matches("Film.2160p\n💾 79 GiB\n🇬🇧 / 🇯🇵 Subs / 🇬🇧 / 🇮🇹"));
         assert!(!it.matches("Film 2010 AC3 5.1 ENG 2160p sub ITA"));
         assert!(it.matches("Film (2010) AC3 5.1 ITA.ENG 2160p H265 sub NUita.eng"));
+    }
+
+    #[test]
+    fn query_bearing_addon_urls_preserve_query_on_normalize_and_configure() {
+        let u = normalize_custom_addon_url("https://addon.example/base?token=abc").unwrap();
+        assert_eq!(u, "https://addon.example/base/manifest.json?token=abc");
+        let cfg = derive_configure_url(&u).unwrap();
+        assert_eq!(cfg, "https://addon.example/base/configure?token=abc");
     }
 
     #[test]

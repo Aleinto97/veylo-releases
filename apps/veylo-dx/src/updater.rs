@@ -61,39 +61,50 @@ pub fn newer(latest: &str, current: &str) -> bool {
     !a.is_empty() && a > b
 }
 
+const MAX_UPDATE_BYTES: u64 = 256 * 1024 * 1024;
+static CHECKED: tokio::sync::OnceCell<Option<Release>> = tokio::sync::OnceCell::const_new();
+
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().user_agent("veylo-dx").build().unwrap_or_default()
+    reqwest::Client::builder()
+        .user_agent("veylo-dx")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
 }
 
 /// The latest release when it is newer than this build and has this platform's file; None offline or up to date.
+/// Cached for the session so navigating overlays never burns through GitHub's unauthenticated rate limit.
 pub async fn check() -> Option<Release> {
     let asset = ASSET?;
     crate::backend::on_runtime(async move {
-        let http = client();
-        let body = http.get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
-            .header("Accept", "application/vnd.github+json")
-            .send().await.ok()?.error_for_status().ok()?.bytes().await.ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-        let version = v["tag_name"].as_str()?.trim_start_matches('v').to_owned();
-        if !newer(&version, env!("CARGO_PKG_VERSION")) { return None; }
-        let assets = v["assets"].as_array()?;
-        let entry = assets.iter().find(|a| a["name"] == asset)?;
-        let url = entry["browser_download_url"].as_str()?.to_owned();
-        let mut sha256 = parse_github_digest(entry["digest"].as_str());
-        if sha256.is_none() {
-            if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(|a| a["browser_download_url"].as_str()) {
-                if let Ok(resp) = http.get(sums_url).send().await {
-                    if let Ok(ok_resp) = resp.error_for_status() {
-                        if let Ok(text) = ok_resp.text().await {
-                            sha256 = parse_sha256sums(&text, asset);
+        CHECKED.get_or_init(|| async move {
+            let http = client();
+            let body = http.get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+                .header("Accept", "application/vnd.github+json")
+                .send().await.ok()?.error_for_status().ok()?.bytes().await.ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            let version = v["tag_name"].as_str()?.trim_start_matches('v').to_owned();
+            if !newer(&version, env!("CARGO_PKG_VERSION")) { return None; }
+            let assets = v["assets"].as_array()?;
+            let entry = assets.iter().find(|a| a["name"] == asset)?;
+            let url = entry["browser_download_url"].as_str()?.to_owned();
+            let mut sha256 = parse_github_digest(entry["digest"].as_str());
+            if sha256.is_none() {
+                if let Some(sums_url) = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(|a| a["browser_download_url"].as_str()) {
+                    if let Ok(resp) = http.get(sums_url).send().await {
+                        if let Ok(ok_resp) = resp.error_for_status() {
+                            if let Ok(text) = ok_resp.text().await {
+                                sha256 = parse_sha256sums(&text, asset);
+                            }
                         }
                     }
                 }
             }
-        }
-        // Fail closed: never offer an update unless a valid 64-hex SHA-256 digest was verified.
-        let sha256 = sha256?;
-        Some(Release { version, url, sha256 })
+            // Fail closed: never offer an update unless a valid 64-hex SHA-256 digest was verified.
+            let sha256 = sha256?;
+            Some(Release { version, url, sha256 })
+        }).await.clone()
     }).await.ok().flatten()
 }
 
@@ -101,6 +112,25 @@ pub async fn check() -> Option<Release> {
 /// Stream the release file to `to` (an APK is ~150 MB: never held in memory) and verify SHA-256.
 async fn download(url: String, to: PathBuf, expected_sha256: String) -> Result<()> {
     crate::backend::on_runtime(verify_download_to(url, to, expected_sha256)).await?
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+fn file_matches_sha256(path: &std::path::Path, expected_sha256: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) { return false; }
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hasher.finalize()) == expected
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos", test)), allow(dead_code))]
@@ -114,18 +144,39 @@ async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -
     );
     let mut response = client().get(&url).send().await.and_then(|r| r.error_for_status())
         .map_err(|_| anyhow!("Couldn't download the update"))?;
+    if let Some(len) = response.content_length() {
+        anyhow::ensure!(len <= MAX_UPDATE_BYTES, "The update file is unexpectedly large.");
+    }
     if let Some(dir) = to.parent() { std::fs::create_dir_all(dir).context("Couldn't save the update")?; }
-    let mut file = std::fs::File::create(&to).context("Couldn't save the update")?;
+    let part = to.with_extension(format!("{}.part", to.extension().and_then(|e| e.to_str()).unwrap_or("bin")));
+    let _ = std::fs::remove_file(&part);
+    let mut file = std::fs::File::create(&part).context("Couldn't save the update")?;
     let mut hasher = Sha256::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| anyhow!("The download was interrupted"))? {
+    let mut written: u64 = 0;
+    while let Some(chunk) = response.chunk().await.map_err(|_| { let _ = std::fs::remove_file(&part); anyhow!("The download was interrupted") })? {
+        written = written.saturating_add(chunk.len() as u64);
+        if written > MAX_UPDATE_BYTES {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            anyhow::bail!("The update file is unexpectedly large.");
+        }
         hasher.update(&chunk);
-        file.write_all(&chunk).context("Couldn't save the update")?;
+        if let Err(e) = file.write_all(&chunk) {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            return Err(e).context("Couldn't save the update");
+        }
     }
     file.sync_all().context("Couldn't save the update")?;
+    drop(file);
     let actual = format!("{:x}", hasher.finalize());
     if actual != expected {
-        let _ = std::fs::remove_file(&to);
+        let _ = std::fs::remove_file(&part);
         anyhow::bail!("The downloaded update failed verification. Try again.");
+    }
+    if let Err(e) = std::fs::rename(&part, &to) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).context("Couldn't save the update");
     }
     Ok(())
 }
@@ -154,12 +205,16 @@ pub enum Outcome { Installing, NeedsPermission }
 #[cfg(target_os = "android")]
 pub async fn install(release: Release) -> Result<Outcome> {
     let apk = crate::android::files_dir()?.join("updates").join(ASSET.context("No update for this platform")?);
-    // Already downloaded (the viewer went to allow installs and came back): use it.
-    let fresh = std::fs::metadata(&apk).map(|m| m.len() > 0).unwrap_or(false)
-        && std::fs::read_to_string(apk.with_extension("version")).ok().as_deref() == Some(release.version.as_str());
+    // Already downloaded (the viewer went to allow installs and came back): reuse only if SHA-256 still matches.
+    let apk_check = apk.clone();
+    let expected = release.sha256.clone();
+    let fresh = std::fs::read_to_string(apk.with_extension("version")).ok().as_deref() == Some(release.version.as_str())
+        && crate::backend::on_runtime(async move {
+            tokio::task::spawn_blocking(move || file_matches_sha256(&apk_check, &expected)).await.unwrap_or(false)
+        }).await.unwrap_or(false);
     if !fresh {
         download(release.url.clone(), apk.clone(), release.sha256.clone()).await?;
-        std::fs::write(apk.with_extension("version"), &release.version).context("Couldn't save the update")?;
+        let _ = crate::backend::write_private_file(&apk.with_extension("version"), release.version.as_bytes());
     }
     match crate::android::install_update(&apk)?.as_str() {
         "permission" => Ok(Outcome::NeedsPermission),
@@ -341,8 +396,10 @@ mod tests {
             });
             let url = format!("http://127.0.0.1:{port}/release.zip");
             let ok_path = dir.join("good.zip");
-            super::verify_download_to(url.clone(), ok_path.clone(), good_hash).await.expect("matching SHA-256 must pass");
+            super::verify_download_to(url.clone(), ok_path.clone(), good_hash.clone()).await.expect("matching SHA-256 must pass");
             assert_eq!(std::fs::read(&ok_path).unwrap(), payload);
+            assert!(super::file_matches_sha256(&ok_path, &good_hash));
+            assert!(!super::file_matches_sha256(&ok_path, &bad_hash));
 
             let bad_path = dir.join("bad.zip");
             let err = super::verify_download_to(url.clone(), bad_path.clone(), bad_hash).await.unwrap_err();

@@ -58,6 +58,7 @@ pub struct Account { pub uid: String, pub email: String, pub name: String, pub p
 struct Session { account: Account, refresh: String, id_token: String, expires: i64 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+static SESSION_IO: Mutex<()> = Mutex::new(());
 static LOADED: OnceLock<()> = OnceLock::new();
 static LAST_SYNCED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static SYNC_KEY_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -90,10 +91,10 @@ fn load_sync_key() -> Option<[u8; 32]> {
     parse_recovery_code(v["key"].as_str()?).ok()
 }
 
-fn save_sync_key(key: &[u8; 32]) {
+fn save_sync_key(key: &[u8; 32]) -> Result<()> {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
     let data = json!({"v": 3, "key": encoded}).to_string();
-    let _ = write_private_file(&sync_key_path(), data.as_bytes());
+    write_private_file(&sync_key_path(), data.as_bytes()).context("Couldn't save the encryption key")
 }
 
 fn ensure_sync_key() -> Result<[u8; 32]> {
@@ -101,7 +102,7 @@ fn ensure_sync_key() -> Result<[u8; 32]> {
     if let Some(k) = load_sync_key() { return Ok(k); }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|_| anyhow!("Couldn't generate an encryption key"))?;
-    save_sync_key(&key);
+    save_sync_key(&key)?;
     Ok(key)
 }
 
@@ -117,12 +118,25 @@ pub fn sync_key_needed() -> bool {
 }
 
 /// Replace this device's local Sync Key with a Recovery Key from another device and trigger sync.
+/// Verifies the candidate key against existing v3 cloud data BEFORE overwriting `sync-key.json`.
 pub async fn set_sync_recovery_code(code: &str) -> Result<(usize, usize)> {
     let key = parse_recovery_code(code)?;
     let _one = SYNCING.lock().await;
+    let (token, uid) = id_token().await?;
+    let base = documents().context("Accounts aren't set up in this build")?;
+    let project = config().map(|c| c.project).unwrap_or_default();
+    if let Some(doc) = get_doc(&token, format!("{base}/users/{uid}/config/keys")).await? {
+        if matches!(open_keys_payload(&key, &uid, project, &doc["fields"]), KeysOpen::WrongKey) {
+            anyhow::bail!("That Recovery Key doesn't match this account's encrypted data.");
+        }
+    }
+    let sample = list_items(&token, &uid, None, None, 1).await?;
+    if sample.iter().any(|(_, fields)| open_item_fields(fields, &key) == ItemOpen::WrongKey) {
+        anyhow::bail!("That Recovery Key doesn't match this account's encrypted data.");
+    }
     {
         let _k = SYNC_KEY_LOCK.lock();
-        save_sync_key(&key);
+        save_sync_key(&key)?;
     }
     SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     // Reset sync cursors atomically while holding SYNCING so encrypted cloud items and keys are re-read with the new key.
@@ -130,8 +144,10 @@ pub async fn set_sync_recovery_code(code: &str) -> Result<(usize, usize)> {
         let _guard = STATE_LOCK.lock();
         let mut st = load_state_unlocked();
         st.taken_until = None;
+        st.taken_doc = None;
         st.keys_hash.clear();
         st.keys_updated = 0;
+        st.key_verified = false;
         save_state_unlocked(&st);
     }
     sync_now_locked().await
@@ -172,9 +188,12 @@ pub fn account() -> Option<Account> {
 }
 
 fn set_session(session: Session) -> Account {
-    save_session(Some(&session));
     let account = session.account.clone();
-    if let Ok(mut slot) = SESSION.lock() { *slot = Some(session); }
+    {
+        let _io = SESSION_IO.lock();
+        save_session(Some(&session));
+        if let Ok(mut slot) = SESSION.lock() { *slot = Some(session); }
+    }
     start_sync();
     sync_soon();
     // Pull synced library, API keys and add-ons right away on sign-in.
@@ -386,8 +405,9 @@ async fn id_token() -> Result<(String, String)> {
             // only if the session hasn't already changed to another account.
             let code = e.to_string();
             if ["TOKEN_EXPIRED", "USER_NOT_FOUND", "INVALID_REFRESH_TOKEN", "USER_DISABLED"].iter().any(|c| code.starts_with(c)) {
+                let _io = SESSION_IO.lock();
                 let same_session = SESSION.lock().ok().and_then(|s| s.as_ref().map(|x| x.account.uid == expected_uid && x.refresh == current.refresh)).unwrap_or(false);
-                if same_session { forget_session(); }
+                if same_session { forget_session_locked(); }
             }
             anyhow::bail!(auth_error(&code));
         }
@@ -398,21 +418,31 @@ async fn id_token() -> Result<(String, String)> {
     next.expires = now_secs() + v["expires_in"].as_str().and_then(|x| x.parse().ok()).unwrap_or(3600) - 60;
     let out = (next.id_token.clone(), next.account.uid.clone());
     // Never resurrect a session that was signed out or replaced while the refresh request was in flight.
-    let updated = if let Ok(mut slot) = SESSION.lock() {
-        let still_same = slot.as_ref().is_some_and(|s| s.account.uid == expected_uid && s.refresh == current.refresh);
-        if still_same { *slot = Some(next.clone()); true } else { false }
-    } else { false };
+    // Hold SESSION_IO across both the memory update and save_session so sign-out cannot race the disk write.
+    let updated = {
+        let _io = SESSION_IO.lock();
+        let still_same = if let Ok(mut slot) = SESSION.lock() {
+            let matches = slot.as_ref().is_some_and(|s| s.account.uid == expected_uid && s.refresh == current.refresh);
+            if matches { *slot = Some(next.clone()); true } else { false }
+        } else { false };
+        if still_same { save_session(Some(&next)); }
+        still_same
+    };
     anyhow::ensure!(updated, "Not signed in");
-    save_session(Some(&next));
     Ok(out)
 }
 
-fn forget_session() {
+fn forget_session_locked() {
     if let Ok(mut slot) = SESSION.lock() { *slot = None; }
     if let Ok(mut f) = FORGOTTEN.lock() { f.clear(); }
     LAST_SYNCED.store(0, std::sync::atomic::Ordering::Relaxed);
     SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     save_session(None);
+}
+
+fn forget_session() {
+    let _io = SESSION_IO.lock();
+    forget_session_locked();
 }
 
 /// Sign out on this device (the account and the other devices stay).
@@ -423,18 +453,18 @@ pub async fn delete_account() -> Result<()> {
     let (token, uid) = id_token().await?;
     // The synced titles first: a deleted account can't reach them any more.
     loop {
-        let docs = list_items(&token, &uid, None, 300).await?;
+        let docs = list_items(&token, &uid, None, None, 300).await?;
         if docs.is_empty() { break; }
         let writes: Vec<Value> = docs.iter().map(|(name, _)| json!({"delete": name})).collect();
         commit(&token, writes).await?;
     }
     if let Some(base) = documents() {
-        // Synced keys & add-ons config document.
-        let _ = commit(&token, vec![json!({"delete": format!("{base}/users/{uid}/config/keys")})]).await;
+        // Synced keys & add-ons config document (Firestore delete is idempotent if absent).
+        commit(&token, vec![json!({"delete": format!("{base}/users/{uid}/config/keys")})]).await?;
         // Any legacy key handoff requests and diagnostic reports, paginated to completion.
         for coll in ["handoff", "diagnostics"] {
             loop {
-                let list = get_doc(&token, format!("{base}/users/{uid}/{coll}?pageSize=300")).await.ok().flatten().unwrap_or_default();
+                let Some(list) = get_doc(&token, format!("{base}/users/{uid}/{coll}?pageSize=300")).await? else { break };
                 let writes: Vec<Value> = list["documents"].as_array().into_iter().flatten().filter_map(|d| d["name"].as_str()).map(|n| json!({"delete": n})).collect();
                 if writes.is_empty() { break; }
                 commit(&token, writes).await?;
@@ -470,14 +500,37 @@ async fn commit(token: &str, writes: Vec<Value>) -> Result<()> {
     Ok(())
 }
 
-/// The account's synced documents changed after `since` (the server's time), oldest first:
-/// (document name, its fields).
-async fn list_items(token: &str, uid: &str, since: Option<&str>, limit: usize) -> Result<Vec<(String, Value)>> {
-    let base = documents().context("Accounts aren't set up in this build")?;
-    let mut query = json!({"from":[{"collectionId":"items"}],"orderBy":[{"field":{"fieldPath":"synced"}}],"limit":limit});
-    if let Some(t) = since {
-        query["where"] = json!({"fieldFilter":{"field":{"fieldPath":"synced"},"op":"GREATER_THAN","value":{"timestampValue":t}}});
+/// Build the Firestore structuredQuery for paginated item listing using a composite
+/// `(synced, __name__)` cursor so equal server timestamps across a page boundary are never skipped.
+fn items_query(since: Option<&str>, after_doc: Option<&str>, limit: usize) -> Value {
+    let mut query = json!({
+        "from": [{"collectionId": "items"}],
+        "orderBy": [
+            {"field": {"fieldPath": "synced"}},
+            {"field": {"fieldPath": "__name__"}},
+        ],
+        "limit": limit,
+    });
+    match (since, after_doc) {
+        (Some(t), Some(doc)) => {
+            query["startAt"] = json!({
+                "values": [{"timestampValue": t}, {"referenceValue": doc}],
+                "before": false,
+            });
+        }
+        (Some(t), None) => {
+            query["where"] = json!({"fieldFilter":{"field":{"fieldPath":"synced"},"op":"GREATER_THAN","value":{"timestampValue":t}}});
+        }
+        _ => {}
     }
+    query
+}
+
+/// The account's synced documents changed after `(since, after_doc)` (the server's time), oldest
+/// first: (document name, its fields).
+async fn list_items(token: &str, uid: &str, since: Option<&str>, after_doc: Option<&str>, limit: usize) -> Result<Vec<(String, Value)>> {
+    let base = documents().context("Accounts aren't set up in this build")?;
+    let query = items_query(since, after_doc, limit);
     let v = post(format!("https://firestore.googleapis.com/v1/{base}/users/{uid}:runQuery"), json!({"structuredQuery":query}), Some(token.to_owned())).await?;
     Ok(v.as_array().into_iter().flatten().filter_map(|r| {
         let doc = &r["document"];
@@ -529,12 +582,14 @@ fn doc_id(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes()
 struct State {
     sent_until: i64,
     taken_until: Option<String>,
+    taken_doc: Option<String>,
     seen: BTreeMap<String, i64>,
     known: std::collections::BTreeSet<String>,
     forgotten: Vec<Value>,
     last: i64,
     keys_hash: String,
     keys_updated: i64,
+    key_verified: bool,
 }
 
 fn state_path() -> PathBuf { backend().data_dir.join("sync-state.json") }
@@ -542,15 +597,18 @@ fn state_path() -> PathBuf { backend().data_dir.join("sync-state.json") }
 fn load_state_unlocked() -> State {
     let v: Value = std::fs::read_to_string(state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let last = v["last"].as_i64().unwrap_or(0);
+    let keys_hash = s(&v, "keys_hash");
     LAST_SYNCED.store(last, std::sync::atomic::Ordering::Relaxed);
     State {
         sent_until: v["sent_until"].as_i64().unwrap_or(0),
         taken_until: v["taken_until"].as_str().map(str::to_owned),
+        taken_doc: v["taken_doc"].as_str().map(str::to_owned),
         seen: v["seen"].as_object().map(|o| o.iter().filter_map(|(k, t)| Some((k.clone(), t.as_i64()?))).collect()).unwrap_or_default(),
         known: v["known"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
         forgotten: v["forgotten"].as_array().cloned().unwrap_or_default(),
         last,
-        keys_hash: s(&v, "keys_hash"),
+        key_verified: v["key_verified"].as_bool().unwrap_or(!keys_hash.is_empty()),
+        keys_hash,
         keys_updated: v["keys_updated"].as_i64().unwrap_or(0),
     }
 }
@@ -576,12 +634,14 @@ fn save_state_unlocked(st: &State) {
     let data = json!({
         "sent_until": st.sent_until,
         "taken_until": st.taken_until,
+        "taken_doc": st.taken_doc,
         "seen": seen,
         "known": st.known,
         "forgotten": forgotten,
         "last": st.last,
         "keys_hash": st.keys_hash,
         "keys_updated": st.keys_updated,
+        "key_verified": st.key_verified,
     }).to_string();
     let _ = write_private_file(&state_path(), data.as_bytes());
 }
@@ -636,12 +696,15 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
     let mut taken = 0;
     let mut wrong_key_seen = false;
     loop {
-        let docs = list_items(&token, &uid, st.taken_until.as_deref(), 300).await?;
+        let docs = list_items(&token, &uid, st.taken_until.as_deref(), st.taken_doc.as_deref(), 300).await?;
         if docs.is_empty() { break; }
         let (mut media, mut playback) = (Vec::new(), Vec::new());
         for (_, fields) in &docs {
             let row = match open_item_fields(fields, &sync_key) {
-                ItemOpen::Ok(row) => row,
+                ItemOpen::Ok(row) => {
+                    if fields["sealed"]["stringValue"].as_str().is_some() { st.key_verified = true; }
+                    row
+                }
                 ItemOpen::WrongKey => { wrong_key_seen = true; continue; }
                 ItemOpen::Empty => continue,
             };
@@ -656,17 +719,22 @@ async fn sync_now_locked() -> Result<(usize, usize)> {
         }
         taken += docs.len();
         exec(json!({"op":"sync_apply","media":media,"playback":playback})).await?;
-        st.taken_until = docs.last().and_then(|(_, f)| f["synced"]["timestampValue"].as_str().map(str::to_owned));
+        if let Some((last_name, last_fields)) = docs.last() {
+            if let Some(ts) = last_fields["synced"]["timestampValue"].as_str() {
+                st.taken_until = Some(ts.to_owned());
+                st.taken_doc = Some(last_name.clone());
+            }
+        }
         save_state(&st);
         if docs.len() < 300 { break; }
     }
     // Sync encrypted keys & add-ons before pushing so we detect a mismatched key before overwriting.
-    // On a first unverified sync (empty keys_hash), abort rather than pushing items encrypted under
-    // an unverified local key.
+    // On an unverified local key, abort rather than pushing items encrypted under an unchecked key.
     if let Err(e) = sync_keys(&token, &uid, &base, &sync_key, &mut st).await {
-        if sync_key_needed() || st.keys_hash.is_empty() { return Err(e); }
+        if sync_key_needed() || !st.key_verified { return Err(e); }
         dev_log(&format!("keys: {e}"));
     } else {
+        st.key_verified = true;
         SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     // Send: what changed here since the last time, but not what just came from elsewhere.
@@ -1090,7 +1158,7 @@ pub async fn take_link(offer: &LinkOffer) -> Result<Option<Account>> {
     // Transfer the E2EE Sync Key before starting sync so encrypted history & add-ons open immediately.
     if let Some(code) = v["sync_key"].as_str() {
         if let Ok(k) = parse_recovery_code(code) {
-            save_sync_key(&k);
+            save_sync_key(&k)?;
             SYNC_KEY_NEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -1323,7 +1391,7 @@ mod tests {
             println!("first sync: took {took}, sent {sent}");
             assert!(sent >= 1);
             let (token, uid) = id_token().await.unwrap();
-            let docs = list_items(&token, &uid, None, 50).await.unwrap();
+            let docs = list_items(&token, &uid, None, None, 50).await.unwrap();
             println!("on the server: {} document(s)", docs.len());
             assert!(docs.iter().any(|(_, f)| f["sealed"]["stringValue"].is_string() && f["data"].is_null()));
             // The QR handshake: a computer asks, the phone (this session) answers, the computer takes it.
@@ -1334,12 +1402,25 @@ mod tests {
             assert_eq!(linked.uid, me.uid);
             println!("linked as the same account");
             // Someone else's data stays out of reach.
-            let other = list_items(&offer.token, &uid, None, 5).await;
+            let other = list_items(&offer.token, &uid, None, None, 5).await;
             assert!(other.is_err(), "an anonymous session must not read an account's items");
             delete_account().await.unwrap();
             assert!(account().is_none());
             println!("deleted");
         });
+    }
+
+    #[test]
+    fn items_query_uses_composite_cursor_when_doc_present() {
+        let q = items_query(Some("2026-01-01T00:00:00Z"), Some("projects/p/databases/(default)/documents/users/u/items/a"), 300);
+        assert_eq!(q["orderBy"].as_array().unwrap().len(), 2);
+        assert_eq!(q["orderBy"][1]["field"]["fieldPath"], "__name__");
+        assert_eq!(q["startAt"]["before"], false);
+        assert_eq!(q["startAt"]["values"][0]["timestampValue"], "2026-01-01T00:00:00Z");
+        assert!(q.get("where").is_none());
+
+        let legacy = items_query(Some("2026-01-01T00:00:00Z"), None, 300);
+        assert_eq!(legacy["where"]["fieldFilter"]["op"], "GREATER_THAN");
     }
 
     /// A computer's Google sign-in through the browser page, with your own account: it signs in,

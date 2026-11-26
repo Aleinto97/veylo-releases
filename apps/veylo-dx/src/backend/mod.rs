@@ -918,7 +918,7 @@ pub struct Picks {
 }
 
 pub async fn picks() -> Result<Picks> {
-    let v = exec(json!({"op":"recommendations","limit":100})).await?;
+    let v = exec(json!({"op":"recommendations","limit":100,"exclude_liked":true})).await?;
     Ok(Picks {
         items: metas(&v, "").into_iter().filter(|m| m.liked == 0).collect(),
     })

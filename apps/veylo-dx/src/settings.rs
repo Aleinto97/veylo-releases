@@ -17,7 +17,7 @@ enum AddonSetupTab { Link, Bundle, Stremio, Directory }
 #[component]
 pub fn SettingsPage() -> Element {
     let mut lamp = use_context::<crate::Shell>().lamp_source;
-    use_hook(move || lamp.set(String::new()));
+    use_effect(move || { if !lamp.peek().is_empty() { lamp.set(String::new()); } });
     let mut settings = use_signal(backend::load_settings);
     let mut shell = use_context::<crate::Shell>();
     let mut section = use_signal(|| Section::All);
@@ -31,6 +31,7 @@ pub fn SettingsPage() -> Element {
     let mut busy = use_signal(|| None::<String>);
     let mut problem = use_signal(|| None::<String>);
     let mut check_note = use_signal(|| None::<String>);
+    let mut arm_remove = use_signal(|| None::<usize>);
     let mut setup_tab = use_signal(|| AddonSetupTab::Link);
     let mut custom_url = use_signal(String::new);
     let mut bundle_text = use_signal(String::new);
@@ -228,7 +229,7 @@ pub fn SettingsPage() -> Element {
                         match overview() {
                             None => rsx! { div { class: "setting-row", div { class: "row skeleton-row", style: "width: 100%; min-height: 36px;" } } },
                             Some(ov) => rsx! {
-                                for r in ov.addons.clone() {
+                                for (idx, r) in ov.addons.clone().into_iter().enumerate() {
                                     div { class: "addon-item",
                                         div { class: "addon-item-copy",
                                             div { class: "setting-title-line",
@@ -254,10 +255,19 @@ pub fn SettingsPage() -> Element {
                                                 } }
                                             }
                                             if r.removable() {
-                                                { let r = r.clone(); let label = r.name.clone(); rsx! {
-                                                    button { class: "pill glass small danger", disabled: busy().is_some(),
-                                                        onclick: move |_| { let r = r.clone(); run(label.clone(), Box::pin(async move { addons::remove(&r).await })) },
-                                                        icons::Trash {} span { "Remove" } }
+                                                { let r = r.clone(); let label = r.name.clone(); let armed = arm_remove() == Some(idx); rsx! {
+                                                    if armed {
+                                                        span { class: "confirm", role: "group", aria_label: "Remove {label}?",
+                                                            button { class: "pill forget-confirm small", disabled: busy().is_some(),
+                                                                onclick: move |_| { arm_remove.set(None); let r = r.clone(); run(label.clone(), Box::pin(async move { addons::remove(&r).await })) },
+                                                                icons::Trash {} span { "Confirm" } }
+                                                            icons::IconButton { label: "Cancel", class: "glass small", onclick: move |_| arm_remove.set(None), icons::Close {} }
+                                                        }
+                                                    } else {
+                                                        button { class: "pill glass small danger", disabled: busy().is_some(),
+                                                            onclick: move |_| arm_remove.set(Some(idx)),
+                                                            icons::Trash {} span { "Remove" } }
+                                                    }
                                                 } }
                                             }
                                         }
@@ -297,9 +307,9 @@ pub fn SettingsPage() -> Element {
                                                         if e.key() == Key::Enter {
                                                             let url = custom_url.peek().trim().to_owned();
                                                             if !url.is_empty() {
-                                                                custom_url.set(String::new());
                                                                 run("custom".into(), Box::pin(async move {
                                                                     let name = addons::install_custom(url).await?;
+                                                                    custom_url.set(String::new());
                                                                     check_note.set(Some(format!("Installed {name}.")));
                                                                     Ok(())
                                                                 }));
@@ -310,9 +320,9 @@ pub fn SettingsPage() -> Element {
                                                 button { class: "pill accent small", disabled: busy().is_some() || custom_url().trim().is_empty(),
                                                     onclick: move |_| {
                                                         let url = custom_url.peek().trim().to_owned();
-                                                        custom_url.set(String::new());
                                                         run("custom".into(), Box::pin(async move {
                                                             let name = addons::install_custom(url).await?;
+                                                            custom_url.set(String::new());
                                                             check_note.set(Some(format!("Installed {name}.")));
                                                             Ok(())
                                                         }));
@@ -625,6 +635,7 @@ pub fn SettingsPage() -> Element {
                                 div { class: "account-actions",
                                     select { class: "select-field", aria_label: "Issue type",
                                         value: "{bug_kind}",
+                                        onkeydown: move |e| e.stop_propagation(),
                                         onchange: move |e| bug_kind.set(e.value()),
                                         option { value: "bug", "Bug" }
                                         option { value: "ui_error", "UI / layout error" }

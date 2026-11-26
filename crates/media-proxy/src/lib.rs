@@ -689,7 +689,10 @@ async fn send_error<W: AsyncWriteExt + Unpin>(writer: &mut W, status: u16) -> Re
 }
 /// One upstream chunk with an idle deadline; no whole-movie deadline.
 /// Returns `bytes::Bytes` directly to avoid copying every chunk of large 4K streams into a fresh Vec.
-async fn chunk(response: &mut Response, stream_timeout: Duration) -> Result<Option<impl std::ops::Deref<Target = [u8]>>> {
+async fn chunk(
+    response: &mut Response,
+    stream_timeout: Duration,
+) -> Result<Option<impl std::ops::Deref<Target = [u8]>>> {
     Ok(timeout(stream_timeout, response.chunk())
         .await
         .context("upstream body idle timeout")??)
@@ -747,7 +750,48 @@ fn safe_response_headers(headers: &HeaderMap) -> bool {
         .iter()
         .all(|name| headers.get_all(*name).iter().count() <= 1)
 }
-fn single_range_length(headers: &HeaderMap) -> Option<u64> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestedRange {
+    From(u64),
+    Bounds(u64, u64),
+    Suffix(u64),
+}
+
+fn parse_client_range(headers: &HeaderMap) -> Option<RequestedRange> {
+    let raw = headers.get("range")?.to_str().ok()?.trim();
+    let spec = raw.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    match (start_s.is_empty(), end_s.is_empty()) {
+        (true, false) => {
+            if !end_s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let suffix = end_s.parse::<u64>().ok()?;
+            (suffix > 0).then_some(RequestedRange::Suffix(suffix))
+        }
+        (false, true) => {
+            if !start_s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(RequestedRange::From(start_s.parse::<u64>().ok()?))
+        }
+        (false, false) => {
+            if !start_s.bytes().all(|b| b.is_ascii_digit())
+                || !end_s.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let (start, end) = (start_s.parse::<u64>().ok()?, end_s.parse::<u64>().ok()?);
+            (start <= end).then_some(RequestedRange::Bounds(start, end))
+        }
+        (true, true) => None,
+    }
+}
+
+fn single_range_length(headers: &HeaderMap, requested: Option<RequestedRange>) -> Option<u64> {
     let range = headers
         .get("content-range")?
         .to_str()
@@ -764,8 +808,40 @@ fn single_range_length(headers: &HeaderMap) -> Option<u64> {
     }
     let (start, end) = (start.parse::<u64>().ok()?, end.parse::<u64>().ok()?);
     let length = end.checked_sub(start)?.checked_add(1)?;
-    if total != "*" && !total.parse::<u64>().is_ok_and(|n| n > end) {
-        return None;
+    let total_val = if total == "*" {
+        None
+    } else {
+        let n = total.parse::<u64>().ok()?;
+        if n <= end {
+            return None;
+        }
+        Some(n)
+    };
+    if let Some(req) = requested {
+        match req {
+            RequestedRange::From(req_start) => {
+                if start != req_start {
+                    return None;
+                }
+            }
+            RequestedRange::Bounds(req_start, req_end) => {
+                if start != req_start || end > req_end {
+                    return None;
+                }
+                if let Some(t) = total_val {
+                    if end != req_end.min(t - 1) {
+                        return None;
+                    }
+                }
+            }
+            RequestedRange::Suffix(suffix) => {
+                let t = total_val?;
+                let expected_start = t.saturating_sub(suffix);
+                if start != expected_start || end != t - 1 {
+                    return None;
+                }
+            }
+        }
     }
     if !headers
         .get("content-length")
@@ -812,7 +888,7 @@ fn is_aes_key_body(
     // A 16-byte slice of a larger representation is NOT a complete AES key.
     // Otherwise ID3 metadata could bypass inspection in 16-byte range fragments.
     let whole = !headers.contains_key("content-range")
-        || (single_range_length(headers) == Some(16)
+        || (single_range_length(headers, None) == Some(16)
             && headers
                 .get("content-range")
                 .and_then(|v| v.to_str().ok())
@@ -1067,7 +1143,12 @@ async fn relay<W: AsyncWriteExt + Unpin>(
         };
     let head = request.method == Method::HEAD;
     let range_length = if status.as_u16() == 206 {
-        single_range_length(&headers)
+        if request.headers.contains_key("range") {
+            parse_client_range(&request.headers)
+                .and_then(|req| single_range_length(&headers, Some(req)))
+        } else {
+            single_range_length(&headers, None)
+        }
     } else {
         None
     };
@@ -1335,7 +1416,10 @@ async fn relay<W: AsyncWriteExt + Unpin>(
             let mut active_read = Duration::ZERO;
             let mut skip_after_pause = false;
             // Measure bandwidth on all streamed binary media (direct files and HLS/DASH segments).
-            let measure_bw = is_source || content_type.starts_with("video/") || content_type.starts_with("audio/") || content_type == "application/octet-stream";
+            let measure_bw = is_source
+                || content_type.starts_with("video/")
+                || content_type.starts_with("audio/")
+                || content_type == "application/octet-stream";
             loop {
                 let read_started = Instant::now();
                 let Some(bytes) = chunk(&mut response, lease.stream_timeout).await? else {
@@ -1578,5 +1662,32 @@ mod tests {
                 "{reference}"
             );
         }
+    }
+    #[test]
+    fn range_validation_rejects_mismatched_upstream_content_range() {
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("range", HeaderValue::from_static("bytes=100-199"));
+        let req = parse_client_range(&req_headers).unwrap();
+
+        let mut ok_resp = HeaderMap::new();
+        ok_resp.insert(
+            "content-range",
+            HeaderValue::from_static("bytes 100-199/1000"),
+        );
+        ok_resp.insert("content-length", HeaderValue::from_static("100"));
+        assert_eq!(single_range_length(&ok_resp, Some(req)), Some(100));
+
+        let mut wrong_start = HeaderMap::new();
+        wrong_start.insert("content-range", HeaderValue::from_static("bytes 0-99/1000"));
+        wrong_start.insert("content-length", HeaderValue::from_static("100"));
+        assert_eq!(single_range_length(&wrong_start, Some(req)), None);
+
+        let mut wrong_end = HeaderMap::new();
+        wrong_end.insert(
+            "content-range",
+            HeaderValue::from_static("bytes 100-250/1000"),
+        );
+        wrong_end.insert("content-length", HeaderValue::from_static("151"));
+        assert_eq!(single_range_length(&wrong_end, Some(req)), None);
     }
 }

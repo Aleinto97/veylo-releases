@@ -42,6 +42,7 @@ object VeyloVideo {
     private var hostActivity: java.lang.ref.WeakReference<Activity>? = null
     private var frame: FrameLayout? = null
     private var surface: SurfaceView? = null
+    private var surfaceCallback: SurfaceHolder.Callback? = null
     private var aspect = 0.0
     private var fit = 0
     private var pendingFps = 0f
@@ -88,28 +89,38 @@ object VeyloVideo {
             // If Android recreated the Activity in the same process, discard stale views bound to the old one.
             if (frame != null && hostActivity?.get() !== activity) {
                 hostActivity?.get()?.let { stopMediaControls(it) }
+                surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
+                surfaceCallback = null
                 frame = null; surface = null; hostActivity = null
             }
             if (frame != null) return@runOnUiThread
             val web = findWebView(activity.window.decorView) ?: return@runOnUiThread
             val parent = web.parent as? ViewGroup ?: return@runOnUiThread
             val view = SurfaceView(activity)
-            view.holder.addCallback(object : SurfaceHolder.Callback {
+            val cb = object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
+                    if (surface !== view) return
                     val r = holder.surfaceFrame
                     applyFrameRate(holder.surface, pendingFps)
                     nativeSurface(holder.surface, r.width(), r.height())
                 }
-                override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) = nativeSurface(holder.surface, w, h)
-                override fun surfaceDestroyed(holder: SurfaceHolder) = nativeSurface(null, 0, 0)
-            })
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+                    if (surface !== view) return
+                    nativeSurface(holder.surface, w, h)
+                }
+                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                    if (surface !== view) return
+                    nativeSurface(null, 0, 0)
+                }
+            }
+            view.holder.addCallback(cb)
             val box = FrameLayout(activity).apply { setBackgroundColor(Color.BLACK) }
             box.addView(view, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
             box.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> relayout() }
             parent.addView(box, parent.indexOfChild(web), ViewGroup.LayoutParams(-1, -1))
             web.setBackgroundColor(Color.TRANSPARENT)
             hostActivity = java.lang.ref.WeakReference(activity)
-            frame = box; surface = view
+            frame = box; surface = view; surfaceCallback = cb
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             immersive(activity, true)
             startMediaControls(activity)
@@ -133,6 +144,8 @@ object VeyloVideo {
                 activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
             val box = frame ?: return@runOnUiThread
+            surfaceCallback?.let { cb -> surface?.holder?.removeCallback(cb) }
+            surfaceCallback = null
             (box.parent as? ViewGroup)?.removeView(box)
             frame = null; surface = null; hostActivity = null; aspect = 0.0; fit = 0; pendingFps = 0f
             findWebView(activity.window.decorView)?.setBackgroundColor(Color.BLACK)

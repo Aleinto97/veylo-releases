@@ -51,11 +51,15 @@ pub(crate) fn unpack(text: &str) -> Option<Vec<f32>> {
 }
 
 static CACHE: OnceLock<RwLock<Cache>> = OnceLock::new();
-static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
+static SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
+static SAVE_RUNNING: AtomicBool = AtomicBool::new(false);
 static EMBEDDER: Mutex<Option<Result<Embedder, String>>> = Mutex::new(None);
 static FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
 fn cache() -> &'static RwLock<Cache> { CACHE.get_or_init(Default::default) }
+
+/// Number of embeddings currently loaded in the local cache.
+pub fn embedding_count() -> usize { cache().read().map(|c| c.map.len()).unwrap_or(0) }
 
 /// The saved embeddings, read once, before the model is first needed: Picks reads vectors (the
 /// brain's projection, similarity) long before anything new is embedded.
@@ -304,15 +308,24 @@ fn read_cache(path: &Path) -> Cache {
     cache
 }
 
-/// Rewriting the whole file per title is costly on flash, so one delayed write covers every
-/// title embedded meanwhile. A failed save must not disable inference.
+/// Rewriting the whole file per title is costly on flash, so one delayed atomic write covers
+/// every title embedded meanwhile. A failed save must not disable inference.
 fn save_soon(path: PathBuf) {
-    if SAVE_PENDING.swap(true, Ordering::AcqRel) { return; }
+    SAVE_DIRTY.store(true, Ordering::Release);
+    if SAVE_RUNNING.swap(true, Ordering::AcqRel) { return; }
     std::thread::spawn(move || {
-        std::thread::sleep(SAVE_EVERY);
-        SAVE_PENDING.store(false, Ordering::Release);
-        let serialized = cache().read().map(|c| c.encode().to_string());
-        if let Ok(serialized) = serialized { let _ = std::fs::write(path, serialized); }
+        loop {
+            std::thread::sleep(SAVE_EVERY);
+            SAVE_DIRTY.store(false, Ordering::Release);
+            let serialized = cache().read().map(|c| c.encode().to_string());
+            if let Ok(serialized) = serialized {
+                let _ = backend::write_private_file(&path, serialized.as_bytes());
+            }
+            if !SAVE_DIRTY.load(Ordering::Acquire) {
+                SAVE_RUNNING.store(false, Ordering::Release);
+                if !SAVE_DIRTY.load(Ordering::Acquire) || SAVE_RUNNING.swap(true, Ordering::AcqRel) { break; }
+            }
+        }
     });
 }
 

@@ -17,8 +17,12 @@
         }
         return true;
     };
-    const usable = el => !el.disabled && el.tabIndex >= 0 && !el.closest('[inert]')
-        && visible(el) && (r => r.width > 0 && r.height > 0)(el.getBoundingClientRect());
+    const rectIfUsable = el => {
+        if (el.disabled || el.tabIndex < 0 || el.closest('[inert]') || !visible(el)) return null;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 ? r : null;
+    };
+    const usable = el => rectIfUsable(el) !== null;
     // An open dialog keeps focus inside it (including player sheets, error modal, and Up Next).
     const scope = () => {
         const playerModal = document.querySelector('.app.playing .player-sheet, .app.playing .player-error, .app.playing .player-upnext');
@@ -46,15 +50,19 @@
     document.addEventListener('focusin', e => {
         if (e.target === document.body || e.target.classList.contains('app')) return;
         const label = name(e.target);
-        seen.set(place(), label ? { label, nth: named(label).indexOf(e.target) } : null);
+        const ref = typeof WeakRef === 'function' ? new WeakRef(e.target) : null;
+        seen.set(place(), (ref || label) ? { ref, label } : null);
         light();
     });
     const remembered = () => seen.get(place());
     const restore = () => {
         const last = remembered();
         if (!last) return null;
-        const el = named(last.label)[last.nth];
-        return el && usable(el) && scope().contains(el) ? el : null;
+        const direct = last.ref && last.ref.deref();
+        if (direct && direct.isConnected && usable(direct) && scope().contains(direct)) return direct;
+        if (!last.label) return null;
+        const el = named(last.label).find(c => usable(c) && scope().contains(c));
+        return el || null;
     };
     // Arriving somewhere puts focus in view at once: a page still filling in would cut a glide short.
     const land = (el, block = 'center') => {
@@ -77,21 +85,48 @@
             // On the seekbar scrubber, ← and → scrub directly rather than moving focus away.
             if (dir[0] && document.activeElement && document.activeElement.classList.contains('scrubber')) return;
         }
-        if (dir[0] && document.querySelector('.theatre')) return;
         const active = document.activeElement;
-        const inside = !idle() && usable(active);
+        if (dir[0] && document.querySelector('.theatre') && !(active && active.closest && active.closest('.theatre-tools'))) return;
+        const activeRect = !idle() ? rectIfUsable(active) : null;
+        const inside = activeRect !== null;
         // In a text field ← and → move the caret; ↑ and ↓ leave it.
         if (inside && typing(active) && dir[0]) return;
         e.preventDefault();
         e.stopPropagation();
-        const all = [...scope().querySelectorAll(FOCUSABLE)].filter(el => el !== active && usable(el));
+        const root = scope();
+        const collect = nodes => {
+            const out = [];
+            for (const el of nodes) {
+                if (el === active) continue;
+                const r = rectIfUsable(el);
+                if (r) out.push({ el, r });
+            }
+            return out;
+        };
         let best;
-        if (!inside) best = restore() || document.querySelector('.dock-tab.on') || all[0];
-        else {
-            const a = active.getBoundingClientRect();
-            // Within the page first: the top bar floats over it, so it is only reached past the page's top.
-            const page = active.closest('.page');
-            best = (page && pick(a, dir, active, all.filter(el => page.contains(el)))) || pick(a, dir, active, all);
+        if (!inside) {
+            const first = collect(root.querySelectorAll(FOCUSABLE));
+            best = restore() || document.querySelector('.dock-tab.on') || (first[0] && first[0].el);
+        } else {
+            const a = activeRect;
+            // Fast path inside shelves: avoid forcing layout on off-screen content-visibility:auto shelves.
+            const shelf = active.closest && active.closest('.shelf');
+            if (shelf) {
+                const nearNodes = [];
+                if (dir[0]) {
+                    nearNodes.push(...shelf.querySelectorAll(FOCUSABLE));
+                } else {
+                    const sib = dir[1] > 0 ? shelf.nextElementSibling : shelf.previousElementSibling;
+                    if (sib) nearNodes.push(...sib.querySelectorAll(FOCUSABLE));
+                }
+                if (nearNodes.length) best = pick(a, dir, active, collect(nearNodes));
+            }
+            if (!best) {
+                const all = collect(root.querySelectorAll(FOCUSABLE));
+                // Within the page first: the top bar floats over it, so it is only reached past the page's top.
+                const page = active.closest('.page');
+                best = (page && pick(a, dir, active, all.filter(c => page.contains(c.el)))) || pick(a, dir, active, all);
+            }
             // Coming up into the tabs lands on the one that is open.
             if (best && dir[1] && best.classList.contains('dock-tab') && !active.classList.contains('dock-tab')) best = document.querySelector('.dock-tab.on') || best;
         }
@@ -105,10 +140,10 @@
     // most aligned. ← and → stay on their row: at its end they stop rather than jump to another.
     function pick(a, dir, active, all) {
         let best = null, score = Infinity;
-        for (const el of all) {
+        const ac = [(a.left + a.right) / 2, (a.top + a.bottom) / 2];
+        for (const { el, r: c } of all) {
             if (active.contains(el) || el.contains(active)) continue;
-            const c = el.getBoundingClientRect();
-            const ac = [(a.left + a.right) / 2, (a.top + a.bottom) / 2], cc = [(c.left + c.right) / 2, (c.top + c.bottom) / 2];
+            const cc = [(c.left + c.right) / 2, (c.top + c.bottom) / 2];
             let along, across, centre;
             if (dir[1]) {
                 if (dir[1] * (cc[1] - ac[1]) <= 0) continue;

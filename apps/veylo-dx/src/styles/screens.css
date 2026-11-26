@@ -318,13 +318,16 @@
 @media (hover: none), (pointer: coarse) {
   .theatre-keys, .clip-key { display: none; }
 }
-@media (max-width: 900px), (orientation: portrait) {
+@media (max-width: 900px) and (min-height: 540px), (orientation: portrait) {
   .theatre { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: auto; max-height: calc(100dvh - var(--top-inset) - var(--bottom-inset) - 24px); overflow-y: auto; }
   .theatre .trailer-frame { max-width: none; }
   .theatre-side { padding: 0 4px; }
   .theatre-side > .theatre-list { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
   .theatre-clip { flex: none; flex-direction: column; align-items: stretch; width: 150px; }
   .theatre-thumb { width: 100%; }
+}
+@media (max-height: 540px) and (orientation: landscape) {
+  .theatre .trailer-frame { max-height: calc(100dvh - var(--top-inset) - var(--bottom-inset) - 48px); width: auto; max-width: 100%; margin: 0 auto; }
 }
 
 /* ---------------------------------------------------------------- posters on wide pages */

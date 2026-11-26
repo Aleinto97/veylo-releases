@@ -869,11 +869,28 @@ fn similar_size(a: Option<u64>, b: Option<u64>) -> bool {
     }
 }
 
+/// Opaque identity of a source for probe caching and release deduplication: hashes both URL and
+/// effective request headers so distinct auth contexts never share a cached probe or resolved URL.
+pub(super) fn probe_key(src: &Source) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(src.url.as_bytes());
+    let mut headers: Vec<(&str, &str)> = src.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    headers.sort_unstable();
+    for (k, v) in headers {
+        h.update(b"\0");
+        h.update(k.as_bytes());
+        h.update(b":");
+        h.update(v.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
 pub(super) fn group_releases(candidates: &[Source], pack_episodes: Option<usize>) -> Vec<ReleaseGroup> {
     let mut groups: Vec<(String, Option<u64>, ReleaseGroup)> = Vec::new();
-    let mut seen_urls: HashSet<&str> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
     for c in candidates {
-        if !seen_urls.insert(c.url.as_str()) { continue; }
+        if !seen_keys.insert(probe_key(c)) { continue; }
         let stem = normalized_release_stem(c);
         let ep_sz = episode_size(c, pack_episodes);
         if !stem.is_empty() {
@@ -1178,6 +1195,7 @@ fn header_http() -> &'static reqwest::Client {
 /// The relay's one-byte check of a link, then (when it works) its header for audio tracks,
 /// picture, video codec, and optional zero-extra-request CDN speed burst.
 pub(super) async fn probe_one(src: Source, allow_speed_burst: bool) -> Option<ProbeOutcome> {
+    let key = probe_key(&src);
     let cell = {
         let mut map = PROBED.get_or_init(Default::default).lock().ok()?;
         map.retain(|_, (at, cell)| {
@@ -1187,13 +1205,13 @@ pub(super) async fn probe_one(src: Source, allow_speed_burst: bool) -> Option<Pr
             };
             at.elapsed() < ttl
         });
-        if map.len() >= 800 && !map.contains_key(&src.url) {
+        if map.len() >= 800 && !map.contains_key(&key) {
             // Evict oldest half rather than clearing all cached probes.
             let mut ages: Vec<(std::time::Instant, String)> = map.iter().map(|(k, (at, _))| (*at, k.clone())).collect();
             ages.sort_by_key(|(at, _)| *at);
             for (_, k) in ages.into_iter().take(400) { map.remove(&k); }
         }
-        map.entry(src.url.clone()).or_insert_with(|| (std::time::Instant::now(), Probed::default())).1.clone()
+        map.entry(key).or_insert_with(|| (std::time::Instant::now(), Probed::default())).1.clone()
     };
     match cell.get_or_try_init(|| async move {
         let gate = {
@@ -1315,7 +1333,8 @@ pub(super) async fn file_header_with_client_full(
     while head.len() < crate::tracks::HEAD_BYTES {
         let Ok(Some(chunk)) = response.chunk().await else { break };
         account_chunk(chunk.len() as u64, &mut total_read, &mut post_warmup_at, &mut post_warmup_bytes);
-        head.extend_from_slice(&chunk);
+        let take = chunk.len().min(crate::tracks::HEAD_BYTES - head.len());
+        head.extend_from_slice(&chunk[..take]);
         if head.len() >= next_parse {
             if let Some(tracks) = crate::tracks::audio_tracks(&head) {
                 parsed = Some((tracks, crate::tracks::picture(&head), crate::tracks::video_codec(&head)));
@@ -1363,15 +1382,40 @@ pub(super) async fn file_header_with_client_full(
     }
 
     // Non-fast-start MP4 fallback: read the last 1 MiB from the resolved URL to parse tail `moov`.
-    if crate::tracks::mp4_moov_at_end(&head) && total_bytes.is_some_and(|b| b > 1_048_576) {
+    const TAIL_CAP: usize = 1_048_576;
+    if crate::tracks::mp4_moov_at_end(&head) && total_bytes.is_some_and(|b| b > TAIL_CAP as u64) {
         let tail_target = resolved.as_deref().unwrap_or(&src.url);
-        let mut treq = http.get(tail_target).header("range", "bytes=-1048576");
+        let mut treq = http.get(tail_target).header("range", format!("bytes=-{TAIL_CAP}"));
         if same_origin(&src.url, tail_target) {
             for (k, v) in &src.headers { treq = treq.header(k.as_str(), v.as_str()); }
         }
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_millis(600), treq.send()).await {
-            if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_millis(600), resp.bytes()).await {
+        if let Ok(Ok(mut resp)) = tokio::time::timeout(Duration::from_millis(600), treq.send()).await {
+            let range_ok = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                && resp.headers().get("content-range").and_then(|v| v.to_str().ok()).is_some_and(|cr| {
+                    cr.strip_prefix("bytes ")
+                        .and_then(|s| s.split_once('/'))
+                        .and_then(|(span, _)| span.split_once('-'))
+                        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                        .is_some_and(|(a, b)| b >= a && (b - a + 1) <= TAIL_CAP as u64)
+                });
+            if range_ok {
+                let mut tail = Vec::with_capacity(65536);
+                let deadline = std::time::Instant::now() + Duration::from_millis(600);
+                let mut ok = true;
+                while let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) {
+                    match tokio::time::timeout(rem, resp.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            if tail.len().saturating_add(chunk.len()) > TAIL_CAP {
+                                ok = false;
+                                break;
+                            }
+                            tail.extend_from_slice(&chunk);
+                        }
+                        Ok(Ok(None)) => break,
+                        _ => { ok = false; break; }
+                    }
+                }
+                if ok && !tail.is_empty() {
                     let (t_tracks, t_pic, t_codec) = crate::tracks::parse_mp4_tail(&tail);
                     return (t_tracks, t_pic, t_codec.or(codec), resolved, speed_sample);
                 }
@@ -1895,6 +1939,15 @@ mod unit_tests {
         let ita = crate::addons::language("italian").unwrap();
         assert!(!ita.matches("Movie.2024.1080p.ENG | Subs: ITA FRE SPA"));
         assert!(ita.matches("Movie.2024.1080p.ITA.ENG | Subs: ENG"));
+
+        // Distinct request headers on the same URL must never collide in probe cache or release dedup.
+        let mut s_a = mk("Movie.2024.2160p.WEB.mkv", "https://cdn.invalid/stream", 4_000_000_000);
+        s_a.headers.push(("Authorization".into(), "Bearer token-a".into()));
+        let mut s_b = mk("Movie.2024.2160p.WEB.mkv", "https://cdn.invalid/stream", 4_000_000_000);
+        s_b.headers.push(("Authorization".into(), "Bearer token-b".into()));
+        assert_ne!(probe_key(&s_a), probe_key(&s_b));
+        let grouped = group_releases(&[s_a, s_b], None);
+        assert_eq!(grouped[0].mirrors.len(), 2);
     }
 }
 

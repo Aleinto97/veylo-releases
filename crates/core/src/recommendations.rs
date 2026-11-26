@@ -97,7 +97,12 @@ fn reason(candidate: &Media, a: &Features, seed: &Media, b: &Features, similar: 
 fn positive(m: &Media) -> bool {
     m.liked > 0 || m.saved || m.watched || m.watched_ms >= 60_000
 }
-pub(crate) fn recommend(all: &[Media], similar_key: Option<&str>, limit: usize) -> Value {
+pub(crate) fn recommend(
+    all: &[Media],
+    similar_key: Option<&str>,
+    limit: usize,
+    exclude_liked: bool,
+) -> Value {
     let similar = similar_key.and_then(|key| all.iter().position(|m| m.key == key));
     if similar_key.is_some() && similar.is_none() {
         return json!({"metas":[],"needs_history":false,"missing_metadata":true});
@@ -123,7 +128,11 @@ pub(crate) fn recommend(all: &[Media], similar_key: Option<&str>, limit: usize) 
         if c.liked < 0
             || similar == Some(index)
             || c.meta.get("name").and_then(Value::as_str).is_none()
-            || (similar.is_none() && (c.saved || c.watched || c.watched_ms >= 60_000))
+            || (similar.is_none()
+                && (c.saved
+                    || c.watched
+                    || c.watched_ms >= 60_000
+                    || (exclude_liked && c.liked > 0)))
         {
             continue;
         }
@@ -260,4 +269,42 @@ pub(crate) fn collections(all: &[Media]) -> Value {
         collections.push(json!({"id":json!(["curated",addon,kind,id]).to_string(),"name":name,"kind":"addon_curated_franchise","metas":items.iter().take(100).map(|m|m.value()).collect::<Vec<_>>()}));
     }
     json!({"collections":collections})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(key: &str, name: &str, genres: &[&str], liked: i64) -> Media {
+        Media {
+            key: key.into(),
+            kind: "movie".into(),
+            id: key.into(),
+            addon: "https://a.invalid/manifest.json".into(),
+            meta: json!({"name": name, "genres": genres}),
+            saved: false,
+            watched: false,
+            liked,
+            watched_ms: 0,
+            position: 0,
+            duration: 0,
+            video_id: None,
+            video_watched: false,
+        }
+    }
+
+    #[test]
+    fn exclude_liked_keeps_liked_as_seeds_without_consuming_candidate_slots() {
+        let all = vec![
+            mk("liked1", "Liked SciFi", &["Sci-Fi", "Thriller"], 1),
+            mk("cand1", "Unseen SciFi", &["Sci-Fi", "Thriller"], 0),
+            mk("cand2", "Unseen Comedy", &["Comedy"], 0),
+        ];
+        let v = recommend(&all, None, 10, true);
+        let metas = v["metas"].as_array().unwrap();
+        assert_eq!(v["needs_history"], false);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0]["id"], "cand1");
+        assert!(metas.iter().all(|m| m["id"] != "liked1"));
+    }
 }

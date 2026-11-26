@@ -415,7 +415,7 @@ fn Shell_() -> Element {
     // Android Back closes a page, Search or the videos, like Esc; on a top-level screen it leaves the app.
     // On a TV it never leaves: Back only goes back (to Home at most), and the remote's Home key leaves.
     #[cfg(target_os = "android")]
-    use_effect(move || { let _ = android::set_back_enabled(is_tv() || shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
+    use_effect(move || { let _ = android::set_back_enabled(is_tv() || deep_link.read().is_some() || shortcuts_open() || search_open() || opened.read().is_some() || (shell.player)().is_some()
         || (shell.trailer)().is_some() || matches!(player_status(), Some(PlayerStatus::Finding(_) | PlayerStatus::Opening(_)))); });
     // A failure says why once; it doesn't stay over the app (a new playback replaces it sooner).
     let mut status = shell.player_status;
@@ -435,6 +435,13 @@ fn Shell_() -> Element {
 
     // App shortcuts (the ? sheet lists them). Typing in Search or a field never triggers them.
     let on_key = move |e: KeyboardEvent| {
+        if deep_link.read().is_some() {
+            if matches!(e.key(), Key::Escape | Key::Backspace) {
+                e.prevent_default();
+                deep_link.set(None);
+            }
+            return;
+        }
         if shortcuts_open() {
             if matches!(e.key(), Key::Escape | Key::Backspace) || e.key() == Key::Character("?".into()) {
                 e.prevent_default(); shortcuts_open.set(false);
@@ -466,6 +473,7 @@ fn Shell_() -> Element {
                 go(tab, opened, Tab::ALL[c.parse::<usize>().unwrap_or(1) - 1]);
             }
             Key::Escape if shell.trailer.read().is_some() => { let mut t = shell.trailer; t.set(None); }
+            Key::MediaPlayPause if shell.trailer.read().is_some() => { e.prevent_default(); theatre::command("toggle"); }
             // In the theatre, ← and → step through the title's videos.
             Key::ArrowLeft | Key::ArrowRight if shell.trailer.read().is_some() => {
                 e.prevent_default();
@@ -676,26 +684,32 @@ fn Shell_() -> Element {
                 sync();
             }
         };
-        // Selection pills slide: the dock's glass pill and each segmented control's thumb move to the
-        // selected item and take its width. Groups whose slider is placed get data-sliding, so the
-        // item's own fill steps aside (styles/motion.css); without this script the items keep their fill.
-        const slide = () => document.querySelectorAll('.dock, .segmented').forEach(g => {
-            const s = g.querySelector('.slider'), on = g.querySelector('.dock-tab.on, .seg.on');
-            if (!s) return;
-            if (!on) { s.style.opacity = '0'; return; }
-            const at = [on.offsetLeft, on.offsetTop, on.offsetWidth, on.offsetHeight];
-            if (s.dataset.at === at.join()) return;
-            const first = !s.dataset.at; s.dataset.at = at.join();
-            if (first) s.style.transition = 'none';
-            Object.assign(s.style, {
-                transform: `translate3d(${at[0]}px, ${at[1]}px, 0)`,
-                width: at[2] + 'px',
-                height: at[3] + 'px',
-                opacity: '1',
+        // Selection pills slide: batch all layout reads before writes so no read forces a reflow.
+        const slide = () => {
+            const plans = [];
+            document.querySelectorAll('.dock, .segmented').forEach(g => {
+                const s = g.querySelector('.slider'), on = g.querySelector('.dock-tab.on, .seg.on');
+                if (!s) return;
+                if (!on) { plans.push({ g, s, hide: true }); return; }
+                const at = [on.offsetLeft, on.offsetTop, on.offsetWidth, on.offsetHeight];
+                const key = at.join();
+                if (s.dataset.at === key) return;
+                plans.push({ g, s, at, key, first: !s.dataset.at });
             });
-            g.dataset.sliding = '';
-            if (first) requestAnimationFrame(() => requestAnimationFrame(() => { s.style.transition = ''; }));
-        });
+            for (const p of plans) {
+                if (p.hide) { p.s.style.opacity = '0'; continue; }
+                p.s.dataset.at = p.key;
+                if (p.first) p.s.style.transition = 'none';
+                Object.assign(p.s.style, {
+                    transform: `translate3d(${p.at[0]}px, ${p.at[1]}px, 0)`,
+                    width: p.at[2] + 'px',
+                    height: p.at[3] + 'px',
+                    opacity: '1',
+                });
+                p.g.dataset.sliding = '';
+                if (p.first) requestAnimationFrame(() => requestAnimationFrame(() => { p.s.style.transition = ''; }));
+            }
+        };
         addEventListener('resize', () => requestAnimationFrame(() => { slide(); syncStrips(); }));
         // A new tab slides in from the side you moved toward.
         document.addEventListener('click', e => {
@@ -724,11 +738,21 @@ fn Shell_() -> Element {
         };
         document.addEventListener('pointermove', glare, { passive: true });
         // Single rAF-throttled observer for scroll shadow, title scroll-reset, pill sliders, and shelf fades.
-        let framed = false;
-        new MutationObserver(() => {
+        // Skips all work while the player is active and only refreshes strip fades when DOM children change.
+        let framed = false, dirtyStrips = false;
+        new MutationObserver(mutations => {
+            if (document.querySelector('.app.playing')) return;
+            if (mutations.some(m => m.type === 'childList')) dirtyStrips = true;
             if (framed) return;
             framed = true;
-            requestAnimationFrame(() => { framed = false; restoreScroll(); sync(); slide(); syncStrips(); });
+            requestAnimationFrame(() => {
+                framed = false;
+                if (document.querySelector('.app.playing')) { dirtyStrips = false; return; }
+                const needStrips = dirtyStrips;
+                dirtyStrips = false;
+                restoreScroll(); sync(); slide();
+                if (needStrips) syncStrips();
+            });
         }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
     })();"#); });
 
@@ -775,10 +799,10 @@ fn Shell_() -> Element {
             }
             // Android's status bar sits on solid black on every screen, above every overlay.
             div { class: "status-guard", aria_hidden: "true" }
-            TopBar {}
+            TopBar { deep_link_open: deep_link.read().is_some() }
             // `inert` is a boolean attribute: present means on, even as inert="false". Omit it when unused.
             main { class: "page", key: "{opened.read().as_ref().map(|m| m.key()).unwrap_or_default()}",
-                inert: (search_open() || shortcuts_open() || shell.trailer.read().is_some()).then_some("true"),
+                inert: (search_open() || shortcuts_open() || shell.trailer.read().is_some() || deep_link.read().is_some()).then_some("true"),
                 if let Some(media) = opened() { for media in [media] { title::TitlePage { key: "{media.key()}", media } } }
                 else { match tab() {
                     Tab::Home => rsx! { home::Home {} },
@@ -800,8 +824,12 @@ fn Shell_() -> Element {
             if search_open() { search::SearchOverlay {} }
             if shortcuts_open() { shortcuts::AppShortcuts {} }
             // Windows, macOS and Android install releases; Linux builds from source.
-            if updater::ASSET.is_some() && (shell.player)().is_none() && shell.pending().is_none() && !search_open() && shell.trailer.read().is_none() {
-                updater::UpdateNotice {}
+            // Keep mounted so "Later" and active downloads survive opening Search, Player, or Theatre.
+            if updater::ASSET.is_some() {
+                div {
+                    style: if (shell.player)().is_some() || shell.pending().is_some() || search_open() || shell.trailer.read().is_some() { "display: none;" } else { "" },
+                    updater::UpdateNotice {}
+                }
             }
             if let Some(theatre) = (shell.trailer)() { theatre::TheatreSheet { theatre } }
             if let Some(url) = deep_link() {
@@ -811,16 +839,27 @@ fn Shell_() -> Element {
     }
 }
 
-/// One-tap confirmation dialog when Veylo is opened with a `stremio://` or `veylo://` add-on link.
+/// Confirmation dialog when Veylo is opened with a `stremio://` or `veylo://` add-on link.
+/// Never auto-fetches untrusted deep-link URLs on mount: the user inspects the host first.
 #[component]
 fn DeepLinkInstallModal(url: String, on_close: EventHandler<()>) -> Element {
-    let fetch_url = url.clone();
-    let preview = use_resource(move || {
-        let u = fetch_url.clone();
-        async move { addons::preview_manifest(&u).await.map_err(|e| format!("{e:#}")) }
-    });
+    let host = addons::host_of(&url);
+    let mut inspecting = use_signal(|| false);
+    let mut preview = use_signal(|| None::<Result<addons::ManifestPreview, String>>);
     let mut installing = use_signal(|| false);
     let mut err = use_signal(|| None::<String>);
+    let inspect_url = url.clone();
+    let mut do_inspect = move || {
+        if *inspecting.peek() { return; }
+        let u = inspect_url.clone();
+        inspecting.set(true);
+        preview.set(None);
+        spawn(async move {
+            let res = addons::preview_manifest(&u).await.map_err(|e| format!("{e:#}"));
+            preview.set(Some(res));
+            inspecting.set(false);
+        });
+    };
     rsx! {
         div { class: "scrim", role: "dialog", aria_modal: "true", aria_label: "Install Stremio add-on",
             div { class: "modal-card glass",
@@ -828,11 +867,28 @@ fn DeepLinkInstallModal(url: String, on_close: EventHandler<()>) -> Element {
                     span { class: "group-icon", icons::Stack {} }
                     div { class: "setting-copy",
                         span { class: "group-name", "Install add-on?" }
-                        span { class: "dim setting-about", "Review this add-on before adding it to Veylo." }
+                        span { class: "dim setting-about", "An external link asked Veylo to add an add-on from {host}." }
                     }
                 }
                 match preview() {
-                    None => rsx! { p { class: "dim setting-about", "Reading add-on manifest…" } },
+                    None if !inspecting() => rsx! {
+                        div { class: "modal-preview",
+                            p { class: "dim setting-about", "Host: {host}" }
+                            p { class: "setting-about", "Inspect the add-on's manifest before deciding whether to install it." }
+                        }
+                        div { class: "modal-actions",
+                            button { class: "pill glass small",
+                                onmounted: move |e| async move { let _ = e.set_focus(true).await; },
+                                onclick: move |_| on_close.call(()), span { "Cancel" } }
+                            button { class: "pill accent small", onclick: move |_| do_inspect(), icons::Search {} span { "Inspect add-on" } }
+                        }
+                    },
+                    None => rsx! {
+                        p { class: "dim setting-about", "Reading add-on manifest from {host}…" }
+                        div { class: "modal-actions",
+                            button { class: "pill glass small", onclick: move |_| on_close.call(()), span { "Cancel" } }
+                        }
+                    },
                     Some(Err(e)) => rsx! {
                         p { class: "addon-problem", role: "alert", icons::Alert {} span { "{e}" } }
                         div { class: "modal-actions",
@@ -886,9 +942,9 @@ fn DeepLinkInstallModal(url: String, on_close: EventHandler<()>) -> Element {
 /// Wordmark, a glass dock of destination icons (the selected one shows its
 /// name), and the search orb.
 #[component]
-fn TopBar() -> Element {
+fn TopBar(deep_link_open: bool) -> Element {
     let mut shell = use_context::<Shell>();
-    let bar_inert = (shell.shortcuts_open)() || (shell.search_open)() || shell.trailer.read().is_some() || (shell.title_sheet_open)();
+    let bar_inert = deep_link_open || (shell.shortcuts_open)() || (shell.search_open)() || shell.trailer.read().is_some() || (shell.title_sheet_open)();
     rsx! {
         header { class: "topbar", inert: bar_inert.then_some("true"),
             if shell.opened.read().is_some() {

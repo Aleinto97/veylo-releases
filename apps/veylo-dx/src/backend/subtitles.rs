@@ -25,11 +25,18 @@ pub fn skip_lookup(video_id: &str) -> Option<SkipLookup> {
     }
 }
 
+static SEGMENTS_CACHE: OnceLock<Mutex<HashMap<String, Vec<crate::engine::Segment>>>> = OnceLock::new();
+
 /// The intro, recap and credits the online databases know for an episode: IntroDB for IMDb
 /// episodes, AniSkip for anime (a Kitsu id is turned into its MyAnimeList id first). Only public
-/// ids are sent. Nothing found, or a service down, is an empty list: the player just offers no skip.
-pub async fn online_segments(video_id: &str, duration: f64) -> Vec<crate::engine::Segment> {
-    let Some(lookup) = skip_lookup(video_id) else { return Vec::new() };
+/// ids are sent. Returns `Some(list)` on a definitive answer (or non-episode) and `None` on a
+/// transient network/HTTP error so the caller can retry once.
+pub async fn online_segments(video_id: &str, duration: f64) -> Option<Vec<crate::engine::Segment>> {
+    let Some(lookup) = skip_lookup(video_id) else { return Some(Vec::new()) };
+    let cache_key = format!("{video_id}|{}", (duration.max(0.0) / 5.0).round() as u64);
+    if let Ok(map) = SEGMENTS_CACHE.get_or_init(Default::default).lock() {
+        if let Some(hit) = map.get(&cache_key) { return Some(hit.clone()); }
+    }
     let found = on_runtime(async move {
         let http = backend_http();
         let get = |url: url::Url| { let http = http.clone(); async move {
@@ -63,7 +70,16 @@ pub async fn online_segments(video_id: &str, duration: f64) -> Vec<crate::engine
             }
         }
     }).await;
-    match found { Ok(Ok(list)) => list, _ => Vec::new() }
+    match found {
+        Ok(Ok(list)) => {
+            if let Ok(mut map) = SEGMENTS_CACHE.get_or_init(Default::default).lock() {
+                if map.len() >= 256 { map.clear(); }
+                map.insert(cache_key, list.clone());
+            }
+            Some(list)
+        }
+        _ => None,
+    }
 }
 
 /// The MyAnimeList id in a Kitsu mappings answer.
@@ -130,19 +146,23 @@ pub async fn online_subtitles(kind: &str, video_id: &str, filename: Option<&str>
         json!({"op":"subtitles","type":kind,"id":video_id,"extra":extra})
     };
     let v = exec(req).await?;
-    let mut list = v["subtitles"].as_array().cloned().unwrap_or_default();
-    if list.len() < 5 && video_id.starts_with("tt") {
+    let raw_list = v["subtitles"].as_array().cloned().unwrap_or_default();
+    let preferred = stream_language().map(|k| subtitle_language_of(&k));
+    let mut parsed = rank_subtitles_for(raw_list.iter().filter_map(subtitle_of).collect(), preferred.as_deref(), filename);
+    let want_lang = preferred.as_deref().unwrap_or("English");
+    let usable_in_lang = parsed.iter().filter(|s| s.language == want_lang).count();
+    if usable_in_lang < 3 && video_id.starts_with("tt") {
         if let Ok(os_list) = opensubtitles(kind, video_id).await {
-            list.extend(os_list);
-        } else if list.is_empty() {
+            parsed.extend(os_list.iter().filter_map(subtitle_of));
+            parsed = rank_subtitles_for(parsed, preferred.as_deref(), filename);
+        } else if parsed.is_empty() {
             anyhow::bail!("Subtitle providers could not be reached");
         }
     }
-    if list.is_empty() && v["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+    if parsed.is_empty() && v["errors"].as_array().is_some_and(|e| !e.is_empty()) {
         anyhow::bail!("Subtitle providers could not be reached");
     }
-    let preferred = stream_language().map(|k| subtitle_language_of(&k));
-    Ok(rank_subtitles_for(list.iter().filter_map(subtitle_of).collect(), preferred.as_deref(), filename))
+    Ok(parsed)
 }
 
 pub(super) async fn opensubtitles(kind: &str, video_id: &str) -> Result<Vec<Value>> {
@@ -229,15 +249,34 @@ pub fn subtitle_matches(s: &OnlineSubtitle, query: &str) -> bool {
     s.code.to_lowercase() == q || s.language.to_lowercase().split([' ', '(', ')', ',']).any(|w| w.starts_with(&q)) || s.language.to_lowercase().starts_with(&q)
 }
 
-/// Download one subtitle into the cache and return the local file for the player; a file the
-/// server says not to keep (or one Veylo can't read, like ASS) is handed to the player as a link.
-pub async fn fetch_subtitle(url: &str) -> String {
-    // Plain http needs consent the core doesn't have for subtitle links: such a link isn't
-    // cached, and goes to the player as offered.
-    match exec(json!({"op":"subtitle_file","url":url})).await {
-        Ok(v) => v["cache_path"].as_str().map(str::to_owned).unwrap_or_else(|| url.to_owned()),
-        Err(_) => url.to_owned(),
+fn format_vtt_time(ms: i64) -> String {
+    let ms = ms.max(0);
+    let h = ms / 3_600_000;
+    let m = (ms % 3_600_000) / 60_000;
+    let s = (ms % 60_000) / 1000;
+    let frac = ms % 1000;
+    format!("{h:02}:{m:02}:{s:02}.{frac:03}")
+}
+
+/// Download and validate one subtitle through core and return its local file path for the player.
+/// Never falls back to handing an unvalidated remote URL directly to libmpv.
+pub async fn fetch_subtitle(url: &str) -> Result<String> {
+    let v = exec(json!({"op":"subtitle_file","url":url})).await?;
+    if let Some(path) = v["cache_path"].as_str().filter(|p| !p.is_empty()) {
+        return Ok(path.to_owned());
     }
+    // Valid `Cache-Control: no-store` subtitle: render the core-validated cues into an ephemeral
+    // private VTT file rather than bypassing core validation with the raw remote URL.
+    let cues = v["cues"].as_array().filter(|c| !c.is_empty())
+        .context("Subtitle could not be cached or read")?;
+    let mut vtt = String::from("WEBVTT\n\n");
+    for cue in cues {
+        let (Some(start), Some(end), Some(text)) = (cue["start_ms"].as_i64(), cue["end_ms"].as_i64(), cue["text"].as_str()) else { continue };
+        vtt.push_str(&format!("{} --> {}\n{}\n\n", format_vtt_time(start), format_vtt_time(end), text));
+    }
+    let path = backend_data_dir().join("sub-ephemeral.vtt");
+    write_private_file(&path, vtt.as_bytes()).context("Couldn't stage subtitle")?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

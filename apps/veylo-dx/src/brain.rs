@@ -16,7 +16,7 @@
 //! Nothing here leaves the device. The log keeps titles' features, never add-on URLs.
 use crate::{backend::Media, picks_ai, picks_rules as rules};
 use serde_json::{json, Value};
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Mutex};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, mpsc, Mutex, OnceLock}};
 
 /// Projected embedding directions.
 const K: usize = 24;
@@ -478,6 +478,13 @@ impl Brain {
     pub fn keep(&mut self, won: &Media, lost: &Media) -> Event { let (w, l) = (self.remember(won), self.remember(lost)); self.learn(Signal::Keep { won: w, lost: l }) }
     pub fn neither(&mut self, a: &Media, b: &Media) -> Event { let (x, y) = (self.remember(a), self.remember(b)); self.learn(Signal::Neither(x, y)) }
     pub fn play(&mut self, m: &Media) -> Event { let x = self.remember(m); self.learn(Signal::Play(x)) }
+    fn push_event(&mut self, e: Event) {
+        self.events.push(e);
+        if self.events.len() > MAX_EVENTS {
+            let excess = self.events.len() - MAX_EVENTS;
+            self.events.drain(..excess);
+        }
+    }
     fn learn(&mut self, signal: Signal) -> Event {
         let e = Event { at: crate::backend::now_secs(), session: self.session, signal };
         let (mut long, mut night) = (self.long.clone(), self.tonight.clone());
@@ -486,7 +493,7 @@ impl Brain {
         self.teach(&mut night, &e, false);
         self.long = long;
         self.tonight = night;
-        self.events.push(e.clone());
+        self.push_event(e.clone());
         e
     }
     /// Turn a mood on (with the words' embedding) or off; tonight is replayed.
@@ -497,7 +504,7 @@ impl Brain {
             None => Signal::Unmood(key),
         };
         let e = Event { at: crate::backend::now_secs(), session: self.session, signal };
-        self.events.push(e.clone());
+        self.push_event(e.clone());
         self.rebuild();
         e
     }
@@ -509,7 +516,7 @@ impl Brain {
         let mut out = Vec::with_capacity(on.len());
         for words in on {
             let e = Event { at, session: self.session, signal: Signal::Unmood(mood_id(&words)) };
-            self.events.push(e.clone());
+            self.push_event(e.clone());
             out.push(e);
         }
         self.rebuild();
@@ -714,7 +721,7 @@ fn load_events(dir: &Path) -> Vec<Event> {
     if events.len() > MAX_EVENTS * 2 {
         events.drain(..events.len() - MAX_EVENTS);
         let body: String = events.iter().map(|e| format!("{}\n", e.encode())).collect();
-        let _ = std::fs::write(&path, body);
+        let _ = crate::backend::write_private_file(&path, body.as_bytes());
     } else if events.len() > MAX_EVENTS {
         events.drain(..events.len() - MAX_EVENTS);
     }
@@ -785,33 +792,99 @@ pub fn load(session: u64) -> Brain {
 /// The title store waiting to be written: the titles (their embeddings shared, not copied) and,
 /// past the cap, the log and library facts that decide which titles are kept.
 type PendingItems = (HashMap<String, Item>, Vec<Event>, Vec<Fact>);
-static PENDING_ITEMS: Mutex<Option<PendingItems>> = Mutex::new(None);
-/// Serializes background disk writes with `reset()` so a delayed persist never resurrects wiped files.
-static IO_LOCK: Mutex<()> = Mutex::new(());
+enum PersistMsg {
+    Write { gen: u64, dir: PathBuf, event: Option<Event>, items: Option<PendingItems> },
+    Reset { dir: PathBuf, done: mpsc::SyncSender<()> },
+}
+static RESET_GEN: AtomicU64 = AtomicU64::new(0);
+static WRITER: OnceLock<mpsc::Sender<PersistMsg>> = OnceLock::new();
 
-/// Log an event at once; the title store is written a few seconds later, one write for a burst,
-/// and encoded there too (thousands of embeddings): a vote never waits for it.
-pub fn persist(brain: &mut Brain, event: Option<&Event>) {
-    let dir = dir();
-    if let Some(e) = event {
-        let _io = IO_LOCK.lock();
-        append_event(&dir, e);
-    }
-    if !brain.dirty { return; }
-    brain.dirty = false;
-    // Only past the cap does the encoding need the log and the library (what to keep).
-    let over = brain.items.len() > MAX_ITEMS;
-    let snapshot = (brain.items.clone(), if over { brain.events.clone() } else { Vec::new() }, if over { brain.facts.clone() } else { Vec::new() });
-    let first = PENDING_ITEMS.lock().map(|mut p| p.replace(snapshot).is_none()).unwrap_or(false);
-    if first {
+fn writer() -> &'static mpsc::Sender<PersistMsg> {
+    WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PersistMsg>();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(4));
-            let _io = IO_LOCK.lock();
-            if let Some((items, events, facts)) = PENDING_ITEMS.lock().ok().and_then(|mut p| p.take()) {
-                let _ = crate::backend::write_private_file(&dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string().as_bytes());
+            let flush_items = |pending: &mut Option<(u64, PathBuf, PendingItems)>| {
+                let Some((gen, dir, (items, events, facts))) = pending.take() else { return true };
+                if gen < RESET_GEN.load(Ordering::Acquire) { return true; }
+                crate::backend::write_private_file(&dir.join(ITEMS_FILE), items_value(&items, &events, &facts).to_string().as_bytes()).is_ok()
+            };
+            let mut pending: Option<(u64, PathBuf, PendingItems)> = None;
+            loop {
+                let msg = if pending.is_some() {
+                    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(m) => m,
+                        Err(mpsc::RecvTimeoutError::Timeout) => { flush_items(&mut pending); continue; }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match rx.recv() { Ok(m) => m, Err(_) => break }
+                };
+                match msg {
+                    PersistMsg::Reset { dir, done } => {
+                        pending = None;
+                        for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(dir.join(f)); }
+                        let _ = done.send(());
+                    }
+                    PersistMsg::Write { gen, dir, event, items } => {
+                        if gen < RESET_GEN.load(Ordering::Acquire) { continue; }
+                        let mut events_batch = Vec::new();
+                        if let Some(i) = items { pending = Some((gen, dir.clone(), i)); }
+                        if let Some(e) = event { events_batch.push((gen, dir, e)); }
+                        // Coalesce any already-queued writes so a burst of votes writes items once
+                        // before appending every queued event in order.
+                        let mut reset_after: Option<(PathBuf, mpsc::SyncSender<()>)> = None;
+                        while let Ok(next) = rx.try_recv() {
+                            match next {
+                                PersistMsg::Reset { dir, done } => {
+                                    pending = None;
+                                    events_batch.clear();
+                                    reset_after = Some((dir, done));
+                                    break;
+                                }
+                                PersistMsg::Write { gen, dir, event, items } => {
+                                    if gen < RESET_GEN.load(Ordering::Acquire) { continue; }
+                                    if let Some(i) = items { pending = Some((gen, dir.clone(), i)); }
+                                    if let Some(e) = event { events_batch.push((gen, dir, e)); }
+                                }
+                            }
+                        }
+                        if let Some((rdir, done)) = reset_after {
+                            for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(rdir.join(f)); }
+                            let _ = done.send(());
+                            continue;
+                        }
+                        if !events_batch.is_empty() {
+                            // Persist referenced items BEFORE appending the event so exiting right
+                            // after a vote never leaves an orphan event that replay silently skips.
+                            let items_ok = if pending.is_some() { flush_items(&mut pending) } else { true };
+                            if items_ok {
+                                for (g, d, e) in events_batch {
+                                    if g >= RESET_GEN.load(Ordering::Acquire) { append_event(&d, &e); }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
-    }
+        tx
+    })
+}
+
+/// Queue an event and/or title-store update for the single ordered background writer so the UI
+/// voting thread never blocks on disk I/O, while guaranteeing referenced items land before events.
+pub fn persist(brain: &mut Brain, event: Option<&Event>) {
+    let dir = dir();
+    let items = if brain.dirty {
+        brain.dirty = false;
+        let over = brain.items.len() > MAX_ITEMS;
+        Some((brain.items.clone(), if over { brain.events.clone() } else { Vec::new() }, if over { brain.facts.clone() } else { Vec::new() }))
+    } else {
+        None
+    };
+    if event.is_none() && items.is_none() { return; }
+    let gen = RESET_GEN.load(Ordering::Acquire);
+    let _ = writer().send(PersistMsg::Write { gen, dir, event: event.cloned(), items });
 }
 
 /// A projection fitted to the titles embedded so far, when there is none yet or the catalogue
@@ -826,7 +899,7 @@ pub async fn refresh_space(current: Option<Space>, items: Vec<Vec<f32>>) -> Opti
             let stale = match &current { None => n >= 16, Some(s) => n >= s.count + 40 && n * 2 >= s.count * 3 };
             if !stale { return None; }
             let space = Space::fit(&vectors)?;
-            let _ = std::fs::write(dir.join(SPACE_FILE), space.encode().to_string());
+            let _ = crate::backend::write_private_file(&dir.join(SPACE_FILE), space.encode().to_string().as_bytes());
             Some(space)
         }).await.ok().flatten()
     }).await.ok().flatten()
@@ -835,6 +908,7 @@ pub async fn refresh_space(current: Option<Space>, items: Vec<Vec<f32>>) -> Opti
 impl Brain {
     /// Embeddings the brain keeps for titles, for fitting the projection.
     pub fn item_embeddings(&self) -> Vec<Vec<f32>> { self.items.values().filter(|i| !i.mood).filter_map(|i| i.emb.as_deref().map(<[f32]>::to_vec)).collect() }
+    pub fn item_embedding_count(&self) -> usize { self.items.values().filter(|i| !i.mood && i.emb.is_some()).count() }
 }
 
 /// Mood words embedded by the local model (once; cached with the titles' embeddings).
@@ -849,9 +923,15 @@ pub async fn anchors() -> Vec<(String, Vec<f32>)> {
 /// Forget everything Picks learned: the log, the titles and the earlier profile.
 pub fn reset() {
     let dir = dir();
-    let _io = IO_LOCK.lock();
-    if let Ok(mut p) = PENDING_ITEMS.lock() { p.take(); }
+    RESET_GEN.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut l) = LOADED.lock() { l.take(); }
+    if let Some(tx) = WRITER.get() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if tx.send(PersistMsg::Reset { dir: dir.clone(), done: done_tx }).is_ok() {
+            let _ = done_rx.recv();
+            return;
+        }
+    }
     for f in [ITEMS_FILE, EVENTS_FILE, OLD_TASTE_FILE, "picks-duel.json"] { let _ = std::fs::remove_file(dir.join(f)); }
 }
 

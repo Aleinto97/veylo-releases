@@ -130,20 +130,37 @@ fn windows() {
         .unwrap_or_else(|| Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("windows/mpv"));
     let dll = dir.join("libmpv-2.dll");
     assert!(dll.is_file(), "libmpv for Windows is missing: run windows/fetch-mpv.ps1 (or set VEYLO_MPV_DIR)");
+    println!("cargo:rerun-if-changed={}", dll.display());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // libmpv2-sys links "mpv": MSVC looks for mpv.lib, GNU for libmpv.dll.a; the release's import library serves both.
-    if !dir.join("mpv.lib").is_file() && dir.join("libmpv.dll.a").is_file() {
-        std::fs::copy(dir.join("libmpv.dll.a"), out.join("mpv.lib")).expect("copy the mpv import library");
+    let import_lib = dir.join("mpv.lib");
+    let gnu_lib = dir.join("libmpv.dll.a");
+    if import_lib.is_file() {
+        println!("cargo:rerun-if-changed={}", import_lib.display());
+    } else if gnu_lib.is_file() {
+        println!("cargo:rerun-if-changed={}", gnu_lib.display());
+        std::fs::copy(&gnu_lib, out.join("mpv.lib")).expect("copy the mpv import library");
         println!("cargo:rustc-link-search=native={}", out.display());
     }
     println!("cargo:rustc-link-search=native={}", dir.display());
     // OUT_DIR sits under <target>/<profile>/build/ (as build/veylo-dx-<hash>/out or build/veylo-dx/<hash>/out):
     // the exe lives in <profile>, test binaries in <profile>/deps.
     if let Some(profile) = out.ancestors().find(|a| a.file_name().is_some_and(|n| n == "build")).and_then(Path::parent) {
+        let src_meta = std::fs::metadata(&dll).ok();
+        let src_id = dll.display().to_string();
         for to in [profile.to_path_buf(), profile.join("deps")] {
             let dest = to.join("libmpv-2.dll");
-            let stale = std::fs::metadata(&dest).and_then(|m| m.modified()).ok() < std::fs::metadata(&dll).and_then(|m| m.modified()).ok();
-            if stale && std::fs::create_dir_all(&to).is_ok() { std::fs::copy(&dll, &dest).expect("copy libmpv-2.dll beside the executable"); }
+            let marker = to.join("libmpv-2.dll.src");
+            let dest_meta = std::fs::metadata(&dest).ok();
+            let same_source = std::fs::read_to_string(&marker).ok().as_deref() == Some(src_id.as_str());
+            let same_file = match (&src_meta, &dest_meta) {
+                (Some(s), Some(d)) => s.len() == d.len() && s.modified().ok() == d.modified().ok(),
+                _ => false,
+            };
+            if (!same_source || !same_file) && std::fs::create_dir_all(&to).is_ok() {
+                std::fs::copy(&dll, &dest).expect("copy libmpv-2.dll beside the executable");
+                let _ = std::fs::write(&marker, &src_id);
+            }
         }
     }
 }

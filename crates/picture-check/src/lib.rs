@@ -121,13 +121,17 @@ const MIN_BAR: usize = 6;
 /// (4 bytes) screenshot. The player's controls may cover the top and bottom of the picture: a band of
 /// rows in the middle is enough.
 pub fn find_bars(pixels: &[u8], width: usize, height: usize, channels: usize) -> Result<Found, String> {
-    if !(3..=4).contains(&channels) || pixels.len() < width * height * channels {
+    let stride = width.checked_mul(channels);
+    let total = stride.and_then(|s| s.checked_mul(height));
+    let (Some(stride), Some(total)) = (stride, total) else {
+        return Err(format!("not a {width}x{height} image with {channels} channels ({} bytes)", pixels.len()));
+    };
+    if width == 0 || height == 0 || !(3..=4).contains(&channels) || pixels.len() < total {
         return Err(format!("not a {width}x{height} image with {channels} channels ({} bytes)", pixels.len()));
     }
     let mut hits: Vec<(usize, usize, usize)> = Vec::new(); // (row, left, right)
     let mut best = 0;
-    for y in 0..height {
-        let row = &pixels[y * width * channels..(y + 1) * width * channels];
+    for (y, row) in pixels[..total].chunks_exact(stride).enumerate() {
         let runs = runs(row, width, channels);
         match bars_in(&runs) {
             Ok((left, right)) => hits.push((y, left, right)),
@@ -294,6 +298,13 @@ mod tests {
         let y = h / 2;
         for row in y..y + 3 { img[row * w * 3..(row + 1) * w * 3].copy_from_slice(&full[row * w * 3..(row + 1) * w * 3]); }
         assert!(find_bars(&img, w, h, 3).unwrap_err().contains("only 3 row(s)"));
+    }
+
+    #[test]
+    fn overflowing_or_zero_dimensions_fail_safely() {
+        assert!(find_bars(&[], 0, 0, 3).is_err());
+        assert!(find_bars(&[0u8; 16], usize::MAX, 2, 4).is_err());
+        assert!(find_bars(&[0u8; 16], 1 << 32, 1 << 32, 4).is_err());
     }
 
     #[test]

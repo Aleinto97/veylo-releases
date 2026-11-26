@@ -629,10 +629,12 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
             }
             Ok(Event::PropertyChange { name, change, .. }) => match (name, change) {
                 ("time-pos", PropertyData::Double(v)) => {
-                    if let Some(prev) = last_tick { measured += played_between(prev, v, speed); }
+                    if !seeking && !paused {
+                        if let Some(prev) = last_tick { measured += played_between(prev, v, speed); }
+                    }
                     #[cfg(target_os = "android")]
                     if last_tick.is_none() { crate::android::log(&format!("playing from {v:.1}s")); }
-                    last_tick = Some(v);
+                    last_tick = if seeking { None } else { Some(v) };
                     position = v;
                     if v > 1.0 { played = true; }
                     live.update(|s| {
@@ -674,6 +676,7 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
                 }
                 ("seeking", PropertyData::Flag(v)) => {
                     seeking = v;
+                    last_tick = None;
                     let buf = paused_for_cache || seeking;
                     live.update(|s| { let c = s.buffering != buf; s.buffering = buf; c })
                 }

@@ -156,6 +156,7 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
                 }
                 aside { class: "theatre-side",
                     div { class: "theatre-tools",
+                        onkeydown: move |e: KeyboardEvent| if e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                         if n > 1 {
                             icons::IconButton { label: "Previous video (←)", class: "glass small", onclick: move |_| go((at + n - 1) % n), icons::ArrowLeft {} }
                             span { class: "theatre-count tnum", "{at + 1} / {n}" }
@@ -192,6 +193,7 @@ pub fn TheatreSheet(theatre: Theatre) -> Element {
                     }
                     if n > 1 {
                         div { class: "theatre-list", role: "list", aria_label: "All videos",
+                            onkeydown: move |e: KeyboardEvent| if e.key() == Key::Character(" ".into()) { e.stop_propagation(); },
                             for (i, c) in theatre.clips.iter().cloned().enumerate() {
                                 button { key: "{c.youtube}", class: if i == at { "theatre-clip on" } else { "theatre-clip" }, role: "listitem",
                                     aria_current: if i == at { "true" } else { "false" }, aria_label: "{c.label()}: {c.name}", onclick: move |_| go(i),

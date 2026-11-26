@@ -11,16 +11,30 @@ object VeyloPicks {
         File(activity.filesDir, "picks-ai/21edefaf-v1").deleteRecursively()
         val root = File(activity.filesDir, "picks-ai/bge-ea104dac-v1")
         root.mkdirs()
-        for (name in arrayOf("model.onnx", "tokenizer.json", "LICENSE", "NOTICE")) {
-            val dest = File(root, name)
-            activity.assets.open("picks-ai/$name").use { input ->
-                // A marker is written only after both large files finished copying.
-                if (!File(root, "ready").exists() || !dest.isFile) {
-                    dest.outputStream().use { output -> input.copyTo(output) }
+        val files = arrayOf("model.onnx", "tokenizer.json", "LICENSE", "NOTICE")
+        val ready = File(root, "ready")
+        val needsUnpack = !ready.isFile || files.any { val f = File(root, it); !f.isFile || f.length() == 0L }
+        if (needsUnpack) {
+            ready.delete()
+            for (name in files) {
+                val dest = File(root, name)
+                val tmp = File(root, "$name.tmp")
+                tmp.delete()
+                activity.assets.open("picks-ai/$name").use { input ->
+                    tmp.outputStream().use { output -> input.copyTo(output) }
+                }
+                if (tmp.length() == 0L) {
+                    tmp.delete()
+                    throw java.io.IOException("Empty unpacked asset: $name")
+                }
+                if (dest.exists()) dest.delete()
+                if (!tmp.renameTo(dest)) {
+                    tmp.delete()
+                    throw java.io.IOException("Failed to place asset: $name")
                 }
             }
+            ready.writeText("bge-ea104dac-v1")
         }
-        File(root, "ready").writeText("bge-ea104dac-v1")
         return root.absolutePath
     }
 

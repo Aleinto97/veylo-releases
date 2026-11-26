@@ -37,6 +37,7 @@
 .settings-block .group-head .pill.small { min-height: 36px; height: 36px; padding: 0 14px; font-size: 13.5px; }
 
 .settings-group { display: flex; flex-direction: column; border-radius: 22px; overflow: hidden; --glass: rgba(255,255,255,.045); }
+.settings-group .glass { -webkit-backdrop-filter: none; backdrop-filter: none; }
 .settings-group > .setting-row { margin-top: 0; border-radius: 0; background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none;
   box-shadow: none; padding: 15px 20px; min-height: 66px; gap: 16px; transition: background-color .14s ease; }
 .settings-group > .setting-row + .setting-row,

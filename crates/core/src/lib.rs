@@ -324,7 +324,7 @@ impl Core {
                     .filter(|m| m.in_library())
                     .map(|m| m.value())
                     .collect::<Vec<_>>();
-                let recommendations = recommendations::recommend(&all, None, limit);
+                let recommendations = recommendations::recommend(&all, None, limit, false);
                 let collections = recommendations::collections(&all);
                 Ok(
                     json!({"library":library,"recommendations":recommendations["metas"],
@@ -358,15 +358,24 @@ impl Core {
                 &self.with_db(|db| db::personal_media(db))?,
                 None,
                 limit(&request)?,
+                request["exclude_liked"].as_bool().unwrap_or(false),
             )),
             "similar" => {
                 let kind = text(&request, "type")?;
                 let id = text(&request, "id")?;
                 let addon = addon::normalize(text(&request, "addon_url")?, true)?;
+                let key = db::identity(kind, id, &addon);
+                let mut all = self.with_db(|db| db::personal_media(db))?;
+                if !all.iter().any(|m| m.key == key) {
+                    if let Some(seed) = self.with_db(|db| db::media_item(db, &key))? {
+                        all.push(seed);
+                    }
+                }
                 Ok(recommendations::recommend(
-                    &self.with_db(|db| db::personal_media(db))?,
-                    Some(&db::identity(kind, id, &addon)),
+                    &all,
+                    Some(&key),
                     limit(&request)?,
+                    false,
                 ))
             }
             "collections" => Ok(recommendations::collections(

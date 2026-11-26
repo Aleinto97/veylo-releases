@@ -342,7 +342,13 @@ mod subsurface {
                 (e.destroy_context)(dpy, ctx);
                 let err = "EGL surface".to_owned(); let _ = init_tx.send(Err(err.clone())); return Err(err);
             }
-            (e.make_current)(dpy, surf, surf, ctx);
+            if (e.make_current)(dpy, surf, surf, ctx) == 0 {
+                (e.destroy_surface)(dpy, surf);
+                (e.destroy_context)(dpy, ctx);
+                let err = "EGL make current".to_owned();
+                let _ = init_tx.send(Err(err.clone()));
+                return Err(err);
+            }
             // mpv paces frames itself; never block on the compositor (a hidden window would stall it).
             (e.swap_interval)(dpy, 0);
             let cb = Arc::into_raw(shared.clone()) as *mut c_void;

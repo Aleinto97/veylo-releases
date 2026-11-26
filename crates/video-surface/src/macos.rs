@@ -23,7 +23,7 @@ use objc2_quartz_core::{CALayer, CAOpenGLLayer, CATransaction};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
 use std::ptr::{null_mut, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[link(name = "OpenGL", kind = "framework")]
@@ -73,8 +73,9 @@ static DIRTY: AtomicBool = AtomicBool::new(false);
 /// The screen's EDR headroom, read on the main thread at attach (f64 bits); 1.0 is SDR only.
 static HEADROOM: AtomicU64 = AtomicU64::new(0);
 static POTENTIAL: AtomicU64 = AtomicU64::new(0);
-/// What the layer and mpv are set to: 0 SDR, 1 PQ in BT.2020, 2 PQ in Display P3.
+/// What the layer and mpv are set to: 0 SDR, 1 PQ in BT.2020, 2 PQ in Display P3, plus peak nits.
 static HDR_MODE: AtomicU64 = AtomicU64::new(0);
+static HDR_PEAK: AtomicI64 = AtomicI64::new(0);
 
 /// The video layer, for HDR changes from the engine thread (layer properties are thread-safe in
 /// an explicit CATransaction).
@@ -299,6 +300,7 @@ pub fn open(_path: Path, host: &Host, player: &Arc<dyn Player>) -> Result<(), St
     let render = unsafe { create_render(player.mpv()) }.map_err(|e| format!("video layer: {e}"))?;
     if let Ok(mut s) = RENDER.lock() { *s = Some(Session { _player: player.clone(), render }); }
     HDR_MODE.store(0, Ordering::Release);
+    HDR_PEAK.store(0, Ordering::Release);
     if let Ok(layer) = LAYER.lock() {
         if let Some(l) = layer.as_ref() {
             l.0.setAsynchronous(true);
@@ -346,6 +348,9 @@ fn set_edr(layer: &VideoLayer, pq: Option<&objc2_core_foundation::CFString>) {
 
 /// The video's format is known (or changed): HDR video on an EDR screen goes out as PQ.
 pub fn layout(player: &dyn Player, hdr_output: bool) {
+    if MainThreadMarker::new().is_some() {
+        read_headroom();
+    }
     let mpv = player.mpv();
     let primaries: String = mpv.get_property("video-params/primaries").unwrap_or_default();
     let gamma: String = mpv.get_property("video-params/gamma").unwrap_or_default();
@@ -360,7 +365,15 @@ pub fn layout(player: &dyn Player, hdr_output: bool) {
         ("pq" | "hlg", "display-p3") => 2,
         _ => 0,
     };
-    if HDR_MODE.swap(mode, Ordering::AcqRel) == mode { return; }
+    let peak = if mode == 0 { 0 } else { (headroom * 203.0).round().clamp(203.0, 10000.0) as i64 };
+    let prev_mode = HDR_MODE.swap(mode, Ordering::AcqRel);
+    let prev_peak = HDR_PEAK.swap(peak, Ordering::AcqRel);
+    if prev_mode == mode && prev_peak == peak { return; }
+    if prev_mode == mode && mode != 0 {
+        let _ = mpv.set_property("target-peak", peak);
+        eprintln!("veylo: HDR target peak updated to {peak} nits (EDR headroom {headroom:.1})");
+        return;
+    }
     let Ok(layer) = LAYER.lock() else { return };
     let Some(layer) = layer.as_ref() else { return };
     if mode == 0 {
@@ -373,7 +386,6 @@ pub fn layout(player: &dyn Player, hdr_output: bool) {
     let name = unsafe { if mode == 1 { objc2_core_graphics::kCGColorSpaceITUR_2100_PQ } else { objc2_core_graphics::kCGColorSpaceDisplayP3_PQ } };
     set_edr(&layer.0, Some(name));
     // EDR 1.0 is SDR white (203 nits by BT.2408); mpv tone-maps what the screen can't reach.
-    let peak = (headroom * 203.0).round().clamp(203.0, 10000.0) as i64;
     let _ = mpv.set_property("icc-profile", "");
     let _ = mpv.set_property("target-prim", primaries.as_str());
     let _ = mpv.set_property("target-trc", "pq");
