@@ -514,9 +514,10 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
             "a" | "A" => {
                 let (label, track) = live.cycle_track(true);
                 say(format!("Audio: {label}"));
-                // Remembered for the series like a pick in the sheet, so the next episode keeps it.
-                if let (Some(mk), Some(lang)) = (&pref_key, track.map(|t| t.lang).filter(|l| !l.is_empty())) {
-                    backend::save_track_pref(mk, |p| p.audio_lang = Some(lang));
+                // Remembered for the series like a pick in the sheet, so the next episode keeps it
+                // (never save a commentary/audio-description track as the series's main audio preference).
+                if let (Some(mk), Some(track)) = (&pref_key, track.filter(|t| !engine::extra_audio(t))) {
+                    if !track.lang.is_empty() { backend::save_track_pref(mk, |p| p.audio_lang = Some(track.lang)); }
                 }
             }
             "c" | "C" => {
@@ -1027,14 +1028,17 @@ pub fn PlayerScreen(live: LiveRef) -> Element {
                                         OptionRow { key: "{t.id}", on: t.selected, label: t.label.clone(),
                                             about: if audio || !s.direct { String::new() } else if t.image { "Image subtitles: drawn by mpv, off the direct path".to_string() }
                                                 else if t.styled { "Styled: full look on SDR, plain text over HDR".to_string() } else { String::new() },
-                                            pick: { let live = lc(); let id = t.id; let lang = t.lang.clone(); let mk = mk_sheet.clone(); move |_| {
+                                            pick: { let live = lc(); let id = t.id; let lang = t.lang.clone(); let is_extra = engine::extra_audio(&t); let mk = mk_sheet.clone(); move |_| {
                                                 live.select(audio, Some(id));
                                                 if let Some(mk) = &mk {
                                                     let lang = lang.clone();
-                                                    backend::save_track_pref(mk, |p| {
-                                                        if audio { if !lang.is_empty() { p.audio_lang = Some(lang); } }
-                                                        else { p.sub_off = false; if !lang.is_empty() { p.sub_lang = Some(lang); } }
-                                                    });
+                                                    if audio {
+                                                        if !is_extra && !lang.is_empty() {
+                                                            backend::save_track_pref(mk, |p| p.audio_lang = Some(lang));
+                                                        }
+                                                    } else {
+                                                        backend::save_track_pref(mk, |p| { p.sub_off = false; if !lang.is_empty() { p.sub_lang = Some(lang); } });
+                                                    }
                                                 }
                                                 sheet.set(None);
                                             } } }

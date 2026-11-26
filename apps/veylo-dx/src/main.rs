@@ -862,7 +862,6 @@ fn Shell_() -> Element {
             if (shell.player)().is_none() { account_ui::KeysPrompt {} }
             if search_open() { search::SearchOverlay {} }
             if shortcuts_open() { shortcuts::AppShortcuts {} }
-            // Windows, macOS and Android install releases; Linux builds from source.
             // Keep mounted so "Later" and active downloads survive opening Search, Player, or Theatre.
             if updater::ASSET.is_some() {
                 div {

@@ -26,14 +26,34 @@ pub struct Language {
 
 impl Language {
     /// Whether a source's label says it has this audio (flag, name or release tag). Subtitle
-    /// languages do not count: flags after "Subs" or a tag after "Sub" ("Sub ITA").
+    /// languages and commentary / audio-description tags do not count (e.g. "Sub ITA", "ENG Commentary").
     pub fn matches(&self, label: &str) -> bool {
+        const SKIP_BEFORE: &[&str] = &[
+            "sub", "subs", "subbed", "subtitles",
+            "commentary", "commento", "comentario", "commentaire", "kommentar",
+            "descriptive", "audiodescription", "audiodescrizione",
+        ];
+        const SKIP_AFTER: &[&str] = &[
+            "commentary", "commento", "comentario", "commentaire", "kommentar",
+            "descriptive", "ad", "dvs",
+        ];
+        const SKIP_ROLE: &[&str] = &["director", "directors", "cast", "crew", "audio"];
+        const SKIP_NOUN: &[&str] = &[
+            "commentary", "commento", "comentario", "commentaire", "kommentar",
+            "description", "descriptive",
+        ];
+        let matches_any = |arr: &[&str], w: &str| arr.iter().any(|s| w.eq_ignore_ascii_case(s));
         label.lines().any(|line| {
             let audio = line.find("Subs").map_or(line, |i| &line[..i]);
             if audio.contains(self.flag) { return true; }
             let words: Vec<&str> = audio.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-            words.iter().enumerate().any(|(i, w)| self.tags.iter().any(|t| w.eq_ignore_ascii_case(t))
-                && !(i > 0 && ["sub", "subs", "subbed", "subtitles"].iter().any(|s| words[i - 1].eq_ignore_ascii_case(s))))
+            words.iter().enumerate().any(|(i, w)| {
+                self.tags.iter().any(|t| w.eq_ignore_ascii_case(t))
+                    && !(i > 0 && matches_any(SKIP_BEFORE, words[i - 1]))
+                    && !words.get(i + 1).is_some_and(|n| matches_any(SKIP_AFTER, n))
+                    && !(words.get(i + 1).is_some_and(|r| matches_any(SKIP_ROLE, r))
+                        && words.get(i + 2).is_some_and(|n| matches_any(SKIP_NOUN, n)))
+            })
         })
     }
 }
@@ -587,6 +607,8 @@ mod tests {
     #[test]
     fn languages_match_flags_and_release_tags() {
         let it = language("italian").unwrap();
+        let en = language("english").unwrap();
+        let ko = language("korean").unwrap();
         assert!(it.matches("Inception 2010 2160p\n🇬🇧 / 🇮🇹"));
         assert!(it.matches("Inception.2010.BDRemux.Ita.Eng.x265"));
         assert!(!it.matches("Inception.2010.2160p.WEB-DL.Italic.Subs"));
@@ -594,6 +616,14 @@ mod tests {
         assert!(!it.matches("Film.2160p\n💾 79 GiB\n🇬🇧 / 🇯🇵 Subs / 🇬🇧 / 🇮🇹"));
         assert!(!it.matches("Film 2010 AC3 5.1 ENG 2160p sub ITA"));
         assert!(it.matches("Film (2010) AC3 5.1 ITA.ENG 2160p H265 sub NUita.eng"));
+        // Commentary / AD language tags never advertise main audio in that language.
+        assert!(!en.matches("Film.2020.KOR.ENG.Commentary.1080p.mkv"));
+        assert!(ko.matches("Film.2020.KOR.ENG.Commentary.1080p.mkv"));
+        assert!(!en.matches("Film.2020.KOR.Commentary.ENG.1080p.mkv"));
+        assert!(!en.matches("Film.2020.KOR.ENG.Director.Commentary.1080p.mkv"));
+        assert!(!it.matches("Film.2020.ENG.ITA.Commento.1080p.mkv"));
+        assert!(en.matches("Film.2020.ENG.ITA.Commentary.1080p.mkv"));
+        assert!(!it.matches("Film.2020.ENG.ITA.Commentary.1080p.mkv"));
     }
 
     #[test]

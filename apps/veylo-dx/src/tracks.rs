@@ -9,20 +9,47 @@
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioTrack { pub lang: String, pub name: String, pub commentary: bool }
 
+/// True when an audio track title names a commentary, audio-description, or isolated-score/M&E
+/// track rather than the film or episode's main dialogue audio.
+pub fn is_extra_audio_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "commentary", "audio description", "audio-description", "audiodescription",
+        "descriptive", "description", "visually impaired", "visual impaired",
+        "(ad)", "[ad]", "(vi)", "[vi]", "(comm)", "[comm]", "audio comm",
+        "cast & crew", "cast and crew", "cast/crew", "film historian", "trivia track",
+        "director's track", "directors track", "with director", "with the director",
+        "by director", "by the director", "isolated score", "score only", "music only",
+        "music & effects", "music and effects", "m&e",
+        "commento", "commenti", "audiodescrizione", "audio descrizione",
+        "comentario", "comentarios", "audiodescripcion", "audiodescripción",
+        "audio descripcion", "audio descripción",
+        "commentaire", "commentaires",
+        "kommentar", "kommentare", "audiodeskription", "hörfilm", "hoerfilm", "bildbeschreibung",
+        "comentário", "comentários", "audiodescrição", "audiodescricao",
+        "commentaar", "audiobeschrijving",
+        "komentarz", "audiodeskrypcja",
+        "комментар", "тифлокоммент",
+        "コメンタリー", "音声解説", "副音声",
+        "코멘터리", "음성 해설",
+        "评论音轨", "評論音軌", "导评", "導評", "口述影像",
+        "sesli betimleme", "yönetmen yorumu",
+    ];
+    if PHRASES.iter().any(|p| n.contains(p)) { return true; }
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.iter().enumerate().any(|(i, w)| {
+        matches!(*w, "comm" | "comment" | "dvs")
+            || (*w == "ad" && (words.len() == 1
+                || i + 1 == words.len()
+                || words[i + 1].as_bytes().first().is_some_and(u8::is_ascii_digit)
+                || matches!(words[i + 1], "stereo" | "mono" | "surround" | "dolby" | "ac3" | "eac3" | "aac" | "dd" | "ddp" | "track" | "audio")))
+    })
+}
+
 impl AudioTrack {
     /// Commentary or audio description: not the film's own sound (as `engine::extra_audio`).
     pub fn extra(&self) -> bool {
-        if self.commentary { return true; }
-        let n = self.name.to_lowercase();
-        n.contains("commentary")
-            || n.contains("description")
-            || n.contains("descriptive")
-            || n.contains("visually impaired")
-            || n.contains("visual impaired")
-            || n.contains("(ad)")
-            || n.contains("[ad]")
-            || n.contains("(vi)")
-            || n.contains("[vi]")
+        self.commentary || is_extra_audio_name(&self.name)
     }
 }
 
@@ -276,7 +303,8 @@ fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
                     0x22B59C => lang = Some(text(v)),
                     0x22B59D => bcp47 = Some(text(v)),
                     0x536E => name = text(v),
-                    0x55EE => commentary = uint(v) != 0,
+                    // RFC 9559: FlagCommentary (0x55AF) and FlagVisualImpaired (0x55AC); 0x55EE is MaxBlockAdditionID.
+                    0x55AF | 0x55AC if uint(v) != 0 => commentary = true,
                     _ => {}
                 }
             }
@@ -409,13 +437,38 @@ fn mp4(head: &[u8]) -> Option<Vec<AudioTrack>> {
     let moov = &head[ms..me];
     Some(boxes(moov).into_iter().filter(|b| &b.0 == b"trak").filter_map(|(_, ts, te, _)| {
         let trak = &moov[ts..te];
-        let (_, ds, de, _) = boxes(trak).into_iter().find(|b| &b.0 == b"mdia")?;
+        let trak_boxes = boxes(trak);
+        let (_, ds, de, _) = *trak_boxes.iter().find(|b| &b.0 == b"mdia")?;
         let mdia = &trak[ds..de];
         let parts = boxes(mdia);
         let (_, hs, he, _) = *parts.iter().find(|b| &b.0 == b"hdlr")?;
         let hdlr = &mdia[hs..he];
         if hdlr.get(8..12) != Some(b"soun") { return None; }
-        let name = hdlr.get(24..).map(text).unwrap_or_default();
+        let mut name = hdlr.get(24..).map(text).unwrap_or_default();
+        let mut commentary = false;
+        if let Some((_, us, ue, _)) = trak_boxes.iter().find(|b| &b.0 == b"udta") {
+            let udta = &trak[*us..*ue];
+            for (kind, s, e, _) in boxes(udta) {
+                match &kind {
+                    b"name" => {
+                        let u = text(&udta[s..e]);
+                        if !u.is_empty() {
+                            if is_extra_audio_name(&u) { commentary = true; }
+                            if name.is_empty() || name.eq_ignore_ascii_case("SoundHandler") { name = u; }
+                        }
+                    }
+                    b"tagc" => {
+                        if let Some(tag) = udta.get(s + 4..e).map(text) {
+                            let t = tag.to_lowercase();
+                            if t.contains("describes-video") || t.contains("auxiliary-content") || t.contains("commentary") || t.contains("visual-impaired") {
+                                commentary = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let elng = parts.iter().find(|b| &b.0 == b"elng").and_then(|(_, s, e, _)| mdia.get(s + 4..*e)).map(text);
         let packed = parts.iter().find(|b| &b.0 == b"mdhd").and_then(|(_, s, e, _)| {
             let box_data = mdia.get(*s..*e)?;
@@ -428,7 +481,7 @@ fn mp4(head: &[u8]) -> Option<Vec<AudioTrack>> {
         Some(AudioTrack {
             lang: if lang.eq_ignore_ascii_case("und") || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { String::new() } else { lang },
             name,
-            commentary: false,
+            commentary,
         })
     }).collect())
 }
@@ -693,20 +746,28 @@ mod tests {
 
     #[test]
     fn matroska_commentary_flag_and_bcp47_und_override() {
-        // Track 1: main Japanese audio.
+        // Track 1: main Japanese audio with MaxBlockAdditionID=1 (0x55EE must NOT trigger commentary).
         let mut t1 = el(&[0x83], &[2]);
         t1.extend(el(&[0x22, 0xB5, 0x9C], b"jpn"));
-        // Track 2: English audio flagged as commentary via FlagCommentary (0x55EE = 1), no "commentary" in Name.
+        t1.extend(el(&[0x55, 0xEE], &[1]));
+        // Track 2: English audio flagged as commentary via FlagCommentary (0x55AF = 1), no "commentary" in Name.
         let mut t2 = el(&[0x83], &[2]);
         t2.extend(el(&[0x22, 0xB5, 0x9C], b"eng"));
-        t2.extend(el(&[0x55, 0xEE], &[1]));
-        // Track 3: legacy Language=eng overridden by LanguageBCP47=und (unknown language).
+        t2.extend(el(&[0x55, 0xAF], &[1]));
+        // Track 3: English audio-description track via FlagVisualImpaired (0x55AC = 1).
         let mut t3 = el(&[0x83], &[2]);
         t3.extend(el(&[0x22, 0xB5, 0x9C], b"eng"));
-        t3.extend(el(&[0x22, 0xB5, 0x9D], b"und"));
+        t3.extend(el(&[0x55, 0xAC], &[1]));
+        // Track 4: legacy Language=eng overridden by LanguageBCP47=und (unknown language).
+        let mut t4 = el(&[0x83], &[2]);
+        t4.extend(el(&[0x22, 0xB5, 0x9C], b"eng"));
+        t4.extend(el(&[0x22, 0xB5, 0x9D], b"und"));
+        // Track 5: absent language (defaults to "eng" per RFC 9559), flagged FlagCommentary=1.
+        let mut t5 = el(&[0x83], &[2]);
+        t5.extend(el(&[0x55, 0xAF], &[1]));
 
         let mut tracks = Vec::new();
-        for t in [t1, t2, t3] {
+        for t in [t1, t2, t3, t4, t5] {
             tracks.extend(el(&[0xAE], &t));
         }
         let mut segment = el(&[0x16, 0x54, 0xAE, 0x6B], &tracks);
@@ -715,13 +776,63 @@ mod tests {
         file.extend(el(&[0x18, 0x53, 0x80, 0x67], &segment));
 
         let parsed = audio_tracks(&file).expect("mkv parsed");
-        assert_eq!(parsed.len(), 3);
-        assert!(!parsed[0].commentary);
-        assert!(parsed[1].commentary && parsed[1].extra());
-        assert_eq!(parsed[2].lang, "");
-        // Commentary-only English + untagged track => unknown rather than false English match.
-        assert_eq!(in_language(&parsed[..2], "english"), Some(false));
+        assert_eq!(parsed.len(), 5);
+        assert!(!parsed[0].commentary && !parsed[0].extra(), "MaxBlockAdditionID (0x55EE) must not mark commentary");
+        assert!(parsed[1].commentary && parsed[1].extra(), "FlagCommentary (0x55AF) must mark commentary");
+        assert!(parsed[2].commentary && parsed[2].extra(), "FlagVisualImpaired (0x55AC) must mark commentary/AD");
+        assert_eq!(parsed[3].lang, "");
+        assert!(parsed[4].commentary && parsed[4].extra());
+        // Commentary/AD-only English (plus default-eng commentary) => false; adding untagged => None.
+        assert_eq!(in_language(&parsed[..3], "english"), Some(false));
+        assert_eq!(in_language(&[parsed[0].clone(), parsed[4].clone()], "english"), Some(false));
         assert_eq!(in_language(&parsed, "english"), None);
+    }
+
+    #[test]
+    fn mp4_udta_name_and_tagc_mark_commentary_and_extra_names() {
+        let mut mdia = Vec::new();
+        let l = b"eng";
+        let packed = l.iter().fold(0u16, |a, c| (a << 5) | (*c - 0x60) as u16);
+        let mut mdhd = vec![0u8; 20];
+        mdhd.extend(packed.to_be_bytes());
+        mdhd.extend([0, 0]);
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"soun");
+        hdlr.extend([0u8; 12]);
+        hdlr.extend_from_slice(b"SoundHandler\0");
+        mdia.extend(bx(b"mdhd", &mdhd));
+        mdia.extend(bx(b"hdlr", &hdlr));
+
+        let mut t_name_payload = bx(b"mdia", &mdia);
+        t_name_payload.extend(bx(b"udta", &bx(b"name", b"Director Commentary\0")));
+
+        let mut tagc = vec![0u8; 4];
+        tagc.extend_from_slice(b"public.accessibility.describes-video");
+        let mut t_tagc_payload = bx(b"mdia", &mdia);
+        t_tagc_payload.extend(bx(b"udta", &bx(b"tagc", &tagc)));
+
+        let mut moov = trak(b"soun", "jpn", "Main");
+        moov.extend(bx(b"trak", &t_name_payload));
+        moov.extend(bx(b"trak", &t_tagc_payload));
+        let mp4_file = [bx(b"ftyp", b"isom"), bx(b"moov", &moov)].concat();
+        let parsed = audio_tracks(&mp4_file).expect("mp4 parsed");
+        assert_eq!(parsed.len(), 3);
+        assert!(!parsed[0].extra());
+        assert_eq!(parsed[1].name, "Director Commentary");
+        assert!(parsed[1].commentary && parsed[1].extra());
+        assert!(parsed[2].commentary && parsed[2].extra());
+        assert_eq!(in_language(&parsed, "english"), Some(false));
+
+        for extra_name in [
+            "Commento del regista", "Comentarios", "Commentaire audio",
+            "Audiokommentar", "Hörfilm", "Comentário", "Audio Descrizione",
+            "English AD", "English (AD)", "AD 2.0", "Cast & Crew", "Isolated Score", "English DVS",
+        ] {
+            assert!(is_extra_audio_name(extra_name), "expected extra: {extra_name}");
+        }
+        for main_name in ["Director's Cut", "Theatrical", "Extended", "Original", "English 5.1", "Ad Astra"] {
+            assert!(!is_extra_audio_name(main_name), "unexpected extra: {main_name}");
+        }
     }
 
     #[test]

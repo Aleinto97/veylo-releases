@@ -54,6 +54,9 @@ pub struct PlayRequest {
     /// An automatic choice with others left: when its audio tracks are tagged and none is in the
     /// Audio-language setting's language, the next source is tried instead of subtitles.
     pub language_check: bool,
+    /// 0-based container audio track indices known from probing to be commentary / audio description
+    /// (preserved when mpv omits Matroska FlagCommentary from `track-list`).
+    pub extra_audio_tracks: Vec<usize>,
 }
 
 /// What is actually playing: resolution, picture (from the stream where it can tell) and size.

@@ -1,4 +1,4 @@
-# Builds Windows, macOS, and both Android ABIs IN PARALLEL and publishes them as a release whenever
+# Builds Windows, macOS, Linux, and both Android ABIs IN PARALLEL and publishes them as a release whenever
 # a push to main raises `version` in apps/veylo-dx/Cargo.toml. Installed copies see it at launch
 # and offer Update. Run manually from Actions with "publish" off to only build (saved as artifact).
 # Secrets: ANDROID_KEYSTORE_B64 (the release keystore, base64) and ANDROID_KEYSTORE_PASSWORD; for
@@ -13,6 +13,7 @@ on:
       - "crates/**"
       - "Cargo.lock"
       - "tools/release.sh"
+      - "tools/build-linux.sh"
       - "tools/build-macos.sh"
       - "tools/picks-ai/**"
       - ".github/workflows/release.yml"
@@ -151,7 +152,49 @@ jobs:
           name: release-windows
           path: dist/veylo-windows-x64.zip
 
-  # 3. Android arm64 (phones/tablets) and armv7 (32-bit Android TVs) built & signed in parallel.
+  # 3. Linux x64 and ARM64 bundles (runs in parallel with macOS, Windows and Android).
+  linux:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            asset: veylo-linux-x64.tar.gz
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            asset: veylo-linux-arm64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libmpv-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/veylo-dx -> target
+          shared-key: release-linux-${{ matrix.arch }}
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - run: tools/build-linux.sh
+        env:
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
+      - name: Install and self-test the packaged bundle
+        run: |
+          VEYLO_TARBALL="dist/${{ matrix.asset }}" VEYLO_NO_LAUNCH=1 sh install.sh
+          "$HOME/.local/bin/veylo" --self-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/${{ matrix.asset }}
+
+  # 4. Android arm64 (phones/tablets) and armv7 (32-bit Android TVs) built & signed in parallel.
   android:
     needs: plan
     if: needs.plan.outputs.build == 'true'
@@ -238,9 +281,9 @@ jobs:
           name: release-android-${{ matrix.abi }}
           path: dist/${{ matrix.asset }}
 
-  # 4. Run privacy check across all 4 archives, generate SHA256SUMS.txt, and publish the release.
+  # 5. Run privacy check across all 6 archives, generate SHA256SUMS.txt, and publish the release.
   publish:
-    needs: [plan, macos, windows, android]
+    needs: [plan, macos, windows, linux, android]
     if: needs.plan.outputs.build == 'true'
     permissions:
       contents: write
@@ -259,7 +302,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools
       - name: Verify all platform assets are present
         run: |
-          for asset in veylo-windows-x64.zip veylo-macos-arm64.zip veylo-android-arm64.apk veylo-android-armv7.apk; do
+          for asset in veylo-windows-x64.zip veylo-macos-arm64.zip veylo-linux-x64.tar.gz veylo-linux-arm64.tar.gz veylo-android-arm64.apk veylo-android-armv7.apk; do
             [ -s "${{ runner.temp }}/extra/$asset" ] || { echo "::error::Missing release asset: $asset"; exit 1; }
           done
           ls -lh "${{ runner.temp }}/extra"

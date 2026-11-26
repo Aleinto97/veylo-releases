@@ -87,6 +87,12 @@ fn bundle() -> Result<String> {
             .flatten().any(|e| e.file_name().to_string_lossy().starts_with("libmpv"));
         ensure!(mpv, "Veylo.app carries no libmpv");
     }
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = updater::linux_install_dir() {
+        for part in ["veylo", "licenses/THIRD_PARTY_LICENSES.md", "icons/veylo.png"] {
+            ensure!(dir.join(part).is_file(), "Veylo bundle has no {part}");
+        }
+    }
     Ok(format!("model, tokenizer and ONNX Runtime found{}", updater::ASSET.map(|a| format!("; updates from {a}")).unwrap_or_default()))
 }
 

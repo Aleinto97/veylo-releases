@@ -42,6 +42,14 @@ curl -fsSL https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/insta
 
 Installs `Veylo.app` into `/Applications` (or `~/Applications`) and launches it. Re-run to update. To uninstall, move Veylo to the Bin; your data stays in `~/Library/Application Support/veylo-dx`.
 
+### Linux (`x86_64` & `ARM64`)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Aleinto97/veylo-releases/main/install.sh | sh
+```
+
+Installs Veylo into `~/.local/lib/veylo` with a `~/.local/bin/veylo` link, desktop launcher entry, and `stremio://` / `veylo://` protocol registration (no `sudo` required). Requires system `libmpv` and `webkit2gtk-4.1` runtime packages (`pacman -S mpv webkit2gtk-4.1`, `apt install libmpv2 libwebkit2gtk-4.1-0`, or `dnf install mpv-libs webkit2gtk4.1`). Re-run or use the in-app **Update** button to upgrade; your data lives in `~/.local/share/veylo-dx`.
+
 ### Windows 10 / 11 (64-bit)
 
 ```powershell
@@ -74,7 +82,7 @@ Veylo checks the latest GitHub release at launch, verifies downloads against `SH
 | `crates/media-proxy/` | Token-scoped loopback media relay and header-safe stream prober |
 | `crates/video-surface/` | Desktop video surface bridges (Wayland subsurface / GTK GL area, Windows D3D11, macOS Core Animation EDR) |
 | `crates/picture-check/` | Colour-bar picture verification test used by CI |
-| `tools/` | `release.sh`, `build-macos.sh`, `picks-ai/fetch.py`, and CI launch checks (`tools/ci/`) |
+| `tools/` | `release.sh`, `build-linux.sh`, `build-macos.sh`, `picks-ai/fetch.py`, and CI launch checks (`tools/ci/`) |
 | `branding/` | App icon and Android TV banner sources |
 
 ---
@@ -86,7 +94,7 @@ Veylo checks the latest GitHub release at launch, verifies downloads against `SH
 ```sh
 cd apps/veylo-dx
 python3 ../../tools/picks-ai/fetch.py linux-x64   # use linux-aarch64 on ARM64 Linux
-cargo run --release
+cargo run --release                              # or run tools/build-linux.sh for a self-contained tarball
 ```
 
 ### Android (`arm64-v8a` / `armeabi-v7a`)
@@ -144,7 +152,7 @@ It validates bundled model/runtime/libmpv assets, store persistence, on-device P
 
 ## Releases
 
-Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` triggers `.github/workflows/release.yml`, building signed Android (`arm64` + `armv7`), Windows (`x64`), and macOS (`arm64`) binaries plus `SHA256SUMS.txt` and publishing them automatically. `tools/release.sh` runs the same build locally (`VEYLO_PUBLISH=0` builds into `dist/` without publishing) and runs a privacy check ensuring no local paths or API keys appear in release artifacts.
+Every push to `main` that raises `version` in `apps/veylo-dx/Cargo.toml` triggers `.github/workflows/release.yml`, building signed Android (`arm64` + `armv7`), Windows (`x64`), macOS (`arm64`), and Linux (`x64` + `arm64`) binaries plus `SHA256SUMS.txt` and publishing them automatically. `tools/release.sh` runs the same build locally (`VEYLO_PUBLISH=0` builds into `dist/` without publishing) and runs a privacy check ensuring no local paths or API keys appear in release artifacts.
 
 <details>
 <summary><strong>How on-device Picks AI works</strong></summary>

@@ -35,6 +35,8 @@ pub struct Source {
     pub picture: Option<crate::tracks::Picture>,
     /// Number of main audio tracks read from the container header (used to discount multi-dub bloat).
     pub audio_tracks_count: Option<u8>,
+    /// 0-based container audio track indices flagged as commentary / audio description during probing.
+    pub extra_audio_tracks: Vec<usize>,
     /// Video codec read from the container header ("av1", "hevc", "avc"), when available.
     pub video_codec: Option<&'static str>,
 }
@@ -286,6 +288,7 @@ pub(super) fn source_of(addon: &str, v: &Value) -> Source {
         off_title: false,
         picture: None,
         audio_tracks_count: None,
+        extra_audio_tracks: Vec::new(),
         video_codec: None,
     }
 }
@@ -966,6 +969,19 @@ pub(super) fn probe_key(src: &Source) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Extra (commentary / audio-description) 0-based container audio track indices cached from a
+/// prior header probe of `src`, used when starting playback from the manual Source Chooser.
+pub fn cached_extra_audio_tracks(src: &Source) -> Vec<usize> {
+    let key = probe_key(src);
+    let Ok(map) = PROBED.get_or_init(Default::default).lock() else { return Vec::new() };
+    let Some((at, cell)) = map.get(&key) else { return Vec::new() };
+    if at.elapsed() >= PROBED_TTL { return Vec::new(); }
+    let Some(outcome) = cell.get() else { return Vec::new() };
+    outcome.tracks.as_deref().unwrap_or_default().iter().enumerate()
+        .filter_map(|(i, t)| t.extra().then_some(i))
+        .collect()
+}
+
 pub(super) fn group_releases(candidates: &[Source], pack_episodes: Option<usize>) -> Vec<ReleaseGroup> {
     let mut groups: Vec<(String, Option<u64>, ReleaseGroup)> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
@@ -1612,6 +1628,9 @@ pub(super) async fn probe_wave(
                     if let Some(tracks) = &result.tracks {
                         let main_count = tracks.iter().filter(|t| !t.extra()).count().min(u8::MAX as usize) as u8;
                         if main_count > 0 { src.audio_tracks_count = Some(main_count); }
+                        src.extra_audio_tracks = tracks.iter().enumerate()
+                            .filter_map(|(idx, t)| t.extra().then_some(idx))
+                            .collect();
                     }
                     if result.video_codec.is_some() { src.video_codec = result.video_codec; }
                     if let Some(url) = result.resolved {

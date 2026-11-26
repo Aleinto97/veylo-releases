@@ -42,7 +42,9 @@ pub struct Track { pub id: i64, pub audio: bool, pub label: String, pub selected
     /// The track's language tag as the file has it ("ita", "en"), empty when untagged.
     pub lang: String,
     /// Forced subtitles: signs and foreign lines only, not the dialogue.
-    pub forced: bool }
+    pub forced: bool,
+    /// Commentary, audio description, or isolated-score track rather than main dialogue audio.
+    pub extra: bool }
 
 /// A part of the video the viewer may want to pass over, from the file's chapter names.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -642,9 +644,9 @@ fn run(live: Arc<Live>, events: UnboundedSender<PlayerEvent>, stop: PlayerHandle
         match event {
             Ok(Event::FileLoaded) => {
                 refresh_tracks(&live);
+                skip_commentary(&live);
                 let size = mpv.get_property::<i64>("file-size").unwrap_or(0).max(0);
                 live.update(|s| { s.loaded = true; s.error = None; s.file_size = size; true });
-                skip_commentary(&live);
                 // Profile 5 carries no HDR10 layer: without a Dolby Vision panel only mpv's renderer
                 // (libplacebo's reshaping) shows its colours right (both direct and mediacodec-copy
                 // drop the RPU on Android unless hwdec=no).
@@ -834,7 +836,7 @@ fn refresh_tracks(live: &Live) {
 
 fn refresh_tracks_from_json(live: &Live, json: &str) {
     let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
-    let tracks = parse_tracks_list(&list);
+    let tracks = parse_tracks_list(&list, &live.request.extra_audio_tracks);
     let mut dv = dv_profile_list(&list);
     // mpv names the colour matrix of a profile 5 stream "dolbyvision" when the track doesn't carry the tag.
     if dv == 0 && live.mpv.get_property::<String>("video-params/colormatrix").is_ok_and(|m| m == "dolbyvision") { dv = 5; }
@@ -911,11 +913,17 @@ fn dv_profile_list(list: &[serde_json::Value]) -> i64 {
 
 #[cfg(test)]
 pub fn parse_tracks(json: &str) -> Vec<Track> {
-    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
-    parse_tracks_list(&list)
+    parse_tracks_with_extra(json, &[])
 }
 
-fn parse_tracks_list(list: &[serde_json::Value]) -> Vec<Track> {
+#[cfg(test)]
+pub fn parse_tracks_with_extra(json: &str, extra_audio_indices: &[usize]) -> Vec<Track> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    parse_tracks_list(&list, extra_audio_indices)
+}
+
+fn parse_tracks_list(list: &[serde_json::Value], extra_audio_indices: &[usize]) -> Vec<Track> {
+    let mut audio_idx = 0usize;
     list.iter().filter_map(|t| {
         let audio = match t["type"].as_str()? { "audio" => true, "sub" => false, _ => return None };
         let id = t["id"].as_i64()?;
@@ -923,18 +931,32 @@ fn parse_tracks_list(list: &[serde_json::Value]) -> Vec<Track> {
         let language = t["lang"].as_str().map(language_name).unwrap_or_default();
         let codec = t["codec"].as_str().unwrap_or("");
         let channels = t["demux-channel-count"].as_i64().unwrap_or(0);
+        let external = t["external"].as_bool() == Some(true);
+        let idx_extra = if audio && !external {
+            let hit = extra_audio_indices.contains(&audio_idx);
+            audio_idx += 1;
+            hit
+        } else {
+            false
+        };
+        let visual_impaired = audio && t["visual-impaired"].as_bool() == Some(true);
+        let commentary_flag = audio && (t["commentary"].as_bool() == Some(true) || t["comment"].as_bool() == Some(true));
+        let name_extra = audio && crate::tracks::is_extra_audio_name(title);
+        let extra = audio && (visual_impaired || commentary_flag || name_extra || idx_extra);
         let mut parts: Vec<String> = Vec::new();
         if !title.is_empty() { parts.push(title.to_owned()); }
         if !language.is_empty() && !title.to_lowercase().contains(&language.to_lowercase()) { parts.push(language); }
+        if extra && !name_extra { parts.push(if visual_impaired { "Audio Description".into() } else { "Commentary".into() }); }
         if audio && channels > 0 { parts.push(match channels { 1 => "Mono".into(), 2 => "Stereo".into(), 6 => "5.1".into(), 8 => "7.1".into(), n => format!("{n} ch") }); }
         if let Some(c) = pretty_codec(codec) { parts.push(c); }
-        if t["external"].as_bool() == Some(true) { parts.push("External".into()); }
+        if external { parts.push("External".into()); }
         let image = t["image"].as_bool().unwrap_or(matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle"));
         let styled = matches!(codec, "ass" | "ssa");
         Some(Track { id, audio, label: if parts.is_empty() { format!("Track {id}") } else { parts.join(", ") }, selected: t["selected"].as_bool() == Some(true), image, styled,
             // "und" (undetermined), "mul" (several), "zxx" (no speech) say nothing about the language.
             lang: t["lang"].as_str().map(str::trim).filter(|l| !["und", "mul", "zxx", "mis"].contains(&l.to_lowercase().as_str())).unwrap_or_default().to_owned(),
-            forced: t["forced"].as_bool() == Some(true) || title.to_lowercase().contains("forced") })
+            forced: t["forced"].as_bool() == Some(true) || title.to_lowercase().contains("forced"),
+            extra })
     }).collect()
 }
 
@@ -1020,17 +1042,31 @@ pub fn picture(transfer: &str, label: Option<&str>, dv_profile: i64, screen: Scr
 /// `alang` picks a track by language before the file's default, so it can land on a commentary or
 /// audio-description track: then take the first other track in that language, else the default.
 pub fn extra_audio(t: &Track) -> bool {
-    let l = t.label.to_lowercase();
-    t.audio && (l.contains("commentary") || l.contains("description") || l.contains("descriptive"))
+    t.audio && (t.extra || crate::tracks::is_extra_audio_name(&t.label))
 }
 
 fn skip_commentary(live: &Live) {
-    let s = live.state();
-    let Some(on) = s.tracks.iter().find(|t| t.audio && t.selected) else { return };
-    if !extra_audio(on) { return; }
-    let main = s.tracks.iter().find(|t| t.audio && !extra_audio(t) && t.lang == on.lang && !on.lang.is_empty())
-        .or_else(|| s.tracks.iter().find(|t| t.audio && !extra_audio(t)));
-    if let Some(t) = main { live.select(true, Some(t.id)); }
+    let next_id = {
+        let s = live.state();
+        let Some(on) = s.tracks.iter().find(|t| t.audio && t.selected) else { return };
+        if !extra_audio(on) { return; }
+        s.tracks.iter().find(|t| t.audio && !extra_audio(t) && !on.lang.is_empty() && crate::player_rules::lang_matches(&t.lang, &on.lang))
+            .or_else(|| s.tracks.iter().find(|t| t.audio && !extra_audio(t)))
+            .map(|t| t.id)
+    };
+    if let Some(id) = next_id {
+        live.select(true, Some(id));
+        live.update(|s| {
+            let mut changed = false;
+            for t in &mut s.tracks {
+                if t.audio {
+                    let sel = t.id == id;
+                    if t.selected != sel { t.selected = sel; changed = true; }
+                }
+            }
+            changed
+        });
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1190,6 +1226,20 @@ mod tests {
         assert!(extra_audio(&t[2]), "commentary tracks are flagged as extra");
         assert!(t[3].image && !t[3].audio);
         assert!(t[4].styled && t[4].forced && t[4].label.contains("External"));
+
+        // Audio description flag, container-probed commentary index (where mpv omits FlagCommentary),
+        // and localized commentary names are all marked extra and clearly labelled.
+        let extra_json = r#"[
+            {"id":1,"type":"audio","lang":"jpn","codec":"aac","demux-channel-count":2,"selected":false},
+            {"id":2,"type":"audio","lang":"eng","codec":"aac","demux-channel-count":2,"selected":true},
+            {"id":3,"type":"audio","lang":"eng","codec":"aac","demux-channel-count":2,"visual-impaired":true},
+            {"id":4,"type":"audio","lang":"ita","title":"Commento del regista","codec":"aac","demux-channel-count":2}
+        ]"#;
+        let et = parse_tracks_with_extra(extra_json, &[1]);
+        assert!(!extra_audio(&et[0]));
+        assert!(extra_audio(&et[1]) && et[1].label.contains("Commentary"));
+        assert!(extra_audio(&et[2]) && et[2].label.contains("Audio Description"));
+        assert!(extra_audio(&et[3]) && et[3].label.contains("Commento"));
     }
 
     /// Against the real libmpv: streaming stability properties (HTTP reconnect, network timeout,

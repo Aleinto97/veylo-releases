@@ -1,6 +1,6 @@
-//! Updates from the public releases repo, on Windows, macOS and Android. At launch Veylo asks GitHub
-//! for the latest release; a newer one shows a notice, and Update downloads it and installs it:
-//! Windows and macOS swap the files and restart, Android hands the APK to the system installer.
+//! Updates from the public releases repo, on Windows, macOS, Linux and Android. At launch Veylo asks
+//! GitHub for the latest release; a newer one shows a notice, and Update downloads and installs it:
+//! desktop platforms swap the files and restart, Android hands the APK to the system installer.
 //! Only public release metadata is fetched: no account, key or setting is ever sent.
 use crate::icons;
 use anyhow::{anyhow, Context, Result};
@@ -9,18 +9,20 @@ use std::path::PathBuf;
 
 /// The public repo: its releases are the builds (published by .github/workflows/release.yml).
 pub const REPO: &str = "Aleinto97/veylo-releases";
-/// This platform's release asset; None where releases aren't installed (Linux builds from source).
+/// This platform's release asset; None where releases aren't packaged.
 pub const ASSET: Option<&str> = if cfg!(all(target_os = "android", target_arch = "arm")) { Some("veylo-android-armv7.apk") }
     else if cfg!(target_os = "android") { Some("veylo-android-arm64.apk") }
     else if cfg!(target_os = "windows") { Some("veylo-windows-x64.zip") }
     else if cfg!(all(target_os = "macos", target_arch = "aarch64")) { Some("veylo-macos-arm64.zip") }
+    else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some("veylo-linux-x64.tar.gz") }
+    else if cfg!(all(target_os = "linux", target_arch = "aarch64")) { Some("veylo-linux-arm64.tar.gz") }
     else { None };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release { pub version: String, url: String, sha256: String }
 
 /// Keep only safe path characters from a release version string.
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux", test)), allow(dead_code))]
 fn safe_version(version: &str) -> String {
     let clean: String = version.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).take(48).collect();
     if clean.is_empty() || clean.starts_with('.') { "update".into() } else { clean }
@@ -160,7 +162,7 @@ async fn fetch_latest(asset: &str) -> std::result::Result<Option<Release>, ()> {
     Ok(sha256.map(|sha256| Release { version, url, sha256 }))
 }
 
-#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 /// Stream the release file to `to` (an APK is ~150 MB: never held in memory) and verify SHA-256.
 async fn download(url: String, to: PathBuf, expected_sha256: String) -> Result<()> {
     crate::backend::on_runtime(verify_download_to(url, to, expected_sha256)).await?
@@ -185,7 +187,7 @@ fn file_matches_sha256(path: &std::path::Path, expected_sha256: &str) -> bool {
     format!("{:x}", hasher.finalize()) == expected
 }
 
-#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "windows", target_os = "macos", target_os = "linux", test)), allow(dead_code))]
 async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -236,7 +238,7 @@ async fn verify_download_to(url: String, to: PathBuf, expected_sha256: String) -
 }
 
 /// Create a private, unpredictable staging directory under Veylo's own data folder (never shared /tmp).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn update_work_dir(version: &str) -> Result<PathBuf> {
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(|_| anyhow!("Couldn't generate an update folder name"))?;
@@ -503,8 +505,80 @@ pub async fn install(release: Release) -> Result<Outcome> {
     std::process::exit(0);
 }
 
-/// Linux builds from source: nothing to install (the notice never shows there).
-#[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos")))]
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn bundle_dir_for(exe: &std::path::Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    dir.join(".veylo-bundle").is_file().then(|| dir.to_path_buf())
+}
+
+/// The bundled Linux install folder (`~/.local/lib/veylo`), only when installed from a release bundle.
+#[cfg(target_os = "linux")]
+pub fn linux_install_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    bundle_dir_for(&exe)
+}
+
+/// Linux: waits for Veylo to close, unpacks the bundle beside the target directory, swaps atomically
+/// with rollback on failure, updates installed user icons if present, and relaunches.
+#[cfg(target_os = "linux")]
+const APPLY_LINUX: &str = r#"pid="$1"; tarball="$2"; dest="$3"
+work=$(dirname "$tarball")
+parent=$(dirname "$dest")
+stage="$parent/.veylo.new.$$"
+cleanup() { rm -rf "$work" "$stage"; }
+trap cleanup EXIT
+i=0
+while [ "$i" -lt 60 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+    i=$((i + 1))
+done
+mkdir -p "$stage" && tar -xzf "$tarball" -C "$stage" || { nohup "$dest/veylo" >/dev/null 2>&1 </dev/null & exit 1; }
+[ -x "$stage/veylo/veylo" ] && [ -f "$stage/veylo/.veylo-bundle" ] || { nohup "$dest/veylo" >/dev/null 2>&1 </dev/null & exit 1; }
+backup="$dest.old"
+if [ -d "$backup" ] && [ -f "$backup/.veylo-bundle" ]; then
+    rm -rf "$backup"
+elif [ -e "$backup" ]; then
+    backup="$dest.old.$$"
+fi
+if mv "$dest" "$backup"; then
+    if mv "$stage/veylo" "$dest"; then
+        rm -rf "$backup"
+    else
+        mv "$backup" "$dest" 2>/dev/null || true
+    fi
+fi
+data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+if [ -d "$data_home/icons/hicolor" ]; then
+    mkdir -p "$data_home/icons/hicolor/512x512/apps" "$data_home/icons/hicolor/scalable/apps" 2>/dev/null || true
+    [ -f "$dest/icons/veylo.png" ] && cp "$dest/icons/veylo.png" "$data_home/icons/hicolor/512x512/apps/veylo.png" 2>/dev/null || true
+    [ -f "$dest/icons/veylo.svg" ] && cp "$dest/icons/veylo.svg" "$data_home/icons/hicolor/scalable/apps/veylo.svg" 2>/dev/null || true
+fi
+nohup "$dest/veylo" >/dev/null 2>&1 </dev/null &
+"#;
+
+#[cfg(target_os = "linux")]
+pub async fn install(release: Release) -> Result<Outcome> {
+    let dest = linux_install_dir().context("Install Veylo with the install script first so it can update itself")?;
+    let parent = dest.parent().context("Couldn't locate Veylo's folder")?;
+    let probe = parent.join(format!(".veylo-update-probe-{}", std::process::id()));
+    std::fs::File::create(&probe).context("Veylo doesn't have permission to update its install folder")?;
+    let _ = std::fs::remove_file(&probe);
+    let work = update_work_dir(&release.version)?;
+    let tarball = work.join(ASSET.context("No update for this platform")?);
+    let script = work.join("apply.sh");
+    download(release.url.clone(), tarball.clone(), release.sha256.clone()).await?;
+    std::fs::write(&script, APPLY_LINUX).context("Couldn't save the update")?;
+    crate::backend::flush_progress().await;
+    crate::backend::flush_writes();
+    std::process::Command::new("/bin/sh").arg(&script).arg(std::process::id().to_string()).arg(&tarball).arg(&dest)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().context("Couldn't start the updater")?;
+    std::process::exit(0);
+}
+
+/// Fallback for unsupported targets.
+#[cfg(not(any(target_os = "android", target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub async fn install(_release: Release) -> Result<Outcome> { Err(anyhow!("Update Veylo by building it again")) }
 
 #[derive(Clone, PartialEq)]
@@ -636,6 +710,19 @@ mod tests {
             assert!(!missing_path.exists());
             server.await.unwrap();
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linux_bundle_dir_requires_marker() {
+        let dir = std::env::temp_dir().join(format!("veylo-linux-bundle-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("veylo");
+        std::fs::write(&exe, b"").unwrap();
+        assert_eq!(super::bundle_dir_for(&exe), None);
+        std::fs::write(dir.join(".veylo-bundle"), b"0.13.7\n").unwrap();
+        assert_eq!(super::bundle_dir_for(&exe), Some(dir.clone()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

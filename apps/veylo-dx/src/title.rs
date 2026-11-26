@@ -766,6 +766,11 @@ fn start_with(
         on_switch_source: Some(on_switch_source),
         on_switch_episode: Some(on_switch_episode),
     };
+    let extra_audio_tracks = if src.extra_audio_tracks.is_empty() {
+        backend::cached_extra_audio_tracks(&src)
+    } else {
+        src.extra_audio_tracks.clone()
+    };
     crate::start_playback_hooks(shell, PlayRequest {
         title: short_title, subtitle, url: src.url, filename, start_ms: resume, headers: src.headers,
         size: src.size.clone(), hdr: src.hdr.map(str::to_owned), quality: src.quality.map(str::to_owned),
@@ -777,6 +782,7 @@ fn start_with(
         episodes: season_eps,
         current_video_id: (video != media.id).then(|| video.to_owned()),
         language_check,
+        extra_audio_tracks,
         ..Default::default()
     }, hooks);
 }

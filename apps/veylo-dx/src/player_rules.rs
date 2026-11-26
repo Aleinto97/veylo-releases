@@ -129,7 +129,7 @@ pub fn missing_audio_language(tracks: &[engine::Track], global_key: Option<&str>
     !audio_tracks.iter().any(|t| backend::track_in_language(&t.lang, key))
 }
 
-fn lang_matches(track_lang: &str, wanted: &str) -> bool {
+pub(crate) fn lang_matches(track_lang: &str, wanted: &str) -> bool {
     if track_lang.is_empty() || wanted.is_empty() { return false; }
     if track_lang.eq_ignore_ascii_case(wanted) { return true; }
     let base_t = track_lang.split(['-', '_']).next().unwrap_or(track_lang);
@@ -250,5 +250,14 @@ mod tests {
         assert!(!super::missing_audio_language(&[track(1, true, "eng"), track(2, true, "ita")], it));
         assert!(!super::missing_audio_language(&[track(1, true, "")], it));
         assert!(!super::missing_audio_language(&tracks, None));
+    }
+
+    #[test]
+    fn extra_flagged_track_never_satisfies_audio_language() {
+        let jpn = track(1, true, "jpn");
+        let eng_commentary = Track { label: "English, Stereo, AAC".into(), extra: true, ..track(2, true, "eng") };
+        let tracks = [jpn, eng_commentary];
+        assert_eq!(fallback(&tracks, Some("english")), Fallback::Download);
+        assert!(super::missing_audio_language(&tracks, Some("english")));
     }
 }
