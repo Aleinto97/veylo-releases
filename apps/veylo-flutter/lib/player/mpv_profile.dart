@@ -1,5 +1,32 @@
+import 'dart:io';
+
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter/widgets.dart' show BoxFit;
 import 'package:media_kit/media_kit.dart';
+import 'package:path_provider/path_provider.dart';
+
+String? _caPath;
+
+/// mpv's TLS on Android, Windows and macOS (media_kit's libmpv builds) has no system certificate
+/// store, so with `tls-verify=yes` every HTTPS stream fails to open. Like the DX app on Android,
+/// hand it Mozilla's CA bundle (curl's cacert.pem, assets/tls/), written once to app support.
+/// Linux uses the distro's mpv, which reads the system store.
+Future<String?> caBundlePath() async {
+  if (Platform.isLinux) return null;
+  if (_caPath != null) return _caPath;
+  try {
+    final dir = await getApplicationSupportDirectory();
+    final file = File('${dir.path}${Platform.pathSeparator}cacert.pem');
+    final data = await rootBundle.load('assets/tls/cacert.pem');
+    if (!file.existsSync() || file.lengthSync() != data.lengthInBytes) {
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes), flush: true);
+    }
+    return _caPath = file.path;
+  } catch (_) {
+    return null;
+  }
+}
 
 /// The mpv properties every Veylo playback uses (buffering, HTTP resilience, scaling, HDR
 /// tone-mapping, libass subtitles). Shared by the player screen and the runtime player tests so
@@ -48,6 +75,8 @@ Future<void> applyMpvProfile(
     'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=5',
   );
   await setProp('tls-verify', 'yes');
+  final ca = await caBundlePath();
+  if (ca != null) await setProp('tls-ca-file', ca);
 
   // Match DX GPU video quality & HDR-to-SDR tone-mapping (override media_kit's bilinear defaults).
   await setProp('hwdec', mpvHwdec);
@@ -68,4 +97,23 @@ Future<void> applyMpvProfile(
   await setProp('sub-pos', '$subPos');
   await setProp('sub-back-color', subBg ? '#A8000000' : '#00000000');
 
+}
+
+/// mpv reports some problems on its error stream that don't stop playback: no audio device
+/// (video still plays, silently), a non-seekable stream, a missing subtitle font. Only the
+/// others mean the file can't be played. Shared by the player screen and the runtime tests.
+bool isFatalPlayerError(String message) {
+  final m = message.toLowerCase();
+  const nonFatal = [
+    // No audio output: video plays silently.
+    'audio device', 'no sound', 'audio output', 'ao: ',
+    // Not seekable: playback from the start still works.
+    'cannot seek', 'seek',
+    // Hardware decoding unavailable: mpv falls back to software decoding.
+    'avhwdevicecontext', 'hwdec', 'hardware decod', 'vaapi', 'vdpau', 'cuda', 'nvdec',
+    'd3d11va', 'dxva', 'videotoolbox', 'mediacodec', 'vulkan',
+    // Subtitles/fonts: the picture is unaffected.
+    'subtitle', 'libass', 'font',
+  ];
+  return !nonFatal.any(m.contains);
 }

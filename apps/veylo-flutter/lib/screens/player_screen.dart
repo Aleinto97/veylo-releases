@@ -215,7 +215,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }));
     _subs.add(_player.stream.error.listen((e) {
       if (!mounted || e.isEmpty) return;
-      if (_loaded && _playing) {
+      if ((_loaded && _playing) || !isFatalPlayerError(e)) {
         _say('Playback notice: $e');
       } else {
         setState(() => _error = e);

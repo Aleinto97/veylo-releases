@@ -91,7 +91,7 @@ jobs:
         run: |
           export VEYLO_DX_DATA="$RUNNER_TEMP/veylo-data" VEYLO_BRIDGE_LIB="$PWD/rust/target/release/${{ matrix.lib }}"
           PY=$(command -v python3 || command -v python)
-          (cd build/test-clips && "$PY" -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1) &
+          "$PY" tool/serve-clips.py build/test-clips 8765 &
           sleep 2
           drive=(flutter drive --profile --driver=test_driver/integration_test.dart
                  --target=integration_test/runtime_test.dart -d ${{ matrix.device }}
@@ -101,11 +101,24 @@ jobs:
           else
             "${drive[@]}"
           fi
+      - name: Native crash reports (if the app process died)
+        if: failure()
+        run: |
+          if [[ "${{ matrix.target }}" == macos ]]; then
+            for f in $(ls -t ~/Library/Logs/DiagnosticReports/*veylo* /Library/Logs/DiagnosticReports/*veylo* 2>/dev/null | head -2); do
+              echo "=== $f"; head -c 60000 "$f"; echo
+            done
+          fi
+          if [[ "${{ matrix.target }}" == windows ]]; then
+            powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1001,1026} -MaxEvents 6 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,Message" || true
+          fi
+          if [[ "${{ matrix.target }}" == linux ]]; then
+            coredumpctl info --no-pager 2>/dev/null | head -80 || true
+          fi
       - name: Upload debug symbols to Sentry (file:line for native crashes)
         if: always() && env.SENTRY_AUTH_TOKEN != ''
         run: |
           npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
-          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
           lib="rust/target/release/${{ matrix.lib }}"
           [[ "${{ matrix.target }}" == macos ]] && dsymutil "$lib" -o "$lib.dSYM"
           files=("$lib"); [[ -d "$lib.dSYM" ]] && files+=("$lib.dSYM")
@@ -164,7 +177,7 @@ jobs:
           path: apps/veylo-flutter/build/test-clips
       - run: flutter pub get
       - name: Serve the clips
-        run: (cd build/test-clips && nohup python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+        run: nohup python3 tool/serve-clips.py build/test-clips 8765 >/dev/null 2>&1 &
       - name: Run the app on the ${{ matrix.target }} emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -179,12 +192,11 @@ jobs:
           working-directory: apps/veylo-flutter
           script: |
             adb reverse tcp:8765 tcp:8765
-            flutter drive --profile --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }}
+            flutter drive --profile --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }} || { adb logcat -d -b crash | tail -150; adb logcat -d | grep -E " (DEBUG|libc|AndroidRuntime|lowmemorykiller|ActivityManager)" | grep -iE "veylo|fatal|signal|backtrace|#[0-9]{2} pc|abort|died|kill" | tail -120; exit 1; }
       - name: Upload debug symbols to Sentry
         if: always() && env.SENTRY_AUTH_TOKEN != ''
         run: |
           npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
-          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
           sentry debug-files upload rust/target/x86_64-linux-android/release/libveylo_bridge.so || echo "::warning::debug symbol upload failed"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -225,7 +237,6 @@ jobs:
         if: env.SENTRY_AUTH_TOKEN != ''
         run: |
           npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
-          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
           for dir in runtime/snapshots/*/; do
             t=$(basename "$dir")
             sentry snapshots upload "$dir" --app-id "veylo-flutter-$t" --diff-threshold 0.02 || echo "::warning::snapshot upload failed for $t"

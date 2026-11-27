@@ -39,6 +39,7 @@ flutter:
   assets:
     - assets/ratings/
     - assets/branding/
+    - assets/tls/
   fonts:
     - family: Outfit
       fonts:

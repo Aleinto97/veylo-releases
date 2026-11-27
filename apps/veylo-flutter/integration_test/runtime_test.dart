@@ -21,6 +21,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:sentry/sentry.dart';
 import 'package:veylo_flutter/bridge/veylo_bridge.dart';
 import 'package:veylo_flutter/main.dart';
+import 'package:veylo_flutter/player/mpv_profile.dart';
 import 'package:veylo_flutter/screens/player_screen.dart';
 import 'package:veylo_flutter/state/app_state.dart';
 
@@ -179,12 +180,25 @@ Future<Map<String, Object?>> _play(
 }) async {
   final sw = Stopwatch()..start();
   String? playerError;
+  final notices = <String>[];
+  final mpvLog = <String>[];
   StreamSubscription<String>? errSub;
+  StreamSubscription<PlayerLog>? logSub;
   app.startPlaySession(session);
   try {
     await _until(t, () => PlayerScreen.debugActivePlayer.value != null, const Duration(seconds: 10), 'player screen');
     final p = PlayerScreen.debugActivePlayer.value!;
-    errSub = p.stream.error.listen((e) => playerError ??= e);
+    logSub = p.stream.log.listen((l) {
+      mpvLog.add(_redact('[${l.level}] ${l.prefix}: ${l.text.trim()}'));
+      if (mpvLog.length > 25) mpvLog.removeAt(0);
+    });
+    errSub = p.stream.error.listen((e) {
+      if (isFatalPlayerError(e)) {
+        playerError ??= e;
+      } else if (notices.length < 5) {
+        notices.add(_redact(e));
+      }
+    });
     await _until(t, () => playerError != null || (p.state.width ?? 0) > 0, openTimeout, 'first video frame');
     if (playerError != null) throw StateError('player error: $playerError');
     final ttff = sw.elapsedMilliseconds;
@@ -206,6 +220,7 @@ Future<Map<String, Object?>> _play(
       'fps_out': await _prop(p, 'estimated-vf-fps'),
       'dropped_vo': int.tryParse(await _prop(p, 'frame-drop-count')) ?? -1,
       'dropped_dec': int.tryParse(await _prop(p, 'decoder-frame-drop-count')) ?? -1,
+      'notices': notices,
     };
     await _shot(t, 'player/$shotName');
     m['frame_varied'] = await _frameShot(t, p, shotName);
@@ -218,7 +233,11 @@ Future<Map<String, Object?>> _play(
     if (advanced.inMilliseconds < 500) throw StateError('playback stalled (advanced ${advanced.inMilliseconds} ms in 3 s)');
     if (m['frame_varied'] == false) throw StateError('decoded frame is blank');
     return m;
+  } catch (e) {
+    // The last mpv log lines say *why* (TLS, demuxer, decoder…): keep them with the failure.
+    throw StateError('$e${mpvLog.isEmpty ? '' : '\nmpv log:\n${mpvLog.join('\n')}'}');
   } finally {
+    await logSub?.cancel();
     await errSub?.cancel();
     await app.closePlayer();
     await _until(t, () => PlayerScreen.debugActivePlayer.value == null, const Duration(seconds: 10), 'player close');
