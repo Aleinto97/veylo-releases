@@ -25,6 +25,9 @@ class _TitleScreenState extends State<TitleScreen> {
   String? _metaError;
   late MediaItem _media;
   ArtworkModel? _art;
+  bool _artComplete = false;
+  bool _identsPending = true;
+  bool _identsFinal = false;
   Map<String, dynamic> _meta = {};
   List<EpisodeItem> _episodes = [];
   List<Map<String, dynamic>> _idents = [];
@@ -107,18 +110,57 @@ class _TitleScreenState extends State<TitleScreen> {
       }
     } catch (_) {}
     if (!mounted) return;
-    // Phase 2 (slow Wikidata + studio idents) runs alongside so it never delays the main details.
-    final extras = app.bridge.titleExtras(_media);
-    await _loadMainDetails(app);
-    try {
-      final x = await extras;
-      if (!mounted) return;
-      final artMap = x['artwork'] as Map<String, dynamic>?;
-      setState(() {
-        if (artMap != null) _art = ArtworkModel.fromJson(artMap);
-        _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-      });
-    } catch (_) {}
+    // Everything else at once, each part painted as soon as it lands: the first paint (meta +
+    // hero art) never waits for scores, the saga lookup or Wikidata.
+    final media = _media;
+    await Future.wait([
+      _loadMainDetails(app),
+      app.bridge.titleScores(media).then((d) {
+        if (!mounted) return;
+        final scores = (d['scores'] as Map<String, dynamic>?) ?? {};
+        setState(() {
+          _tomatometer = (scores['tomatometer'] as num?)?.toInt();
+          _metascore = (scores['metascore'] as num?)?.toInt();
+          _seriesStatus = d['status'] as String?;
+          _rank = (d['rank'] as num?)?.toInt();
+        });
+      }).catchError((_) {}),
+      app.bridge.titleMore(media).then((d) {
+        if (!mounted) return;
+        setState(() {
+          _collection = d['collection'] as Map<String, dynamic>?;
+          _similar = (d['similar'] as List<dynamic>? ?? [])
+              .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
+              .toList();
+        });
+      }).catchError((_) {}),
+      app.bridge.titleStudios(media).then((x) {
+        if (!mounted) return;
+        setState(() {
+          _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+          _identsPending = false;
+          _identsFinal = true;
+        });
+      }).catchError((_) {}),
+      app.bridge.titleExtras(media).then((x) {
+        if (!mounted) return;
+        final artMap = x['artwork'] as Map<String, dynamic>?;
+        setState(() {
+          // A superset of the first-paint art (adds Wikidata credits/certificate/studios).
+          if (artMap != null) {
+            _art = ArtworkModel.fromJson(artMap);
+            _artComplete = true;
+          }
+          // Only a fallback: once the fast studio path answered, its logos stay put.
+          if (!_identsFinal) {
+            _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+          }
+          _identsPending = false;
+        });
+      }).catchError((_) {
+        if (mounted) setState(() => _identsPending = false);
+      }),
+    ]);
   }
 
   Future<void> _loadMainDetails(AppState app) async {
@@ -134,7 +176,6 @@ class _TitleScreenState extends State<TitleScreen> {
       final stored = d['stored'] is Map<String, dynamic>
           ? MediaItem.fromJson(d['stored'] as Map<String, dynamic>)
           : null;
-      final scores = (d['scores'] as Map<String, dynamic>?) ?? {};
       final epProgRaw = (d['episode_progress'] as Map<String, dynamic>?) ?? {};
 
       int? initSeason = _selectedSeason;
@@ -148,19 +189,12 @@ class _TitleScreenState extends State<TitleScreen> {
         _loading = false;
         _meta = meta;
         _metaError = meta['error'] as String?;
-        if (art != null || _art == null) _art = art;
+        // Never replace the fuller Wikidata-merged art if it landed first.
+        if (!_artComplete && (art != null || _art == null)) _art = art;
         _episodes = eps;
         _selectedSeason = initSeason;
-        _tomatometer = (scores['tomatometer'] as num?)?.toInt();
-        _metascore = (scores['metascore'] as num?)?.toInt();
-        _seriesStatus = d['status'] as String?;
-        _rank = (d['rank'] as num?)?.toInt();
         _watchedEps = (d['watched_episodes'] as List<dynamic>? ?? []).map((e) => e.toString()).toSet();
         _epProgress = epProgRaw.map((k, v) => MapEntry(k, (v as Map<String, dynamic>)));
-        _collection = d['collection'] as Map<String, dynamic>?;
-        _similar = (d['similar'] as List<dynamic>? ?? [])
-            .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
-            .toList();
         if (stored != null) {
           _media = stored;
           _saved = stored.saved;
@@ -318,6 +352,26 @@ class _TitleScreenState extends State<TitleScreen> {
     return Stack(
       fit: StackFit.expand,
       children: [
+        // The left reading scrim spans the whole page, not just the hero: ending it at the hero's
+        // bottom left a hard horizontal line where the artwork met the ambient blur.
+        const Positioned.fill(
+          child: IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.centerLeft,
+                  end: Alignment.centerRight,
+                  stops: [0.0, 0.50, 0.85],
+                  colors: [
+                    Color.fromRGBO(0, 0, 0, 0.80),
+                    Color.fromRGBO(0, 0, 0, 0.35),
+                    Color.fromRGBO(0, 0, 0, 0.0),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
         SingleChildScrollView(
           controller: _scroll,
           padding: const EdgeInsets.only(bottom: 72),
@@ -336,11 +390,22 @@ class _TitleScreenState extends State<TitleScreen> {
                         shaderCallback: (r) => const LinearGradient(
                           begin: Alignment.topCenter,
                           end: Alignment.bottomCenter,
-                          stops: [0.0, 0.50, 1.0],
-                          colors: [Color(0xFFFFFFFF), Color(0xFFFFFFFF), Color(0x00FFFFFF)],
+                          stops: [0.0, 0.45, 0.72, 0.90, 1.0],
+                          colors: [
+                            Color(0xFFFFFFFF),
+                            Color(0xFFFFFFFF),
+                            Color(0x99FFFFFF),
+                            Color(0x26FFFFFF),
+                            Color(0x00FFFFFF),
+                          ],
                         ).createShader(r),
                         blendMode: BlendMode.dstIn,
-                        child: ClipRect(
+                        // The reading scrim rides inside the same fade as the artwork, so at the
+                        // hero's bottom both dissolve into the page-wide scrim underneath.
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            ClipRect(
                           child: ValueListenableBuilder<double>(
                             valueListenable: _heroScrollY,
                             builder: (_, scrollY, child) => Transform.translate(
@@ -366,21 +431,23 @@ class _TitleScreenState extends State<TitleScreen> {
                             ),
                           ),
                         ),
-                      ),
-                    ),
-                    const IgnorePointer(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.centerLeft,
-                            end: Alignment.centerRight,
-                            stops: [0.0, 0.50, 0.85],
-                            colors: [
-                              Color.fromRGBO(0, 0, 0, 0.80),
-                              Color.fromRGBO(0, 0, 0, 0.35),
-                              Color.fromRGBO(0, 0, 0, 0.0),
-                            ],
-                          ),
+                            const IgnorePointer(
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.centerLeft,
+                                    end: Alignment.centerRight,
+                                    stops: [0.0, 0.50, 0.85],
+                                    colors: [
+                                      Color.fromRGBO(0, 0, 0, 0.55),
+                                      Color.fromRGBO(0, 0, 0, 0.20),
+                                      Color.fromRGBO(0, 0, 0, 0.0),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -680,32 +747,60 @@ class _TitleScreenState extends State<TitleScreen> {
                           ),
                         ),
 
-                      if (_idents.isNotEmpty) ...[
-                        const SizedBox(height: 22),
-                        Wrap(
-                          spacing: 28,
-                          runSpacing: 14,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            for (final st in _idents)
-                              VeyloTooltip(
-                                message: st['name']?.toString() ?? '',
-                                child: Opacity(
-                                  opacity: 0.72,
-                                  child: ColorFiltered(
-                                    colorFilter: const ColorFilter.mode(VeyloColors.bone, BlendMode.srcIn),
-                                    child: CachedNetworkImage(
-                                      imageUrl: st['logo']?.toString() ?? '',
-                                      height: 24,
-                                      memCacheHeight: 48,
-                                      errorWidget: (_, _, _) => const SizedBox.shrink(),
+                      // Studio idents arrive last (Wikidata + a logo check): the row's space is
+                      // held while they load and every logo has a fixed box, so nothing below
+                      // moves when they appear; without studios the row closes smoothly.
+                      AnimatedSize(
+                        duration: const Duration(milliseconds: 260),
+                        curve: Curves.easeOutCubic,
+                        alignment: Alignment.topLeft,
+                        child: (_identsPending || _idents.isNotEmpty)
+                            ? Padding(
+                                padding: const EdgeInsets.only(top: 22),
+                                child: SizedBox(
+                                  height: 24,
+                                  child: AnimatedSwitcher(
+                                    duration: const Duration(milliseconds: 320),
+                                    layoutBuilder: (current, previous) => Stack(
+                                      alignment: Alignment.centerLeft,
+                                      children: [...previous, ?current],
+                                    ),
+                                    child: Row(
+                                      key: ValueKey(_idents.length),
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        for (final (i, st) in _idents.take(6).indexed) ...[
+                                          if (i > 0) const SizedBox(width: 28),
+                                          VeyloTooltip(
+                                            message: st['name']?.toString() ?? '',
+                                            // Opacity baked into the filter colour: an Opacity over a
+                                            // ColorFiltered is what Impeller rejected on macOS/Android.
+                                            child: ColorFiltered(
+                                              colorFilter: ColorFilter.mode(
+                                                VeyloColors.bone.withValues(alpha: 0.72),
+                                                BlendMode.srcIn,
+                                              ),
+                                              child: CachedNetworkImage(
+                                                imageUrl: st['logo']?.toString() ?? '',
+                                                width: 104,
+                                                height: 24,
+                                                fit: BoxFit.contain,
+                                                alignment: Alignment.centerLeft,
+                                                memCacheHeight: 48,
+                                                fadeInDuration: const Duration(milliseconds: 200),
+                                                placeholder: (_, _) => const SizedBox(width: 104, height: 24),
+                                                errorWidget: (_, _, _) => const SizedBox(width: 104, height: 24),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
                                     ),
                                   ),
                                 ),
-                              ),
-                          ],
-                        ),
-                      ],
+                              )
+                            : const SizedBox(width: double.infinity),
+                      ),
 
                       if (_metaError != null) ...[
                         const SizedBox(height: 20),

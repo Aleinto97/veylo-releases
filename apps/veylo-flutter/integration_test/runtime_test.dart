@@ -30,6 +30,7 @@ const _target = String.fromEnvironment('VEYLO_TARGET', defaultValue: 'local');
 const _clipBase = String.fromEnvironment('CLIP_BASE');
 const _release = String.fromEnvironment('VEYLO_RELEASE', defaultValue: 'veylo-flutter@dev');
 const _runId = String.fromEnvironment('RUN_ID', defaultValue: 'local');
+const _onlyScreens = bool.fromEnvironment('ONLY_SCREENS');
 
 final _shots = <String, String>{}; // name -> base64 PNG, for Sentry snapshots
 final _results = <Map<String, Object?>>[];
@@ -356,14 +357,14 @@ void main() {
     }
 
     // Real streaming: the app's demo stream over the internet.
-    if (app.demoStream.isNotEmpty) {
+    if (app.demoStream.isNotEmpty && !_onlyScreens) {
       await _step('player.demo-stream', (tx) => _play(t, app, tx,
           PlaySession(title: 'Runtime test', subtitle: 'Demo stream', url: app.demoStream),
           shotName: 'demo-stream', openTimeout: const Duration(seconds: 45)));
     }
 
     // Codec × size matrix over HTTP from the runner (like a real stream).
-    if (_clipBase.isNotEmpty) {
+    if (_clipBase.isNotEmpty && !_onlyScreens) {
       Map<String, dynamic>? manifest;
       await _step('player.manifest', (tx) async {
         manifest = await t.runAsync(() async {

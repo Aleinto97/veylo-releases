@@ -1026,6 +1026,8 @@ class _PosterCardState extends State<PosterCard> {
       onEnter: (_) {
         setState(() => _hovered = true);
         widget.onHoverChanged?.call(true);
+        // Warm this title's page so opening it paints from the session cache.
+        VeyloBridge.instance.titlePrefetch(widget.media);
       },
       onExit: (_) {
         setState(() {

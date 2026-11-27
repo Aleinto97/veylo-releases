@@ -17,6 +17,7 @@ pub mod picks_rules;
 #[path = "../../../veylo-dx/src/tracks.rs"]
 pub mod tracks;
 mod crash;
+mod studios;
 
 pub fn is_tv() -> bool { false }
 
@@ -622,21 +623,19 @@ async fn handle_request(req: Value) -> Result<Value> {
             }))
         }
         "title_details" => {
-            // Everything except slow Wikidata SPARQL + studio idents (see `title_extras`).
+            // Only what the page's first paint needs (~0.1–0.7 s cold): addon meta, hero art,
+            // stills, free series art and local progress. Scores, collection/similar and
+            // Wikidata each come from their own op, so the slowest (a saga lookup can take
+            // 10+ s) never holds the page back.
             let m = media_from_arg(&req["media"])?;
-            let (meta_res, hero_art, stills, series_art, scores, status, rank, stored, watched_eps, ep_prog, col, sim) = tokio::join!(
+            let (meta_res, hero_art, stills, series_art, stored, watched_eps, ep_prog) = tokio::join!(
                 backend::title_meta(&m),
                 backend::title_artwork_fast(&m),
                 backend::title_stills(&m),
                 async { if m.kind != "movie" { backend::open_series_free(&m).await } else { None } },
-                backend::review_scores(&m),
-                async { if m.kind != "movie" { backend::series_status(&m).await } else { None } },
-                backend::today_rank(&m),
                 backend::stored(&m),
                 backend::watched_episodes(&m),
                 backend::episode_playback_map(&m),
-                backend::collection_parts(&m),
-                backend::similar_titles(&m),
             );
             let hero_merged = backend::merge_title_stills(hero_art, &stills);
             let full_art = merge_title_art(hero_merged, series_art, backend::cached_wikidata(&m));
@@ -649,15 +648,61 @@ async fn handle_request(req: Value) -> Result<Value> {
             Ok(json!({
                 "meta": meta_json,
                 "artwork": full_art.as_ref().map(artwork_to_json),
-                "scores": { "tomatometer": scores.tomatometer, "metascore": scores.metascore },
-                "status": status,
-                "rank": rank,
                 "stored": stored.as_ref().map(media_to_json),
                 "watched_episodes": watched_eps.into_iter().collect::<Vec<_>>(),
                 "episode_progress": ep_prog_map,
+            }))
+        }
+        "title_scores" => {
+            let m = media_from_arg(&req["media"])?;
+            let (scores, status, rank) = tokio::join!(
+                backend::review_scores(&m),
+                async { if m.kind != "movie" { backend::series_status(&m).await } else { None } },
+                backend::today_rank(&m),
+            );
+            Ok(json!({
+                "scores": { "tomatometer": scores.tomatometer, "metascore": scores.metascore },
+                "status": status,
+                "rank": rank,
+            }))
+        }
+        "title_more" => {
+            let m = media_from_arg(&req["media"])?;
+            let (col, sim) = tokio::join!(backend::collection_parts(&m), backend::similar_titles(&m));
+            Ok(json!({
                 "collection": col.map(|c| json!({ "name": c.name, "parts": c.parts.iter().map(media_to_json).collect::<Vec<_>>() })),
                 "similar": sim.iter().map(media_to_json).collect::<Vec<_>>(),
             }))
+        }
+        "title_studios" => {
+            // Studio idents on their own fast path (keyless Wikidata API + disk cache), so the
+            // logos don't wait for the big Wikidata query.
+            let m = media_from_arg(&req["media"])?;
+            let list = studios::studios(&m.id).await.unwrap_or_default();
+            let idents = backend::idents(list).await;
+            Ok(json!({ "idents": idents.iter().map(|s| json!({"name": s.name, "logo": s.logo})).collect::<Vec<_>>() }))
+        }
+        "title_prefetch" => {
+            // Hovering/focusing a card warms the caches the title page reads on open, so opening
+            // it paints its final layout from the session cache at once. Fire-and-forget.
+            let m = media_from_arg(&req["media"])?;
+            tokio::spawn(async move {
+                let _ = tokio::join!(
+                    backend::title_meta(&m),
+                    backend::title_artwork_fast(&m),
+                    backend::title_stills(&m),
+                    async { if m.kind != "movie" { backend::open_series_free(&m).await } else { None } },
+                    // Studios only come from Wikidata (0.4–3 s cold) and each logo is then checked:
+                    // warming both here is what makes the idents row appear with the page.
+                    async {
+                        if let Some(list) = studios::studios(&m.id).await {
+                            let _ = backend::idents(list).await;
+                        }
+                    },
+                    backend::open_wikidata(&m),
+                );
+            });
+            Ok(json!({}))
         }
         "title_extras" => {
             // Slow layer: Wikidata credits/certificate/studios, then studio idents. Fast pieces are
@@ -1550,6 +1595,76 @@ mod smoke {
         let text = report["report"].as_str().unwrap_or("");
         assert!(!text.contains("token=abc") && !text.contains("example.com"), "diagnostics leaked a URL");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Per-call timing of what a title page waits for (cold, then warm), to find what makes opening
+/// a film slow. `cargo test --release -- --ignored title_timings --nocapture`
+#[cfg(test)]
+mod timings {
+    use super::*;
+
+    #[test]
+    #[ignore = "network; run with --ignored"]
+    fn title_timings() {
+        let dir = std::env::temp_dir().join(format!("veylo-timings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("VEYLO_DX_DATA", &dir);
+        rt().block_on(async {
+            handle_request(json!({"op": "init"})).await.unwrap();
+            for q in ["Dune Part Two", "Oppenheimer", "Severance"] {
+                let found = handle_request(json!({"op": "search", "query": q})).await.unwrap();
+                let Some(v) = found["results"].as_array().and_then(|r| r.first()).map(|x| x["media"].clone()) else { continue };
+                let m = media_from_arg(&v).unwrap();
+                let s0 = std::time::Instant::now();
+                let _ = handle_request(json!({"op": "title_details", "media": v.clone()})).await;
+                eprintln!("{q} first-paint title_details (cold) = {}ms", s0.elapsed().as_millis());
+                let ss = std::time::Instant::now();
+                let st = studios::studios(&m.id).await.unwrap_or_default();
+                let t_st = ss.elapsed().as_millis();
+                let ids = backend::idents(st.clone()).await;
+                let ss2 = std::time::Instant::now();
+                let _ = studios::studios(&m.id).await;
+                eprintln!("{q} NEW studios: {} in {t_st}ms (+idents {}ms total, {} logos) | reopen {}us",
+                    st.len(), ss.elapsed().as_millis(), ids.len(), ss2.elapsed().as_micros());
+                let s1 = std::time::Instant::now();
+                let fast = backend::title_artwork_fast(&m).await;
+                let fast_studios = fast.as_ref().map(|a| a.studios.clone()).unwrap_or_default();
+                let n_fast = fast_studios.len();
+                let si = std::time::Instant::now();
+                let ids_fast = backend::idents(fast_studios).await;
+                let t_ids_fast = si.elapsed().as_millis();
+                let sw = std::time::Instant::now();
+                let wiki = backend::open_wikidata(&m).await;
+                let t_wiki = sw.elapsed().as_millis();
+                let n_wiki = wiki.as_ref().map(|a| a.studios.len()).unwrap_or(0);
+                let sx = std::time::Instant::now();
+                let x = handle_request(json!({"op": "title_extras", "media": v.clone()})).await.unwrap();
+                eprintln!("{q} studios: fast={n_fast} idents(fast)={t_ids_fast}ms -> {} | wiki={n_wiki} wikidata={t_wiki}ms | title_extras(after)={}ms idents={} | total {}ms",
+                    ids_fast.len(), sx.elapsed().as_millis(), x["idents"].as_array().map(|a| a.len()).unwrap_or(0), s1.elapsed().as_millis());
+                for pass in ["cold", "warm"] {
+                    macro_rules! t { ($name:expr, $f:expr) => { async { let s = std::time::Instant::now(); let _ = $f.await; ($name, s.elapsed().as_millis()) } } }
+                    let rows = tokio::join!(
+                        t!("title_meta", backend::title_meta(&m)),
+                        t!("artwork_fast", backend::title_artwork_fast(&m)),
+                        t!("stills", backend::title_stills(&m)),
+                        t!("series_free", async { if m.kind != "movie" { backend::open_series_free(&m).await } else { None } }),
+                        t!("wikidata", backend::open_wikidata(&m)),
+                        t!("scores", backend::review_scores(&m)),
+                        t!("status", async { if m.kind != "movie" { backend::series_status(&m).await } else { None } }),
+                        t!("rank", backend::today_rank(&m)),
+                        t!("collection", backend::collection_parts(&m)),
+                        t!("similar", backend::similar_titles(&m)),
+                    );
+                    let s = std::time::Instant::now();
+                    let _ = handle_request(json!({"op": "title_details", "media": v.clone()})).await;
+                    let total = s.elapsed().as_millis();
+                    let r = [rows.0, rows.1, rows.2, rows.3, rows.4, rows.5, rows.6, rows.7, rows.8, rows.9];
+                    eprintln!("{q} [{pass}] title_details={total}ms :: {}", r.iter().map(|(n, ms)| format!("{n}={ms}")).collect::<Vec<_>>().join(" "));
+                }
+            }
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

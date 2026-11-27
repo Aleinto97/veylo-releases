@@ -190,6 +190,25 @@ class VeyloBridge {
   Future<Map<String, dynamic>> titleCached(MediaItem media) =>
       call('title_cached', {'media': media.toArg()});
 
+  /// Studio idents on their own fast path (keyless Wikidata API, cached on disk).
+  Future<Map<String, dynamic>> titleStudios(MediaItem media) =>
+      call('title_studios', {'media': media.toArg()});
+
+  /// Review scores, today's rank and series status.
+  Future<Map<String, dynamic>> titleScores(MediaItem media) =>
+      call('title_scores', {'media': media.toArg()});
+
+  /// Collection/saga shelf and "More like this" (the saga lookup can be slow).
+  Future<Map<String, dynamic>> titleMore(MediaItem media) =>
+      call('title_more', {'media': media.toArg()});
+
+  /// Warm the caches a title page reads (fire-and-forget), e.g. on card hover.
+  final Set<String> _prefetched = {};
+  void titlePrefetch(MediaItem media) {
+    if (!_prefetched.add(media.key) || _prefetched.length > 400) return;
+    unawaited(call('title_prefetch', {'media': media.toArg()}).catchError((_) => <String, dynamic>{}));
+  }
+
   /// Slow enrichment layer (Wikidata credits/certificate/studios + studio idents).
   Future<Map<String, dynamic>> titleExtras(MediaItem media) =>
       call('title_extras', {'media': media.toArg()});

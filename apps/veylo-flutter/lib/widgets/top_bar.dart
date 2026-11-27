@@ -240,6 +240,27 @@ class _SlidingDockState extends State<_SlidingDock> {
     }
   }
 
+  bool _instant = false;
+
+  /// A hovered tab opens its label (AnimatedSize, 220 ms), which shifts the tabs after it: keep
+  /// the active pill glued to its tab on every frame of that animation.
+  void _followLayout() {
+    var frames = 0;
+    void tick(Duration _) {
+      if (!mounted) return;
+      _instant = true;
+      _measure();
+      if (++frames < 20) {
+        WidgetsBinding.instance.addPostFrameCallback(tick);
+        WidgetsBinding.instance.scheduleFrame();
+      } else {
+        _instant = false;
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback(tick);
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
   void _measure() {
     if (!mounted) return;
     final rowBox = _rowKey.currentContext?.findRenderObject() as RenderBox?;
@@ -264,7 +285,7 @@ class _SlidingDockState extends State<_SlidingDock> {
         children: [
           if (_measured)
             AnimatedPositioned(
-              duration: const Duration(milliseconds: 260),
+              duration: _instant ? Duration.zero : const Duration(milliseconds: 260),
               curve: VeyloCurves.slider,
               left: _sliderLeft,
               top: 0,
@@ -291,6 +312,7 @@ class _SlidingDockState extends State<_SlidingDock> {
                   compact: widget.compact,
                   hasDot: VeyloTab.values[i] == VeyloTab.settings && widget.addonUpdates > 0,
                   onTap: () => widget.onSelect(VeyloTab.values[i]),
+                  onHoverChanged: _followLayout,
                 ),
               ],
             ],
@@ -309,6 +331,7 @@ class _DockTab extends StatefulWidget {
     required this.compact,
     required this.hasDot,
     required this.onTap,
+    this.onHoverChanged,
   });
 
   final VeyloTab tab;
@@ -316,6 +339,7 @@ class _DockTab extends StatefulWidget {
   final bool compact;
   final bool hasDot;
   final VoidCallback onTap;
+  final VoidCallback? onHoverChanged;
 
   @override
   State<_DockTab> createState() => _DockTabState();
@@ -330,15 +354,20 @@ class _DockTabState extends State<_DockTab> {
     final app = AppStateScope.read(context);
     final fg = (widget.active || _hovered) ? VeyloColors.bone : VeyloColors.dust;
 
-    return VeyloTooltip(
-      message: widget.tab.title,
-      child: MouseRegion(
+    final showLabel = (widget.active || _hovered) && !widget.compact;
+    final tab = MouseRegion(
         cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _hovered = true),
-        onExit: (_) => setState(() {
-          _hovered = false;
-          _pressed = false;
-        }),
+        onEnter: (_) {
+          setState(() => _hovered = true);
+          widget.onHoverChanged?.call();
+        },
+        onExit: (_) {
+          setState(() {
+            _hovered = false;
+            _pressed = false;
+          });
+          widget.onHoverChanged?.call();
+        },
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapDown: (_) => setState(() => _pressed = true),
@@ -352,12 +381,19 @@ class _DockTabState extends State<_DockTab> {
             child: Stack(
               clipBehavior: Clip.none,
               children: [
-                Container(
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  curve: VeyloCurves.out,
                   height: 48,
                   constraints: const BoxConstraints(minWidth: 48),
+                  // Hovering an inactive tab lights the whole tab (icon + label), not just the icon.
+                  decoration: BoxDecoration(
+                    color: _hovered && !widget.active ? const Color.fromRGBO(255, 255, 255, 0.07) : const Color(0x00FFFFFF),
+                    borderRadius: BorderRadius.circular(24),
+                  ),
                   padding: EdgeInsets.only(
-                    left: widget.active && !widget.compact ? 13 : 12,
-                    right: widget.active && !widget.compact ? 16 : 12,
+                    left: showLabel ? 13 : 12,
+                    right: showLabel ? 16 : 12,
                   ),
                   child: TweenAnimationBuilder<Color?>(
                     tween: ColorTween(end: fg),
@@ -373,7 +409,7 @@ class _DockTabState extends State<_DockTab> {
                             duration: const Duration(milliseconds: 220),
                             curve: VeyloCurves.slider,
                             alignment: Alignment.centerLeft,
-                            child: (widget.active && !widget.compact)
+                            child: showLabel
                                 ? AnimatedOpacity(
                                     opacity: 1.0,
                                     duration: const Duration(milliseconds: 200),
@@ -414,8 +450,9 @@ class _DockTabState extends State<_DockTab> {
             ),
           ),
         ),
-      ),
-    );
+      );
+    // With the label shown on hover, the tooltip only helps in compact (icon-only) mode.
+    return widget.compact ? VeyloTooltip(message: widget.tab.title, child: tab) : tab;
   }
 }
 
