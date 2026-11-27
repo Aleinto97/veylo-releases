@@ -199,13 +199,23 @@ class VeyloBridge {
       call('title_scores', {'media': media.toArg()});
 
   /// Collection/saga shelf and "More like this" (the saga lookup can be slow).
-  Future<Map<String, dynamic>> titleMore(MediaItem media) =>
-      call('title_more', {'media': media.toArg()});
+  Future<Map<String, dynamic>> titleSimilar(MediaItem media) =>
+      call('title_similar', {'media': media.toArg()});
+
+  /// Collection/saga shelf alone (the saga lookup can take 10+ s cold).
+  Future<Map<String, dynamic>> titleCollection(MediaItem media) =>
+      call('title_collection', {'media': media.toArg()});
+
+  /// Hero art + stills + free series art (posters per season, billing-order cast).
+  Future<Map<String, dynamic>> titleArt(MediaItem media) =>
+      call('title_art', {'media': media.toArg()});
 
   /// Warm the caches a title page reads (fire-and-forget), e.g. on card hover.
-  final Set<String> _prefetched = {};
+  // Insertion-ordered: the oldest entries roll off, so prefetching never stops for new titles.
+  final Set<String> _prefetched = <String>{};
   void titlePrefetch(MediaItem media) {
-    if (!_prefetched.add(media.key) || _prefetched.length > 400) return;
+    if (!_prefetched.add(media.key)) return;
+    if (_prefetched.length > 400) _prefetched.remove(_prefetched.first);
     unawaited(call('title_prefetch', {'media': media.toArg()}).catchError((_) => <String, dynamic>{}));
   }
 

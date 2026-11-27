@@ -61,9 +61,16 @@ fn save(c: &Cache) {
         .map(|(k, (n, l))| (k.clone(), json!([n, l]))).collect();
     let text = json!({ "titles": titles, "companies": companies }).to_string();
     let p = path();
+    static SAVE: Mutex<u64> = Mutex::new(0);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     std::thread::spawn(move || {
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() { let _ = std::fs::rename(&tmp, &p); }
+        // One writer; an older snapshot never replaces a newer one.
+        let Ok(mut last) = SAVE.lock() else { return };
+        if *last > seq { return; }
+        *last = seq;
+        let tmp = p.with_extension(format!("{}.{seq}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() { let _ = std::fs::rename(&tmp, &p); } else { let _ = std::fs::remove_file(&tmp); }
     });
 }
 
@@ -102,7 +109,8 @@ pub async fn studios(imdb: &str) -> Option<Vec<Studio>> {
     let search = format!("haswbstatement:P345={imdb}");
     let found = get(vec![("action", "query".to_string()), ("list", "search".to_string()), ("srsearch", search.to_string()), ("srlimit", "1".to_string())]).await?;
     let Some(qid) = found["query"]["search"][0]["title"].as_str().map(str::to_owned) else {
-        if let Ok(mut c) = cache().lock() { c.titles.insert(imdb.to_owned(), Vec::new()); save(&c); }
+        // Not on Wikidata (yet): remembered for this session only, so a later edit is picked up.
+        if let Ok(mut c) = cache().lock() { c.titles.insert(imdb.to_owned(), Vec::new()); }
         return Some(Vec::new());
     };
     // 2. Production companies and original networks, in parallel.
@@ -110,6 +118,9 @@ pub async fn studios(imdb: &str) -> Option<Vec<Studio>> {
         get(vec![("action", "wbgetclaims".to_string()), ("entity", qid.to_string()), ("property", "P272".to_string())]),
         get(vec![("action", "wbgetclaims".to_string()), ("entity", qid.to_string()), ("property", "P449".to_string())]),
     );
+    // A failed request (or an API error answer) is "unknown", never "no studios".
+    let ok = |v: &Option<Value>| v.as_ref().is_some_and(|v| v.get("error").is_none() && v.get("claims").is_some());
+    if !ok(&p272) || !ok(&p449) { return None; }
     let mut ids: Vec<String> = Vec::new();
     for id in p272.as_ref().map(|v| claim_ids(v, "P272")).unwrap_or_default().into_iter()
         .chain(p449.as_ref().map(|v| claim_ids(v, "P449")).unwrap_or_default())
@@ -129,13 +140,16 @@ pub async fn studios(imdb: &str) -> Option<Vec<Studio>> {
             let q = q.clone();
             async move {
                 let v = get(vec![("action", "wbgetclaims".to_string()), ("entity", q.to_string()), ("property", "P154".to_string())]).await;
-                let file = v.as_ref().and_then(|v| v["claims"]["P154"][0]["mainsnak"]["datavalue"]["value"].as_str().map(str::to_owned));
+                // None = the request failed (retry later); Some(None) = the company has no logo.
+                let file = v.filter(|v| v.get("claims").is_some())
+                    .map(|v| v["claims"]["P154"][0]["mainsnak"]["datavalue"]["value"].as_str().map(str::to_owned));
                 (q, file)
             }
         }).collect());
         let (names, logos) = tokio::join!(names_fut, logos_fut);
         if let Ok(mut c) = cache().lock() {
             for (q, file) in logos {
+                let Some(file) = file else { continue };
                 let ent = names.as_ref().map(|n| &n["entities"][&q]);
                 let name = ent.and_then(|e| e["labels"]["en"]["value"].as_str().or_else(|| e["labels"]["mul"]["value"].as_str()))
                     .map(str::to_owned);

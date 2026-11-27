@@ -26,7 +26,6 @@ class _TitleScreenState extends State<TitleScreen> {
   String? _metaError;
   late MediaItem _media;
   ArtworkModel? _art;
-  bool _artComplete = false;
   bool _identsPending = true;
   bool _identsFinal = false;
   bool _bodyReady = false;
@@ -69,13 +68,14 @@ class _TitleScreenState extends State<TitleScreen> {
     _liked = _media.liked;
     _scroll.addListener(_onScroll);
     // Fallback: a slow/failed details fetch never keeps the body hidden longer than this.
-    _bodyTimer = Timer(const Duration(milliseconds: 700), () {
+    _bodyTimer = Timer(const Duration(milliseconds: 900), () {
       if (mounted && !_bodyReady) setState(() => _bodyReady = true);
     });
     _frameTimer = Timer.periodic(const Duration(seconds: 9), (_) {
       if (mounted) _frameIndexN.value++;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       final app = AppStateScope.read(context);
       if (_media.backdrop.isNotEmpty) unawaited(app.setLampSource(_media.backdrop));
       unawaited(_loadDetails());
@@ -113,7 +113,45 @@ class _TitleScreenState extends State<TitleScreen> {
     return true;
   }
 
+  // Artwork from two kinds of sources, merged by role instead of arrival order: the hero
+  // sources (details' first-paint art, then `title_art` with stills/series art) own the
+  // backdrop, logo, stills and videos; Wikidata (`title_extras`) only enriches credits,
+  // studios, certificate and language.
+  Map<String, dynamic>? _heroArt;
+  bool _heroArtFull = false; // `title_art` answered (a superset of details' art)
+  Map<String, dynamic>? _enrichArt;
+  static const _heroKeys = ['backdrop', 'backdrop_clean', 'logo', 'poster', 'stills', 'trailers', 'tagline', 'videos', 'season_posters'];
+
+  void _rebuildArt() {
+    final hero = _heroArt, enrich = _enrichArt;
+    if (hero == null && enrich == null) return;
+    final merged = <String, dynamic>{...?enrich};
+    if (hero != null) {
+      for (final e in hero.entries) {
+        final v = e.value;
+        final empty = v == null || (v is String && v.isEmpty) || (v is List && v.isEmpty) || (v is Map && v.isEmpty);
+        if (_heroKeys.contains(e.key) ? !empty : (merged[e.key] == null || (merged[e.key] is List && (merged[e.key] as List).isEmpty))) {
+          merged[e.key] = v;
+        }
+      }
+    }
+    _art = ArtworkModel.fromJson(merged);
+  }
+
+  // Set by the bookmark/like/watched buttons: a library snapshot read before the tap must not
+  // undo it when it lands.
+  bool _localEdit = false;
+  bool _studiosKnown = false;
+  bool _extrasDone = false;
+
+  void _maybeBodyReady() {
+    if (!_bodyReady && _detailsKnown && _studiosKnown) _bodyReady = true;
+  }
+
+  bool _detailsKnown = false;
+
   Future<void> _loadDetails() async {
+    if (!mounted) return;
     final app = AppStateScope.read(context);
     final media = _media;
     // Every part starts at once; each is painted as soon as it lands.
@@ -122,16 +160,32 @@ class _TitleScreenState extends State<TitleScreen> {
         if (mounted && _loading) {
           setState(() {
             _loading = false;
-            _bodyReady = true;
-            _metaError = e.toString();
+            _detailsKnown = true;
+            _maybeBodyReady();
+            if (_meta.isEmpty) _metaError = e.toString();
           });
         }
       }),
+      app.bridge.titleArt(media).then(_applyArt).catchError((_) {}),
       app.bridge.titleScores(media).then(_applyScores).catchError((_) {}),
-      app.bridge.titleMore(media).then(_applyMore).catchError((_) {}),
-      app.bridge.titleStudios(media).then(_applyStudios).catchError((_) {}),
+      app.bridge.titleSimilar(media).then(_applySimilar).catchError((_) {}),
+      app.bridge.titleCollection(media).then(_applyCollection).catchError((_) {}),
+      app.bridge.titleStudios(media).then(_applyStudios).catchError((_) {
+        // Unavailable (offline, timeout): the Wikidata path stays eligible as a fallback.
+        if (mounted && !_studiosKnown) {
+          setState(() {
+            _studiosKnown = true;
+            _maybeBodyReady();
+          });
+        }
+      }),
       app.bridge.titleExtras(media).then(_applyExtras).catchError((_) {
-        if (mounted && _identsPending) setState(() => _identsPending = false);
+        if (mounted) {
+          setState(() {
+            _extrasDone = true;
+            if (!_identsFinal) _identsPending = false;
+          });
+        }
       }),
     ];
     // Meanwhile: session cache + the disk copy of the whole page from the last visit (even
@@ -143,16 +197,20 @@ class _TitleScreenState extends State<TitleScreen> {
         final artMap = c['artwork'] as Map<String, dynamic>?;
         final meta = c['meta'] as Map<String, dynamic>?;
         if (stored != null) {
-          for (final part in ['details', 'scores', 'more', 'studios', 'extras']) {
+          for (final part in ['details', 'art', 'scores', 'similar', 'collection', 'studios', 'extras']) {
             final d = stored[part];
             if (d is! Map<String, dynamic> || _appliedParts.containsKey(part)) continue;
             switch (part) {
               case 'details':
                 _applyDetails(app, d, live: false);
+              case 'art':
+                _applyArt(d);
               case 'scores':
                 _applyScores(d);
-              case 'more':
-                _applyMore(d);
+              case 'similar':
+                _applySimilar(d);
+              case 'collection':
+                _applyCollection(d);
               case 'studios':
                 _applyStudios(d);
               case 'extras':
@@ -161,13 +219,27 @@ class _TitleScreenState extends State<TitleScreen> {
           }
         } else if ((artMap != null || meta != null) && !_appliedParts.containsKey('details')) {
           setState(() {
-            if (artMap != null) _art = ArtworkModel.fromJson(artMap);
+            if (artMap != null) {
+              _heroArt ??= artMap;
+              _rebuildArt();
+            }
             if (meta != null) _meta = meta;
           });
         }
       }
     } catch (_) {}
     await Future.wait(live);
+  }
+
+  void _applyArt(Map<String, dynamic> d) {
+    if (!mounted || !_changed('art', d)) return;
+    final art = d['artwork'] as Map<String, dynamic>?;
+    if (art == null) return;
+    setState(() {
+      _heroArt = art;
+      _heroArtFull = true;
+      _rebuildArt();
+    });
   }
 
   void _applyScores(Map<String, dynamic> d) {
@@ -181,64 +253,104 @@ class _TitleScreenState extends State<TitleScreen> {
     });
   }
 
-  void _applyMore(Map<String, dynamic> d) {
-    if (!mounted || !_changed('more', d)) return;
+  void _applySimilar(Map<String, dynamic> d) {
+    if (!mounted || !_changed('similar', d)) return;
     setState(() {
-      _collection = d['collection'] as Map<String, dynamic>?;
       _similar = (d['similar'] as List<dynamic>? ?? [])
           .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
           .toList();
     });
   }
 
+  void _applyCollection(Map<String, dynamic> d) {
+    if (!mounted || !_changed('collection', d)) return;
+    setState(() => _collection = d['collection'] as Map<String, dynamic>?);
+  }
+
   void _applyStudios(Map<String, dynamic> x) {
     if (!mounted) return;
+    final idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
     if (!_changed('studios', x)) {
-      if (_identsPending) setState(() => _identsPending = false);
+      if (!_studiosKnown || _identsPending) {
+        setState(() {
+          _studiosKnown = true;
+          _identsPending = false;
+          _maybeBodyReady();
+        });
+      }
       return;
     }
     setState(() {
-      _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+      // An empty answer is final only for "Wikidata lists none"; extras may still add some.
+      if (idents.isNotEmpty || !_identsFinal) _idents = idents;
+      _identsFinal = idents.isNotEmpty;
       _identsPending = false;
-      _identsFinal = true;
+      _studiosKnown = true;
+      _maybeBodyReady();
     });
   }
 
   void _applyExtras(Map<String, dynamic> x) {
     if (!mounted || !_changed('extras', x)) return;
     final artMap = x['artwork'] as Map<String, dynamic>?;
+    final idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
     setState(() {
-      // A superset of the first-paint art (adds Wikidata credits/certificate/studios).
+      _extrasDone = true;
       if (artMap != null) {
-        _art = ArtworkModel.fromJson(artMap);
-        _artComplete = true;
+        _enrichArt = artMap;
+        _rebuildArt();
       }
-      // Only a fallback: once the fast studio path answered, its logos stay put.
-      if (!_identsFinal) {
-        _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-        _identsPending = false;
+      // Only a fallback: once the fast studio path found logos, they stay put.
+      if (!_identsFinal && idents.isNotEmpty) {
+        _idents = idents;
+        _identsFinal = true;
       }
+      _identsPending = false;
     });
   }
 
   void _applyDetails(AppState app, Map<String, dynamic> d, {required bool live}) {
     if (!mounted) return;
-    if (!_changed('details', d)) {
-      if ((_loading && live) || !_bodyReady) {
-        setState(() {
-          if (live) _loading = false;
-          _bodyReady = true;
-        });
+    final stored = d['stored'] is Map<String, dynamic> ? MediaItem.fromJson(d['stored'] as Map<String, dynamic>) : null;
+    // Library state (progress, saved, liked, watched) always comes from the live answer, even
+    // when the rest of the payload matches the disk copy — and never undoes a tap made since.
+    void applyStored() {
+      if (!live || stored == null) return;
+      _media = stored;
+      if (!_localEdit) {
+        _saved = stored.saved;
+        _watched = stored.watched;
+        _liked = stored.liked;
       }
+    }
+
+    final meta = (d['meta'] as Map<String, dynamic>?) ?? {};
+    final failed = meta['error'] is String;
+    // A failed live refresh keeps the good copy on screen (seasons, episodes, synopsis) and
+    // only updates progress.
+    if (live && failed && _meta.isNotEmpty && _meta['error'] == null) {
+      setState(() {
+        _loading = false;
+        _detailsKnown = true;
+        _maybeBodyReady();
+        applyStored();
+        _watchedEps = (d['watched_episodes'] as List<dynamic>? ?? []).map((e) => e.toString()).toSet();
+      });
       return;
     }
-    final meta = (d['meta'] as Map<String, dynamic>?) ?? {};
+    if (!_changed('details', d)) {
+      setState(() {
+        if (live) _loading = false;
+        _detailsKnown = true;
+        _maybeBodyReady();
+        applyStored();
+      });
+      return;
+    }
     final artMap = d['artwork'] as Map<String, dynamic>?;
-    final art = artMap != null ? ArtworkModel.fromJson(artMap) : null;
     final eps = (meta['episodes'] as List<dynamic>? ?? [])
         .map((e) => EpisodeItem.fromJson(e as Map<String, dynamic>))
         .toList();
-    final stored = d['stored'] is Map<String, dynamic> ? MediaItem.fromJson(d['stored'] as Map<String, dynamic>) : null;
     final epProgRaw = (d['episode_progress'] as Map<String, dynamic>?) ?? {};
 
     int? initSeason = _selectedSeason;
@@ -249,28 +361,27 @@ class _TitleScreenState extends State<TitleScreen> {
     }
 
     setState(() {
-      _bodyReady = true;
+      _detailsKnown = true;
+      _maybeBodyReady();
       // The disk copy paints the final layout; "loading" (Play disabled for series) ends only
       // with the live answer, which carries fresh progress.
       if (live) _loading = false;
       _meta = meta;
       _metaError = meta['error'] as String?;
-      // Never replace the fuller Wikidata-merged art if it landed first.
-      if (!_artComplete && (art != null || _art == null)) _art = art;
+      if (artMap != null && !_heroArtFull) {
+        _heroArt = artMap;
+        _rebuildArt();
+      }
       _episodes = eps;
       _selectedSeason = initSeason;
       _watchedEps = (d['watched_episodes'] as List<dynamic>? ?? []).map((e) => e.toString()).toSet();
       _epProgress = epProgRaw.map((k, v) => MapEntry(k, (v as Map<String, dynamic>)));
-      if (stored != null && live) {
-        _media = stored;
-        _saved = stored.saved;
-        _watched = stored.watched;
-        _liked = stored.liked;
-      }
+      applyStored();
     });
 
-    if (art?.backdrop != null && art!.backdrop!.isNotEmpty) {
-      unawaited(app.setLampSource(art.backdrop!));
+    final backdrop = _art?.backdrop;
+    if (backdrop != null && backdrop.isNotEmpty) {
+      unawaited(app.setLampSource(backdrop));
     }
   }
 
@@ -575,7 +686,9 @@ class _TitleScreenState extends State<TitleScreen> {
                                 duration: const Duration(milliseconds: 240),
                                 curve: Curves.easeOutCubic,
                                 alignment: Alignment.bottomLeft,
-                                child: _art?.tagline?.isNotEmpty == true
+                                // Shown with the logo (both wait for the page's details), so a late
+                                // tagline can't lift an already visible logo.
+                                child: _bodyReady && _art?.tagline?.isNotEmpty == true
                                     ? Padding(
                                         padding: const EdgeInsets.only(top: 12),
                                         child: Text(
@@ -679,10 +792,14 @@ class _TitleScreenState extends State<TitleScreen> {
                               LiftIn(
                                 key: const ValueKey('shift.title.actions'),
                                 delay: const Duration(milliseconds: 140),
-                                child: Wrap(
+                                // One line too: the trailer button landing late used to wrap the bar
+                                // onto a second line and lift the whole hero by 58 px.
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  clipBehavior: Clip.none,
+                                  child: Row(
+                                  mainAxisSize: MainAxisSize.min,
                                   spacing: 10,
-                                  runSpacing: 10,
-                                  crossAxisAlignment: WrapCrossAlignment.center,
                                   children: [
                                     // Series: room for "Play S1E1" from the start, so the label filling in
                                     // when episodes land doesn't widen the bar and wrap it.
@@ -722,7 +839,10 @@ class _TitleScreenState extends State<TitleScreen> {
                                       active: _saved,
                                       tooltip: _saved ? 'Saved to Library (S)' : 'Save to Library (S)',
                                       onTap: () async {
-                                        setState(() => _saved = !_saved);
+                                        setState(() {
+                                          _localEdit = true;
+                                          _saved = !_saved;
+                                        });
                                         await app.bridge.setSaved(_media, _saved);
                                         app.bumpPicksDirty();
                                       },
@@ -733,7 +853,10 @@ class _TitleScreenState extends State<TitleScreen> {
                                       tooltip: _liked > 0 ? 'Liked' : 'Like',
                                       onTap: () async {
                                         final next = _liked == 1 ? 0 : 1;
-                                        setState(() => _liked = next);
+                                        setState(() {
+                                          _localEdit = true;
+                                          _liked = next;
+                                        });
                                         await app.bridge.feedback(_media, next);
                                         app.bumpPicksDirty();
                                       },
@@ -744,7 +867,10 @@ class _TitleScreenState extends State<TitleScreen> {
                                       tooltip: 'Not for me',
                                       onTap: () async {
                                         final next = _liked == -1 ? 0 : -1;
-                                        setState(() => _liked = next);
+                                        setState(() {
+                                          _localEdit = true;
+                                          _liked = next;
+                                        });
                                         await app.bridge.feedback(_media, next);
                                         app.bumpPicksDirty();
                                       },
@@ -755,7 +881,10 @@ class _TitleScreenState extends State<TitleScreen> {
                                         icon: _watched ? 'Check' : 'EyeOff',
                                         active: _watched,
                                         onTap: () async {
-                                          setState(() => _watched = !_watched);
+                                          setState(() {
+                                            _localEdit = true;
+                                            _watched = !_watched;
+                                          });
                                           await app.bridge.setWatched(_media, _watched);
                                           app.bumpPicksDirty();
                                         },
@@ -798,6 +927,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                         onTap: () => app.bridge.openExternal('https://www.youtube.com/watch?v=$trailerId'),
                                       ),
                                   ],
+                                ),
                                 ),
                               ),
                             ],
@@ -1038,7 +1168,7 @@ class _TitleScreenState extends State<TitleScreen> {
                       // Cast (.people-block)
                       if (_castFor().isNotEmpty) ...[
                         const SizedBox(height: 32),
-                        const GroupHead(icon: 'Users', title: 'Cast'),
+                        const GroupHead(key: ValueKey('shift.title.cast'), icon: 'Users', title: 'Cast'),
                         const SizedBox(height: 12),
                         SizedBox(
                           height: 242,
@@ -1062,6 +1192,23 @@ class _TitleScreenState extends State<TitleScreen> {
                         ),
                       ],
 
+                      // More like this
+                      if (_similar.isNotEmpty) ...[
+                        const SizedBox(height: 28),
+                        const GroupHead(key: ValueKey('shift.title.similar'), icon: 'Sparkles', title: 'More like this'),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: posterW * 1.5 + 28,
+                          child: ListView.separated(
+                            scrollDirection: Axis.horizontal,
+                            itemCount: _similar.length,
+                            separatorBuilder: (_, _) => const SizedBox(width: 16),
+                            itemBuilder: (_, i) => PosterCard(media: _similar[i], width: posterW),
+                          ),
+                        ),
+                      ],
+                      // Order = arrival order (last to land goes lowest, so it moves nothing):
+                      // similar (~1 s), crew (Wikidata, 1–3 s), then the saga (up to 10+ s).
                       // Crew credits (.crew-grid)
                       if (_crewFor().isNotEmpty) ...[
                         const SizedBox(height: 28),
@@ -1072,9 +1219,11 @@ class _TitleScreenState extends State<TitleScreen> {
                       ],
 
                       // Collection shelf
-                      if (_collection != null) ...[
+                      // Waits for the crew above it (its height is only known then).
+                      if (_collection != null && _extrasDone) ...[
                         const SizedBox(height: 28),
                         GroupHead(
+                          key: const ValueKey('shift.title.collection'),
                           icon: 'Stack',
                           title: _collection!['name']?.toString() ?? 'Collection',
                           count: (_collection!['parts'] as List<dynamic>? ?? []).length,
@@ -1094,21 +1243,6 @@ class _TitleScreenState extends State<TitleScreen> {
                         ),
                       ],
 
-                      // More like this
-                      if (_similar.isNotEmpty) ...[
-                        const SizedBox(height: 28),
-                        const GroupHead(icon: 'Sparkles', title: 'More like this'),
-                        const SizedBox(height: 8),
-                        SizedBox(
-                          height: posterW * 1.5 + 28,
-                          child: ListView.separated(
-                            scrollDirection: Axis.horizontal,
-                            itemCount: _similar.length,
-                            separatorBuilder: (_, _) => const SizedBox(width: 16),
-                            itemBuilder: (_, i) => PosterCard(media: _similar[i], width: posterW),
-                          ),
-                        ),
-                      ],
                     ],
                   ),
                         ),
@@ -1174,7 +1308,23 @@ class _TitleScreenState extends State<TitleScreen> {
   }
 
   /// TMDB/TVmaze/Wikidata crew when present, else the addon meta's directors & writers.
+  List<Map<String, dynamic>>? _crewShown;
+
+  /// The crew grid shown in this visit never changes once visible: Wikidata's credits vary a
+  /// little from one answer to the next (its result limit), which grew or shrank the grid and
+  /// moved the saga below it. The fresher list shows next visit.
   List<Map<String, dynamic>> _crewFor() {
+    final shown = _crewShown;
+    if (shown != null) return shown;
+    final crew = _crewCandidate();
+    if (crew.isNotEmpty) _crewShown = crew;
+    return crew;
+  }
+
+  List<Map<String, dynamic>> _crewCandidate() {
+    // Shown once its final source answered (Wikidata credits, or the add-on's directors and
+    // writers when that failed), so the grid doesn't grow a row later.
+    if (!_extrasDone) return const [];
     if (_art != null && _art!.crew.isNotEmpty) return _art!.crew;
     List<String> names(String k) => (_meta[k] as List<dynamic>? ?? []).map((e) => e.toString()).toList();
     final directors = names('directors');

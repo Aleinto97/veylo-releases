@@ -630,17 +630,16 @@ async fn handle_request(req: Value) -> Result<Value> {
             // Wikidata each come from their own op, so the slowest (a saga lookup can take
             // 10+ s) never holds the page back.
             let m = media_from_arg(&req["media"])?;
-            let (meta_res, hero_art, stills, series_art, stored, watched_eps, ep_prog) = tokio::join!(
+            // Stills (JustWatch, up to 4 s cold) and free series art come from `title_art`.
+            let (meta_res, hero_art, stored, watched_eps, ep_prog) = tokio::join!(
                 backend::title_meta(&m),
                 backend::title_artwork_fast(&m),
-                backend::title_stills(&m),
-                async { if m.kind != "movie" { backend::open_series_free(&m).await } else { None } },
                 backend::stored(&m),
                 backend::watched_episodes(&m),
                 backend::episode_playback_map(&m),
             );
-            let hero_merged = backend::merge_title_stills(hero_art, &stills);
-            let full_art = merge_title_art(hero_merged, series_art, backend::cached_wikidata(&m));
+            let hero_merged = backend::merge_title_stills(hero_art, &backend::cached_title_stills(&m).unwrap_or_default());
+            let full_art = merge_title_art(hero_merged, backend::cached_series_free(&m), None);
             let meta_json = match meta_res {
                 Ok(tm) => title_meta_json(&tm),
                 Err(e) => json!({ "error": format!("{e:#}") }),
@@ -668,19 +667,36 @@ async fn handle_request(req: Value) -> Result<Value> {
                 "rank": rank,
             }))
         }
-        "title_more" => {
+        "title_art" => {
+            // Hero art + stills + free series art (posters per season, billing-order cast).
             let m = media_from_arg(&req["media"])?;
-            let (col, sim) = tokio::join!(backend::collection_parts(&m), backend::similar_titles(&m));
+            let (hero_art, stills, series_art) = tokio::join!(
+                backend::title_artwork_fast(&m),
+                backend::title_stills(&m),
+                async { if m.kind != "movie" { backend::open_series_free(&m).await } else { None } },
+            );
+            let art = merge_title_art(backend::merge_title_stills(hero_art, &stills), series_art, None);
+            Ok(json!({ "artwork": art.as_ref().map(artwork_to_json) }))
+        }
+        "title_similar" => {
+            let m = media_from_arg(&req["media"])?;
+            let sim = backend::similar_titles(&m).await;
+            Ok(json!({ "similar": sim.iter().map(media_to_json).collect::<Vec<_>>() }))
+        }
+        "title_collection" => {
+            // The saga lookup can take 10+ s cold: its own op so nothing else waits for it.
+            let m = media_from_arg(&req["media"])?;
+            let col = backend::collection_parts(&m).await;
             Ok(json!({
                 "collection": col.map(|c| json!({ "name": c.name, "parts": c.parts.iter().map(media_to_json).collect::<Vec<_>>() })),
-                "similar": sim.iter().map(media_to_json).collect::<Vec<_>>(),
             }))
         }
         "title_studios" => {
             // Studio idents on their own fast path (keyless Wikidata API + disk cache), so the
             // logos don't wait for the big Wikidata query.
             let m = media_from_arg(&req["media"])?;
-            let list = studios::studios(&m.id).await.unwrap_or_default();
+            // A failed lookup is an error (the slow path stays eligible), not "no studios".
+            let list = studios::studios(&m.id).await.ok_or_else(|| anyhow!("studio lookup unavailable"))?;
             let idents = backend::idents(list).await;
             Ok(json!({ "idents": idents.iter().map(|s| json!({"name": s.name, "logo": s.logo})).collect::<Vec<_>>() }))
         }
@@ -1497,7 +1513,9 @@ async fn run_op(v: Value) -> Value {
     let store_part: Option<(&'static str, String)> = match op.as_str() {
         "title_details" => Some("details"),
         "title_scores" => Some("scores"),
-        "title_more" => Some("more"),
+        "title_art" => Some("art"),
+        "title_similar" => Some("similar"),
+        "title_collection" => Some("collection"),
         "title_studios" => Some("studios"),
         "title_extras" => Some("extras"),
         _ => None,
