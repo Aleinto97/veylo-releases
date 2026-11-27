@@ -10,6 +10,12 @@ if [[ -z "${VEYLO_SENTRY_DSN:-}" && -r "$HOME/.config/veylo/sentry-dsn" ]]; then
   VEYLO_SENTRY_DSN="$(tr -d '[:space:]' < "$HOME/.config/veylo/sentry-dsn")"
 fi
 export VEYLO_SENTRY_DSN="${VEYLO_SENTRY_DSN:-}"
+# Accounts (sign-in + sync) are compiled in from the owner's local Firebase config, like
+# tools/release.sh does; without it the build runs signed-out only.
+if [[ -z "${VEYLO_FIREBASE_API_KEY:-}" && -r "$HOME/.config/veylo/firebase.env" ]]; then
+  set -a; . "$HOME/.config/veylo/firebase.env"; set +a
+fi
+[[ -n "${VEYLO_FIREBASE_API_KEY:-}" ]] || echo "note: no Firebase config; sign-in will be unavailable in this build" >&2
 [[ -n "$VEYLO_SENTRY_DSN" ]] || echo "note: no Sentry DSN; crash reporting will be inert in this build" >&2
 (cd rust && cargo build --release)
 flutter build linux --release
