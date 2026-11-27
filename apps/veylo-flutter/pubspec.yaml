@@ -1,0 +1,48 @@
+name: veylo_flutter
+description: "Veylo — fast, quiet media client in Flutter over the Rust core."
+publish_to: 'none'
+version: 0.13.7+1
+
+environment:
+  sdk: ^3.14.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_svg: ^2.0.17
+  ffi: ^2.1.3
+  media_kit: ^1.2.0
+  media_kit_video: ^1.3.0
+  cached_network_image: ^4.0.7
+  flutter_animate: ^4.5.2
+  path_parsing: ^1.1.0
+  material_ui: ^1.11.1
+  media_kit_libs_video: ^1.0.7
+  path_provider: ^2.1.6
+
+dependency_overrides:
+  media_kit_video:
+    path: third_party/media_kit_video
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  integration_test:
+    sdk: flutter
+  flutter_driver:
+    sdk: flutter
+  sentry: ^10.7.0
+
+flutter:
+  uses-material-design: false
+  assets:
+    - assets/ratings/
+    - assets/branding/
+  fonts:
+    - family: Outfit
+      fonts:
+        - asset: assets/fonts/Outfit.ttf
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter.ttf

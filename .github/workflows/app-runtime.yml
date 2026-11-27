@@ -1,0 +1,232 @@
+name: app-runtime
+# Runs the real Flutter app (apps/veylo-flutter) on GitHub's machines — Linux, macOS, Windows, an
+# Android phone emulator and an Android TV emulator — through integration_test/runtime_test.dart:
+# every screen (home, search, title pages, tabs, window sizes) plus the player on the demo stream
+# and a codec × resolution matrix (H.264/HEVC/HEVC HDR10/VP9/AV1/MPEG-2, 240p…4K, portrait,
+# ultrawide; AAC/AC-3/E-AC-3/DTS/FLAC/Opus). Each step reports to Sentry (project veylo-flutter):
+# a transaction with timings and decode metrics, an error event on failure; the Rust core reports
+# its own panics/errors; screenshots go to Sentry Snapshots for visual diffs between runs.
+# Secrets: VEYLO_SENTRY_DSN (events) and SENTRY_AUTH_TOKEN (snapshots + debug symbols).
+on:
+  workflow_dispatch:
+  push:
+    paths: ["apps/veylo-flutter/**", "apps/veylo-dx/src/**", "crates/**", ".github/workflows/app-runtime.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: app-runtime-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  FLUTTER_VERSION: 3.50.1
+  SENTRY_CLI_VERSION: 0.51.0
+  VEYLO_SENTRY_DSN: ${{ secrets.VEYLO_SENTRY_DSN }}
+  SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+  SENTRY_ORG: veylo-sza
+  SENTRY_PROJECT: veylo-flutter
+  RUNTIME_DEFINES: >-
+    --dart-define=SENTRY_DSN=${{ secrets.VEYLO_SENTRY_DSN }}
+    --dart-define=VEYLO_RELEASE=veylo-flutter@0.13.7
+    --dart-define=RUN_ID=${{ github.run_id }}
+    --dart-define=CLIP_BASE=http://127.0.0.1:8765
+jobs:
+  clips:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Generate the codec × size matrix (every clip must be produced)
+        run: |
+          apps/veylo-flutter/tool/make-test-clips.sh clips 5
+          python3 -c "import json,sys; m=json.load(open('clips/manifest.json')); print(len(m['clips']),'clips'); sys.exit(1 if m['skipped'] else 0)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-clips
+          path: clips
+          retention-days: 3
+
+  desktop:
+    needs: clips
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux, os: ubuntu-24.04, device: linux, lib: libveylo_bridge.so }
+          - { target: macos, os: macos-15, device: macos, lib: libveylo_bridge.dylib }
+          - { target: windows, os: windows-2022, device: windows, lib: veylo_bridge.dll }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/veylo-flutter
+    env:
+      VEYLO_TEST_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "${{ env.FLUTTER_VERSION }}"
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/veylo-flutter/rust -> target"
+          key: runtime-${{ matrix.target }}
+      - name: Linux build dependencies
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libmpv-dev \
+            libwayland-dev libegl-dev xvfb libgl1-mesa-dri mesa-utils
+      - name: Build the Rust core
+        run: cd rust && cargo build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-clips
+          path: apps/veylo-flutter/build/test-clips
+      - run: flutter pub get
+      - name: Run the app (whole app + player matrix)
+        run: |
+          export VEYLO_DX_DATA="$RUNNER_TEMP/veylo-data" VEYLO_BRIDGE_LIB="$PWD/rust/target/release/${{ matrix.lib }}"
+          PY=$(command -v python3 || command -v python)
+          (cd build/test-clips && "$PY" -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1) &
+          sleep 2
+          drive=(flutter drive --profile --driver=test_driver/integration_test.dart
+                 --target=integration_test/runtime_test.dart -d ${{ matrix.device }}
+                 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }})
+          if [[ "${{ matrix.target }}" == linux ]]; then
+            xvfb-run -a -s "-screen 0 1920x1080x24" "${drive[@]}"
+          else
+            "${drive[@]}"
+          fi
+      - name: Upload debug symbols to Sentry (file:line for native crashes)
+        if: always() && env.SENTRY_AUTH_TOKEN != ''
+        run: |
+          npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
+          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
+          lib="rust/target/release/${{ matrix.lib }}"
+          [[ "${{ matrix.target }}" == macos ]] && dsymutil "$lib" -o "$lib.dSYM"
+          files=("$lib"); [[ -d "$lib.dSYM" ]] && files+=("$lib.dSYM")
+          [[ -f rust/target/release/veylo_bridge.pdb ]] && files+=(rust/target/release/veylo_bridge.pdb)
+          sentry debug-files upload "${files[@]}" || echo "::warning::debug symbol upload failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "runtime-${{ matrix.target }}"
+          path: apps/veylo-flutter/build/runtime
+          retention-days: 14
+
+  android:
+    needs: clips
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: android, api: 34, image: google_apis, profile: pixel_6 }
+          - { target: android-tv, api: 36, image: android-tv, profile: tv_1080p }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: apps/veylo-flutter
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM (hardware-accelerated emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "${{ env.FLUTTER_VERSION }}"
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/veylo-flutter/rust -> target"
+          key: runtime-android
+      - name: Build the Rust core for the emulator (x86_64) into jniLibs
+        run: |
+          cargo install cargo-ndk --locked >/dev/null 2>&1 || true
+          cd rust && ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" \
+            cargo ndk -t x86_64 -P 24 -o ../android/app/src/main/jniLibs build --release --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-clips
+          path: apps/veylo-flutter/build/test-clips
+      - run: flutter pub get
+      - name: Serve the clips
+        run: (cd build/test-clips && nohup python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+      - name: Run the app on the ${{ matrix.target }} emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          target: ${{ matrix.image }}
+          arch: x86_64
+          profile: ${{ matrix.profile }}
+          ram-size: 4096M
+          disk-size: 6000M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          working-directory: apps/veylo-flutter
+          script: |
+            adb reverse tcp:8765 tcp:8765
+            flutter drive --profile --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }}
+      - name: Upload debug symbols to Sentry
+        if: always() && env.SENTRY_AUTH_TOKEN != ''
+        run: |
+          npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
+          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
+          sentry debug-files upload rust/target/x86_64-linux-android/release/libveylo_bridge.so || echo "::warning::debug symbol upload failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "runtime-${{ matrix.target }}"
+          path: apps/veylo-flutter/build/runtime
+          retention-days: 14
+
+  report:
+    needs: [desktop, android]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "runtime-*"
+          path: runtime
+          merge-multiple: true
+      - name: Summary (every OS × step)
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, glob
+          print("## Veylo runtime matrix\n")
+          for f in sorted(glob.glob("runtime/*/report.json")):
+              r = json.load(open(f)); rows = r["results"]
+              bad = [x for x in rows if not x.get("ok")]
+              print(f"### {r['target']}: {len(rows)-len(bad)}/{len(rows)} passed\n")
+              print("| step | ok | ms | codec | size | hwdec | ttff | dropped | error |\n|---|---|---|---|---|---|---|---|---|")
+              for x in rows:
+                  drops = max(x.get("dropped_vo", 0) or 0, 0) + max(x.get("dropped_dec", 0) or 0, 0)
+                  print(f"| {x['step']} | {'✅' if x.get('ok') else '❌'} | {x.get('ms','')} | {x.get('video_codec','')} | "
+                        f"{x.get('resolution','')} | {x.get('hwdec','')} | {x.get('ttff_ms','')} | {drops if 'ttff_ms' in x else ''} | "
+                        f"{(x.get('error') or '')[:120]} |")
+              print()
+          PY
+      - name: Upload screenshots to Sentry Snapshots (visual diff per OS)
+        if: env.SENTRY_AUTH_TOKEN != ''
+        run: |
+          npm install -g "sentry@$SENTRY_CLI_VERSION" >/dev/null
+          sentry auth login --token "$SENTRY_AUTH_TOKEN" >/dev/null
+          for dir in runtime/snapshots/*/; do
+            t=$(basename "$dir")
+            sentry snapshots upload "$dir" --app-id "veylo-flutter-$t" --diff-threshold 0.02 || echo "::warning::snapshot upload failed for $t"
+          done
