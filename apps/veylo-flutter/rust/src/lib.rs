@@ -18,6 +18,7 @@ pub mod picks_rules;
 pub mod tracks;
 mod crash;
 mod studios;
+mod title_store;
 
 pub fn is_tv() -> bool { false }
 
@@ -620,6 +621,7 @@ async fn handle_request(req: Value) -> Result<Value> {
             Ok(json!({
                 "meta": backend::cached_title_meta(&m).as_ref().map(title_meta_json),
                 "artwork": art.as_ref().map(artwork_to_json),
+                "stored": title_store::read(&m.key()),
             }))
         }
         "title_details" => {
@@ -1491,6 +1493,15 @@ fn to_cstring_ptr(v: Value) -> *mut c_char {
 /// becomes an ordinary error reply, and failures are logged (redacted) and reported to Sentry.
 async fn run_op(v: Value) -> Value {
     let op = v["op"].as_str().unwrap_or("").to_owned();
+    // Title page parts are kept on disk (stale-while-revalidate, see title_store).
+    let store_part: Option<(&'static str, String)> = match op.as_str() {
+        "title_details" => Some("details"),
+        "title_scores" => Some("scores"),
+        "title_more" => Some("more"),
+        "title_studios" => Some("studios"),
+        "title_extras" => Some("extras"),
+        _ => None,
+    }.and_then(|part| Some((part, media_from_arg(&v["media"]).ok()?.key())));
     let started = std::time::Instant::now();
     let tx = crash::op_transaction(&op);
     let joined = tokio::spawn(handle_request(v)).await;
@@ -1498,6 +1509,10 @@ async fn run_op(v: Value) -> Value {
     use sentry::protocol::SpanStatus;
     match joined {
         Ok(Ok(data)) => {
+            if let Some((part, key)) = &store_part {
+                // A failed meta fetch isn't worth keeping over a good stored copy.
+                if !(*part == "details" && data["meta"]["error"].is_string()) { title_store::put(key, part, &data); }
+            }
             crash::finish_transaction(tx, SpanStatus::Ok);
             crash::op_slow(&op, elapsed);
             json!({ "ok": true, "data": data })

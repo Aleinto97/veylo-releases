@@ -256,7 +256,11 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
                                 height: 76,
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(38),
+                                  // expand: the glass fills the whole 76 px field. Without it the
+                                  // glass shrank to ~50 px at the top (misaligned with the buttons
+                                  // and its corners cut by the 38 px clip).
                                   child: Stack(
+                                    fit: StackFit.expand,
                                     children: [
                                       GlassBox(
                                         borderRadius: 38,

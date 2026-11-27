@@ -23,6 +23,7 @@ import 'package:veylo_flutter/bridge/veylo_bridge.dart';
 import 'package:veylo_flutter/main.dart';
 import 'package:veylo_flutter/player/mpv_profile.dart';
 import 'package:veylo_flutter/screens/player_screen.dart';
+import 'package:veylo_flutter/screens/title_screen.dart';
 import 'package:veylo_flutter/state/app_state.dart';
 
 const _dsn = String.fromEnvironment('SENTRY_DSN');
@@ -246,6 +247,46 @@ Future<Map<String, Object?>> _play(
   }
 }
 
+/// Layout-shift detector (like the web's CLS): samples every `shift.*`-keyed widget of [root]
+/// every 100 ms and reports any that moves or resizes by more than 2 px after it first appeared
+/// — data or images landing late and pushing the page around.
+Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) async {
+  final first = <String, Rect>{};
+  final firstAt = <String, int>{};
+  final shifts = <String, String>{};
+  final sw = Stopwatch()..start();
+  while (sw.elapsed < window) {
+    await t.pump(const Duration(milliseconds: 100));
+    if (root.evaluate().isEmpty) continue;
+    final rootBox = t.renderObject(root.first) as RenderBox;
+    final keyed = find.descendant(
+      of: root.first,
+      matching: find.byWidgetPredicate((w) => w.key is ValueKey<String> && (w.key! as ValueKey<String>).value.startsWith('shift.')),
+    );
+    for (final e in keyed.evaluate()) {
+      final name = ((e.widget.key! as ValueKey<String>).value).substring(6);
+      final ro = e.renderObject;
+      if (ro is! RenderBox || !ro.hasSize || !ro.attached) continue;
+      final r = ro.localToGlobal(Offset.zero, ancestor: rootBox) & ro.size;
+      if (const bool.fromEnvironment('SHIFT_TRACE') && name == 'title.actions') {
+        debugPrint('TRACE ${sw.elapsedMilliseconds} actions=$r');
+      }
+      final base = first[name];
+      if (base == null) {
+        first[name] = r;
+        firstAt[name] = sw.elapsedMilliseconds;
+        continue;
+      }
+      final dy = r.top - base.top, dx = r.left - base.left, dh = r.height - base.height;
+      if ((dy.abs() > 2 || dx.abs() > 2 || dh.abs() > 2) && !shifts.containsKey(name)) {
+        shifts[name] = '$name moved dy=${dy.round()} dx=${dx.round()} dh=${dh.round()} at ${sw.elapsedMilliseconds} ms '
+            '(appeared at ${firstAt[name]} ms)';
+      }
+    }
+  }
+  return shifts.values.toList();
+}
+
 MediaItem? _firstOf(Map<String, dynamic> res, String type) {
   for (final r in (res['results'] as List<dynamic>? ?? [])) {
     final m = (r as Map<String, dynamic>)['media'] as Map<String, dynamic>?;
@@ -316,18 +357,25 @@ void main() {
       if (movie == null) throw StateError('search found no film');
     }, settle: const Duration(seconds: 5));
 
-    if (movie != null) {
-      await screen('title-movie', () async {
-        app.closeSearch();
-        app.openTitle(movie!);
-      }, settle: const Duration(seconds: 8));
+    // Title pages: opened cold (first visit) and again (disk/session cache), watched for layout
+    // shifts while their data and images land.
+    Future<void> titlePage(String name, MediaItem m) async {
+      for (final pass in ['cold', 'reopen']) {
+        await _step('shift.$name-$pass', (tx) async {
+          app.closeSearch();
+          app.closeTitle();
+          await _settle(t, const Duration(milliseconds: 600));
+          app.openTitle(m);
+          final shifts = await _watchShifts(t, find.byType(TitleScreen), const Duration(seconds: 7));
+          tx.setMeasurement('layout_shifts', shifts.length);
+          await _shot(t, '$name-$pass');
+          if (shifts.isNotEmpty) throw StateError('layout shifts: ${shifts.join(' | ')}');
+          return {'shifts': 0};
+        });
+      }
     }
-    if (series != null) {
-      await screen('title-series', () async {
-        app.closeTitle();
-        app.openTitle(series!);
-      }, settle: const Duration(seconds: 8));
-    }
+    if (movie != null) await titlePage('title-movie', movie!);
+    if (series != null) await titlePage('title-series', series!);
     for (final tab in [VeyloTab.picks, VeyloTab.library, VeyloTab.settings, VeyloTab.home]) {
       await screen('tab-${tab.name}', () async {
         app.closeTitle();

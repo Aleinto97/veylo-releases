@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ui';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/widgets.dart';
@@ -28,6 +29,9 @@ class _TitleScreenState extends State<TitleScreen> {
   bool _artComplete = false;
   bool _identsPending = true;
   bool _identsFinal = false;
+  bool _bodyReady = false;
+  String? _shownLogo;
+  Timer? _bodyTimer;
   Map<String, dynamic> _meta = {};
   List<EpisodeItem> _episodes = [];
   List<Map<String, dynamic>> _idents = [];
@@ -64,6 +68,10 @@ class _TitleScreenState extends State<TitleScreen> {
     _watched = _media.watched;
     _liked = _media.liked;
     _scroll.addListener(_onScroll);
+    // Fallback: a slow/failed details fetch never keeps the body hidden longer than this.
+    _bodyTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted && !_bodyReady) setState(() => _bodyReady = true);
+    });
     _frameTimer = Timer.periodic(const Duration(seconds: 9), (_) {
       if (mounted) _frameIndexN.value++;
     });
@@ -77,6 +85,7 @@ class _TitleScreenState extends State<TitleScreen> {
   @override
   void dispose() {
     _frameTimer?.cancel();
+    _bodyTimer?.cancel();
     _frameIndexN.dispose();
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
@@ -93,15 +102,64 @@ class _TitleScreenState extends State<TitleScreen> {
     }
   }
 
+  /// JSON of the last payload applied per part: a live answer identical to what's on screen
+  /// (usually, after the disk cache painted) triggers no rebuild, so nothing moves.
+  final Map<String, String> _appliedParts = {};
+
+  bool _changed(String part, Map<String, dynamic> d) {
+    final sig = jsonEncode(d);
+    if (_appliedParts[part] == sig) return false;
+    _appliedParts[part] = sig;
+    return true;
+  }
+
   Future<void> _loadDetails() async {
     final app = AppStateScope.read(context);
-    // Phase 0: session caches (instant on re-open) so the hero paints its final layout up front.
+    final media = _media;
+    // Every part starts at once; each is painted as soon as it lands.
+    final live = <Future<void>>[
+      app.bridge.titleDetails(media).then((d) => _applyDetails(app, d, live: true)).catchError((Object e) {
+        if (mounted && _loading) {
+          setState(() {
+            _loading = false;
+            _bodyReady = true;
+            _metaError = e.toString();
+          });
+        }
+      }),
+      app.bridge.titleScores(media).then(_applyScores).catchError((_) {}),
+      app.bridge.titleMore(media).then(_applyMore).catchError((_) {}),
+      app.bridge.titleStudios(media).then(_applyStudios).catchError((_) {}),
+      app.bridge.titleExtras(media).then(_applyExtras).catchError((_) {
+        if (mounted && _identsPending) setState(() => _identsPending = false);
+      }),
+    ];
+    // Meanwhile: session cache + the disk copy of the whole page from the last visit (even
+    // after a restart), painted in one frame before any live answer.
     try {
-      final c = await app.bridge.titleCached(_media);
+      final c = await app.bridge.titleCached(media);
       if (mounted) {
+        final stored = c['stored'] as Map<String, dynamic>?;
         final artMap = c['artwork'] as Map<String, dynamic>?;
         final meta = c['meta'] as Map<String, dynamic>?;
-        if (artMap != null || meta != null) {
+        if (stored != null) {
+          for (final part in ['details', 'scores', 'more', 'studios', 'extras']) {
+            final d = stored[part];
+            if (d is! Map<String, dynamic> || _appliedParts.containsKey(part)) continue;
+            switch (part) {
+              case 'details':
+                _applyDetails(app, d, live: false);
+              case 'scores':
+                _applyScores(d);
+              case 'more':
+                _applyMore(d);
+              case 'studios':
+                _applyStudios(d);
+              case 'extras':
+                _applyExtras(d);
+            }
+          }
+        } else if ((artMap != null || meta != null) && !_appliedParts.containsKey('details')) {
           setState(() {
             if (artMap != null) _art = ArtworkModel.fromJson(artMap);
             if (meta != null) _meta = meta;
@@ -109,110 +167,110 @@ class _TitleScreenState extends State<TitleScreen> {
         }
       }
     } catch (_) {}
-    if (!mounted) return;
-    // Everything else at once, each part painted as soon as it lands: the first paint (meta +
-    // hero art) never waits for scores, the saga lookup or Wikidata.
-    final media = _media;
-    await Future.wait([
-      _loadMainDetails(app),
-      app.bridge.titleScores(media).then((d) {
-        if (!mounted) return;
-        final scores = (d['scores'] as Map<String, dynamic>?) ?? {};
-        setState(() {
-          _tomatometer = (scores['tomatometer'] as num?)?.toInt();
-          _metascore = (scores['metascore'] as num?)?.toInt();
-          _seriesStatus = d['status'] as String?;
-          _rank = (d['rank'] as num?)?.toInt();
-        });
-      }).catchError((_) {}),
-      app.bridge.titleMore(media).then((d) {
-        if (!mounted) return;
-        setState(() {
-          _collection = d['collection'] as Map<String, dynamic>?;
-          _similar = (d['similar'] as List<dynamic>? ?? [])
-              .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
-              .toList();
-        });
-      }).catchError((_) {}),
-      app.bridge.titleStudios(media).then((x) {
-        if (!mounted) return;
-        setState(() {
-          _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-          _identsPending = false;
-          _identsFinal = true;
-        });
-      }).catchError((_) {}),
-      app.bridge.titleExtras(media).then((x) {
-        if (!mounted) return;
-        final artMap = x['artwork'] as Map<String, dynamic>?;
-        setState(() {
-          // A superset of the first-paint art (adds Wikidata credits/certificate/studios).
-          if (artMap != null) {
-            _art = ArtworkModel.fromJson(artMap);
-            _artComplete = true;
-          }
-          // Only a fallback: once the fast studio path answered, its logos stay put.
-          if (!_identsFinal) {
-            _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-          }
-          _identsPending = false;
-        });
-      }).catchError((_) {
-        if (mounted) setState(() => _identsPending = false);
-      }),
-    ]);
+    await Future.wait(live);
   }
 
-  Future<void> _loadMainDetails(AppState app) async {
-    try {
-      final d = await app.bridge.titleDetails(_media);
-      if (!mounted) return;
-      final meta = (d['meta'] as Map<String, dynamic>?) ?? {};
-      final artMap = d['artwork'] as Map<String, dynamic>?;
-      final art = artMap != null ? ArtworkModel.fromJson(artMap) : null;
-      final eps = (meta['episodes'] as List<dynamic>? ?? [])
-          .map((e) => EpisodeItem.fromJson(e as Map<String, dynamic>))
+  void _applyScores(Map<String, dynamic> d) {
+    if (!mounted || !_changed('scores', d)) return;
+    final scores = (d['scores'] as Map<String, dynamic>?) ?? {};
+    setState(() {
+      _tomatometer = (scores['tomatometer'] as num?)?.toInt();
+      _metascore = (scores['metascore'] as num?)?.toInt();
+      _seriesStatus = d['status'] as String?;
+      _rank = (d['rank'] as num?)?.toInt();
+    });
+  }
+
+  void _applyMore(Map<String, dynamic> d) {
+    if (!mounted || !_changed('more', d)) return;
+    setState(() {
+      _collection = d['collection'] as Map<String, dynamic>?;
+      _similar = (d['similar'] as List<dynamic>? ?? [])
+          .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
           .toList();
-      final stored = d['stored'] is Map<String, dynamic>
-          ? MediaItem.fromJson(d['stored'] as Map<String, dynamic>)
-          : null;
-      final epProgRaw = (d['episode_progress'] as Map<String, dynamic>?) ?? {};
+    });
+  }
 
-      int? initSeason = _selectedSeason;
-      if (initSeason == null && eps.isNotEmpty) {
-        final lv = stored?.lastVideoId ?? _media.lastVideoId;
-        final match = lv != null ? eps.where((e) => e.id == lv).firstOrNull : null;
-        initSeason = match?.season ?? eps.where((e) => e.season > 0).firstOrNull?.season ?? eps.first.season;
+  void _applyStudios(Map<String, dynamic> x) {
+    if (!mounted) return;
+    if (!_changed('studios', x)) {
+      if (_identsPending) setState(() => _identsPending = false);
+      return;
+    }
+    setState(() {
+      _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+      _identsPending = false;
+      _identsFinal = true;
+    });
+  }
+
+  void _applyExtras(Map<String, dynamic> x) {
+    if (!mounted || !_changed('extras', x)) return;
+    final artMap = x['artwork'] as Map<String, dynamic>?;
+    setState(() {
+      // A superset of the first-paint art (adds Wikidata credits/certificate/studios).
+      if (artMap != null) {
+        _art = ArtworkModel.fromJson(artMap);
+        _artComplete = true;
       }
-
-      setState(() {
-        _loading = false;
-        _meta = meta;
-        _metaError = meta['error'] as String?;
-        // Never replace the fuller Wikidata-merged art if it landed first.
-        if (!_artComplete && (art != null || _art == null)) _art = art;
-        _episodes = eps;
-        _selectedSeason = initSeason;
-        _watchedEps = (d['watched_episodes'] as List<dynamic>? ?? []).map((e) => e.toString()).toSet();
-        _epProgress = epProgRaw.map((k, v) => MapEntry(k, (v as Map<String, dynamic>)));
-        if (stored != null) {
-          _media = stored;
-          _saved = stored.saved;
-          _watched = stored.watched;
-          _liked = stored.liked;
-        }
-      });
-
-      if (art?.backdrop != null && art!.backdrop!.isNotEmpty) {
-        unawaited(app.setLampSource(art.backdrop!));
+      // Only a fallback: once the fast studio path answered, its logos stay put.
+      if (!_identsFinal) {
+        _idents = (x['idents'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+        _identsPending = false;
       }
-    } catch (e) {
-      if (mounted) {
+    });
+  }
+
+  void _applyDetails(AppState app, Map<String, dynamic> d, {required bool live}) {
+    if (!mounted) return;
+    if (!_changed('details', d)) {
+      if ((_loading && live) || !_bodyReady) {
         setState(() {
-          _loading = false;
-          _metaError = e.toString();
+          if (live) _loading = false;
+          _bodyReady = true;
         });
       }
+      return;
+    }
+    final meta = (d['meta'] as Map<String, dynamic>?) ?? {};
+    final artMap = d['artwork'] as Map<String, dynamic>?;
+    final art = artMap != null ? ArtworkModel.fromJson(artMap) : null;
+    final eps = (meta['episodes'] as List<dynamic>? ?? [])
+        .map((e) => EpisodeItem.fromJson(e as Map<String, dynamic>))
+        .toList();
+    final stored = d['stored'] is Map<String, dynamic> ? MediaItem.fromJson(d['stored'] as Map<String, dynamic>) : null;
+    final epProgRaw = (d['episode_progress'] as Map<String, dynamic>?) ?? {};
+
+    int? initSeason = _selectedSeason;
+    if (initSeason == null && eps.isNotEmpty) {
+      final lv = stored?.lastVideoId ?? _media.lastVideoId;
+      final match = lv != null ? eps.where((e) => e.id == lv).firstOrNull : null;
+      initSeason = match?.season ?? eps.where((e) => e.season > 0).firstOrNull?.season ?? eps.first.season;
+    }
+
+    setState(() {
+      _bodyReady = true;
+      // The disk copy paints the final layout; "loading" (Play disabled for series) ends only
+      // with the live answer, which carries fresh progress.
+      if (live) _loading = false;
+      _meta = meta;
+      _metaError = meta['error'] as String?;
+      // Never replace the fuller Wikidata-merged art if it landed first.
+      if (!_artComplete && (art != null || _art == null)) _art = art;
+      _episodes = eps;
+      _selectedSeason = initSeason;
+      _watchedEps = (d['watched_episodes'] as List<dynamic>? ?? []).map((e) => e.toString()).toSet();
+      _epProgress = epProgRaw.map((k, v) => MapEntry(k, (v as Map<String, dynamic>)));
+      if (stored != null && live) {
+        _media = stored;
+        _saved = stored.saved;
+        _watched = stored.watched;
+        _liked = stored.liked;
+      }
+    });
+
+    if (art?.backdrop != null && art!.backdrop!.isNotEmpty) {
+      unawaited(app.setLampSource(art.backdrop!));
     }
   }
 
@@ -330,7 +388,16 @@ class _TitleScreenState extends State<TitleScreen> {
     final rawLogo = (_art?.logo?.isNotEmpty == true)
         ? _art!.logo!
         : ((_meta['logo'] as String?)?.isNotEmpty == true ? _meta['logo'] as String : _media.logo);
-    final logo = rawLogo.isNotEmpty && !_failedLogos.contains(rawLogo) ? rawLogo : null;
+    // Pick the logo once the best source had its chance (details or the ≤700 ms fallback), then
+    // keep it: swapping the card's logo for the artwork's a moment later read as the logo
+    // jumping. Only a logo that fails to load is replaced.
+    if ((_bodyReady || _art?.logo?.isNotEmpty == true) &&
+        (_shownLogo == null || _failedLogos.contains(_shownLogo)) &&
+        rawLogo.isNotEmpty &&
+        !_failedLogos.contains(rawLogo)) {
+      _shownLogo = rawLogo;
+    }
+    final logo = _shownLogo != null && !_failedLogos.contains(_shownLogo) ? _shownLogo : null;
     final imdb = (_meta['rating'] as String?)?.isNotEmpty == true ? _meta['rating'] as String : _media.rating;
     final runtime = (_meta['runtime'] as String?)?.isNotEmpty == true ? _meta['runtime'] as String : _media.runtime;
     final released = _meta['released']?.toString() ?? '';
@@ -464,6 +531,7 @@ class _TitleScreenState extends State<TitleScreen> {
                               // Fixed-height, bottom-anchored logo slot: swapping the wordmark for the
                               // logo (or the logo image decoding late) never moves anything below it.
                               LiftIn(
+                                key: const ValueKey('shift.title.logo'),
                                 delay: Duration.zero,
                                 child: SizedBox(
                                   height: 144,
@@ -493,7 +561,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                               );
                                             },
                                           )
-                                        : (_loading
+                                        : (!_bodyReady
                                             ? const SizedBox.expand(key: ValueKey('logo-pending'))
                                             : Align(
                                                 key: const ValueKey('logo-text'),
@@ -526,23 +594,18 @@ class _TitleScreenState extends State<TitleScreen> {
                               ),
                               const SizedBox(height: 18),
                               LiftIn(
+                                key: const ValueKey('shift.title.pills'),
                                 delay: const Duration(milliseconds: 90),
-                                child: Wrap(
+                                // One line, never wrapping: late facts (scores, rank, certificate,
+                                // series status) are appended at the end, so when they land nothing
+                                // moves — a wrapped second line used to push the logo up.
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  clipBehavior: Clip.none,
+                                  child: Row(
+                                  mainAxisSize: MainAxisSize.min,
                                   spacing: 8,
-                                  runSpacing: 8,
                                   children: [
-                                    if (_rank != null)
-                                      FactPill(
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            const VeyloIcon('Trophy', size: 16, color: VeyloColors.bone),
-                                            const SizedBox(width: 6),
-                                            Text('#$_rank today', style: const TextStyle(fontFeatures: VeyloText.tnum)),
-                                          ],
-                                        ),
-                                      ),
-                                    ScoresPill(imdb: imdb, tomatometer: _tomatometer, metascore: _metascore),
                                     if (runtime.isNotEmpty)
                                       FactPill(
                                         child: Row(
@@ -571,7 +634,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                         children: [
                                           VeyloIcon(film ? 'Film' : 'Tv', size: 16, color: VeyloColors.dust),
                                           const SizedBox(width: 6),
-                                          Text(_seriesStatus ?? (film ? 'Film' : 'Series')),
+                                          Text(film ? 'Film' : 'Series'),
                                         ],
                                       ),
                                     ),
@@ -586,6 +649,18 @@ class _TitleScreenState extends State<TitleScreen> {
                                           ],
                                         ),
                                       ),
+                                    ScoresPill(imdb: imdb, tomatometer: _tomatometer, metascore: _metascore),
+                                    if (_rank != null)
+                                      FactPill(
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            const VeyloIcon('Trophy', size: 16, color: VeyloColors.bone),
+                                            const SizedBox(width: 6),
+                                            Text('#$_rank today', style: const TextStyle(fontFeatures: VeyloText.tnum)),
+                                          ],
+                                        ),
+                                      ),
                                     if (_art?.certificate?.isNotEmpty == true)
                                       FactPill(
                                         child: Text(
@@ -593,19 +668,27 @@ class _TitleScreenState extends State<TitleScreen> {
                                           style: VeyloText.ui(13.5, weight: 800),
                                         ),
                                       ),
+                                    if (_seriesStatus != null)
+                                      FactPill(child: Text(_seriesStatus!)),
                                   ],
+                                ),
                                 ),
                               ),
                               const SizedBox(height: 22),
                               // Action bar (.title-actions)
                               LiftIn(
+                                key: const ValueKey('shift.title.actions'),
                                 delay: const Duration(milliseconds: 140),
                                 child: Wrap(
                                   spacing: 10,
                                   runSpacing: 10,
                                   crossAxisAlignment: WrapCrossAlignment.center,
                                   children: [
-                                    VeyloPill(
+                                    // Series: room for "Play S1E1" from the start, so the label filling in
+                                    // when episodes land doesn't widen the bar and wrap it.
+                                    ConstrainedBox(
+                                      constraints: BoxConstraints(minWidth: film ? 0 : 196),
+                                      child: VeyloPill(
                                       label: film
                                           ? (_media.inProgress ? 'Resume' : 'Play')
                                           : (upNext != null
@@ -632,6 +715,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                           unawaited(app.autoplayMedia(_media));
                                         }
                                       },
+                                    ),
                                     ),
                                     VeyloOrb(
                                       icon: 'Bookmark',
@@ -725,16 +809,26 @@ class _TitleScreenState extends State<TitleScreen> {
                 ),
               ),
 
-              // Body (.title-body)
+              // Body (.title-body): built once the page has its details (disk cache or live,
+              // ≤700 ms), so the synopsis landing late can't push the studios/trailers down —
+              // it fades in already laid out at its final size.
               Padding(
                 padding: EdgeInsets.fromLTRB(gutter, 12, gutter, 0),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 1180),
-                  child: Column(
+                  child: !_bodyReady
+                      ? const SizedBox(height: 320, width: double.infinity)
+                      : TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 0, end: 1),
+                          duration: const Duration(milliseconds: 260),
+                          curve: Curves.easeOutCubic,
+                          builder: (_, v, child) => Opacity(opacity: v, child: child),
+                          child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       if (synopsis.isNotEmpty)
                         ConstrainedBox(
+                          key: const ValueKey('shift.title.synopsis'),
                           constraints: const BoxConstraints(maxWidth: 760),
                           child: Text(
                             synopsis,
@@ -751,6 +845,7 @@ class _TitleScreenState extends State<TitleScreen> {
                       // held while they load and every logo has a fixed box, so nothing below
                       // moves when they appear; without studios the row closes smoothly.
                       AnimatedSize(
+                        key: const ValueKey('shift.title.idents'),
                         duration: const Duration(milliseconds: 260),
                         curve: Curves.easeOutCubic,
                         alignment: Alignment.topLeft,
@@ -907,7 +1002,12 @@ class _TitleScreenState extends State<TitleScreen> {
                       // Videos & Trailers strip (.videos-block)
                       if (_art != null && _art!.videos.isNotEmpty) ...[
                         const SizedBox(height: 32),
-                        GroupHead(icon: 'Film', title: 'Trailers & Clips', count: _art!.videos.length),
+                        GroupHead(
+                          key: const ValueKey('shift.title.trailers'),
+                          icon: 'Film',
+                          title: 'Trailers & Clips',
+                          count: _art!.videos.length,
+                        ),
                         const SizedBox(height: 12),
                         SizedBox(
                           height: 196,
@@ -1011,6 +1111,7 @@ class _TitleScreenState extends State<TitleScreen> {
                       ],
                     ],
                   ),
+                        ),
                 ),
               ),
             ],
