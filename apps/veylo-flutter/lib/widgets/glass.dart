@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:material_ui/material_ui.dart' show Tooltip;
@@ -7,6 +8,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import 'title_prefetch.dart';
 import 'veylo_icons.dart';
 
 /// CSS `saturate(140%)` color matrix matching `.glass` (`backdrop-filter: blur(...) saturate(140%)`).
@@ -820,10 +822,12 @@ class PosterCard extends StatefulWidget {
 class _PosterCardState extends State<PosterCard> {
   bool _hovered = false;
   bool _pressed = false;
+  Timer? _prefetchTimer;
   final ValueNotifier<Alignment> _glare = ValueNotifier(const Alignment(0, -1));
 
   @override
   void dispose() {
+    _prefetchTimer?.cancel();
     _glare.dispose();
     super.dispose();
   }
@@ -1034,8 +1038,12 @@ class _PosterCardState extends State<PosterCard> {
       onEnter: (_) {
         setState(() => _hovered = true);
         widget.onHoverChanged?.call(true);
-        // Warm this title's page so opening it paints from the session cache.
-        VeyloBridge.instance.titlePrefetch(widget.media);
+        // A short dwell (not every card the pointer crosses), then warm the title page: data in
+        // Rust's caches, hero backdrop + logo downloaded and decoded at the page's exact size.
+        _prefetchTimer?.cancel();
+        _prefetchTimer = Timer(const Duration(milliseconds: 150), () {
+          if (mounted && _hovered) prefetchTitle(context, widget.media);
+        });
       },
       onExit: (_) {
         setState(() {

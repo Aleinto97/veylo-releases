@@ -8,6 +8,7 @@ import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
 import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
+import '../widgets/title_prefetch.dart';
 import '../widgets/veylo_icons.dart';
 
 class TitleScreen extends StatefulWidget {
@@ -31,6 +32,7 @@ class _TitleScreenState extends State<TitleScreen> {
   bool _identsFinal = false;
   bool _bodyReady = false;
   bool _scoresKnown = false;
+  bool _identsHold = false;
   // One reveal: hero art, logo, tagline, facts and body appear together, already decoded, with
   // values frozen for this visit (fresher data shows next visit via the disk cache).
   bool _revealed = false;
@@ -149,7 +151,9 @@ class _TitleScreenState extends State<TitleScreen> {
   bool _extrasDone = false;
 
   void _maybeBodyReady() {
-    if (!_bodyReady && _detailsKnown && _studiosKnown && _scoresKnown) _bodyReady = true;
+    // Details only: scores fill in at the end of the facts row and studio logos in their
+    // reserved row, so neither has to hold the page back.
+    if (!_bodyReady && _detailsKnown) _bodyReady = true;
   }
 
   bool _detailsKnown = false;
@@ -418,12 +422,12 @@ class _TitleScreenState extends State<TitleScreen> {
     final logo = snap['logo'] as String?;
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final width = MediaQuery.sizeOf(context).width;
-    final heroWidth = _heroDecodeWidth(width, dpr);
+    final heroWidth = heroDecodeWidth(width, dpr);
     final jobs = <Future<void>>[
       if (frames.isNotEmpty)
-        warm(ResizeImage.resizeIfNeeded(heroWidth, null, CachedNetworkImageProvider(frames.first))).then((_) {}),
+        warm(heroProvider(frames.first, heroWidth)).then((_) {}),
       if (logo != null)
-        warm(ResizeImage.resizeIfNeeded(920, null, CachedNetworkImageProvider(logo))).then((ok) {
+        warm(logoProvider(logo)).then((ok) {
           if (!ok) snap['logo'] = null;
         }),
     ];
@@ -432,12 +436,10 @@ class _TitleScreenState extends State<TitleScreen> {
     setState(() {
       _frozen = snap;
       _revealed = true;
+      _identsHold = _identsPending || _idents.isNotEmpty;
     });
     if (frames.isNotEmpty) unawaited(app.setLampSource(frames.first));
   }
-
-  /// Decode the hero at the physical width it covers (capped), not a fixed 1600 px.
-  static int _heroDecodeWidth(double width, double dpr) => (width * dpr).clamp(960, 2880).round();
 
   Future<void> _openSourceSheet(String videoId, String? label) async {
     setState(() {
@@ -794,7 +796,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                       ? KenBurnsImage(
                                           key: ValueKey(activeBg),
                                           url: activeBg,
-                                          cacheWidth: _heroDecodeWidth(size.width, MediaQuery.devicePixelRatioOf(context)),
+                                          cacheWidth: heroDecodeWidth(size.width, MediaQuery.devicePixelRatioOf(context)),
                                           alignment: const Alignment(0, -0.4),
                                           settle: false,
                                           fadeIn: Duration.zero,
@@ -1188,11 +1190,14 @@ class _TitleScreenState extends State<TitleScreen> {
                         duration: const Duration(milliseconds: 260),
                         curve: Curves.easeOutCubic,
                         alignment: Alignment.topLeft,
-                        child: (_identsPending || _idents.isNotEmpty)
+                        // Reserved at the reveal while still loading, and kept for the visit even
+                        // if no logos come: collapsing it later would move everything below.
+                        child: ((_revealed && _identsHold) || _identsPending || _idents.isNotEmpty)
                             ? Padding(
                                 padding: const EdgeInsets.only(top: 22),
                                 child: SizedBox(
                                   height: 24,
+                                  width: double.infinity,
                                   child: AnimatedSwitcher(
                                     duration: const Duration(milliseconds: 320),
                                     layoutBuilder: (current, previous) => Stack(

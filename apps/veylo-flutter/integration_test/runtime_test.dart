@@ -265,7 +265,11 @@ Future<Map<String, Object?>> _play(
 /// Layout-shift detector (like the web's CLS): samples every `shift.*`-keyed widget of [root]
 /// every 100 ms and reports any that moves or resizes by more than 2 px after it first appeared
 /// — data or images landing late and pushing the page around.
+/// When the title's logo slot first became visible (ms after opening): time-to-reveal.
+int? _lastRevealMs;
+
 Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) async {
+  _lastRevealMs = null;
   final first = <String, Rect>{};
   final firstAt = <String, int>{};
   final shifts = <String, String>{};
@@ -295,6 +299,7 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
       if (base == null) {
         first[name] = r;
         firstAt[name] = sw.elapsedMilliseconds;
+        if (name == 'title.logo') _lastRevealMs = sw.elapsedMilliseconds;
         continue;
       }
       final dy = r.top - base.top, dx = r.left - base.left, dh = r.height - base.height, dw = r.width - base.width;
@@ -421,9 +426,12 @@ void main() {
           app.openTitle(m);
           final shifts = await _watchShifts(t, find.byType(TitleScreen), const Duration(seconds: 7));
           tx.setMeasurement('layout_shifts', shifts.length);
+          if (_lastRevealMs != null) {
+            tx.setMeasurement('reveal', _lastRevealMs!, unit: DurationSentryMeasurementUnit.milliSecond);
+          }
           await _shot(t, '$name-$pass');
           if (shifts.isNotEmpty) throw StateError('layout shifts: ${shifts.join(' | ')}');
-          return {'shifts': 0};
+          return {'shifts': 0, 'reveal_ms': _lastRevealMs};
         });
       }
     }

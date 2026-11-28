@@ -509,6 +509,15 @@ async fn handle_request(req: Value) -> Result<Value> {
             backend::init()?;
             crash::init();
             backend::start_sync();
+            // Warm the on-device Picks AI in the background (ONNX session, tokenizer and the mood
+            // anchors, all cached), so the first Vibe search or Picks load doesn't pay for it.
+            static WARMED: std::sync::Once = std::sync::Once::new();
+            WARMED.call_once(|| {
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    if !picks_ai::failed() { let _ = brain::anchors().await; }
+                });
+            });
             Ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "demo_stream": backend::DEMO_STREAM,
@@ -730,6 +739,20 @@ async fn handle_request(req: Value) -> Result<Value> {
             let list = studios::studios(&m.id).await.ok_or_else(|| anyhow!("studio lookup unavailable"))?;
             let idents = backend::idents(list).await;
             Ok(json!({ "idents": idents.iter().map(|s| json!({"name": s.name, "logo": s.logo})).collect::<Vec<_>>() }))
+        }
+        "title_prefetch_art" => {
+            // The hero backdrop + logo a title page will paint first, so the UI can download and
+            // decode them while the pointer rests on the card.
+            let m = media_from_arg(&req["media"])?;
+            let hero = backend::merge_title_stills(
+                backend::title_artwork_fast(&m).await,
+                &backend::cached_title_stills(&m).unwrap_or_default(),
+            );
+            let art = merge_title_art(hero, backend::cached_series_free(&m), None);
+            Ok(json!({
+                "backdrop": art.as_ref().and_then(|a| a.backdrop.clone()),
+                "logo": art.as_ref().and_then(|a| a.logo.clone()),
+            }))
         }
         "title_prefetch" => {
             // Hovering/focusing a card warms the caches the title page reads on open, so opening
