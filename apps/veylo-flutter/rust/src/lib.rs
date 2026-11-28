@@ -18,6 +18,7 @@ pub mod picks_rules;
 pub mod tracks;
 mod crash;
 mod studios;
+mod home_store;
 mod title_store;
 mod youtube;
 
@@ -142,12 +143,25 @@ pub mod android {
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
 
 type AsyncCallback = extern "C" fn(u64, *mut c_char);
+
+fn catalog_row_json(row: &backend::CatalogRow) -> Value {
+    json!({
+        "key": row.key,
+        "title": row.title,
+        "subtitle": row.subtitle,
+        "addon_url": row.addon_url,
+        "kind": row.kind,
+        "id": row.id,
+        "extra": row.extra,
+        "ranked": row.ranked,
+    })
+}
 
 fn media_to_json(m: &backend::Media) -> Value {
     let ep_label = m.last_video_id.as_deref().and_then(backend::episode_label);
@@ -325,6 +339,7 @@ fn settings_to_json(s: &backend::Settings) -> Value {
         "audio_passthrough": s.audio_passthrough,
         "hwdec_mode": s.hwdec_mode,
         "auto_next": s.auto_next,
+        "auto_skip_intro": s.auto_skip_intro,
         "max_bitrate_mbps": s.max_bitrate_mbps,
         "telemetry_enabled": s.telemetry_enabled,
         "prefetch_sources": s.prefetch_sources,
@@ -546,20 +561,10 @@ async fn handle_request(req: Value) -> Result<Value> {
                 "ai_failed": picks_ai::failed(),
             }))
         }
+        "home_cached" => home_store::snapshot().await,
         "home_rows" => {
             let rows = backend::home_rows().await?;
-            Ok(json!({
-                "rows": rows.into_iter().map(|r| json!({
-                    "key": r.key,
-                    "title": r.title,
-                    "subtitle": r.subtitle,
-                    "addon_url": r.addon_url,
-                    "kind": r.kind,
-                    "id": r.id,
-                    "extra": r.extra.map(|(a, b)| json!([a, b])),
-                    "ranked": r.ranked,
-                })).collect::<Vec<_>>()
-            }))
+            Ok(json!({ "rows": rows.iter().map(catalog_row_json).collect::<Vec<_>>() }))
         }
         "catalog" => {
             let r = &req["row"];
@@ -948,15 +953,28 @@ async fn handle_request(req: Value) -> Result<Value> {
                 }
             }
             let original_language = ctx.original_language.clone();
+            let expected_seconds = ctx.expected_seconds;
+            let pack_episodes = ctx.pack_episodes;
             let pick = backend::autoplay_for(&m.kind, &video, ctx).await;
+            let autoplay_source = |source: &backend::Source, verified: bool| {
+                let mut data = source_to_json(source);
+                data["verified"] = json!(verified);
+                let bitrate = backend::episode_size(source, pack_episodes)
+                    .and_then(|bytes| backend::estimated_avg_mbps(source, bytes, expected_seconds));
+                data["bitrate_mbps"] = json!(bitrate);
+                data
+            };
             Ok(json!({
-                "best": pick.best.as_ref().map(source_to_json),
-                "rest": pick.rest.iter().take(15).map(source_to_json).collect::<Vec<_>>(),
+                "best": pick.best.as_ref().map(|s| autoplay_source(s, true)),
+                "rest": pick.rest.iter().take(15).enumerate()
+                    .map(|(index, s)| autoplay_source(s, index < pick.verified_rest))
+                    .collect::<Vec<_>>(),
                 "debrid": pick.debrid,
                 "original_language": original_language,
                 "message": if pick.best.is_none() { Some(backend::no_source_message(pick.debrid.as_deref())) } else { None },
             }))
         }
+        "cancel_autoplay" => Ok(json!({"ok": true})),
         "feedback" => {
             let m = media_from_arg(&req["media"])?;
             let value = req["value"].as_i64().unwrap_or(0);
@@ -994,7 +1012,8 @@ async fn handle_request(req: Value) -> Result<Value> {
             let pos = req["position_ms"].as_i64().unwrap_or(0);
             let dur = req["duration_ms"].as_i64().unwrap_or(0);
             let watched_ms = req["watched_ms"].as_i64().unwrap_or(0);
-            backend::record_progress(m, video_id, pos, dur, watched_ms, true);
+            let with_meta = req["with_meta"].as_bool().unwrap_or(false);
+            backend::record_progress(m, video_id, pos, dur, watched_ms, with_meta);
             Ok(json!({"ok": true}))
         }
         "flush_progress" => {
@@ -1016,6 +1035,13 @@ async fn handle_request(req: Value) -> Result<Value> {
                     "end": s.end,
                 })).collect::<Vec<_>>()
             }))
+        }
+        "fetch_subtitle" => {
+            // Download + validate through core, then hand the player a local file (never an
+            // unvalidated remote URL), like the DX app.
+            let url = req["url"].as_str().unwrap_or("");
+            let path = backend::fetch_subtitle(url).await?;
+            Ok(json!({ "path": path }))
         }
         "online_subtitles" => {
             let kind = req["kind"].as_str().unwrap_or("movie").to_owned();
@@ -1089,6 +1115,7 @@ async fn handle_request(req: Value) -> Result<Value> {
                 if let Some(v) = patch.get("stream_language").and_then(Value::as_str) { s.stream_language = Some(v.to_owned()); }
                 if let Some(v) = patch.get("hdr_output").and_then(Value::as_bool) { s.hdr_output = v; }
                 if let Some(v) = patch.get("auto_next").and_then(Value::as_bool) { s.auto_next = v; }
+                if let Some(v) = patch.get("auto_skip_intro").and_then(Value::as_bool) { s.auto_skip_intro = v; }
                 if let Some(v) = patch.get("audio_passthrough").and_then(Value::as_bool) { s.audio_passthrough = v; }
                 if let Some(v) = patch.get("audio_night_mode").and_then(Value::as_bool) { s.audio_night_mode = v; }
                 if let Some(v) = patch.get("prefetch_sources").and_then(Value::as_bool) { s.prefetch_sources = v; }
@@ -1682,9 +1709,54 @@ fn to_cstring_ptr(v: Value) -> *mut c_char {
     CString::new(s).unwrap_or_else(|_| CString::new("{}").unwrap()).into_raw()
 }
 
+static AUTOPLAY_TASKS: OnceLock<Mutex<HashMap<i64, tokio::task::AbortHandle>>> = OnceLock::new();
+
+struct AutoplayTicket(i64);
+
+impl Drop for AutoplayTicket {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = AUTOPLAY_TASKS.get_or_init(Default::default).lock() {
+            tasks.remove(&self.0);
+        }
+    }
+}
+
+/// Register or cancel before returning to Dart. Tokio can schedule the async requests out of
+/// order, so registering inside the task could miss a cancellation issued immediately after Play.
+fn prepare_autoplay(req: &Value) -> Option<tokio::task::JoinHandle<Result<Value>>> {
+    let ticket = req["ticket"].as_i64()?;
+    let op = req["op"].as_str()?;
+    if !matches!(op, "autoplay" | "cancel_autoplay") {
+        return None;
+    }
+    let mut tasks = AUTOPLAY_TASKS.get_or_init(Default::default).lock().ok()?;
+    if op == "cancel_autoplay" {
+        if let Some(task) = tasks.get(&ticket) {
+            task.abort();
+        }
+        return None;
+    }
+    if tasks.contains_key(&ticket) {
+        return Some(rt().spawn(async { Err(anyhow!("Play ticket is already active")) }));
+    }
+    let req = req.clone();
+    let registration = AutoplayTicket(ticket);
+    let work = rt().spawn(async move {
+        let _registration = registration;
+        handle_request(req).await
+    });
+    tasks.insert(ticket, work.abort_handle());
+    Some(work)
+}
+
 /// Run one op in its own task so a panic can never leave the Dart future waiting forever: it
 /// becomes an ordinary error reply, and failures are logged (redacted) and reported to Sentry.
 async fn run_op(v: Value) -> Value {
+    let autoplay = prepare_autoplay(&v);
+    run_prepared_op(v, autoplay).await
+}
+
+async fn run_prepared_op(v: Value, autoplay: Option<tokio::task::JoinHandle<Result<Value>>>) -> Value {
     let op = v["op"].as_str().unwrap_or("").to_owned();
     // Title page parts are kept on disk (stale-while-revalidate, see title_store).
     let store_part: Option<(&'static str, String)> = match op.as_str() {
@@ -1697,13 +1769,22 @@ async fn run_op(v: Value) -> Value {
         "title_extras" => Some("extras"),
         _ => None,
     }.and_then(|part| Some((part, media_from_arg(&v["media"]).ok()?.key())));
+    let home_key = match op.as_str() {
+        "catalog" => v["row"]["key"].as_str().map(str::to_owned),
+        "artwork" if v["home"] == true => media_from_arg(&v["media"]).ok().map(|m| m.key()),
+        _ => None,
+    };
     let started = std::time::Instant::now();
     let tx = crash::op_transaction(&op);
-    let joined = tokio::spawn(handle_request(v)).await;
+    let joined = match autoplay {
+        Some(task) => task.await,
+        None => tokio::spawn(handle_request(v)).await,
+    };
     let elapsed = started.elapsed();
     use sentry::protocol::SpanStatus;
     match joined {
         Ok(Ok(data)) => {
+            home_store::put(&op, home_key.as_deref(), &data);
             if let Some((part, key)) = &store_part {
                 // A failed meta fetch isn't worth keeping over a good stored copy.
                 if !(*part == "details" && data["meta"]["error"].is_string()) { title_store::put(key, part, &data); }
@@ -1716,6 +1797,10 @@ async fn run_op(v: Value) -> Value {
             crash::finish_transaction(tx, SpanStatus::InternalError);
             crash::op_failed(&op, elapsed, &e);
             json!({ "ok": false, "error": format!("{e:#}") })
+        }
+        Err(join) if op == "autoplay" && join.is_cancelled() => {
+            crash::finish_transaction(tx, SpanStatus::Cancelled);
+            json!({ "ok": true, "data": { "cancelled": true } })
         }
         Err(join) => {
             crash::finish_transaction(tx, SpanStatus::Aborted);
@@ -1738,9 +1823,11 @@ pub unsafe extern "C" fn veylo_call_async(req_id: u64, req_json: *const c_char, 
     } else {
         unsafe { CStr::from_ptr(req_json) }.to_string_lossy().into_owned()
     };
+    let request = serde_json::from_str::<Value>(&req_str);
+    let autoplay = request.as_ref().ok().and_then(prepare_autoplay);
     rt().spawn(async move {
-        let resp = match serde_json::from_str::<Value>(&req_str) {
-            Ok(v) => run_op(v).await,
+        let resp = match request {
+            Ok(v) => run_prepared_op(v, autoplay).await,
             Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
         };
         cb(req_id, to_cstring_ptr(resp));

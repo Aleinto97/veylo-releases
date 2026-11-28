@@ -64,6 +64,12 @@ class _VeyloAppState extends State<VeyloApp> {
     unawaited(_state.bootstrap());
   }
 
+  @override
+  void dispose() {
+    _state.dispose();
+    super.dispose();
+  }
+
   ThemeData _buildTheme() {
     return ThemeData(
       brightness: Brightness.dark,
@@ -164,7 +170,7 @@ class _VeyloShell extends StatelessWidget {
           children: [
             BackdropGroup(
               child: PlayerScreen(
-                key: ValueKey('${app.activePlayer!.url}-${app.activePlayer!.title}'),
+                key: ObjectKey(app.activePlayer),
                 session: app.activePlayer!,
               ),
             ),
@@ -198,8 +204,8 @@ class _VeyloShell extends StatelessWidget {
       switchOutCurve: Curves.easeIn,
       transitionBuilder: (child, anim) {
         final isTitle = child.key.toString().contains('title-');
-        if (isTitle) {
-          // Opacity only: a title page never slides or scales in (nothing on it may move).
+        if (isTitle || child is HomeScreen) {
+          // Keep Home and title pages stationary for the entire transition.
           return FadeTransition(opacity: anim, child: child);
         }
         final isEntering = child.key == pageKey;

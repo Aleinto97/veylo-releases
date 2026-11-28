@@ -32,6 +32,7 @@ pub struct Settings {
     pub hwdec_mode: String,
     /// Automatically count down to the next episode at credits or end of episode.
     pub auto_next: bool,
+    pub auto_skip_intro: bool,
     /// Streaming bitrate cap for autoplay: None = Auto (match connection speed),
     /// Some(0) = Unlimited (always highest quality), Some(n) = cap at n Mbps.
     pub max_bitrate_mbps: Option<u32>,
@@ -91,7 +92,7 @@ impl Default for Settings {
             stream_language: Some(DEFAULT_LANGUAGE.into()), hdr_output: true,
             sub_scale: 1.05, sub_pos: 100, sub_bg: false, sub_color: "#F2EFEA".into(),
             audio_night_mode: false, audio_passthrough: false, hwdec_mode: "auto".into(),
-            auto_next: true, max_bitrate_mbps: None, telemetry_enabled: false,
+            auto_next: true, auto_skip_intro: true, max_bitrate_mbps: None, telemetry_enabled: false,
             prefetch_sources: false,
         }
     }
@@ -121,6 +122,7 @@ fn parse_settings(v: &Value) -> Settings {
         audio_passthrough: v["audio_passthrough"].as_bool().unwrap_or(false),
         hwdec_mode: match v["hwdec_mode"].as_str() { Some("copy") => "copy", Some("no") => "no", _ => "auto" }.to_owned(),
         auto_next: v["auto_next"].as_bool().unwrap_or(true),
+        auto_skip_intro: v["auto_skip_intro"].as_bool().unwrap_or(true),
         max_bitrate_mbps: parse_max_bitrate(v),
         telemetry_enabled: v["telemetry_enabled"].as_bool().unwrap_or(false),
         prefetch_sources: v["prefetch_sources"].as_bool().unwrap_or(false),
@@ -218,6 +220,7 @@ fn save_settings_unlocked(settings: &Settings) -> std::io::Result<()> {
         "audio_passthrough": settings.audio_passthrough,
         "hwdec_mode": settings.hwdec_mode,
         "auto_next": settings.auto_next,
+        "auto_skip_intro": settings.auto_skip_intro,
         "max_bitrate_mbps": settings.max_bitrate_mbps,
         "telemetry_enabled": settings.telemetry_enabled,
         "prefetch_sources": settings.prefetch_sources,

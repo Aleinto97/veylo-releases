@@ -22,6 +22,7 @@ import 'package:sentry/sentry.dart';
 import 'package:veylo_flutter/bridge/veylo_bridge.dart';
 import 'package:veylo_flutter/main.dart';
 import 'package:veylo_flutter/player/mpv_profile.dart';
+import 'package:veylo_flutter/screens/home_screen.dart';
 import 'package:veylo_flutter/screens/player_screen.dart';
 import 'package:veylo_flutter/screens/title_screen.dart';
 import 'package:veylo_flutter/state/app_state.dart';
@@ -271,16 +272,45 @@ Future<Map<String, Object?>> _play(
 /// — data or images landing late and pushing the page around.
 /// When the title's logo slot first became visible (ms after opening): time-to-reveal.
 int? _lastRevealMs;
+int? _lastHomeContentMs;
 
-Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) async {
+Future<List<String>> _watchShifts(
+  WidgetTester t,
+  Finder root,
+  Duration window, {
+  Stopwatch? clock,
+  bool home = false,
+}) async {
   _lastRevealMs = null;
+  _lastHomeContentMs = null;
   final first = <String, Rect>{};
   final firstAt = <String, int>{};
   final shifts = <String, String>{};
-  final sw = Stopwatch()..start();
+  final sw = clock ?? (Stopwatch()..start());
   while (sw.elapsed < window) {
-    await t.pump(const Duration(milliseconds: 100));
-    if (root.evaluate().isEmpty) continue;
+    if (home) {
+      await t.pump();
+    } else {
+      await t.pump(const Duration(milliseconds: 100));
+    }
+    if (root.evaluate().isEmpty) {
+      if (home) {
+      await Future<void>.delayed(Duration(milliseconds: _lastHomeContentMs == null ? 16 : 100));
+    }
+      continue;
+    }
+    if (home && _lastHomeContentMs == null) {
+      final content = find.descendant(
+        of: root.first,
+        matching: find.byKey(const ValueKey('home.content')),
+      );
+      if (content.evaluate().any((e) {
+        final ro = e.renderObject;
+        return ro != null && _effectiveOpacity(ro) >= 0.01;
+      })) {
+        _lastHomeContentMs = sw.elapsedMilliseconds;
+      }
+    }
     final keyed = find.descendant(
       of: root.first,
       matching: find.byWidgetPredicate((w) => w.key is ValueKey<String> && (w.key! as ValueKey<String>).value.startsWith('shift.')),
@@ -303,7 +333,10 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
       if (base == null) {
         first[name] = r;
         firstAt[name] = sw.elapsedMilliseconds;
-        if (name == 'title.logo') _lastRevealMs = sw.elapsedMilliseconds;
+        if (name == (home ? 'home.hero-content' : 'title.logo')) {
+          _lastRevealMs = sw.elapsedMilliseconds;
+          if (home) _lastHomeContentMs ??= _lastRevealMs;
+        }
         continue;
       }
       final dy = r.top - base.top, dx = r.left - base.left, dh = r.height - base.height, dw = r.width - base.width;
@@ -311,6 +344,9 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
         shifts[name] = '$name moved dy=${dy.round()} dx=${dx.round()} dh=${dh.round()} dw=${dw.round()} at ${sw.elapsedMilliseconds} ms '
             '(appeared at ${firstAt[name]} ms)';
       }
+    }
+    if (home) {
+      await Future<void>.delayed(Duration(milliseconds: _lastHomeContentMs == null ? 16 : 100));
     }
   }
   return shifts.values.toList();
@@ -356,7 +392,38 @@ void main() {
     };
 
     MediaKit.ensureInitialized();
-    await t.pumpWidget(RepaintBoundary(key: _shotKey, child: const VeyloApp()));
+    Future<void> watchHome(String pass, Duration window, Future<void> Function() enter) async {
+      await _step('shift.home-$pass', (tx) async {
+        final before = frameworkErrors.length;
+        final clock = Stopwatch()..start();
+        await enter();
+        final shifts = await _watchShifts(t, find.byType(HomeScreen), window, clock: clock, home: true);
+        final reveal = _lastHomeContentMs;
+        tx.setMeasurement('layout_shifts', shifts.length);
+        if (reveal != null) {
+          tx.setMeasurement('home_reveal', reveal, unit: DurationSentryMeasurementUnit.milliSecond);
+        }
+        await _shot(t, 'home-$pass');
+        if (shifts.isNotEmpty) throw StateError('layout shifts: ${shifts.join(' | ')}');
+        if (frameworkErrors.length > before) {
+          throw StateError('framework errors: ${frameworkErrors.sublist(before).take(3).join(' | ')}');
+        }
+        if (reveal == null) throw StateError('Home showed no content during the watch');
+        return {'shifts': 0, 'home_reveal_ms': reveal, 'home_hero_reveal_ms': _lastRevealMs};
+      });
+    }
+
+    // Pin the boot viewport on Linux so the compositor's initial window
+    // configure cannot be mistaken for content shifting inside a viewport.
+    if (Platform.isLinux) {
+      t.view.devicePixelRatio = 1;
+      t.view.physicalSize = const Size(1280, 800);
+      addTearDown(t.view.resetPhysicalSize);
+      addTearDown(t.view.resetDevicePixelRatio);
+    }
+    await watchHome('cold', const Duration(seconds: 8), () async {
+      await t.pumpWidget(RepaintBoundary(key: _shotKey, child: const VeyloApp()));
+    });
     late AppState app;
 
     await _step('boot', (tx) async {
@@ -399,6 +466,10 @@ void main() {
     await screen('home', () async {
       await _until(t, () => app.homeRows.isNotEmpty, const Duration(seconds: 45), 'home rows');
     }, settle: const Duration(seconds: 5));
+
+    app.setTab(VeyloTab.library);
+    await _settle(t, const Duration(milliseconds: 600));
+    await watchHome('warm', const Duration(seconds: 6), () async => app.setTab(VeyloTab.home));
 
     // Picks AI on this platform: a vibe (plot) search only works with the on-device model loaded.
     await _step('ai.vibe-search', (tx) async {
@@ -464,6 +535,11 @@ void main() {
           app.closeTitle();
         }
       }
+      await screen('size-390x844-home', () async {
+        t.view.devicePixelRatio = 1.0;
+        t.view.physicalSize = const Size(390, 844);
+        app.setTab(VeyloTab.home);
+      });
       t.view.physicalSize = original;
       t.view.devicePixelRatio = originalRatio;
       await _settle(t);

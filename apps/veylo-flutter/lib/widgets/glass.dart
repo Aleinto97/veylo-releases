@@ -801,6 +801,7 @@ class PosterCard extends StatefulWidget {
     this.onTap,
     this.showMetaBelow = false,
     this.lifted = false,
+    this.animateMotion = true,
     this.rimColor,
     this.overlayBuilder,
     this.onHoverChanged,
@@ -811,6 +812,7 @@ class PosterCard extends StatefulWidget {
   final VoidCallback? onTap;
   final bool showMetaBelow;
   final bool lifted;
+  final bool animateMotion;
   final Color? rimColor;
   final Widget Function(BuildContext context, bool hovered)? overlayBuilder;
   final ValueChanged<bool>? onHoverChanged;
@@ -845,11 +847,11 @@ class _PosterCardState extends State<PosterCard> {
       child: AspectRatio(
         aspectRatio: 2 / 3,
         child: AnimatedSlide(
-          offset: Offset(0, raised ? -0.018 : 0.0),
+          offset: Offset(0, widget.animateMotion && raised ? -0.018 : 0.0),
           duration: Duration(milliseconds: _pressed ? 75 : 280),
           curve: _pressed ? Curves.easeOut : VeyloCurves.spring,
           child: AnimatedScale(
-            scale: _pressed ? 0.965 : (raised ? 1.048 : 1.0),
+            scale: widget.animateMotion ? (_pressed ? 0.965 : (raised ? 1.048 : 1.0)) : 1.0,
             duration: Duration(milliseconds: _pressed ? 75 : 280),
             curve: _pressed ? Curves.easeOut : VeyloCurves.spring,
             child: Stack(
@@ -983,7 +985,7 @@ class _PosterCardState extends State<PosterCard> {
                               color: const Color.fromRGBO(0, 0, 0, 0.55),
                               alignment: Alignment.centerLeft,
                               child: TweenAnimationBuilder<double>(
-                                tween: Tween(begin: 0, end: frac.clamp(0.0, 1.0)),
+                                tween: Tween(begin: widget.animateMotion ? 0 : frac.clamp(0.0, 1.0), end: frac.clamp(0.0, 1.0)),
                                 duration: const Duration(milliseconds: 450),
                                 curve: VeyloCurves.out,
                                 builder: (_, v, _) => FractionallySizedBox(

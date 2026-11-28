@@ -51,3 +51,4 @@ app.*.map.json
 
 # Built in CI / locally from rust/ (cargo ndk); never committed.
 /android/app/src/main/jniLibs/
+/android/build/

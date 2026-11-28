@@ -18,6 +18,9 @@ class VeyloTopBar extends StatelessWidget {
     final width = MediaQuery.sizeOf(context).width;
     final gutter = VeyloLayout.gutter(width);
     final compact = width <= 760;
+    // Four dock tabs, Last Played and both shortcuts share this width.
+    // The dock and the three trailing controls use 54 px for padding and gaps.
+    final controlSize = compact ? ((width - 2 * gutter - 54) / 7).clamp(32.0, 48.0) : 48.0;
 
     return SizedBox(
       height: 116, // 84px bar + 32px feathered scroll smoke extension (base.css:133-147)
@@ -161,6 +164,7 @@ class VeyloTopBar extends StatelessWidget {
                                   builder: (_, updates, _) => _SlidingDock(
                                     activeTab: app.tab,
                                     compact: compact,
+                                    controlSize: controlSize,
                                     addonUpdates: updates,
                                     onSelect: app.setTab,
                                   ),
@@ -175,17 +179,24 @@ class VeyloTopBar extends StatelessWidget {
                         if (last == null) return const SizedBox.shrink();
                         return Padding(
                           padding: const EdgeInsets.only(right: 12),
-                          child: _LastPlayedPill(key: ValueKey(last.media.key), seen: last, compact: compact),
+                          child: _LastPlayedPill(
+                            key: ValueKey(last.media.key),
+                            seen: last,
+                            compact: compact,
+                            controlSize: controlSize,
+                          ),
                         );
                       },
                     ),
                     VeyloOrb(
+                      size: controlSize,
                       icon: 'Keyboard',
                       tooltip: 'Page shortcuts (?)',
                       onTap: () => app.setShortcutsOpen(true),
                     ),
                     const SizedBox(width: 12),
                     VeyloOrb(
+                      size: controlSize,
                       icon: 'Search',
                       tooltip: 'Search (Ctrl+K)',
                       onTap: () => app.openSearch(),
@@ -206,12 +217,14 @@ class _SlidingDock extends StatefulWidget {
   const _SlidingDock({
     required this.activeTab,
     required this.compact,
+    required this.controlSize,
     required this.addonUpdates,
     required this.onSelect,
   });
 
   final VeyloTab activeTab;
   final bool compact;
+  final double controlSize;
   final int addonUpdates;
   final ValueChanged<VeyloTab> onSelect;
 
@@ -235,7 +248,9 @@ class _SlidingDockState extends State<_SlidingDock> {
   @override
   void didUpdateWidget(covariant _SlidingDock oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.activeTab != widget.activeTab || oldWidget.compact != widget.compact) {
+    if (oldWidget.activeTab != widget.activeTab ||
+        oldWidget.compact != widget.compact ||
+        oldWidget.controlSize != widget.controlSize) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
     }
   }
@@ -290,7 +305,7 @@ class _SlidingDockState extends State<_SlidingDock> {
               left: _sliderLeft,
               top: 0,
               width: _sliderWidth,
-              height: 48,
+              height: widget.controlSize,
               child: Container(
                 decoration: BoxDecoration(
                   color: const Color.fromRGBO(255, 255, 255, 0.14),
@@ -310,6 +325,7 @@ class _SlidingDockState extends State<_SlidingDock> {
                   tab: VeyloTab.values[i],
                   active: widget.activeTab == VeyloTab.values[i],
                   compact: widget.compact,
+                  controlSize: widget.controlSize,
                   hasDot: VeyloTab.values[i] == VeyloTab.settings && widget.addonUpdates > 0,
                   onTap: () => widget.onSelect(VeyloTab.values[i]),
                   onHoverChanged: _followLayout,
@@ -329,6 +345,7 @@ class _DockTab extends StatefulWidget {
     required this.tab,
     required this.active,
     required this.compact,
+    required this.controlSize,
     required this.hasDot,
     required this.onTap,
     this.onHoverChanged,
@@ -337,6 +354,7 @@ class _DockTab extends StatefulWidget {
   final VeyloTab tab;
   final bool active;
   final bool compact;
+  final double controlSize;
   final bool hasDot;
   final VoidCallback onTap;
   final VoidCallback? onHoverChanged;
@@ -384,16 +402,16 @@ class _DockTabState extends State<_DockTab> {
                 AnimatedContainer(
                   duration: const Duration(milliseconds: 180),
                   curve: VeyloCurves.out,
-                  height: 48,
-                  constraints: const BoxConstraints(minWidth: 48),
+                  height: widget.controlSize,
+                  constraints: BoxConstraints(minWidth: widget.controlSize),
                   // Hovering an inactive tab lights the whole tab (icon + label), not just the icon.
                   decoration: BoxDecoration(
                     color: _hovered && !widget.active ? const Color.fromRGBO(255, 255, 255, 0.07) : const Color(0x00FFFFFF),
                     borderRadius: BorderRadius.circular(24),
                   ),
                   padding: EdgeInsets.only(
-                    left: showLabel ? 13 : 12,
-                    right: showLabel ? 16 : 12,
+                    left: showLabel ? 13 : (widget.controlSize - 22) / 2,
+                    right: showLabel ? 16 : (widget.controlSize - 22) / 2,
                   ),
                   child: TweenAnimationBuilder<Color?>(
                     tween: ColorTween(end: fg),
@@ -457,9 +475,15 @@ class _DockTabState extends State<_DockTab> {
 }
 
 class _LastPlayedPill extends StatefulWidget {
-  const _LastPlayedPill({super.key, required this.seen, required this.compact});
+  const _LastPlayedPill({
+    super.key,
+    required this.seen,
+    required this.compact,
+    required this.controlSize,
+  });
   final SeenItem seen;
   final bool compact;
+  final double controlSize;
 
   @override
   State<_LastPlayedPill> createState() => _LastPlayedPillState();
@@ -499,8 +523,8 @@ class _LastPlayedPillState extends State<_LastPlayedPill> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     SizedBox(
-                      width: 48,
-                      height: 48,
+                      width: widget.controlSize,
+                      height: widget.controlSize,
                       child: TweenAnimationBuilder<double>(
                         tween: Tween(begin: 0, end: frac),
                         duration: const Duration(milliseconds: 550),

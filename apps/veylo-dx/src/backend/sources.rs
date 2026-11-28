@@ -300,6 +300,15 @@ pub async fn sources(kind: &str, video_id: &str) -> Result<(Vec<Source>, Vec<Str
     sources_within(kind, video_id, None, None).await.map(|(list, failed, _)| (list, failed))
 }
 
+/// Keep the provider and probe work on the backend runtime, with the caller owning its lifetime.
+async fn on_source_runtime<T: Send + 'static>(work: impl Future<Output = T> + Send + 'static) -> Result<T> {
+    let runtime = RUNTIME.get().context("Backend not started")?;
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn_on(work, runtime.handle());
+    tasks.join_next().await.expect("source task")
+        .map_err(|error| anyhow!("Background source task failed: {error}"))
+}
+
 /// How long Play waits for the slower add-ons once one has answered with sources it can play.
 pub(super) const ADDON_GRACE: Duration = Duration::from_secs(6);
 
@@ -308,7 +317,8 @@ pub(super) const ADDON_GRACE: Duration = Duration::from_secs(6);
 /// `early` gets each add-on's sources as they come, while others are still answering.
 /// The flag says whether every add-on asked answered (false when `grace` left slower ones out).
 pub(super) async fn sources_within(kind: &str, video_id: &str, grace: Option<Duration>, early: Option<tokio::sync::mpsc::UnboundedSender<Vec<Source>>>) -> Result<(Vec<Source>, Vec<String>, bool)> {
-    let targets = exec(json!({"op":"streams_targets","type":kind,"id":video_id})).await?;
+    let request = json!({"op":"streams_targets","type":kind,"id":video_id});
+    let targets = on_source_runtime(async move { backend().core.execute(request).await }).await??;
     let targets: Vec<Value> = targets["targets"].as_array().cloned().unwrap_or_default();
     let (mut out, failed, complete) = ask_addons(kind, video_id, targets, grace, early).await?;
     out.sort_by_key(|x| (x.kind != SourceKind::Direct, quality_rank(x.quality)));
@@ -319,7 +329,7 @@ pub(super) async fn sources_within(kind: &str, video_id: &str, grace: Option<Dur
 /// whether all of them answered.
 pub(super) async fn ask_addons(kind: &str, video_id: &str, targets: Vec<Value>, grace: Option<Duration>, early: Option<tokio::sync::mpsc::UnboundedSender<Vec<Source>>>) -> Result<(Vec<Source>, Vec<String>, bool)> {
     let (kind, id) = (kind.to_owned(), video_id.to_owned());
-    let (groups, complete) = on_runtime(async move {
+    let (groups, complete) = on_source_runtime(async move {
         let mut jobs = tokio::task::JoinSet::new();
         for (i, t) in targets.into_iter().enumerate() {
             let request = json!({"op":"streams","type":kind,"id":id,"addon_url":t["addon_url"]});
@@ -367,7 +377,7 @@ pub(super) async fn ask_addons(kind: &str, video_id: &str, targets: Vec<Value>, 
 /// (AIOStreams) declare the whole torrent's size as the file's; a declared size that matches
 /// the labelled pack size (or has no label to compare with) is split too, a different one is
 /// the file's own.
-pub(super) fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option<u64> {
+pub fn episode_size(src: &Source, pack_episodes: Option<usize>) -> Option<u64> {
     let size = src.size_bytes?;
     let Some(n) = pack_episodes.filter(|n| src.pack && *n > 1) else { return Some(size) };
     if src.declared_size {
@@ -503,7 +513,7 @@ impl BandwidthBudget {
 }
 
 /// Estimated or verified average bitrate (Mbps) for a source.
-pub(super) fn estimated_avg_mbps(s: &Source, size: u64, expected_seconds: Option<f64>) -> Option<f64> {
+pub fn estimated_avg_mbps(s: &Source, size: u64, expected_seconds: Option<f64>) -> Option<f64> {
     if size == 0 { return None; }
     let episode = s.pack || episode_mark().is_match(&s.label);
     let secs = s.picture.and_then(|p| p.seconds)
@@ -683,7 +693,15 @@ pub(super) fn other_language_only(label: &str, key: &str) -> bool {
 /// `audio_known`: the chosen file's own tracks said whether it has your language (the player
 /// need not check again).
 #[derive(Clone, Debug, Default)]
-pub struct Pick { pub best: Option<Source>, pub rest: Vec<Source>, pub debrid: Option<String>, pub audio_known: bool }
+pub struct Pick {
+    pub best: Option<Source>,
+    pub rest: Vec<Source>,
+    /// The prefix of rest that passed probing, in the same order as playback.
+    #[allow(dead_code)] // Flutter's bridge reads this. DX consumes the full list.
+    pub verified_rest: usize,
+    pub debrid: Option<String>,
+    pub audio_known: bool,
+}
 
 /// Wave probing limits: smaller waves prevent debrid 429 bursts while mirror failover inside each
 /// wave task recovers broken/uncached links without waiting for a second wave.
@@ -752,7 +770,7 @@ pub async fn autoplay_for(kind: &str, video_id: &str, ctx: AutoplayContext) -> P
     };
     if exact.is_empty() && !off_title.is_empty() {
         dev_log(&format!("autoplay: {} sources, none matched title (refusing {} off-title)", list.len(), off_title.len()));
-        return Pick { best: None, rest: off_title, debrid: Some(NO_MATCHING_TITLE.into()), audio_known: false };
+        return Pick { best: None, rest: off_title, verified_rest: 0, debrid: Some(NO_MATCHING_TITLE.into()), audio_known: false };
     }
     let exact_len = exact.len();
     let mut pick = pick_source_with(exact, &ctx).await;
@@ -1154,7 +1172,7 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
     }
     if working.is_empty() {
         dev_log(&format!("probe: 0 working ({}, debrid={:?}) in {} ms", stats.summary(), debrid, started.elapsed().as_millis()));
-        return Pick { best: None, rest: Vec::new(), debrid, audio_known: false };
+        return Pick { best: None, rest: Vec::new(), verified_rest: 0, debrid, audio_known: false };
     }
     let budget = BandwidthBudget::current();
     let ranked = rank_verified(working, lang, ctx.pack_episodes, ctx.expected_seconds, budget, dv_screen);
@@ -1164,8 +1182,9 @@ pub async fn pick_source_with(candidates: Vec<Source>, ctx: &AutoplayContext) ->
     let audio_known = ranked[0].audio.is_some();
     let mut ordered: Vec<Source> = ranked.into_iter().map(|w| w.source).collect();
     let mut rest = ordered.split_off(1);
+    let verified_rest = rest.len();
     rest.extend(candidates.into_iter().filter(|c| !probed_urls.contains(&c.url)));
-    Pick { best: ordered.pop(), rest, debrid: None, audio_known }
+    Pick { best: ordered.pop(), rest, verified_rest, debrid: None, audio_known }
 }
 
 /// What a file's tracks say about the Audio-language setting: (it has that language, its main
@@ -1618,7 +1637,7 @@ pub(super) async fn probe_wave(
     let expected_seconds = ctx.expected_seconds;
     let is_episode = ctx.episode_code.is_some() || pack_episodes.is_some();
     let orig_key = orig_lang.map(str::to_owned);
-    on_runtime(async move {
+    on_source_runtime(async move {
         let mut jobs = tokio::task::JoinSet::new();
         for (i, group) in wave.iter().enumerate() {
             let mirrors: Vec<Source> = group.mirrors.iter().take(MAX_MIRRORS_PER_GROUP).cloned().collect();

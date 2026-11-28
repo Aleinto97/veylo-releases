@@ -67,6 +67,7 @@ class AppState extends ChangeNotifier {
   MediaItem? pendingPlayerMedia;
   String? _inflightPlayKey;
   int _playTicket = 0;
+  int? _autoplayTicket;
   PlaySession? activePlayer;
   TheatreSession? activeTheatre;
   Future<void> Function()? onBeforeClosePlayer;
@@ -74,6 +75,33 @@ class AppState extends ChangeNotifier {
   bool toastIsError = false;
   Timer? _toastTimer;
   Timer? _syncPollTimer;
+  AppLifecycleListener? _syncLifecycle;
+  bool _pollingSyncArrival = false;
+  bool _disposed = false;
+  int _fastSyncPollUsers = 0;
+
+  void setFastSyncPolling(bool active) {
+    if (_disposed) return;
+    _fastSyncPollUsers += active ? 1 : -1;
+    if (_fastSyncPollUsers == (active ? 1 : 0)) _scheduleSyncPolling();
+  }
+
+  void _scheduleSyncPolling() {
+    _syncPollTimer?.cancel();
+    if (!accountsAvailable || !initialized) return;
+    final interval = Duration(seconds: _fastSyncPollUsers > 0 ? 4 : 60);
+    _syncPollTimer = Timer.periodic(interval, (_) => unawaited(_pollSyncArrival()));
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _syncPollTimer?.cancel();
+    _syncLifecycle?.dispose();
+    _toastTimer?.cancel();
+    _advancePlayTicket();
+    super.dispose();
+  }
 
   // Cached Home data with per-shelf notifiers (loading shelf 3 never rebuilds hero or other shelves!)
   List<CatalogRowModel> homeRows = [];
@@ -83,6 +111,13 @@ class AppState extends ChangeNotifier {
   final ValueNotifier<List<MediaItem>> tonightPicksNotifier = ValueNotifier<List<MediaItem>>([]);
   final ValueNotifier<bool> homeLoadingNotifier = ValueNotifier<bool>(true);
   String? homeError;
+  bool homeLibraryReady = false;
+  bool _homeTonightShown = false;
+  Future<void>? _homeRefresh;
+  bool _refreshHomeAgain = false;
+  final Map<String, ArtworkModel> homeArtwork = {};
+  final Map<String, Future<void>> _shelfLoads = {};
+
 
   // Per-title artwork cache with isolated notifiers
   final Map<String, ValueNotifier<ArtworkModel?>> _artworkNotifiers = {};
@@ -106,30 +141,40 @@ class AppState extends ChangeNotifier {
   Future<void> bootstrap() async {
     try {
       final info = await bridge.init();
+      if (_disposed) return;
       version = info['version'] as String? ?? '0.13.7';
       demoStream = info['demo_stream'] as String? ?? '';
       aiFailed = info['ai_failed'] as bool? ?? false;
       accountsAvailable = info['accounts_available'] as bool? ?? false;
       googleAvailable = info['google_available'] as bool? ?? false;
       syncKeyNeededNotifier.value = info['sync_key_needed'] as bool? ?? false;
+      await _restoreHome();
+      if (_disposed) return;
       initialized = true;
       notifyListeners();
       unawaited(loadHome());
       unawaited(refreshLastPlayed());
       unawaited(refreshAddonUpdates());
       if (accountsAvailable) {
-        _syncPollTimer?.cancel();
-        _syncPollTimer = Timer.periodic(const Duration(seconds: 4), (_) => unawaited(_pollSyncArrival()));
+        _syncLifecycle ??= AppLifecycleListener(onResume: () {
+          _scheduleSyncPolling();
+          unawaited(_pollSyncArrival());
+        });
+        _scheduleSyncPolling();
       }
     } catch (e) {
+      if (_disposed) return;
       initError = e.toString();
       notifyListeners();
     }
   }
 
   Future<void> _pollSyncArrival() async {
+    if (_disposed || _pollingSyncArrival) return;
+    _pollingSyncArrival = true;
     try {
       final res = await bridge.accountTakeKeysArrived();
+      if (_disposed) return;
       final from = res['from'] as String?;
       if (from != null && from.isNotEmpty) {
         showToast('Synced settings & add-ons from $from', durationMs: 6500);
@@ -137,96 +182,147 @@ class AppState extends ChangeNotifier {
         bumpPicksDirty();
         unawaited(loadHome(force: true));
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _pollingSyncArrival = false;
+    }
   }
 
-  Future<void> loadHome({bool force = false}) async {
-    if (!force && homeRows.isNotEmpty) {
-      unawaited(_refreshLibrarySilent());
-      return;
-    }
-    homeLoadingNotifier.value = true;
-    homeError = null;
-    if (force) {
-      for (final n in _shelfNotifiers.values) {
-        n.value = null;
+  Future<void> _restoreHome() async {
+    try {
+      final snapshot = await bridge.homeCached();
+      homeRows = snapshot.rows;
+      for (final entry in snapshot.shelves.entries) {
+        shelfNotifier(entry.key).value = entry.value;
       }
+      homeArtwork.addAll(snapshot.artwork);
+      tonightPicksNotifier.value = snapshot.tonight;
+      _homeTonightShown = snapshot.tonight.isNotEmpty;
+      libraryItemsNotifier.value = snapshot.library;
+      homeLibraryReady = true;
+    } catch (_) {
+      await _refreshLibrarySilent();
     }
+  }
 
-    await Future.wait([
-      _refreshLibrarySilent(),
-      _loadRows(),
-      _loadTonight(),
-    ]);
-    homeLoadingNotifier.value = false;
+  Future<void> loadHome({bool force = false}) {
+    if (_homeRefresh case final running?) {
+      _refreshHomeAgain |= force;
+      return running;
+    }
+    return _homeRefresh = _refreshHome().whenComplete(() => _homeRefresh = null);
+  }
+
+  Future<void> _refreshHome() async {
+    do {
+      _refreshHomeAgain = false;
+      homeLoadingNotifier.value = true;
+      await Future.wait([
+        _refreshLibrarySilent(),
+        _loadRows(),
+        _loadTonight(),
+      ]);
+      // A fresh store may have no recommendation candidates until its first
+      // catalogs have populated the backend's local index.
+      if (!_homeTonightShown &&
+          homeRows.any((row) => shelfNotifier(row.key).value?.isNotEmpty == true)) {
+        await _loadTonight();
+      }
+      homeLoadingNotifier.value = false;
+    } while (_refreshHomeAgain);
   }
 
   Future<void> _refreshLibrarySilent() async {
     try {
-      libraryItemsNotifier.value = await bridge.library();
+      final library = await bridge.library();
+      homeLibraryReady = true;
+      libraryItemsNotifier.value = library;
     } catch (_) {}
   }
 
   Future<void> _loadRows() async {
     try {
       final rows = await bridge.homeRows();
-      homeRows = rows;
-      notifyListeners();
-      for (final row in rows) {
-        unawaited(_loadShelf(row));
+      final existing = homeRows.map((row) => row.key).toSet();
+      final appended = rows.where((row) => existing.add(row.key)).toList();
+      if (appended.isNotEmpty || homeError != null) {
+        homeRows = [...homeRows, ...appended];
+        homeError = null;
+        notifyListeners();
       }
+      // Use today's routing fields when available. A removed add-on keeps its
+      // visible slot until the next launch.
+      final loads = rows.map(_loadShelf).toList();
+      final live = rows.map((row) => row.key).toSet();
+      for (final row in homeRows) {
+        if (!live.contains(row.key) && shelfNotifier(row.key).value == null) {
+          shelfNotifier(row.key).value = [];
+        }
+      }
+      await Future.wait(loads);
     } catch (e) {
       if (homeRows.isEmpty) {
         homeError = e.toString();
         notifyListeners();
       }
+      await Future.wait(homeRows.map(_loadShelf));
     }
   }
 
-  Future<void> _loadShelf(CatalogRowModel row) async {
+  Future<void> _loadShelf(CatalogRowModel row) => _shelfLoads.putIfAbsent(
+        row.key,
+        () => _refreshShelf(row).whenComplete(() {
+          _shelfLoads.remove(row.key);
+        }),
+      );
+
+  Future<void> _refreshShelf(CatalogRowModel row) async {
+    final shelf = shelfNotifier(row.key);
+    final error = shelfErrorNotifier(row.key);
     try {
-      shelfErrorNotifier(row.key).value = null;
+      error.value = null;
       final items = await bridge.catalog(row);
-      shelfNotifier(row.key).value = items;
+      if (shelf.value?.isNotEmpty != true) shelf.value = items;
     } catch (e) {
-      shelfErrorNotifier(row.key).value = e.toString();
+      if (shelf.value?.isNotEmpty != true) error.value = e.toString();
     }
   }
 
-  Future<void> retryShelf(CatalogRowModel row) async {
-    shelfErrorNotifier(row.key).value = null;
-    shelfNotifier(row.key).value = null;
-    await _loadShelf(row);
-  }
+  Future<void> retryShelf(CatalogRowModel row) => _loadShelf(row);
 
   Future<void> _loadTonight() async {
     try {
       final picks = await bridge.tonightPicks();
-      tonightPicksNotifier.value = picks;
-      for (final p in picks.take(4)) {
-        unawaited(fetchArtwork(p));
+      if (!_homeTonightShown && picks.isNotEmpty) {
+        _homeTonightShown = true;
+        tonightPicksNotifier.value = picks;
+      }
+      final disliked = libraryItems.where((m) => m.liked < 0).map((m) => m.id).toSet();
+      for (final pick in picks.where((m) => !disliked.contains(m.id)).take(4)) {
+        unawaited(fetchArtwork(pick, home: true));
       }
     } catch (_) {}
   }
 
-  final Set<String> _artworkInflight = {};
+  final Map<String, Future<ArtworkModel?>> _artworkInflight = {};
 
-  Future<ArtworkModel?> fetchArtwork(MediaItem m) async {
+  Future<ArtworkModel?> fetchArtwork(MediaItem m, {bool home = false}) {
     final notifier = artworkNotifier(m.key);
-    if (notifier.value != null) return notifier.value;
-    if (_artworkInflight.contains(m.key)) return null;
-    _artworkInflight.add(m.key);
-    try {
-      final art = await bridge.artwork(m);
-      if (art != null) {
-        notifier.value = art;
-      }
-      return art;
-    } catch (_) {
-      return null;
-    } finally {
-      _artworkInflight.remove(m.key);
-    }
+    if (notifier.value != null) return Future.value(notifier.value);
+    return _artworkInflight.putIfAbsent(
+      m.key,
+      () async {
+        try {
+          final art = await bridge.artwork(m, home: home);
+          if (art != null) notifier.value = art;
+          return art;
+        } catch (_) {
+          return null;
+        } finally {
+          _artworkInflight.remove(m.key);
+        }
+      },
+    );
   }
 
   Future<Color?> fetchAccent(String url) async {
@@ -388,8 +484,15 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  int _advancePlayTicket() {
+    final previous = _autoplayTicket;
+    _autoplayTicket = null;
+    if (previous != null) unawaited(bridge.cancelAutoplay(previous).catchError((_) {}));
+    return ++_playTicket;
+  }
+
   void cancelPendingPlay() {
-    _playTicket++;
+    _advancePlayTicket();
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
     pendingPlayerMedia = null;
@@ -397,7 +500,7 @@ class AppState extends ChangeNotifier {
   }
 
   void startPlaySession(PlaySession session) {
-    _playTicket++;
+    _advancePlayTicket();
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
     pendingPlayerMedia = null;
@@ -408,7 +511,7 @@ class AppState extends ChangeNotifier {
 
   void openTheatre(TheatreSession session) {
     if (session.clips.isEmpty) return;
-    _playTicket++;
+    _advancePlayTicket();
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
     activeTheatre = session;
@@ -422,7 +525,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> closePlayer() async {
-    _playTicket++;
+    _advancePlayTicket();
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
     final closing = activePlayer;
@@ -470,7 +573,7 @@ class AppState extends ChangeNotifier {
 
     _inflightPlayKey = requestKey;
     dismissToast();
-    final ticket = ++_playTicket;
+    final ticket = _advancePlayTicket();
 
     final displayName = clip.name.isNotEmpty && clip.name.toLowerCase() != clip.label.toLowerCase()
         ? clip.name
@@ -558,7 +661,7 @@ class AppState extends ChangeNotifier {
     _inflightPlayKey = requestKey;
     dismissToast();
 
-    final ticket = ++_playTicket;
+    final ticket = _advancePlayTicket();
     pendingPlayerTitle = episodeLabel != null ? '${media.name} $episodeLabel' : media.name;
     pendingPlayerMedia = media;
     pendingPlayerStep = (videoId == null && media.kind != 'movie') ? 'Resolving episode' : 'Finding a source';
@@ -603,7 +706,14 @@ class AppState extends ChangeNotifier {
       }
 
       final displayTitle = resolvedLabel != null ? '${media.name} $resolvedLabel' : media.name;
-      final res = await bridge.autoplay(media, videoId: targetVideo, pack: resolvedPack);
+      if (_playTicket != ticket) return;
+      _autoplayTicket = ticket;
+      final Map<String, dynamic> res;
+      try {
+        res = await bridge.autoplay(media, videoId: targetVideo, pack: resolvedPack, ticket: ticket);
+      } finally {
+        if (_autoplayTicket == ticket) _autoplayTicket = null;
+      }
       if (_playTicket != ticket) return;
 
       if (res['offline'] is Map<String, dynamic>) {

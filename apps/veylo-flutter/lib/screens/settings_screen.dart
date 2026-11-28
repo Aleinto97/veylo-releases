@@ -53,6 +53,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int? _armRemoveAddon;
   String? _note;
   String? _problem;
+  AppState? _pollingApp;
 
   @override
   void initState() {
@@ -64,7 +65,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _dirUrlFocus.addListener(_onFocus);
     _histImportFocus.addListener(_onFocus);
     _scroll.addListener(_onScroll);
-    WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_load()));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _pollingApp = AppStateScope.read(context)..setFastSyncPolling(true);
+      unawaited(_load());
+    });
   }
 
   void _onFocus() {
@@ -77,6 +82,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
+    _pollingApp?.setFastSyncPolling(false);
     _addonUrlFocus.removeListener(_onFocus);
     _stremioEmailFocus.removeListener(_onFocus);
     _stremioPassFocus.removeListener(_onFocus);
@@ -279,6 +285,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           value: _settings['auto_next'] as bool? ?? true,
                           options: const [(true, 'On', null), (false, 'Off', null)],
                           onChanged: (v) => _patch({'auto_next': v}),
+                        ),
+                      ),
+                      _SettingRow(
+                        name: 'Skip intros automatically',
+                        about: 'Skips intros and recaps the first time they play; a button lets you undo.',
+                        control: VeyloSegmented<bool>(
+                          compact: true,
+                          value: _settings['auto_skip_intro'] as bool? ?? true,
+                          options: const [(true, 'On', null), (false, 'Off', null)],
+                          onChanged: (v) => _patch({'auto_skip_intro': v}),
                         ),
                       ),
                       _SettingRow(
@@ -2107,11 +2123,16 @@ class _QrLinkPanelState extends State<_QrLinkPanel> {
   bool _loading = true;
   bool _disposed = false;
   int _round = 0;
+  AppState? _pollingApp;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_startOffer());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _pollingApp = AppStateScope.read(context);
+      unawaited(_startOffer());
+    });
   }
 
   @override
@@ -2123,6 +2144,16 @@ class _QrLinkPanelState extends State<_QrLinkPanel> {
   }
 
   Future<void> _startOffer() async {
+    final app = _pollingApp;
+    app?.setFastSyncPolling(true);
+    try {
+      await _runOffer();
+    } finally {
+      app?.setFastSyncPolling(false);
+    }
+  }
+
+  Future<void> _runOffer() async {
     final myRound = ++_round;
     if (mounted) {
       setState(() {

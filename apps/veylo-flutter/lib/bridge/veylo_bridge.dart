@@ -130,6 +130,24 @@ class VeyloBridge {
     return call('init');
   }
 
+  Future<HomeSnapshot> homeCached() async {
+    final res = await call('home_cached');
+    List<MediaItem> items(Object? value) => (value as List<dynamic>? ?? [])
+        .map((e) => MediaItem.fromJson(e as Map<String, dynamic>))
+        .toList();
+    return HomeSnapshot(
+      rows: (res['rows'] as List<dynamic>? ?? [])
+          .map((e) => CatalogRowModel.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      shelves: (res['shelves'] as Map<String, dynamic>? ?? {}).map((key, value) => MapEntry(key, items(value))),
+      tonight: items(res['tonight']),
+      artwork: (res['artwork'] as Map<String, dynamic>? ?? {}).map(
+        (key, value) => MapEntry(key, ArtworkModel.fromJson(value as Map<String, dynamic>)),
+      ),
+      library: items(res['library']),
+    );
+  }
+
   Future<List<CatalogRowModel>> homeRows() async {
     final res = await call('home_rows');
     return (res['rows'] as List<dynamic>? ?? [])
@@ -158,8 +176,8 @@ class VeyloBridge {
         .toList();
   }
 
-  Future<ArtworkModel?> artwork(MediaItem media) async {
-    final res = await call('artwork', {'media': media.toArg()});
+  Future<ArtworkModel?> artwork(MediaItem media, {bool home = false}) async {
+    final res = await call('artwork', {'media': media.toArg(), if (home) 'home': true});
     final a = res['artwork'];
     if (a is Map<String, dynamic>) return ArtworkModel.fromJson(a);
     return null;
@@ -245,8 +263,10 @@ class VeyloBridge {
   Future<Map<String, dynamic>> playTarget(MediaItem media) =>
       call('play_target', {'media': media.toArg()});
 
-  Future<Map<String, dynamic>> autoplay(MediaItem media, {String? videoId, int? pack}) =>
-      call('autoplay', {'media': media.toArg(), 'video_id': videoId ?? media.id, 'pack': pack});
+  Future<Map<String, dynamic>> autoplay(MediaItem media, {String? videoId, int? pack, int? ticket}) =>
+      call('autoplay', {'media': media.toArg(), 'video_id': videoId ?? media.id, 'pack': pack, 'ticket': ticket});
+
+  Future<void> cancelAutoplay(int ticket) => call('cancel_autoplay', {'ticket': ticket});
 
   Future<void> feedback(MediaItem media, int value) =>
       call('feedback', {'media': media.toArg(), 'value': value});
@@ -262,13 +282,14 @@ class VeyloBridge {
 
   Future<void> forget(MediaItem media) => call('forget', {'media': media.toArg()});
 
-  Future<void> recordProgress(MediaItem media, {String? videoId, required int positionMs, required int durationMs, required int watchedMs}) =>
+  Future<void> recordProgress(MediaItem media, {String? videoId, required int positionMs, required int durationMs, required int watchedMs, bool withMeta = false}) =>
       call('record_progress', {
         'media': media.toArg(),
         'video_id': videoId,
         'position_ms': positionMs,
         'duration_ms': durationMs,
         'watched_ms': watchedMs,
+        'with_meta': withMeta,
       });
 
   Future<void> flushProgress() => call('flush_progress');
@@ -276,6 +297,12 @@ class VeyloBridge {
   Future<List<Map<String, dynamic>>> onlineSegments(String videoId, double duration) async {
     final res = await call('online_segments', {'video_id': videoId, 'duration': duration});
     return (res['segments'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+  }
+
+  /// Download and validate an online subtitle; returns the local file path for the player.
+  Future<String> fetchSubtitle(String url) async {
+    final r = await call('fetch_subtitle', {'url': url});
+    return r['path'] as String;
   }
 
   Future<List<Map<String, dynamic>>> onlineSubtitles(String kind, String videoId, {String? filename, int? fileSize}) async {
@@ -521,6 +548,22 @@ class MediaItem {
       };
 }
 
+class HomeSnapshot {
+  const HomeSnapshot({
+    required this.rows,
+    required this.shelves,
+    required this.tonight,
+    required this.artwork,
+    required this.library,
+  });
+
+  final List<CatalogRowModel> rows;
+  final Map<String, List<MediaItem>> shelves;
+  final List<MediaItem> tonight;
+  final Map<String, ArtworkModel> artwork;
+  final List<MediaItem> library;
+}
+
 class CatalogRowModel {
   const CatalogRowModel({
     required this.key,
@@ -666,6 +709,9 @@ class SourceItem {
     required this.kind,
     required this.headers,
     required this.offTitle,
+    this.verified = false,
+    this.bitrateMbps,
+    this.videoCodec,
   });
 
   final String addon;
@@ -681,6 +727,9 @@ class SourceItem {
   final String kind;
   final Map<String, String> headers;
   final bool offTitle;
+  final bool verified;
+  final double? bitrateMbps;
+  final String? videoCodec;
 
   factory SourceItem.fromJson(Map<String, dynamic> j) {
     final hdrs = <String, String>{};
@@ -703,6 +752,9 @@ class SourceItem {
       kind: j['kind'] as String? ?? 'direct',
       headers: hdrs,
       offTitle: j['off_title'] as bool? ?? false,
+      verified: j['verified'] as bool? ?? false,
+      bitrateMbps: (j['bitrate_mbps'] as num?)?.toDouble(),
+      videoCodec: j['video_codec'] as String?,
     );
   }
 }

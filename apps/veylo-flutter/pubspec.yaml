@@ -21,6 +21,9 @@ dependencies:
   path_provider: ^2.1.6
 
 dependency_overrides:
+  # 2.3 moved to JNI (native C built with the NDK's x86_64-only clang, which can't run on ARM64
+  # Linux build hosts); 2.2 uses Flutter's standard platform channels, same behaviour.
+  path_provider_android: 2.2.17
   media_kit_video:
     path: third_party/media_kit_video
 

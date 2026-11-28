@@ -13,7 +13,14 @@ int heroDecodeWidth(double logicalWidth, double dpr) => (logicalWidth * dpr).cla
 /// ImageCache entry), shared by the page's reveal and the card-hover prefetch.
 ImageProvider heroProvider(String url, int decodeWidth) =>
     ResizeImage.resizeIfNeeded(decodeWidth, null, CachedNetworkImageProvider(url));
-ImageProvider logoProvider(String url) => ResizeImage.resizeIfNeeded(920, null, CachedNetworkImageProvider(url));
+ImageProvider logoProvider(String url, {int decodeWidth = 920}) =>
+    ResizeImage.resizeIfNeeded(decodeWidth, null, CachedNetworkImageProvider(url));
+
+Future<bool> precacheArtwork(ImageProvider provider, BuildContext context) async {
+  var loaded = true;
+  await precacheImage(provider, context, onError: (_, _) => loaded = false);
+  return loaded;
+}
 
 final Set<String> _artWarmed = <String>{};
 

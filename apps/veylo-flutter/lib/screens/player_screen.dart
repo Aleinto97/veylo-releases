@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show Platform;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:material_ui/material_ui.dart' show CircularProgressIndicator, InputDecoration, TextField;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../bridge/veylo_bridge.dart';
@@ -12,7 +14,16 @@ import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
-enum _PlayerSheet { audio, subtitles, sources, episodes, clips, speed, sleep, picture, info, shortcuts }
+enum _PlayerSheet { audio, subtitles, sources, episodes, clips, chapters, speed, sleep, picture, info, shortcuts }
+
+typedef _Chapter = ({double start, String title});
+
+int _chapterIndexAt(List<_Chapter> chapters, double seconds) {
+  for (var i = chapters.length - 1; i >= 0; i--) {
+    if (seconds >= chapters[i].start) return i;
+  }
+  return -1;
+}
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key, required this.session});
@@ -51,18 +62,57 @@ class _PlayerScreenState extends State<PlayerScreen> {
   double _speed = 1.0;
   BoxFit _fit = BoxFit.contain;
   String? _error;
+  SourceItem? _source;
+  String get _sourceUrl => _source?.url ?? widget.session.url;
+  String? get _sourceQuality => _source?.quality ?? (_source == null ? widget.session.quality : null);
+  String? get _sourceHdr => _source?.hdr ?? (_source == null ? widget.session.hdr : null);
+  String? get _sourceSize => _source?.size ?? (_source == null ? widget.session.size : null);
+  int? get _sourceBytes => _source?.sizeBytes ?? (_source == null ? widget.session.fileSize : null);
+
+  String? _defaultUserAgent;
+  String? _reconnectOptions;
+  int _sourceGeneration = 0;
+  bool _monitorSource = false;
+  bool _firstFrame = false;
+  Timer? _firstFrameTimer;
+  Timer? _stallTimer;
+  Duration _sourcePosition = Duration.zero;
+  Duration _resumePosition = Duration.zero;
+  final _sourceClock = Stopwatch()..start();
+  final List<int> _decodeFailures = [];
+  final Set<String> _failedSources = {};
+  int _automaticSwitches = 0;
+  AudioTrack? _carriedAudio;
+  SubtitleTrack? _carriedSubtitle;
+  bool _restoredSubtitle = false;
 
   List<AudioTrack> _audioTracks = [];
   AudioTrack _activeAudio = AudioTrack.auto();
   String _preferredAudioLang = 'english';
   bool _preferredAudioApplied = false;
+  String? _subtitleFallbackLanguage;
+  Timer? _subtitleFallbackTimer;
+  bool _manualTrackSelected = false;
   List<SubtitleTrack> _subTracks = [];
   SubtitleTrack _activeSub = SubtitleTrack.auto();
   List<Map<String, dynamic>> _onlineSubs = [];
-  bool _loadingOnlineSubs = false;
+  Future<void>? _onlineSubsRequest;
+  Object? _subtitleDownload;
+  final _subSearch = TextEditingController();
+  final _subSearchFocus = FocusNode();
   bool _externalAudioAttached = false;
   List<Map<String, dynamic>> _segments = [];
+  List<Map<String, dynamic>> _onlineSegments = [];
   bool _segmentsRequested = false;
+  bool _chaptersReady = false;
+  bool _autoSkipIntro = true;
+  final Set<(String, int)> _skippedSegments = {};
+  final List<double> _backwardSeekTargets = [];
+  Map<String, dynamic>? _undoSegment;
+  Timer? _undoTimer;
+  List<_Chapter> _chapters = const [];
+  bool _chaptersRequested = false;
+  Timer? _chapterRetry;
 
   bool _chromeVisible = true;
   bool _showStatsHud = false;
@@ -73,8 +123,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _osdTimer;
   Timer? _progressTimer;
   int _watchedAccumMs = 0;
-  bool _savingProgress = false;
-  DateTime? _playingSince;
+  int _lastRecordedMs = 0;
+  bool _sentProgress = false;
+  Duration _recordPosition = Duration.zero;
+  Duration _recordDuration = Duration.zero;
+  bool _seekPending = false;
+  Future<void>? _progressWrite;
+  Future<void>? _finalProgress;
   AppState? _appRef;
 
   // Sleep timer
@@ -94,7 +149,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int _contrast = 0;
   int _saturation = 0;
   int _gamma = 0;
-  String? _subLangFilter;
   bool _autoNext = true;
   bool _upNextDismissed = false;
 
@@ -107,6 +161,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    for (final source in widget.session.sources) {
+      if (source.url == widget.session.url) {
+        _source = source;
+        break;
+      }
+    }
+    _resumePosition = Duration(milliseconds: widget.session.startMs > 5000 ? widget.session.startMs : 0);
     _onlineSubs = List<Map<String, dynamic>>.from(widget.session.initialSubtitles);
     _player = Player(
       configuration: const PlayerConfiguration(
@@ -124,48 +185,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     PlayerScreen.debugActivePlayer.value = _player;
 
     _subs.add(_player.stream.playing.listen((p) {
-      if (!mounted) return;
-      final now = DateTime.now();
-      if (p && _playingSince == null) {
-        _playingSince = now;
-      } else if (!p && _playingSince != null) {
-        _watchedAccumMs += now.difference(_playingSince!).inMilliseconds.clamp(0, 600000);
-        _playingSince = null;
-      }
+      if (!mounted || !_monitorSource) return;
       if (p) _attachExternalAudio();
-      if (_playing != p || (p && !_loaded)) {
-        setState(() {
-          _playing = p;
-          if (p) _loaded = true;
-        });
-      }
+      if (_playing != p) setState(() => _playing = p);
+      _updateStallWatchdog();
     }));
-    _subs.add(_player.stream.position.listen((p) {
-      if (!mounted || _scrubValue != null) return;
-      final moved = p > Duration.zero && p != _posN.value;
-      _posN.value = p;
-      final needState = (p > Duration.zero && !_loaded) || (moved && _error != null);
-      if (needState) {
-        setState(() {
-          if (p > Duration.zero) _loaded = true;
-          if (moved && _error != null) _error = null;
-        });
-      }
-    }));
+    _subs.add(_player.stream.position.listen(_onPosition));
+    _subs.add(_player.stream.buffering.listen((_) => _updateStallWatchdog()));
     _subs.add(_player.stream.duration.listen((d) {
-      if (!mounted) return;
+      if (!mounted || !_monitorSource) return;
       _durN.value = d;
-      if (d > Duration.zero) _attachExternalAudio();
-      if (d > Duration.zero && !_loaded) {
-        setState(() => _loaded = true);
+      if (d <= Duration.zero) return;
+      _attachExternalAudio();
+      if (!_chaptersRequested) {
+        _chaptersRequested = true;
+        unawaited(_readChapters(_sourceGeneration));
+      } else if (_chaptersReady) {
+        _mergeSegments();
       }
-      if (!_segmentsRequested && d > Duration.zero && widget.session.videoId != null) {
+      final videoId = widget.session.videoId ?? widget.session.media?.id;
+      if (!_segmentsRequested && videoId != null) {
         _segmentsRequested = true;
-        unawaited(_fetchSegments(widget.session.videoId!, d.inSeconds.toDouble()));
+        unawaited(_fetchSegments(videoId, d.inMilliseconds / 1000, _sourceGeneration));
       }
     }));
     _subs.add(_player.stream.completed.listen((done) {
-      if (!done || !mounted) return;
+      if (!done || !mounted || !_monitorSource || !_firstFrame) return;
       if (_sleepEndOfItem) {
         unawaited(_player.pause());
         _say('Sleep timer finished');
@@ -191,7 +236,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }));
     _subs.add(_player.stream.buffer.listen((b) {
-      if (mounted) _bufN.value = b;
+      if (mounted && _monitorSource) _bufN.value = b;
     }));
     _subs.add(_player.stream.volume.listen((v) {
       if (mounted) {
@@ -208,16 +253,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (mounted) setState(() => _speed = r);
     }));
     _subs.add(_player.stream.tracks.listen((t) {
-      if (mounted) {
+      if (mounted && _monitorSource) {
         setState(() {
           _audioTracks = t.audio;
           _subTracks = t.subtitle;
         });
         _ensurePreferredAudioTrack(t.audio);
+        _restoreSubtitle(t.subtitle);
+        // media_kit includes the synthetic Auto and Off tracks in every update.
+        if (_subtitleFallbackTimer == null &&
+            !_manualTrackSelected &&
+            _carriedSubtitle == null &&
+            t.audio.any((track) => _isMediaTrack(track.id))) {
+          final generation = _sourceGeneration;
+          _subtitleFallbackTimer = Timer(const Duration(milliseconds: 800), () {
+            unawaited(_applySubtitleFallback(generation));
+          });
+        }
       }
     }));
     _subs.add(_player.stream.track.listen((t) {
-      if (mounted) {
+      if (mounted && _monitorSource) {
         setState(() {
           _activeAudio = t.audio;
           _activeSub = t.subtitle;
@@ -227,22 +283,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
         }
       }
     }));
-    _subs.add(_player.stream.error.listen((e) {
-      if (!mounted || e.isEmpty) return;
-      if ((_loaded && _playing) || !isFatalPlayerError(e)) {
-        _say('Playback notice: $e');
-      } else {
-        setState(() => _error = e);
-      }
+    _subs.add(_player.stream.error.listen((error) {
+      if (!mounted || !_monitorSource || error.isEmpty || _isDecodeFailure(error)) return;
+      if (isFatalPlayerError(error)) _failSource('fatal playback error');
+    }));
+    _subs.add(_player.stream.log.listen((log) {
+      if (!mounted || !_monitorSource || !_isDecodeFailure(log.text)) return;
+      final now = _sourceClock.elapsedMilliseconds;
+      _decodeFailures.removeWhere((at) => now - at > 10000);
+      _decodeFailures.add(now);
+      if (_decodeFailures.length >= 10) _failSource('repeated decode errors');
     }));
 
     _pokeChrome();
     unawaited(_configureAndOpen());
-    _progressTimer = Timer.periodic(const Duration(seconds: 5), (_) => unawaited(_saveProgress()));
+    _progressTimer = Timer.periodic(const Duration(seconds: 15), (_) => _checkpointProgress());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _appRef = AppStateScope.read(context);
-      _appRef!.onBeforeClosePlayer = _saveProgress;
+      _appRef!.onBeforeClosePlayer = _finishProgress;
       _focus.requestFocus();
     });
   }
@@ -277,6 +336,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _ => const [],
       };
 
+  static bool _isMediaTrack(String id) => id != 'auto' && id != 'no';
+
   static bool _isExtraAudioTrack(AudioTrack t) {
     final hay = (t.title ?? '').toLowerCase();
     if (hay.isEmpty) return false;
@@ -286,6 +347,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
       'visually impaired', 'isolated score', 'music only',
     ];
     return markers.any(hay.contains);
+  }
+
+  static bool _isExtraAudioForSubtitles(AudioTrack track) {
+    if (_isExtraAudioTrack(track)) return true;
+    final title = (track.title ?? '').toLowerCase();
+    if (title.isEmpty) return false;
+    const markers = [
+      'description', 'visual impaired',
+      '(ad)', '[ad]', '(vi)', '[vi]', '(comm)', '[comm]', 'audio comm',
+      'cast & crew', 'cast and crew', 'cast/crew', 'film historian', 'trivia track',
+      "director's track", 'directors track', 'with director', 'with the director',
+      'by director', 'by the director', 'score only', 'music & effects', 'music and effects', 'm&e',
+      'commenti', 'audiodescrizione', 'audio descrizione',
+      'audiodescripcion', 'audiodescripción', 'audio descripcion', 'audio descripción',
+      'audiodeskription', 'hörfilm', 'hoerfilm', 'bildbeschreibung',
+      'comentário', 'audiodescrição', 'audiodescricao', 'commentaar', 'audiobeschrijving',
+      'komentarz', 'audiodeskrypcja', 'комментар', 'тифлокоммент',
+      'コメンタリー', '音声解説', '副音声', '코멘터리', '음성 해설',
+      '评论音轨', '評論音軌', '导评', '導評', '口述影像', 'sesli betimleme', 'yönetmen yorumu',
+    ];
+    if (markers.any(title.contains)) return true;
+    final words = title.split(RegExp(r'[^\p{L}\p{N}]+', unicode: true)).where((word) => word.isNotEmpty).toList();
+    const adSuffixes = {'stereo', 'mono', 'surround', 'dolby', 'ac3', 'eac3', 'aac', 'dd', 'ddp', 'track', 'audio'};
+    for (var i = 0; i < words.length; i++) {
+      final word = words[i];
+      if (word == 'comm' || word == 'comment' || word == 'dvs') return true;
+      if (word == 'ad' &&
+          (i + 1 == words.length || adSuffixes.contains(words[i + 1]) || RegExp(r'^\d').hasMatch(words[i + 1]))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool _trackMatchesLang(AudioTrack t, String langKey) {
@@ -307,7 +400,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// falling back to a foreign dub marked default (e.g. French VFF in a MULTI release).
   void _ensurePreferredAudioTrack(List<AudioTrack> tracks) {
     if (_preferredAudioApplied) return;
-    final real = tracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    final real = tracks.where((t) => _isMediaTrack(t.id)).toList();
     if (real.isEmpty) return;
     _preferredAudioApplied = true;
     final main = real.where((t) => !_isExtraAudioTrack(t)).toList();
@@ -321,7 +414,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return null;
     }
 
-    final want = pickFor(_preferredAudioLang) ?? pickFor(widget.session.originalLanguage);
+    AudioTrack? carried;
+    if (_carriedAudio case final previous?) {
+      for (final track in real) {
+        if (_sameTrackLanguage(track.language, previous.language) || _trackMatchesLang(track, previous.language ?? '')) {
+          carried ??= track;
+          if (track.title != null && track.title == previous.title) {
+            carried = track;
+            break;
+          }
+        }
+      }
+    }
+    final want = carried ?? pickFor(_preferredAudioLang) ?? pickFor(widget.session.originalLanguage);
     if (want != null && want.id != _activeAudio.id) {
       unawaited(_player.setAudioTrack(want));
     } else if (_isExtraAudioTrack(_activeAudio) && main.isNotEmpty && main.first.id != _activeAudio.id) {
@@ -341,6 +446,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       passthrough = st['audio_passthrough'] as bool? ?? false;
       nightMode = st['audio_night_mode'] as bool? ?? false;
       final savedLang = st['stream_language']?.toString();
+      _subtitleFallbackLanguage = savedLang;
       if (savedLang != null && savedLang.isNotEmpty) {
         streamLang = savedLang;
       }
@@ -353,6 +459,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _subColor = st['sub_color']?.toString() ?? '#F2EFEA';
           _nightMode = nightMode;
           _autoNext = st['auto_next'] as bool? ?? true;
+          _autoSkipIntro = st['auto_skip_intro'] as bool? ?? true;
         });
       }
     } catch (_) {}
@@ -405,28 +512,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (uniqueAlang.isNotEmpty) {
         await setProp('alang', uniqueAlang.join(','));
       }
-      if (widget.session.startMs > 5000) {
-        await setProp('start', '+${(widget.session.startMs / 1000.0).toStringAsFixed(1)}');
-      } else {
-        await setProp('start', 'none');
-      }
-      final ua = widget.session.headers['User-Agent'] ?? widget.session.headers['user-agent'];
-      if (ua != null && ua.isNotEmpty) {
-        await setProp('user-agent', ua);
-      }
-      final isHls = widget.session.url.contains('.m3u8') || widget.session.url.contains('/hls_variant/');
-      if (isHls) {
-        // FFmpeg's HLS demuxer deadlocks when `reconnect_streamed=1` is set in `stream-lavf-o`.
-        await setProp('stream-lavf-o', '');
-      }
+      try {
+        _defaultUserAgent = await platform.getProperty('user-agent');
+        _reconnectOptions = await platform.getProperty('stream-lavf-o');
+      } catch (_) {}
     }
 
-    if (!mounted) return;
-    await _openStream();
+    if (mounted) await _openStream();
   }
 
   void _attachExternalAudio() {
-    final audioUrl = widget.session.audioUrl;
+    final audioUrl = _source == null ? widget.session.audioUrl : _source!.audioUrl;
     if (_externalAudioAttached || audioUrl == null || audioUrl.isEmpty) return;
     _externalAudioAttached = true;
     unawaited(
@@ -434,24 +530,229 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  Future<void> _openStream() async {
-    if (!mounted) return;
+  Future<void> _openStream({SourceItem? source}) async {
+    if (!mounted || _finalProgress != null) return;
+    final replacing = _sourceGeneration != 0;
+    final generation = ++_sourceGeneration;
+    _monitorSource = false;
+    _firstFrame = false;
+    _firstFrameTimer?.cancel();
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    _decodeFailures.clear();
+    _sourcePosition = _resumePosition;
+    _seekPending = false;
     _externalAudioAttached = false;
     _preferredAudioApplied = false;
+    _restoredSubtitle = false;
+    _subtitleFallbackTimer?.cancel();
+    _subtitleFallbackTimer = null;
+    _subtitleDownload = null;
+    _chapterRetry?.cancel();
+    _chaptersRequested = false;
+    _chaptersReady = false;
+    _segmentsRequested = false;
+    _undoTimer?.cancel();
     setState(() {
+      _source = source ?? _source;
       _error = null;
+      _loaded = false;
+      _playing = true;
+      _audioTracks = [];
+      _subTracks = [];
+      _activeAudio = AudioTrack.auto();
+      _activeSub = SubtitleTrack.auto();
+      _chapters = const [];
+      _onlineSegments = [];
+      _segments = [];
+      _undoSegment = null;
     });
+    _posN.value = _resumePosition;
+    _durN.value = Duration.zero;
+    _bufN.value = Duration.zero;
     try {
+      // Stop the old file before changing file-specific HTTP options or accepting its events.
+      if (replacing) await _player.stop();
+      if (!mounted || _finalProgress != null || generation != _sourceGeneration) return;
+      final platform = _player.platform;
+      final url = _sourceUrl;
+      final headers = _source?.headers ?? widget.session.headers;
+      if (platform is NativePlayer) {
+        final ua = headers['User-Agent'] ?? headers['user-agent'] ?? _defaultUserAgent;
+        if (ua != null) await platform.setProperty('user-agent', ua);
+        // HLS's demuxer can deadlock with reconnect_streamed enabled.
+        final isHls = url.contains('.m3u8') || url.contains('/hls_variant/');
+        if (isHls || _reconnectOptions != null) {
+          await platform.setProperty('stream-lavf-o', isHls ? '' : _reconnectOptions!);
+        }
+      }
+      if (!mounted || _finalProgress != null || generation != _sourceGeneration) return;
+      _monitorSource = true;
+      final slowStart = (_sourceBytes ?? 0) > 40000000000 || (_source?.bitrateMbps ?? 0) > 60;
+      _firstFrameTimer = Timer(Duration(seconds: slowStart ? 20 : 12), () {
+        if (generation == _sourceGeneration && !_firstFrame) _failSource('first frame timed out');
+      });
       await _player.open(
-        Media(widget.session.url, httpHeaders: widget.session.headers),
+        Media(url, httpHeaders: headers, start: _resumePosition > Duration.zero ? _resumePosition : null),
         play: true,
       );
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = 'Failed to open stream: $e';
-        });
+    } catch (_) {
+      if (mounted && generation == _sourceGeneration && _error == null) {
+        _failSource('could not open source');
       }
+    }
+  }
+
+  void _onPosition(Duration position) {
+    if (!mounted || !_monitorSource) return;
+    final step = position - _sourcePosition;
+    final moved = step != Duration.zero;
+    _sourcePosition = position;
+
+    if (!_firstFrame && step > Duration.zero && position > _resumePosition && (_player.state.width ?? 0) > 0) {
+      _firstFrame = true;
+      _firstFrameTimer?.cancel();
+      setState(() => _loaded = true);
+    }
+    if (_firstFrame && _duration > Duration.zero) {
+      if (_player.state.playing && !_player.state.buffering && !_seekPending &&
+          step > Duration.zero && step.inMilliseconds <= 2000 * _speed.clamp(1.0, 3.0)) {
+        _watchedAccumMs += step.inMilliseconds;
+      }
+      _recordPosition = position;
+      _recordDuration = _duration;
+    }
+    if (moved) {
+      _seekPending = false;
+      _stallTimer?.cancel();
+      _stallTimer = null;
+    }
+    _updateStallWatchdog();
+
+    if (_scrubValue != null) return;
+    if (_firstFrame) _posN.value = position;
+    if (_firstFrame && _playing && moved) _maybeAutoSkip();
+  }
+
+  void _updateStallWatchdog() {
+    if (!mounted || !_monitorSource || !_firstFrame || !_player.state.playing || !_player.state.buffering) {
+      _stallTimer?.cancel();
+      _stallTimer = null;
+      return;
+    }
+    _stallTimer ??= Timer(const Duration(seconds: 15), () {
+      _stallTimer = null;
+      if (_monitorSource && _player.state.playing && _player.state.buffering) {
+        _failSource('buffering stalled');
+      }
+    });
+  }
+
+  static bool _isDecodeFailure(String message) {
+    final lower = message.toLowerCase();
+    return const ['hardware accelerator', 'failed to end picture', 'decode issue', 'error while decoding']
+        .any(lower.contains);
+  }
+
+  void _rememberSourceChoices() {
+    if (!_firstFrame) return;
+    _resumePosition = _sourcePosition;
+    if (_isMediaTrack(_activeAudio.id)) _carriedAudio ??= _activeAudio;
+    if (_manualTrackSelected || _isMediaTrack(_activeSub.id)) _carriedSubtitle ??= _activeSub;
+  }
+
+  void _failSource(String reason) {
+    if (!mounted || _error != null || _finalProgress != null) return;
+    _monitorSource = false;
+    _firstFrameTimer?.cancel();
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    _rememberSourceChoices();
+    _failedSources.add(_sourceUrl);
+
+    final candidates = widget.session.sources;
+    final current = candidates.indexWhere((source) => source.url == _sourceUrl);
+    if (_automaticSwitches < 3) {
+      final next = candidates.indexWhere(
+        (source) => source.verified && !_failedSources.contains(source.url),
+        current + 1,
+      );
+      if (next >= 0) {
+        _automaticSwitches++;
+        _reportFailover(reason);
+        final verified = candidates.where((source) => source.verified).toList();
+        final replacement = candidates[next];
+        _say('Source failed — trying the next one (${verified.indexOf(replacement) + 1}/${verified.length})');
+        unawaited(_openStream(source: replacement));
+        return;
+      }
+    }
+
+    setState(() {
+      _error = 'This source could not be played.';
+      _playing = false;
+    });
+    unawaited(_player.stop().catchError((_) {}));
+  }
+
+  void _reportFailover(String reason) {
+    final codec = switch (_source?.videoCodec) {
+      'av1' => 'av1',
+      'hevc' => 'hevc',
+      'avc' => 'avc',
+      'vp9' => 'vp9',
+      _ => 'unknown',
+    };
+    final resolution = switch (_sourceQuality) {
+      '4K' || '2160p' => '4K',
+      '1440p' => '1440p',
+      '1080p' => '1080p',
+      '720p' => '720p',
+      '480p' || 'SD' => 'SD',
+      _ => 'unknown',
+    };
+    final bytes = _sourceBytes;
+    final size = switch (bytes) {
+      null => 'unknown',
+      > 40000000000 => '>40 GB',
+      >= 10000000000 => '10–40 GB',
+      _ => '<10 GB',
+    };
+    unawaited(VeyloBridge.instance.reportError(
+      'player:failover', '$reason · codec=$codec · resolution=$resolution · size=$size', null,
+    ));
+  }
+
+  static bool _sameTrackLanguage(String? a, String? b) {
+    final lang = _baseLanguage(b);
+    if (lang.isEmpty || lang == 'und') return false;
+    final actual = _baseLanguage(a);
+    return actual == lang || _langCodeList(a).contains(lang) || _langCodeList(b).contains(actual);
+  }
+
+  void _restoreSubtitle(List<SubtitleTrack> tracks) {
+    final previous = _carriedSubtitle;
+    if (previous == null || _restoredSubtitle || !tracks.any((track) => _isMediaTrack(track.id)) &&
+        !_player.state.tracks.audio.any((track) => _isMediaTrack(track.id))) {
+      return;
+    }
+    if (previous.uri || previous.data || !_isMediaTrack(previous.id)) {
+      _restoredSubtitle = true;
+      unawaited(_player.setSubtitleTrack(previous).catchError((_) {}));
+      return;
+    }
+    SubtitleTrack? match;
+    for (final track in tracks) {
+      if (!_isMediaTrack(track.id) || !_sameTrackLanguage(track.language, previous.language)) continue;
+      match ??= track;
+      if (track.title == previous.title) {
+        match = track;
+        break;
+      }
+    }
+    if (match != null) {
+      _restoredSubtitle = true;
+      unawaited(_player.setSubtitleTrack(match).catchError((_) {}));
     }
   }
 
@@ -572,17 +873,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
-    if (_appRef?.onBeforeClosePlayer == _saveProgress) {
+    if (_appRef?.onBeforeClosePlayer == _finishProgress) {
       _appRef?.onBeforeClosePlayer = null;
     }
     if (_fullscreen) {
       unawaited(_windowChannel.invokeMethod<bool>('setFullscreen', false).catchError((_) => false));
     }
-    unawaited(_saveProgress());
+    if (_finalProgress == null && widget.session.media != null) {
+      unawaited(_finishProgress().then((_) => VeyloBridge.instance.flushProgress()).catchError((_) {}));
+    }
+    _monitorSource = false;
+    _firstFrameTimer?.cancel();
+    _stallTimer?.cancel();
+    _progressTimer?.cancel();
     _hideTimer?.cancel();
     _osdTimer?.cancel();
-    _progressTimer?.cancel();
+    _undoTimer?.cancel();
     _sleepTick?.cancel();
+    _chapterRetry?.cancel();
+    _subtitleFallbackTimer?.cancel();
+    _subSearch.dispose();
+    _subSearchFocus.dispose();
     for (final s in _subs) {
       unawaited(s.cancel());
     }
@@ -631,58 +942,338 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return m > 0 ? '${m}m' : '${s}s';
   }
 
-  Future<void> _saveProgress() async {
-    final m = widget.session.media;
-    if (m == null || _duration.inMilliseconds <= 0 || _savingProgress) return;
-    _savingProgress = true;
+  void _checkpointProgress() {
+    final media = widget.session.media;
+    final position = _recordPosition.inMilliseconds;
+    final duration = _recordDuration.inMilliseconds;
+    if (media == null || !_monitorSource || !_firstFrame || !_playing ||
+        _finalProgress != null || _progressWrite != null || duration <= 0 || position <= 0 ||
+        (_watchedAccumMs == 0 && (position - _lastRecordedMs).abs() < 1000)) {
+      return;
+    }
+    _progressWrite = _writeProgress(media, position, duration).whenComplete(() => _progressWrite = null);
+  }
+
+  Future<void> _writeProgress(MediaItem media, int position, int duration, {bool last = false}) async {
+    final watched = _watchedAccumMs;
+    _watchedAccumMs = 0;
     try {
-      if (_playing && _playingSince != null) {
-        final now = DateTime.now();
-        _watchedAccumMs += now.difference(_playingSince!).inMilliseconds.clamp(0, 600000);
-        _playingSince = now;
-      }
-      final deltaMs = _watchedAccumMs;
-      _watchedAccumMs = 0;
       await VeyloBridge.instance.recordProgress(
-        m,
+        media,
         videoId: widget.session.videoId,
-        positionMs: _position.inMilliseconds,
-        durationMs: _duration.inMilliseconds,
-        watchedMs: deltaMs,
+        positionMs: position,
+        durationMs: duration,
+        watchedMs: watched,
+        withMeta: !_sentProgress || last,
       );
+      _sentProgress = true;
+      _lastRecordedMs = position;
     } catch (_) {
-    } finally {
-      _savingProgress = false;
+      _watchedAccumMs += watched;
     }
   }
 
-  Future<void> _fetchSegments(String videoId, double durationSec) async {
+  Future<void> _finishProgress() => _finalProgress ??= _flushFinalProgress();
+
+  Future<void> _flushFinalProgress() async {
+    _progressTimer?.cancel();
+    _firstFrameTimer?.cancel();
+    _stallTimer?.cancel();
+    _monitorSource = false;
+    final media = widget.session.media;
+    final position = _recordPosition.inMilliseconds;
+    final duration = _recordDuration.inMilliseconds;
+    if (media == null || duration <= 0 || position <= 0) return;
+    await _progressWrite;
+    await _writeProgress(media, position, duration, last: true);
+  }
+
+  Future<void> _fetchSegments(String videoId, double durationSec, int generation) async {
     try {
       final segs = await VeyloBridge.instance.onlineSegments(videoId, durationSec);
-      if (mounted) setState(() => _segments = segs);
+      if (!mounted || generation != _sourceGeneration || !_monitorSource) return;
+      _onlineSegments = segs;
+      if (_chaptersReady) _mergeSegments();
     } catch (_) {}
   }
 
+  Future<List<Map<String, dynamic>>> _readMpvList(String property) async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return const [];
+    try {
+      final raw = await platform.getProperty(property);
+      final decoded = jsonDecode(raw);
+      if (decoded is List) return decoded.whereType<Map<String, dynamic>>().toList();
+    } catch (_) {}
+    return const [];
+  }
+
+  Future<void> _readChapters(int generation, {bool retry = true}) async {
+    final entries = await _readMpvList('chapter-list');
+    if (!mounted || generation != _sourceGeneration || !_monitorSource) return;
+    final chapters = <_Chapter>[];
+    for (final (index, entry) in entries.indexed) {
+      final time = entry['time'];
+      if (time is! num || !time.isFinite) continue;
+      final rawTitle = entry['title'];
+      final title = rawTitle is String ? rawTitle.trim() : '';
+      chapters.add((
+        start: time < 0 ? 0.0 : time.toDouble(),
+        title: title.isEmpty ? 'Chapter ${index + 1}' : title,
+      ));
+    }
+    if (chapters.isEmpty && retry) {
+      _chapterRetry = Timer(const Duration(seconds: 2), () {
+        unawaited(_readChapters(generation, retry: false));
+      });
+      return;
+    }
+    chapters.sort((a, b) => a.start.compareTo(b.start));
+    _chapters = chapters;
+    _chaptersReady = true;
+    _mergeSegments();
+  }
+
+  static String? _chapterKind(String title) {
+    final lower = title.toLowerCase();
+    final words = lower.split(RegExp(r'[^\p{L}\p{N}]+', unicode: true)).where((word) => word.isNotEmpty).toList();
+    if (words.isEmpty) return null;
+    bool shortName(String prefix) =>
+        RegExp('^$prefix[0-9]*\$').hasMatch(words.first) &&
+        (words.length == 1 || (words.length == 2 && RegExp(r'^[0-9]+$').hasMatch(words[1])));
+    if (words.contains('recap') || words.first == 'previously') return 'recap';
+    if (words.contains('intro') || words.contains('opening') || shortName('op') ||
+        lower.contains('title sequence') || lower.contains('main title')) {
+      return 'intro';
+    }
+    if (words.contains('credits') || words.contains('outro') || words.contains('ending') ||
+        shortName('ed') || lower.contains('end titles')) {
+      return 'credits';
+    }
+    return null;
+  }
+
+  void _mergeSegments() {
+    final duration = _duration.inMilliseconds / 1000;
+    final local = <Map<String, dynamic>>[];
+    for (final (index, chapter) in _chapters.indexed) {
+      final kind = _chapterKind(chapter.title);
+      if (kind == null) continue;
+      final end = index + 1 < _chapters.length ? _chapters[index + 1].start : duration;
+      final length = end - chapter.start;
+      final fits = switch (kind) {
+        'intro' => length >= 5 && length <= 240,
+        'recap' => length >= 5 && length <= 300,
+        _ => length >= 5 && length <= 900 && duration > 0 && chapter.start >= duration / 2,
+      };
+      if (fits) local.add({'kind': kind, 'start': chapter.start, 'end': end});
+    }
+    final localKinds = local.map((segment) => segment['kind']).toSet();
+    setState(() {
+      _segments = [...local, ..._onlineSegments.where((segment) => !localKinds.contains(segment['kind']))];
+    });
+  }
+
+  static bool _segmentContains(Map<String, dynamic> segment, double position, {double tail = 0}) =>
+      position >= (segment['start'] as num) && position < (segment['end'] as num) - tail;
+
+  void _maybeAutoSkip() {
+    if (!_autoSkipIntro || _seekPending) return;
+    final position = _position.inMilliseconds / 1000;
+    final indexes = <String, int>{};
+    for (final segment in _segments) {
+      final kind = segment['kind'] as String;
+      if (kind == 'credits') continue;
+      // The same intro may have different timestamps in an alternate encode.
+      final index = indexes.update(kind, (i) => i + 1, ifAbsent: () => 0);
+      if (!_segmentContains(segment, position) ||
+          _backwardSeekTargets.any((target) => _segmentContains(segment, target)) ||
+          !_skippedSegments.add((kind, index))) {
+        continue;
+      }
+      _seekTo(_segmentBoundary(segment, 'end'), userInitiated: false);
+      _undoTimer?.cancel();
+      setState(() => _undoSegment = segment);
+      _undoTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted) setState(() => _undoSegment = null);
+      });
+      break;
+    }
+  }
+
+  static Duration _segmentBoundary(Map<String, dynamic> segment, String edge) =>
+      Duration(milliseconds: ((segment[edge] as num) * 1000).round());
+
+  void _undoSkip() {
+    final segment = _undoSegment;
+    if (segment == null) return;
+    _undoTimer?.cancel();
+    setState(() => _undoSegment = null);
+    _seekTo(_segmentBoundary(segment, 'start'));
+  }
+
+  void _seekTo(Duration target, {bool userInitiated = true}) {
+    if (!_monitorSource || !_firstFrame) return;
+    if (userInitiated && target < _position) _backwardSeekTargets.add(target.inMilliseconds / 1000);
+    _seekPending = true;
+    unawaited(_player.seek(target).catchError((_) {}));
+  }
+
+  static String _baseLanguage(String? language) =>
+      (language ?? '').trim().toLowerCase().split(RegExp(r'[-_]')).first;
+
+  Future<void> _applySubtitleFallback(int generation) async {
+    bool stillCurrent() => mounted && _monitorSource && generation == _sourceGeneration &&
+        !_manualTrackSelected && _carriedSubtitle == null;
+    final key = _subtitleFallbackLanguage?.trim().toLowerCase();
+    final codes = _langCodeList(key).map(_baseLanguage).toSet();
+    if (!stillCurrent() || key == null || codes.isEmpty) return;
+
+    // media_kit provides the tracks but omits mpv's disposition and selection flags.
+    final metadata = await _readMpvList('track-list');
+    if (!stillCurrent()) return;
+    final audioFlags = {
+      for (final track in metadata)
+        if (track['type'] == 'audio') track['id'].toString(): track,
+    };
+    final subtitleFlags = {
+      for (final track in metadata)
+        if (track['type'] == 'sub') track['id'].toString(): track,
+    };
+
+    final tracks = _player.state.tracks;
+    final mainAudio = tracks.audio.where((track) {
+      final flags = audioFlags[track.id];
+      return _isMediaTrack(track.id) &&
+          !_isExtraAudioForSubtitles(track) &&
+          flags?['visual-impaired'] != true &&
+          flags?['commentary'] != true &&
+          flags?['comment'] != true;
+    });
+    const unknown = {'', 'und', 'mul', 'zxx', 'mis'};
+    if (mainAudio.isEmpty ||
+        mainAudio.any((track) {
+          final language = _baseLanguage(track.language);
+          return unknown.contains(language) || codes.contains(language);
+        })) {
+      return;
+    }
+
+    SubtitleTrack? textTrack;
+    SubtitleTrack? imageTrack;
+    for (final track in tracks.subtitle) {
+      if (!_isMediaTrack(track.id) || !codes.contains(_baseLanguage(track.language))) continue;
+      final flags = subtitleFlags[track.id];
+      final title = (track.title ?? '').toLowerCase();
+      if (flags?['forced'] == true || title.contains('forced') || title.contains('signs')) continue;
+      if (flags?['selected'] == true || _activeSub.id == track.id) return;
+      if (flags?['external'] == true || track.uri || track.data) continue;
+      final codec = (track.codec ?? '').toLowerCase();
+      if (track.image == true || const ['pgs', 'dvd', 'hdmv', 'dvb'].any(codec.contains)) {
+        imageTrack ??= track;
+      } else {
+        textTrack ??= track;
+      }
+    }
+
+    final label = key[0].toUpperCase() + key.substring(1);
+    final embedded = textTrack ?? imageTrack;
+    if (embedded != null) {
+      try {
+        await _player.setSubtitleTrack(embedded);
+        if (stillCurrent()) {
+          _say("Subtitles: $label (audio isn't in $label)");
+        }
+      } catch (_) {
+        if (stillCurrent()) _say('Could not load subtitle');
+      }
+      return;
+    }
+
+    await _fetchOnlineSubs();
+    if (!stillCurrent()) return;
+    for (final sub in _onlineSubs) {
+      if (!codes.contains(_baseLanguage(sub['code']?.toString()))) continue;
+      await _loadOnlineSubtitle(sub, automatic: true);
+      break;
+    }
+  }
+
   Future<void> _fetchOnlineSubs() async {
-    final m = widget.session.media;
-    if (m == null || _loadingOnlineSubs || _onlineSubs.isNotEmpty) return;
-    setState(() => _loadingOnlineSubs = true);
+    final inFlight = _onlineSubsRequest;
+    if (inFlight != null) return inFlight;
+    final media = widget.session.media;
+    if (media == null || _onlineSubs.isNotEmpty) return;
+
+    final request = _requestOnlineSubs(media);
+    setState(() => _onlineSubsRequest = request);
+    await request;
+    if (mounted) setState(() => _onlineSubsRequest = null);
+  }
+
+  Future<void> _requestOnlineSubs(MediaItem media) async {
     try {
       final list = await VeyloBridge.instance.onlineSubtitles(
-        m.kind,
-        widget.session.videoId ?? m.id,
-        filename: widget.session.filename,
-        fileSize: widget.session.fileSize,
+        media.kind,
+        widget.session.videoId ?? media.id,
+        filename: _source == null ? widget.session.filename : _source!.filename,
+        fileSize: _sourceBytes,
       );
-      if (mounted) {
-        setState(() {
-          _onlineSubs = list;
-          _loadingOnlineSubs = false;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loadingOnlineSubs = false);
+      if (mounted) setState(() => _onlineSubs = list);
+    } catch (_) {}
+  }
+
+  Future<void> _loadOnlineSubtitle(Map<String, dynamic> sub, {bool automatic = false}) async {
+    if (_subtitleDownload != null || (automatic && _manualTrackSelected)) return;
+    if (!automatic) {
+      _manualTrackSelected = true;
+      _carriedSubtitle = null;
     }
+    final download = Object();
+    setState(() => _subtitleDownload = download);
+
+    bool stillWanted() =>
+        mounted && identical(_subtitleDownload, download) && (!automatic || !_manualTrackSelected);
+
+    try {
+      final url = sub['url']?.toString() ?? '';
+      if (url.isEmpty) throw StateError('Missing subtitle source');
+      final path = await VeyloBridge.instance.fetchSubtitle(url);
+      if (!stillWanted()) return;
+      final language = sub['language']?.toString() ?? 'Subtitle';
+      final track = SubtitleTrack.uri(path, title: language, language: sub['code']?.toString());
+      await _player.setSubtitleTrack(track);
+      if (!stillWanted()) return;
+
+      // media_kit can report a rejected sub-add command through its log alone.
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        final activePath = await platform.getProperty('current-tracks/sub/external-filename');
+        if (!stillWanted()) return;
+        if (activePath != path) throw StateError('Subtitle file was not selected');
+      }
+
+      _carriedSubtitle = track;
+      _say('Subtitles: $language (downloaded)');
+      if (!automatic && _sheet == _PlayerSheet.subtitles) setState(() => _sheet = null);
+    } catch (_) {
+      if (stillWanted()) _say('Could not load subtitle');
+    } finally {
+      if (mounted && identical(_subtitleDownload, download)) {
+        setState(() => _subtitleDownload = null);
+      }
+    }
+  }
+
+  void _chooseSubtitle(SubtitleTrack track) {
+    _manualTrackSelected = true;
+    _carriedSubtitle = track;
+    _restoredSubtitle = true;
+    unawaited(_player.setSubtitleTrack(track));
+    setState(() {
+      _subtitleDownload = null;
+      _sheet = null;
+    });
   }
 
   void _pokeChrome() {
@@ -708,7 +1299,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final target = _duration > Duration.zero
         ? rawTarget.clamp(0, _duration.inSeconds.clamp(0, 86400))
         : rawTarget.clamp(0, 86400);
-    unawaited(_player.seek(Duration(seconds: target)));
+    _seekTo(Duration(seconds: target));
     setState(() {
       if (secs < 0) {
         _rewKick++;
@@ -730,6 +1321,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _say(next == BoxFit.cover ? 'Fill' : 'Fit');
   }
 
+  void _toggleChapterSheet() {
+    setState(() => _sheet = _sheet == _PlayerSheet.chapters ? null : _PlayerSheet.chapters);
+    _pokeChrome();
+  }
+
   void _toggleMute() {
     setState(() => _muted = !_muted);
     final next = _muted ? 0.0 : (_lastNonZeroVolume > 0 ? _lastNonZeroVolume : 100.0);
@@ -747,12 +1343,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return h > 0 ? '$h:$mm:$ss' : '$m:$ss';
   }
 
-  Map<String, dynamic>? _activeSegment() {
-    final sec = _position.inMilliseconds / 1000.0;
-    for (final s in _segments) {
-      final start = (s['start'] as num?)?.toDouble() ?? 0;
-      final end = (s['end'] as num?)?.toDouble() ?? 0;
-      if (sec >= start && sec < end - 1.0) return s;
+  Map<String, dynamic>? _activeSkip({required bool credits}) {
+    if (!_monitorSource || !_firstFrame || _sheet != null || (!credits && _autoSkipIntro)) return null;
+    final position = _position.inMilliseconds / 1000;
+    for (final segment in _segments) {
+      if ((segment['kind'] == 'credits') == credits && _segmentContains(segment, position, tail: 1)) {
+        return segment;
+      }
     }
     return null;
   }
@@ -789,6 +1386,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
           }
           return KeyEventResult.handled;
         }
+        if (_subSearchFocus.hasFocus) return KeyEventResult.ignored;
+
         if (k == LogicalKeyboardKey.arrowLeft || (isDown && k == LogicalKeyboardKey.keyJ)) {
           _seekBy(-10);
           return KeyEventResult.handled;
@@ -824,6 +1423,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
         if (!isDown) return KeyEventResult.ignored;
 
+        if (_sheet == null && (k == LogicalKeyboardKey.enter || k == LogicalKeyboardKey.numpadEnter)) {
+          if (_undoSegment != null) {
+            _undoSkip();
+            return KeyEventResult.handled;
+          }
+          if (_activeSkip(credits: false) case final segment?) {
+            _seekTo(_segmentBoundary(segment, 'end'));
+            return KeyEventResult.handled;
+          }
+        }
         if (k == LogicalKeyboardKey.space || k == LogicalKeyboardKey.keyK) {
           unawaited(_player.playOrPause());
           _pokeChrome();
@@ -843,6 +1452,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         }
         if (k == LogicalKeyboardKey.keyI) {
           setState(() => _showStatsHud = !_showStatsHud);
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.keyC && _chapters.length >= 2) {
+          _toggleChapterSheet();
           return KeyEventResult.handled;
         }
         if (k == LogicalKeyboardKey.keyT) {
@@ -962,8 +1575,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               _hudLine('Position', '${_clock(_position)} / ${_clock(_duration)}'),
                               _hudLine('Buffered', '${(_buffered - _position).inSeconds.clamp(0, 9999)}s ahead'),
                               _hudLine('Rate / Vol', '$_speed×  ·  ${_muted ? 0 : _volume.round()}%'),
-                              if (s.quality != null) _hudLine('Quality', '${s.quality}${s.hdr != null ? ' · ${s.hdr}' : ''}'),
-                              if (s.size != null) _hudLine('Size', s.size!),
+                              if (_sourceQuality != null) _hudLine('Quality', '$_sourceQuality${_sourceHdr != null ? ' · $_sourceHdr' : ''}'),
+                              if (_sourceSize != null) _hudLine('Size', _sourceSize!),
                               _hudLine('Audio', _activeAudio.title ?? _activeAudio.language ?? _activeAudio.id),
                               _hudLine('Subtitles', _activeSub.id == 'no' ? 'Off' : (_activeSub.title ?? _activeSub.language ?? _activeSub.id)),
                             ],
@@ -1001,30 +1614,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 ),
                                 if (s.sources.length > 1)
                                   VeyloPill(
-                                    label: 'Try next source',
+                                    label: 'Switch source',
                                     icon: 'Layers',
-                                    onTap: () {
-                                      final curIdx = s.sources.indexWhere((x) => x.url == s.url);
-                                      final next = s.sources[(curIdx + 1) % s.sources.length];
-                                      app.startPlaySession(PlaySession(
-                                        title: s.title,
-                                        subtitle: s.subtitle,
-                                        url: next.url,
-                                        headers: next.headers,
-                                        startMs: _position.inMilliseconds > 5000 ? _position.inMilliseconds : s.startMs,
-                                        size: next.size,
-                                        hdr: next.hdr,
-                                        quality: next.quality,
-                                        filename: next.filename.isNotEmpty ? next.filename : null,
-                                        fileSize: next.sizeBytes,
-                                        media: s.media,
-                                        videoId: s.videoId,
-                                        sources: s.sources,
-                                        episodes: s.episodes,
-                                        nextEpisode: s.nextEpisode,
-                                        originalLanguage: s.originalLanguage,
-                                      ));
-                                    },
+                                    onTap: () => setState(() => _sheet = _PlayerSheet.sources),
                                   ),
                                 VeyloPill(label: 'Close', icon: 'Close', onTap: () => app.closePlayer()),
                               ],
@@ -1074,47 +1666,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   builder: (_, _) {
                     final durSec = _duration.inMilliseconds / 1000.0;
                     final posSec = _scrubValue ?? (_position.inMilliseconds / 1000.0);
-                    final seg = _sheet == null ? _activeSegment() : null;
+                    final seg = _activeSkip(credits: false);
+                    final undo = _sheet == null ? _undoSegment : null;
                     final showUpNext = !_upNextDismissed &&
                         _sheet == null &&
                         s.nextEpisode != null &&
                         s.media != null &&
                         durSec > 60 &&
-                        ((durSec - posSec) <= 25 && (durSec - posSec) > 0 || seg?['kind'] == 'credits');
-                    if (seg == null && !showUpNext) return const SizedBox.shrink();
+                        ((durSec - posSec) <= 25 && (durSec - posSec) > 0 || _activeSkip(credits: true) != null);
+                    if (seg == null && undo == null && !showUpNext) return const SizedBox.shrink();
                     return Stack(
                       fit: StackFit.expand,
                       children: [
-                        if (seg != null)
+                        if (undo != null || seg != null)
                           Positioned(
                             right: 24,
                             bottom: visible ? 86 : 32,
                             child: VeyloPill(
-                              label: switch (seg['kind']) {
-                                'recap' => 'Skip recap',
-                                'credits' => 'Next episode',
-                                _ => 'Skip intro',
-                              },
-                              icon: 'Next',
-                              onTap: () {
-                                if (seg['kind'] == 'credits' && s.nextEpisode != null && s.media != null) {
-                                  unawaited(app.autoplayMedia(
-                                    s.media!,
-                                    videoId: s.nextEpisode!.id,
-                                    episodeLabel: s.nextEpisode!.label,
-                                    seasonEpisodes: s.episodes,
-                                  ));
-                                } else {
-                                  final end = (seg['end'] as num?)?.toDouble() ?? 0;
-                                  unawaited(_player.seek(Duration(milliseconds: (end * 1000).round())));
-                                }
-                              },
+                              label: undo != null ? 'Undo' : seg!['kind'] == 'recap' ? 'Skip recap' : 'Skip intro',
+                              icon: undo != null ? 'Undo' : 'Next',
+                              onTap: undo != null ? _undoSkip : () => _seekTo(_segmentBoundary(seg!, 'end')),
                             ),
                           ),
                         if (showUpNext)
                           Positioned(
                             right: 24,
-                            bottom: (visible ? 88.0 : 32.0) + (seg != null ? 58.0 : 0.0),
+                            bottom: (visible ? 88.0 : 32.0) + (seg != null || undo != null ? 58.0 : 0.0),
                             child: LiftIn(
                               offsetY: 12,
                               duration: const Duration(milliseconds: 220),
@@ -1215,12 +1792,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     children: [
                                       if (s.subtitle.isNotEmpty)
                                         Text(s.subtitle, style: VeyloText.ui(13, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.72))),
-                                      if (s.quality != null)
-                                        Text('· ${s.quality}', style: VeyloText.ui(13, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.72))),
-                                      if (s.hdr != null)
-                                        Text('· ${s.hdr}', style: VeyloText.ui(13, weight: 700, color: lamp)),
-                                      if (s.size != null)
-                                        Text('· ${s.size}', style: VeyloText.ui(13, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.72), tabular: true)),
+                                      if (_sourceQuality != null)
+                                        Text('· $_sourceQuality', style: VeyloText.ui(13, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.72))),
+                                      if (_sourceHdr != null)
+                                        Text('· $_sourceHdr', style: VeyloText.ui(13, weight: 700, color: lamp)),
+                                      if (_sourceSize != null)
+                                        Text('· $_sourceSize', style: VeyloText.ui(13, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.72), tabular: true)),
                                     ],
                                   ),
                                 ],
@@ -1252,7 +1829,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               const SizedBox(width: 8),
                             ],
                             // Top right: what you reach for occasionally — navigation (episodes,
-                            // clips, sources), then playback settings (speed, sleep, picture), then
+                            // clips, sources, chapters), then playback settings (speed, sleep, picture), then
                             // help/info. The bottom bar keeps only what you use while watching.
                             if (s.episodes.isNotEmpty)
                               VeyloOrb(
@@ -1278,7 +1855,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 tooltip: 'Switch source',
                                 onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sources ? null : _PlayerSheet.sources),
                               ),
-                            if (s.episodes.isNotEmpty || s.clips.length > 1 || s.sources.length > 1)
+                            if (_chapters.length >= 2)
+                              VeyloOrb(
+                                icon: 'List',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.chapters,
+                                tooltip: 'Chapters',
+                                onTap: _toggleChapterSheet,
+                              ),
+                            if (s.episodes.isNotEmpty || s.clips.length > 1 || s.sources.length > 1 || _chapters.length >= 2)
                               const SizedBox(width: 12),
                             VeyloOrb(
                               icon: 'Gauge',
@@ -1424,6 +2009,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                           buffered: bufPct,
                                           durationSec: durSec,
                                           segments: _segments,
+                                          chapters: _chapters,
                                           lamp: lamp,
                                           formatClock: (sec) => _clock(Duration(seconds: sec.round())),
                                           onScrub: (pct) {
@@ -1433,7 +2019,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                           onCommit: (pct) {
                                             final targetMs = (pct * durSec * 1000).round();
                                             setState(() => _scrubValue = null);
-                                            unawaited(_player.seek(Duration(milliseconds: targetMs)));
+                                            _seekTo(Duration(milliseconds: targetMs));
                                             _pokeChrome();
                                           },
                                         ),
@@ -1573,6 +2159,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                     child: Row(
                                       children: [
                                         Expanded(child: Text(_sheetTitle(_sheet!), style: VeyloText.groupName)),
+                                        if (_sheet == _PlayerSheet.subtitles && _subtitleDownload != null)
+                                          const Padding(
+                                            padding: EdgeInsets.symmetric(horizontal: 8),
+                                            child: SizedBox.square(
+                                              dimension: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                                semanticsLabel: 'Downloading subtitle',
+                                              ),
+                                            ),
+                                          ),
                                         VeyloOrb(icon: 'Close', size: 38, onTap: () => setState(() => _sheet = null)),
                                       ],
                                     ),
@@ -1615,6 +2212,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _PlayerSheet.sources => 'Sources',
         _PlayerSheet.episodes => 'Episodes',
         _PlayerSheet.clips => 'Trailers & Clips',
+        _PlayerSheet.chapters => 'Chapters',
         _PlayerSheet.speed => 'Speed',
         _PlayerSheet.sleep => 'Sleep timer',
         _PlayerSheet.picture => 'Picture',
@@ -1634,6 +2232,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 about: t.language ?? '',
                 selected: _activeAudio.id == t.id,
                 onTap: () {
+                  _manualTrackSelected = true;
+                  _preferredAudioApplied = true;
+                  _carriedAudio = t;
                   unawaited(_player.setAudioTrack(t));
                   setState(() => _sheet = null);
                 },
@@ -1661,78 +2262,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
             _PlayerOptionRow(
               label: 'Off',
               selected: _activeSub.id == 'no',
-              onTap: () {
-                unawaited(_player.setSubtitleTrack(SubtitleTrack.no()));
-                setState(() => _sheet = null);
-              },
+              onTap: () => _chooseSubtitle(SubtitleTrack.no()),
             ),
             for (final t in _subTracks.where((x) => x.id != 'auto' && x.id != 'no'))
               _PlayerOptionRow(
                 label: t.title?.isNotEmpty == true ? t.title! : (t.language?.toUpperCase() ?? 'Subtitle ${t.id}'),
                 about: t.language ?? 'Embedded',
                 selected: _activeSub.id == t.id,
-                onTap: () {
-                  unawaited(_player.setSubtitleTrack(t));
-                  setState(() => _sheet = null);
-                },
+                onTap: () => _chooseSubtitle(t),
               ),
-            if (_loadingOnlineSubs)
-              const Padding(padding: EdgeInsets.all(12), child: Text('Searching online subtitles…', style: VeyloText.credit))
-            else if (_onlineSubs.isNotEmpty) ...[
-              const Padding(
-                padding: EdgeInsets.fromLTRB(12, 12, 12, 6),
-                child: Text('Online subtitles', style: VeyloText.micro),
-              ),
-              Builder(builder: (_) {
-                final langs = <String>{
-                  for (final sub in _onlineSubs)
-                    if ((sub['language']?.toString() ?? '').isNotEmpty) sub['language'].toString(),
-                }.toList();
-                final filtered = _subLangFilter == null
-                    ? _onlineSubs
-                    : _onlineSubs.where((sub) => sub['language']?.toString() == _subLangFilter).toList();
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (langs.length > 1)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-                        child: Wrap(
-                          spacing: 6,
-                          runSpacing: 6,
-                          children: [
-                            _SubFilterChip(
-                              label: 'All',
-                              active: _subLangFilter == null,
-                              onTap: () => setState(() => _subLangFilter = null),
-                            ),
-                            for (final lang in langs.take(8))
-                              _SubFilterChip(
-                                label: lang,
-                                active: _subLangFilter == lang,
-                                onTap: () => setState(() => _subLangFilter = _subLangFilter == lang ? null : lang),
-                              ),
-                          ],
-                        ),
-                      ),
-                    for (final sub in filtered.take(15))
-                      _PlayerOptionRow(
-                        label: sub['language']?.toString() ?? 'Subtitle',
-                        about: sub['release']?.toString() ?? '',
-                        selected: false,
-                        onTap: () {
-                          final u = sub['url']?.toString() ?? '';
-                          if (u.isNotEmpty) {
-                            unawaited(_player.setSubtitleTrack(SubtitleTrack.uri(u, title: sub['language']?.toString())));
-                            _say('Loaded ${sub['language']} subtitle');
-                            setState(() => _sheet = null);
-                          }
-                        },
-                      ),
-                  ],
-                );
-              }),
-            ],
+            if (s.media != null || _onlineSubs.isNotEmpty) _buildOnlineSubtitles(),
             const Padding(
               padding: EdgeInsets.fromLTRB(12, 14, 12, 4),
               child: Text('Timing & Appearance', style: VeyloText.micro),
@@ -1891,33 +2430,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
               _PlayerOptionRow(
                 label: src.filename.isNotEmpty ? src.filename : src.name,
                 about: [if (src.quality != null) src.quality!, if (src.hdr != null) src.hdr!, if (src.size != null) src.size!, src.addon].join(' · '),
-                selected: src.url == s.url,
+                selected: src.url == _sourceUrl,
                 onTap: () {
                   setState(() => _sheet = null);
-                  if (src.url == s.url) return;
-                  app.startPlaySession(PlaySession(
-                    title: s.title,
-                    subtitle: s.subtitle,
-                    url: src.url,
-                    audioUrl: src.audioUrl,
-                    headers: src.headers,
-                    startMs: _position.inMilliseconds,
-                    size: src.size,
-                    hdr: src.hdr,
-                    quality: src.quality,
-                    filename: src.filename.isNotEmpty ? src.filename : null,
-                    fileSize: src.sizeBytes,
-                    media: s.media,
-                    videoId: s.videoId,
-                    sources: s.sources,
-                    episodes: s.episodes,
-                    nextEpisode: s.nextEpisode,
-                    initialSubtitles: s.initialSubtitles,
-                    clips: s.clips,
-                    clipIndex: s.clipIndex,
-                    clipContextTitle: s.clipContextTitle,
-                    originalLanguage: s.originalLanguage,
-                  ));
+                  if (src.url == _sourceUrl && _error == null) return;
+                  if (_monitorSource) _rememberSourceChoices();
+                  unawaited(_openStream(source: src));
                 },
               ),
           ],
@@ -1957,15 +2475,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
           ],
         ),
+      _PlayerSheet.chapters => ValueListenableBuilder<Duration>(
+          valueListenable: _posN,
+          builder: (_, position, _) {
+            final current = _chapterIndexAt(_chapters, position.inMilliseconds / 1000.0);
+            return Column(
+              children: [
+                for (final (index, chapter) in _chapters.indexed)
+                  _PlayerOptionRow(
+                    label: chapter.title,
+                    about: _clock(Duration(milliseconds: (chapter.start * 1000).round())),
+                    selected: index == current,
+                    onTap: () {
+                      _seekTo(Duration(milliseconds: (chapter.start * 1000).round()));
+                      setState(() => _sheet = null);
+                      _pokeChrome();
+                    },
+                  ),
+              ],
+            );
+          },
+        ),
       _PlayerSheet.info => Padding(
           padding: const EdgeInsets.all(12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _infoLine('Title', s.title),
-              if (s.quality != null) _infoLine('Quality', s.quality!),
-              if (s.hdr != null) _infoLine('Picture', s.hdr!),
-              if (s.size != null) _infoLine('Size', s.size!),
+              if (_sourceQuality != null) _infoLine('Quality', _sourceQuality!),
+              if (_sourceHdr != null) _infoLine('Picture', _sourceHdr!),
+              if (_sourceSize != null) _infoLine('Size', _sourceSize!),
               _infoLine('Backend', 'libmpv (media_kit)'),
               const SizedBox(height: 12),
               VeyloPill(
@@ -1990,6 +2529,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ('F / Double-click', 'Toggle fullscreen'),
                 ('[ / ]', 'Decrease / increase speed'),
                 ('Z', 'Toggle fit / fill crop'),
+                ('C', 'Toggle chapters sheet'),
                 ('T', 'Sleep timer'),
                 ('I', 'Toggle live stats HUD'),
                 ('H / ?', 'Toggle shortcuts sheet'),
@@ -2009,6 +2549,87 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ),
     };
+  }
+
+  static bool _subtitleMatches(Map<String, dynamic> sub, String query) {
+    if (query.isEmpty) return true;
+    final language = sub['language']?.toString().toLowerCase() ?? '';
+    return sub['code']?.toString().toLowerCase() == query ||
+        language.startsWith(query) ||
+        language.split(RegExp(r'[ (),]')).any((word) => word.startsWith(query));
+  }
+
+  Widget _buildOnlineSubtitles() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(12, 12, 12, 6),
+          child: Text('Online subtitles', style: VeyloText.micro),
+        ),
+        Container(
+          margin: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          height: 40,
+          decoration: BoxDecoration(
+            color: const Color.fromRGBO(255, 255, 255, 0.075),
+            border: Border.all(color: VeyloColors.edge),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Row(
+            children: [
+              const VeyloIcon('Search', size: 16, color: VeyloColors.dust),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _subSearch,
+                  focusNode: _subSearchFocus,
+                  style: VeyloText.ui(14, weight: 500, color: VeyloColors.bone),
+                  decoration: InputDecoration.collapsed(
+                    hintText: 'Search by language',
+                    hintStyle: VeyloText.ui(13.5, weight: 500, color: VeyloColors.dust),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (_onlineSubsRequest != null)
+          const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('Searching online subtitles…', style: VeyloText.credit),
+          )
+        else ...[
+          ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _subSearch,
+            builder: (_, value, _) {
+              final query = value.text.trim().toLowerCase();
+              final matches = _onlineSubs.where((sub) => _subtitleMatches(sub, query)).take(60).toList();
+              if (matches.isEmpty) {
+                return Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    query.isEmpty ? 'No online subtitles available' : 'No matching subtitles',
+                    style: VeyloText.credit,
+                  ),
+                );
+              }
+              return Column(
+                children: [
+                  for (final sub in matches)
+                    _PlayerOptionRow(
+                      label: sub['language']?.toString() ?? 'Subtitle',
+                      about: sub['release']?.toString() ?? '',
+                      selected: false,
+                      onTap: _subtitleDownload == null ? () => unawaited(_loadOnlineSubtitle(sub)) : null,
+                    ),
+                ],
+              );
+            },
+          ),
+        ],
+      ],
+    );
   }
 
   Widget _infoLine(String k, String v) => Padding(
@@ -2243,7 +2864,7 @@ class _PlayerOptionRow extends StatefulWidget {
   final String label;
   final String about;
   final bool selected;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   @override
   State<_PlayerOptionRow> createState() => _PlayerOptionRowState();
@@ -2258,7 +2879,7 @@ class _PlayerOptionRowState extends State<_PlayerOptionRow> {
     return ValueListenableBuilder<Color>(
       valueListenable: app.lampColorNotifier,
       builder: (_, lamp, _) => MouseRegion(
-        cursor: SystemMouseCursors.click,
+        cursor: widget.onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
         onEnter: (_) => setState(() => _hovered = true),
         onExit: (_) => setState(() => _hovered = false),
         child: GestureDetector(
@@ -2268,7 +2889,7 @@ class _PlayerOptionRowState extends State<_PlayerOptionRow> {
             decoration: BoxDecoration(
               color: widget.selected
                   ? lamp.withValues(alpha: 0.16)
-                  : (_hovered ? const Color.fromRGBO(255, 255, 255, 0.07) : const Color(0x00000000)),
+                  : (_hovered && widget.onTap != null ? const Color.fromRGBO(255, 255, 255, 0.07) : const Color(0x00000000)),
               borderRadius: BorderRadius.circular(16),
             ),
             child: Row(
@@ -2277,7 +2898,12 @@ class _PlayerOptionRowState extends State<_PlayerOptionRow> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(widget.label, maxLines: 1, overflow: TextOverflow.ellipsis, style: VeyloText.ui(15, weight: 600)),
+                      Text(
+                        widget.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: VeyloText.ui(15, weight: 600, color: widget.onTap == null ? VeyloColors.dust : VeyloColors.bone),
+                      ),
                       if (widget.about.isNotEmpty)
                         Text(widget.about, maxLines: 1, overflow: TextOverflow.ellipsis, style: VeyloText.ui(13, weight: 400, color: VeyloColors.dust)),
                     ],
@@ -2363,53 +2989,13 @@ class _CenterPlayButtonState extends State<_CenterPlayButton> {
   }
 }
 
-class _SubFilterChip extends StatefulWidget {
-  const _SubFilterChip({required this.label, required this.active, required this.onTap});
-  final String label;
-  final bool active;
-  final VoidCallback onTap;
-
-  @override
-  State<_SubFilterChip> createState() => _SubFilterChipState();
-}
-
-class _SubFilterChipState extends State<_SubFilterChip> {
-  bool _hovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final app = AppStateScope.read(context);
-    return ValueListenableBuilder<Color>(
-      valueListenable: app.lampColorNotifier,
-      builder: (_, lamp, _) => MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _hovered = true),
-        onExit: (_) => setState(() => _hovered = false),
-        child: GestureDetector(
-          onTap: widget.onTap,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 140),
-            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-            decoration: BoxDecoration(
-              color: widget.active
-                  ? lamp.withValues(alpha: 0.28)
-                  : (_hovered ? const Color.fromRGBO(255, 255, 255, 0.12) : const Color.fromRGBO(255, 255, 255, 0.07)),
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(widget.label, style: VeyloText.ui(12.5, weight: 600, color: VeyloColors.bone)),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class _ScrubberBar extends StatefulWidget {
   const _ScrubberBar({
     required this.played,
     required this.buffered,
     required this.durationSec,
     this.segments = const [],
+    required this.chapters,
     required this.lamp,
     required this.formatClock,
     required this.onScrub,
@@ -2420,6 +3006,7 @@ class _ScrubberBar extends StatefulWidget {
   final double buffered;
   final double durationSec;
   final List<Map<String, dynamic>> segments;
+  final List<_Chapter> chapters;
   final Color lamp;
   final String Function(double) formatClock;
   final ValueChanged<double> onScrub;
@@ -2444,6 +3031,48 @@ class _ScrubberBarState extends State<_ScrubberBar> {
     final box = ctx.findRenderObject() as RenderBox?;
     if (box == null || box.size.width <= 0) return 0;
     return (local.dx / box.size.width).clamp(0.0, 1.0);
+  }
+
+  Widget _hoverTooltip(double pct, double width) {
+    final seconds = pct * widget.durationSec;
+    final index = _chapterIndexAt(widget.chapters, seconds);
+    final chapter = index < 0 ? null : widget.chapters[index];
+    final maxWidth = width.clamp(0.0, chapter == null ? 96.0 : 200.0);
+    final left = (width * pct - maxWidth / 2).clamp(0.0, width - maxWidth);
+    return Positioned(
+      left: left,
+      bottom: 30,
+      width: maxWidth,
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color.fromRGBO(12, 12, 15, 0.90),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color.fromRGBO(242, 239, 234, 0.18)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (chapter != null)
+                Text(
+                  chapter.title,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: VeyloText.ui(12, weight: 600, color: VeyloColors.bone),
+                ),
+              Text(
+                widget.formatClock(seconds),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: VeyloText.ui(12, weight: 600, color: VeyloColors.bone, tabular: true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -2496,6 +3125,7 @@ class _ScrubberBarState extends State<_ScrubberBar> {
                             hoverPct: hoverPct,
                             durationSec: widget.durationSec,
                             segments: widget.segments,
+                            chapters: widget.chapters,
                             trackHeight: trackH,
                             lamp: widget.lamp,
                           ),
@@ -2522,22 +3152,7 @@ class _ScrubberBarState extends State<_ScrubberBar> {
                         ),
                       ),
                       if (hoverPct != null && widget.durationSec > 0)
-                        Positioned(
-                          left: (w * hoverPct - 28).clamp(0.0, (w - 56).clamp(0.0, double.infinity)),
-                          bottom: 30,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: const Color.fromRGBO(12, 12, 15, 0.90),
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: const Color.fromRGBO(242, 239, 234, 0.18)),
-                            ),
-                            child: Text(
-                              widget.formatClock(hoverPct * widget.durationSec),
-                              style: VeyloText.ui(12, weight: 600, color: VeyloColors.bone, tabular: true),
-                            ),
-                          ),
-                        ),
+                        _hoverTooltip(hoverPct, w),
                     ],
                   ),
                 ),
@@ -2557,6 +3172,7 @@ class _ScrubberTrackPainter extends CustomPainter {
     required this.hoverPct,
     required this.durationSec,
     required this.segments,
+    required this.chapters,
     required this.trackHeight,
     required this.lamp,
   });
@@ -2566,6 +3182,7 @@ class _ScrubberTrackPainter extends CustomPainter {
   final double? hoverPct;
   final double durationSec;
   final List<Map<String, dynamic>> segments;
+  final List<_Chapter> chapters;
   final double trackHeight;
   final Color lamp;
 
@@ -2609,6 +3226,16 @@ class _ScrubberTrackPainter extends CustomPainter {
         canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(left, top, segW, trackHeight), r), segPaint);
       }
     }
+    if (durationSec > 0) {
+      final tick = Paint()
+        ..color = const Color.fromRGBO(12, 12, 15, 0.74)
+        ..strokeWidth = 1.5;
+      for (final chapter in chapters) {
+        if (chapter.start <= 0.5 || chapter.start >= durationSec) continue;
+        final x = size.width * chapter.start / durationSec;
+        canvas.drawLine(Offset(x, top), Offset(x, top + trackHeight), tick);
+      }
+    }
   }
 
   @override
@@ -2618,5 +3245,7 @@ class _ScrubberTrackPainter extends CustomPainter {
       old.hoverPct != hoverPct ||
       old.trackHeight != trackHeight ||
       old.lamp != lamp ||
-      old.segments != segments;
+      old.durationSec != durationSec ||
+      old.segments != segments ||
+      old.chapters != chapters;
 }
