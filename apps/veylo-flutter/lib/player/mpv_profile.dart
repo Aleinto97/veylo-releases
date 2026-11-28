@@ -51,7 +51,10 @@ Future<void> applyMpvProfile(
     } catch (_) {}
   }
   // Enable video decoding when using native Wayland subsurface (no VideoController).
-  await setProp('vo', 'libmpv');
+  // Android/iOS: media_kit's video controller owns vo/wid/hwdec (vo=gpu on the Android surface);
+  // forcing vo=libmpv there left every video black (found by the runtime CI on the emulators).
+  final mobile = Platform.isAndroid || Platform.isIOS;
+  if (!mobile) await setProp('vo', 'libmpv');
   await setProp('vid', 'auto');
   await setProp('panscan', fit == BoxFit.cover ? '1.0' : '0.0');
 
@@ -79,7 +82,7 @@ Future<void> applyMpvProfile(
   if (ca != null) await setProp('tls-ca-file', ca);
 
   // Match DX GPU video quality & HDR-to-SDR tone-mapping (override media_kit's bilinear defaults).
-  await setProp('hwdec', mpvHwdec);
+  if (!mobile || hwdecMode == 'no') await setProp('hwdec', mpvHwdec);
   await setProp('hdr-compute-peak', 'yes');
   await setProp('scale', 'lanczos');
   await setProp('dscale', 'hermite');

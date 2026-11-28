@@ -630,7 +630,11 @@ class _TitleScreenState extends State<TitleScreen> {
     final genres = _media.genres.isNotEmpty
         ? _media.genres
         : metaGenres;
-    final synopsis = _media.description.isNotEmpty ? _media.description : (_meta['description'] as String? ?? '');
+    // The title's own metadata first: identical in the disk copy and the live answer, while the
+    // card/library entry's description can differ in length and re-wrap the text (a layout shift
+    // the runtime CI caught on a phone-width screen).
+    final metaSynopsis = _meta['description'] as String? ?? '';
+    final synopsis = metaSynopsis.isNotEmpty ? metaSynopsis : _media.description;
     final upNext = film ? null : _upNextEpisode();
     final seasons = _episodes.map((e) => e.season).toSet().toList()..sort();
     final currentSeasonEps = _episodes.where((e) => e.season == _selectedSeason).toList();
