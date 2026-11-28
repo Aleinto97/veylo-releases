@@ -36,6 +36,12 @@ android {
     sourceSets["main"].assets.srcDir(layout.buildDirectory.get().asFile.resolve("picks-ai/assets"))
     sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.get().asFile.resolve("picks-ai/jni"))
 
+    // Extract native libs to nativeLibraryDir: the shared backend checks for a real
+    // libonnxruntime.so file there (Picks AI), and modern APKs otherwise keep them compressed.
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

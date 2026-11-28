@@ -225,7 +225,13 @@ Future<Map<String, Object?>> _play(
       'notices': notices,
     };
     await _shot(t, 'player/$shotName');
-    m['frame_varied'] = await _frameShot(t, p, shotName);
+    // Real streams often open on black (a trailer's fade-in): look again before calling it blank.
+    var varied = await _frameShot(t, p, shotName);
+    for (var i = 0; i < 3 && !varied; i++) {
+      await _settle(t, const Duration(milliseconds: 1500));
+      varied = await _frameShot(t, p, shotName);
+    }
+    m['frame_varied'] = varied;
     tx.setMeasurement('ttff', ttff, unit: DurationSentryMeasurementUnit.milliSecond);
     tx.setMeasurement('advanced', advanced.inMilliseconds, unit: DurationSentryMeasurementUnit.milliSecond);
     tx.setMeasurement('frames_dropped', ((m['dropped_vo'] as int).clamp(0, 1 << 30)) + ((m['dropped_dec'] as int).clamp(0, 1 << 30)));

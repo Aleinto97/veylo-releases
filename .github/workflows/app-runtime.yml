@@ -225,7 +225,7 @@ jobs:
           working-directory: apps/veylo-flutter
           script: |
             adb reverse tcp:8765 tcp:8765
-            flutter drive --profile --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }} || { adb logcat -d -b crash | tail -150; adb logcat -d | grep -E " (DEBUG|libc|AndroidRuntime|lowmemorykiller|ActivityManager)" | grep -iE "veylo|fatal|signal|backtrace|#[0-9]{2} pc|abort|died|kill" | tail -120; exit 1; }
+            timeout 1800 flutter drive --profile --no-enable-impeller --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }} || { adb devices; adb logcat -d -b crash | tail -150; adb logcat -d | grep -E " (DEBUG|libc|AndroidRuntime|lowmemorykiller|ActivityManager)" | grep -iE "veylo|fatal|signal|backtrace|#[0-9]{2} pc|abort|died|kill" | tail -120; exit 1; }
       - name: Upload debug symbols to Sentry
         if: always() && env.SENTRY_AUTH_TOKEN != ''
         run: |
