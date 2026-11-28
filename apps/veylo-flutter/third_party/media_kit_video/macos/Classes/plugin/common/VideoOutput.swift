@@ -87,19 +87,24 @@ public class VideoOutput: NSObject {
       )
     }
 
-    if enableHardwareAcceleration {
-      texture = SafeResizableTexture(
-        TextureHW(
-          handle: handle,
-          // Use `weak self` to prevent memory leaks
-          updateCallback: { [weak self]() in
-            guard let that = self else {
-              return
-            }
-            that.updateCallback()
+    // Veylo: TextureHW is nil without a usable OpenGL renderer; fall back to software.
+    let hardware: TextureHW? = enableHardwareAcceleration
+      ? TextureHW(
+        handle: handle,
+        // Use `weak self` to prevent memory leaks
+        updateCallback: { [weak self]() in
+          guard let that = self else {
+            return
           }
-        )
+          that.updateCallback()
+        }
       )
+      : nil
+    if enableHardwareAcceleration && hardware == nil {
+      NSLog("VideoOutput: no usable OpenGL renderer, falling back to S/W rendering")
+    }
+    if let hardware = hardware {
+      texture = SafeResizableTexture(hardware)
     } else {
       texture = SafeResizableTexture(
         TextureSW(

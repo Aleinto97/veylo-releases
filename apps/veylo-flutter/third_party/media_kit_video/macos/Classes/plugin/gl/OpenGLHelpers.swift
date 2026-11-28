@@ -3,9 +3,14 @@ import OpenGL.GL
 import OpenGL.GL3
 
 public class OpenGLHelpers {
-  static public func createPixelFormat() -> CGLPixelFormatObj {
+  /// Veylo: optional instead of force-unwrapped. On machines without an accelerated
+  /// OpenGL renderer for mpv's attributes (macOS virtual machines, some remote/headless
+  /// sessions) `CGLChoosePixelFormat` finds none and the old `pixelFormat!` crashed the app
+  /// (EXC_BREAKPOINT); now it retries with lighter requirements, then lets the caller fall
+  /// back to software rendering.
+  static public func createPixelFormat() -> CGLPixelFormatObj? {
     // from mpv
-    let attributes: [CGLPixelFormatAttribute] = [
+    let preferred: [CGLPixelFormatAttribute] = [
       kCGLPFAOpenGLProfile,
       CGLPixelFormatAttribute(kCGLOGLPVersion_3_2_Core.rawValue),
       kCGLPFAAccelerated,
@@ -17,26 +22,38 @@ public class OpenGLHelpers {
       kCGLPFASupportsAutomaticGraphicsSwitching,
       _CGLPixelFormatAttribute(rawValue: 0),
     ]
-
-    var npix: GLint = 0
-    var pixelFormat: CGLPixelFormatObj?
-    CGLChoosePixelFormat(attributes, &pixelFormat, &npix)
-
-    return pixelFormat!
+    // 8-bit colour, no float buffers, any (incl. software) renderer.
+    let fallback: [CGLPixelFormatAttribute] = [
+      kCGLPFAOpenGLProfile,
+      CGLPixelFormatAttribute(kCGLOGLPVersion_3_2_Core.rawValue),
+      kCGLPFADoubleBuffer,
+      kCGLPFAAllowOfflineRenderers,
+      kCGLPFASupportsAutomaticGraphicsSwitching,
+      _CGLPixelFormatAttribute(rawValue: 0),
+    ]
+    for attributes in [preferred, fallback] {
+      var npix: GLint = 0
+      var pixelFormat: CGLPixelFormatObj?
+      let error = CGLChoosePixelFormat(attributes, &pixelFormat, &npix)
+      if error == kCGLNoError, let pixelFormat = pixelFormat {
+        return pixelFormat
+      }
+    }
+    NSLog("OpenGLHelpers: no usable OpenGL pixel format")
+    return nil
   }
 
   static public func createContext(
     _ pixelFormat: CGLPixelFormatObj
-  ) -> CGLContextObj {
+  ) -> CGLContextObj? {
     var context: CGLContextObj?
     let error = CGLCreateContext(pixelFormat, nil, &context)
     if error != kCGLNoError {
       let errS = String(cString: CGLErrorString(error))
-      NSLog(errS)
-      exit(1)
+      NSLog("OpenGLHelpers: CGLCreateContext failed: %@", errS)
+      return nil
     }
-
-    return context!
+    return context
   }
 
   static public func createTextureCache(

@@ -32,8 +32,9 @@ android {
     // Picks AI (on-device synopsis embeddings), from the pinned assets prepared by
     // `python3 tools/picks-ai/fetch.py android-arm64 android-armv7` (same files as the DX app):
     // the model + tokenizer as APK assets (unpacked by MainActivity), ONNX Runtime as a native lib.
-    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("picks-ai/assets"))
-    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("picks-ai/jni"))
+    // Plain paths: AGP refuses Provider instances in the SourceSet API.
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.get().asFile.resolve("picks-ai/assets"))
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.get().asFile.resolve("picks-ai/jni"))
 
     buildTypes {
         release {
