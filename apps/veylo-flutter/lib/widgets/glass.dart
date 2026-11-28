@@ -577,25 +577,33 @@ class KenBurnsImage extends StatelessWidget {
     required this.url,
     this.cacheWidth = 1600,
     this.alignment = const Alignment(0, -0.4),
+    this.settle = true,
+    this.fadeIn = const Duration(milliseconds: 300),
   });
 
   final String url;
   final int cacheWidth;
   final Alignment alignment;
+  /// The slow 1.045 → 1.0 zoom; off where nothing may move (the title page).
+  final bool settle;
+  /// Decode fade; zero when the image was precached before being shown.
+  final Duration fadeIn;
 
   @override
   Widget build(BuildContext context) {
+    final image = CachedNetworkImage(
+      imageUrl: url,
+      fit: BoxFit.cover,
+      alignment: alignment,
+      width: double.infinity,
+      height: double.infinity,
+      memCacheWidth: cacheWidth,
+      fadeInDuration: fadeIn,
+      errorWidget: (_, _, _) => const SizedBox.shrink(),
+    );
+    if (!settle) return RepaintBoundary(child: image);
     return RepaintBoundary(
-      child: CachedNetworkImage(
-        imageUrl: url,
-        fit: BoxFit.cover,
-        alignment: alignment,
-        width: double.infinity,
-        height: double.infinity,
-        memCacheWidth: cacheWidth,
-        fadeInDuration: const Duration(milliseconds: 300),
-        errorWidget: (_, _, _) => const SizedBox.shrink(),
-      ).animate().scale(
+      child: image.animate().scale(
             begin: const Offset(1.045, 1.045),
             end: const Offset(1.0, 1.0),
             duration: const Duration(seconds: 9),

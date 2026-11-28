@@ -199,20 +199,8 @@ class _VeyloShell extends StatelessWidget {
       transitionBuilder: (child, anim) {
         final isTitle = child.key.toString().contains('title-');
         if (isTitle) {
-          return FadeTransition(
-            opacity: anim,
-            child: ScaleTransition(
-              scale: Tween<double>(begin: 0.985, end: 1.0).animate(anim),
-              child: AnimatedBuilder(
-                animation: anim,
-                child: child,
-                builder: (_, c) => Transform.translate(
-                  offset: Offset(0, (1.0 - anim.value) * 16.0),
-                  child: c,
-                ),
-              ),
-            ),
-          );
+          // Opacity only: a title page never slides or scales in (nothing on it may move).
+          return FadeTransition(opacity: anim, child: child);
         }
         final isEntering = child.key == pageKey;
         final sign = (isEntering ? 1.0 : -1.0) * app.tabDirection.toDouble();

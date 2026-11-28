@@ -30,7 +30,12 @@ class _TitleScreenState extends State<TitleScreen> {
   bool _identsPending = true;
   bool _identsFinal = false;
   bool _bodyReady = false;
-  String? _shownLogo;
+  bool _scoresKnown = false;
+  // One reveal: hero art, logo, tagline, facts and body appear together, already decoded, with
+  // values frozen for this visit (fresher data shows next visit via the disk cache).
+  bool _revealed = false;
+  bool _revealing = false;
+  Map<String, Object?> _frozen = const {};
   Timer? _bodyTimer;
   Map<String, dynamic> _meta = {};
   List<EpisodeItem> _episodes = [];
@@ -77,8 +82,6 @@ class _TitleScreenState extends State<TitleScreen> {
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final app = AppStateScope.read(context);
-      if (_media.backdrop.isNotEmpty) unawaited(app.setLampSource(_media.backdrop));
       unawaited(_loadDetails());
     });
   }
@@ -146,7 +149,7 @@ class _TitleScreenState extends State<TitleScreen> {
   bool _extrasDone = false;
 
   void _maybeBodyReady() {
-    if (!_bodyReady && _detailsKnown && _studiosKnown) _bodyReady = true;
+    if (!_bodyReady && _detailsKnown && _studiosKnown && _scoresKnown) _bodyReady = true;
   }
 
   bool _detailsKnown = false;
@@ -168,7 +171,14 @@ class _TitleScreenState extends State<TitleScreen> {
         }
       }),
       app.bridge.titleArt(media).then(_applyArt).catchError((_) {}),
-      app.bridge.titleScores(media).then(_applyScores).catchError((_) {}),
+      app.bridge.titleScores(media).then(_applyScores).catchError((_) {
+        if (mounted && !_scoresKnown) {
+          setState(() {
+            _scoresKnown = true;
+            _maybeBodyReady();
+          });
+        }
+      }),
       app.bridge.titleSimilar(media).then(_applySimilar).catchError((_) {}),
       app.bridge.titleCollection(media).then(_applyCollection).catchError((_) {}),
       app.bridge.titleStudios(media).then(_applyStudios).catchError((_) {
@@ -244,9 +254,20 @@ class _TitleScreenState extends State<TitleScreen> {
   }
 
   void _applyScores(Map<String, dynamic> d) {
-    if (!mounted || !_changed('scores', d)) return;
+    if (!mounted) return;
+    if (!_changed('scores', d)) {
+      if (!_scoresKnown) {
+        setState(() {
+          _scoresKnown = true;
+          _maybeBodyReady();
+        });
+      }
+      return;
+    }
     final scores = (d['scores'] as Map<String, dynamic>?) ?? {};
     setState(() {
+      _scoresKnown = true;
+      _maybeBodyReady();
       _tomatometer = (scores['tomatometer'] as num?)?.toInt();
       _metascore = (scores['metascore'] as num?)?.toInt();
       _seriesStatus = d['status'] as String?;
@@ -380,11 +401,43 @@ class _TitleScreenState extends State<TitleScreen> {
       applyStored();
     });
 
-    final backdrop = _art?.backdrop;
-    if (backdrop != null && backdrop.isNotEmpty) {
-      unawaited(app.setLampSource(backdrop));
-    }
   }
+
+  /// Decode the hero backdrop and logo at their final sizes, then reveal everything at once —
+  /// nothing pops in, fades separately or gets swapped afterwards. Bounded so a slow image
+  /// never holds the page (it then shows the title's text heading / the scrim alone).
+  Future<void> _prepareReveal(Map<String, Object?> snap) async {
+    final app = AppStateScope.read(context);
+    Future<bool> warm(ImageProvider provider) async {
+      var ok = true;
+      await precacheImage(provider, context, onError: (_, _) => ok = false);
+      return ok;
+    }
+
+    final frames = (snap['frames'] as List<String>?) ?? const [];
+    final logo = snap['logo'] as String?;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final width = MediaQuery.sizeOf(context).width;
+    final heroWidth = _heroDecodeWidth(width, dpr);
+    final jobs = <Future<void>>[
+      if (frames.isNotEmpty)
+        warm(ResizeImage.resizeIfNeeded(heroWidth, null, CachedNetworkImageProvider(frames.first))).then((_) {}),
+      if (logo != null)
+        warm(ResizeImage.resizeIfNeeded(920, null, CachedNetworkImageProvider(logo))).then((ok) {
+          if (!ok) snap['logo'] = null;
+        }),
+    ];
+    await Future.any([Future.wait(jobs), Future<void>.delayed(const Duration(milliseconds: 900))]);
+    if (!mounted) return;
+    setState(() {
+      _frozen = snap;
+      _revealed = true;
+    });
+    if (frames.isNotEmpty) unawaited(app.setLampSource(frames.first));
+  }
+
+  /// Decode the hero at the physical width it covers (capped), not a fixed 1600 px.
+  static int _heroDecodeWidth(double width, double dpr) => (width * dpr).clamp(960, 2880).round();
 
   Future<void> _openSourceSheet(String videoId, String? label) async {
     setState(() {
@@ -610,16 +663,6 @@ class _TitleScreenState extends State<TitleScreen> {
     final rawLogo = (_art?.logo?.isNotEmpty == true)
         ? _art!.logo!
         : ((_meta['logo'] as String?)?.isNotEmpty == true ? _meta['logo'] as String : _media.logo);
-    // Pick the logo once the best source had its chance (details or the ≤700 ms fallback), then
-    // keep it: swapping the card's logo for the artwork's a moment later read as the logo
-    // jumping. Only a logo that fails to load is replaced.
-    if ((_bodyReady || _art?.logo?.isNotEmpty == true) &&
-        (_shownLogo == null || _failedLogos.contains(_shownLogo)) &&
-        rawLogo.isNotEmpty &&
-        !_failedLogos.contains(rawLogo)) {
-      _shownLogo = rawLogo;
-    }
-    final logo = _shownLogo != null && !_failedLogos.contains(_shownLogo) ? _shownLogo : null;
     final imdb = (_meta['rating'] as String?)?.isNotEmpty == true ? _meta['rating'] as String : _media.rating;
     final runtime = (_meta['runtime'] as String?)?.isNotEmpty == true ? _meta['runtime'] as String : _media.runtime;
     final released = _meta['released']?.toString() ?? '';
@@ -635,6 +678,42 @@ class _TitleScreenState extends State<TitleScreen> {
     // the runtime CI caught on a phone-width screen).
     final metaSynopsis = _meta['description'] as String? ?? '';
     final synopsis = metaSynopsis.isNotEmpty ? metaSynopsis : _media.description;
+    if (_bodyReady && !_revealed && !_revealing) {
+      _revealing = true;
+      final snap = <String, Object?>{
+        'frames': frames,
+        'logo': (rawLogo.isNotEmpty && !_failedLogos.contains(rawLogo)) ? rawLogo : null,
+        'tagline': _art?.tagline,
+        'imdb': imdb,
+        'runtime': runtime,
+        'year': year,
+        'genres': genres,
+        'tomatometer': _tomatometer,
+        'metascore': _metascore,
+        'rank': _rank,
+        'certificate': _art?.certificate,
+        'status': _seriesStatus,
+        'trailers': _allClips().isNotEmpty,
+      };
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_prepareReveal(snap));
+      });
+    }
+    final f = _frozen;
+    final heroFrames = _revealed ? (f['frames'] as List<String>) : const <String>[];
+    final shownLogo = _revealed ? f['logo'] as String? : null;
+    final logo = shownLogo != null && !_failedLogos.contains(shownLogo) ? shownLogo : null;
+    final tagline = _revealed ? f['tagline'] as String? : null;
+    final factImdb = _revealed ? f['imdb'] as String : imdb;
+    final factRuntime = _revealed ? f['runtime'] as String : runtime;
+    final factYear = _revealed ? f['year'] as String : year;
+    final factGenres = _revealed ? f['genres'] as List<String> : genres;
+    // Scores stay live: their pill is last in the row, so filling in moves nothing.
+    final factTomato = _tomatometer;
+    final factMeta = _metascore;
+    final factRank = _revealed ? f['rank'] as int? : _rank;
+    final factCert = _revealed ? f['certificate'] as String? : _art?.certificate;
+    final factStatus = _revealed ? f['status'] as String? : _seriesStatus;
     final upNext = film ? null : _upNextEpisode();
     final seasons = _episodes.map((e) => e.season).toSet().toList()..sort();
     final currentSeasonEps = _episodes.where((e) => e.season == _selectedSeason).toList();
@@ -708,15 +787,17 @@ class _TitleScreenState extends State<TitleScreen> {
                             child: ValueListenableBuilder<int>(
                               valueListenable: _frameIndexN,
                               builder: (_, idx, _) {
-                                final activeBg = frames.isNotEmpty ? frames[idx % frames.length] : '';
+                                final activeBg = heroFrames.isNotEmpty ? heroFrames[idx % heroFrames.length] : '';
                                 return AnimatedSwitcher(
                                   duration: const Duration(milliseconds: 900),
                                   child: activeBg.isNotEmpty
                                       ? KenBurnsImage(
                                           key: ValueKey(activeBg),
                                           url: activeBg,
-                                          cacheWidth: 1600,
+                                          cacheWidth: _heroDecodeWidth(size.width, MediaQuery.devicePixelRatioOf(context)),
                                           alignment: const Alignment(0, -0.4),
+                                          settle: false,
+                                          fadeIn: Duration.zero,
                                         )
                                       : const SizedBox.shrink(),
                                 );
@@ -750,32 +831,32 @@ class _TitleScreenState extends State<TitleScreen> {
                         alignment: Alignment.bottomLeft,
                         child: ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 780),
-                          child: Column(
+                          // Revealed once, in place (opacity only), when everything below is ready.
+                          child: IgnorePointer(
+                            ignoring: !_revealed,
+                            child: AnimatedOpacity(
+                            opacity: _revealed ? 1 : 0,
+                            duration: const Duration(milliseconds: 220),
+                            child: Column(
                             mainAxisSize: MainAxisSize.min,
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               // Fixed-height, bottom-anchored logo slot: swapping the wordmark for the
                               // logo (or the logo image decoding late) never moves anything below it.
-                              LiftIn(
+                              KeyedSubtree(
                                 key: const ValueKey('shift.title.logo'),
-                                delay: Duration.zero,
                                 child: SizedBox(
                                   height: 144,
                                   width: 460,
-                                  child: AnimatedSwitcher(
-                                    duration: const Duration(milliseconds: 280),
-                                    layoutBuilder: (current, previous) => Stack(
-                                      alignment: Alignment.bottomLeft,
-                                      children: [...previous, ?current],
-                                    ),
-                                    child: logo != null
+                                  child: Builder(
+                                    builder: (_) => logo != null
                                         ? CachedNetworkImage(
                                             key: ValueKey(logo),
                                             imageUrl: logo,
                                             fit: BoxFit.contain,
                                             alignment: Alignment.bottomLeft,
                                             memCacheWidth: 920,
-                                            fadeInDuration: const Duration(milliseconds: 220),
+                                            fadeInDuration: Duration.zero,
                                             placeholder: (_, _) => const SizedBox.expand(),
                                             errorWidget: (_, _, _) {
                                               WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -787,7 +868,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                               );
                                             },
                                           )
-                                        : (!_bodyReady
+                                        : (!_revealed
                                             ? const SizedBox.expand(key: ValueKey('logo-pending'))
                                             : Align(
                                                 key: const ValueKey('logo-text'),
@@ -797,17 +878,14 @@ class _TitleScreenState extends State<TitleScreen> {
                                   ),
                                 ),
                               ),
-                              AnimatedSize(
-                                duration: const Duration(milliseconds: 240),
-                                curve: Curves.easeOutCubic,
-                                alignment: Alignment.bottomLeft,
-                                // Shown with the logo (both wait for the page's details), so a late
-                                // tagline can't lift an already visible logo.
-                                child: _bodyReady && _art?.tagline?.isNotEmpty == true
+                              // Frozen at the reveal with the logo: never appears or grows later.
+                              SizedBox(
+                                width: double.infinity,
+                                child: tagline?.isNotEmpty == true
                                     ? Padding(
                                         padding: const EdgeInsets.only(top: 12),
                                         child: Text(
-                                          _art!.tagline!,
+                                          tagline!,
                                           maxLines: 2,
                                           overflow: TextOverflow.ellipsis,
                                           style: VeyloText.ui(
@@ -818,41 +896,42 @@ class _TitleScreenState extends State<TitleScreen> {
                                           ),
                                         ),
                                       )
-                                    : const SizedBox(width: double.infinity),
+                                    : const SizedBox.shrink(),
                               ),
                               const SizedBox(height: 18),
-                              LiftIn(
+                              KeyedSubtree(
                                 key: const ValueKey('shift.title.pills'),
-                                delay: const Duration(milliseconds: 90),
                                 // One line, never wrapping: late facts (scores, rank, certificate,
                                 // series status) are appended at the end, so when they land nothing
                                 // moves — a wrapped second line used to push the logo up.
-                                child: SingleChildScrollView(
+                                child: SizedBox(
+                                  width: double.infinity,
+                                  child: SingleChildScrollView(
                                   scrollDirection: Axis.horizontal,
                                   clipBehavior: Clip.none,
                                   child: Row(
                                   mainAxisSize: MainAxisSize.min,
                                   spacing: 8,
                                   children: [
-                                    if (runtime.isNotEmpty)
+                                    if (factRuntime.isNotEmpty)
                                       FactPill(
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             const VeyloIcon('Clock', size: 16, color: VeyloColors.dust),
                                             const SizedBox(width: 6),
-                                            Text(runtime),
+                                            Text(factRuntime),
                                           ],
                                         ),
                                       ),
-                                    if (year.isNotEmpty)
+                                    if (factYear.isNotEmpty)
                                       FactPill(
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             const VeyloIcon('Calendar', size: 16, color: VeyloColors.dust),
                                             const SizedBox(width: 6),
-                                            Text(year, style: const TextStyle(fontFeatures: VeyloText.tnum)),
+                                            Text(factYear, style: const TextStyle(fontFeatures: VeyloText.tnum)),
                                           ],
                                         ),
                                       ),
@@ -866,47 +945,50 @@ class _TitleScreenState extends State<TitleScreen> {
                                         ],
                                       ),
                                     ),
-                                    if (genres.isNotEmpty)
+                                    if (factGenres.isNotEmpty)
                                       FactPill(
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             const VeyloIcon('Tag', size: 16, color: VeyloColors.dust),
                                             const SizedBox(width: 6),
-                                            Text(genres.take(3).join(', ')),
+                                            Text(factGenres.take(3).join(', ')),
                                           ],
                                         ),
                                       ),
-                                    ScoresPill(imdb: imdb, tomatometer: _tomatometer, metascore: _metascore),
-                                    if (_rank != null)
+                                    if (factRank != null)
                                       FactPill(
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             const VeyloIcon('Trophy', size: 16, color: VeyloColors.bone),
                                             const SizedBox(width: 6),
-                                            Text('#$_rank today', style: const TextStyle(fontFeatures: VeyloText.tnum)),
+                                            Text('#$factRank today', style: const TextStyle(fontFeatures: VeyloText.tnum)),
                                           ],
                                         ),
                                       ),
-                                    if (_art?.certificate?.isNotEmpty == true)
+                                    if (factCert?.isNotEmpty == true)
                                       FactPill(
                                         child: Text(
-                                          _art!.certificate!,
+                                          factCert!,
                                           style: VeyloText.ui(13.5, weight: 800),
                                         ),
                                       ),
-                                    if (_seriesStatus != null)
-                                      FactPill(child: Text(_seriesStatus!)),
+                                    if (factStatus != null)
+                                      FactPill(child: Text(factStatus)),
+                                    // Last on purpose: the only fact allowed to fill in after the reveal
+                                    // (Rotten Tomatoes / Metacritic can land late), growing to the right
+                                    // without moving anything.
+                                    ScoresPill(imdb: factImdb, tomatometer: factTomato, metascore: factMeta),
                                   ],
+                                ),
                                 ),
                                 ),
                               ),
                               const SizedBox(height: 22),
                               // Action bar (.title-actions)
-                              LiftIn(
+                              KeyedSubtree(
                                 key: const ValueKey('shift.title.actions'),
-                                delay: const Duration(milliseconds: 140),
                                 // One line too: the trailer button landing late used to wrap the bar
                                 // onto a second line and lift the whole hero by 58 px.
                                 child: SingleChildScrollView(
@@ -1035,7 +1117,7 @@ class _TitleScreenState extends State<TitleScreen> {
                                         },
                                       ),
                                     ],
-                                    if (allClips.isNotEmpty)
+                                    if (_revealed ? f['trailers'] == true : allClips.isNotEmpty)
                                       VeyloOrb(
                                         icon: 'Clapper',
                                         tooltip: 'Trailer and videos',
@@ -1057,6 +1139,8 @@ class _TitleScreenState extends State<TitleScreen> {
                               ),
                             ],
                           ),
+                          ),
+                          ),
                         ),
                       ),
                     ),
@@ -1071,7 +1155,7 @@ class _TitleScreenState extends State<TitleScreen> {
                 padding: EdgeInsets.fromLTRB(gutter, 12, gutter, 0),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 1180),
-                  child: !_bodyReady
+                  child: !_revealed
                       ? const SizedBox(height: 320, width: double.infinity)
                       : TweenAnimationBuilder<double>(
                           tween: Tween(begin: 0, end: 1),

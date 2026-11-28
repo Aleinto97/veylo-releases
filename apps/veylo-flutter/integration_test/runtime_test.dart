@@ -273,7 +273,6 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
   while (sw.elapsed < window) {
     await t.pump(const Duration(milliseconds: 100));
     if (root.evaluate().isEmpty) continue;
-    final rootBox = t.renderObject(root.first) as RenderBox;
     final keyed = find.descendant(
       of: root.first,
       matching: find.byWidgetPredicate((w) => w.key is ValueKey<String> && (w.key! as ValueKey<String>).value.startsWith('shift.')),
@@ -282,7 +281,13 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
       final name = ((e.widget.key! as ValueKey<String>).value).substring(6);
       final ro = e.renderObject;
       if (ro is! RenderBox || !ro.hasSize || !ro.attached) continue;
-      final r = ro.localToGlobal(Offset.zero, ancestor: rootBox) & ro.size;
+      // Only what the user can see: content still hidden behind the reveal may settle freely.
+      if (_effectiveOpacity(ro) < 0.01) continue;
+      // Painted corners on screen (all ancestor transforms applied): catches slides and scales
+      // from entrance animations or page transitions, not only layout moves.
+      final tl = ro.localToGlobal(Offset.zero);
+      final br = ro.localToGlobal(ro.size.bottomRight(Offset.zero));
+      final r = Rect.fromPoints(tl, br);
       if (const bool.fromEnvironment('SHIFT_TRACE') && name == 'title.actions') {
         debugPrint('TRACE ${sw.elapsedMilliseconds} actions=$r');
       }
@@ -292,14 +297,26 @@ Future<List<String>> _watchShifts(WidgetTester t, Finder root, Duration window) 
         firstAt[name] = sw.elapsedMilliseconds;
         continue;
       }
-      final dy = r.top - base.top, dx = r.left - base.left, dh = r.height - base.height;
-      if ((dy.abs() > 2 || dx.abs() > 2 || dh.abs() > 2) && !shifts.containsKey(name)) {
-        shifts[name] = '$name moved dy=${dy.round()} dx=${dx.round()} dh=${dh.round()} at ${sw.elapsedMilliseconds} ms '
+      final dy = r.top - base.top, dx = r.left - base.left, dh = r.height - base.height, dw = r.width - base.width;
+      if ((dy.abs() > 1.5 || dx.abs() > 1.5 || dh.abs() > 1.5 || dw.abs() > 1.5) && !shifts.containsKey(name)) {
+        shifts[name] = '$name moved dy=${dy.round()} dx=${dx.round()} dh=${dh.round()} dw=${dw.round()} at ${sw.elapsedMilliseconds} ms '
             '(appeared at ${firstAt[name]} ms)';
       }
     }
   }
   return shifts.values.toList();
+}
+
+/// Product of every ancestor opacity (Opacity / AnimatedOpacity / FadeTransition).
+double _effectiveOpacity(RenderObject ro) {
+  var o = 1.0;
+  RenderObject? n = ro;
+  while (n != null) {
+    if (n is RenderOpacity) o *= n.opacity;
+    if (n is RenderAnimatedOpacity) o *= n.opacity.value;
+    n = n.parent;
+  }
+  return o;
 }
 
 MediaItem? _firstOf(Map<String, dynamic> res, String type) {
