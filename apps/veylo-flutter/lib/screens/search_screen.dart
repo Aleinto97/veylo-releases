@@ -175,6 +175,7 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
     final app = AppStateScope.read(context);
     final size = MediaQuery.sizeOf(context);
     final gutter = VeyloLayout.gutter(size.width);
+    final insets = MediaQuery.viewPaddingOf(context);
     final q = _ctrl.text;
 
     final top = (!_vibeMode && _results.isNotEmpty && _topRank <= 3) ? _results.first : null;
@@ -188,7 +189,7 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
         int order(String k) => switch (k) { 'movie' => 0, 'series' => 1, 'anime' => 2, _ => 3 };
         return order(a).compareTo(order(b));
       });
-    final sideBySide = size.width >= 700 && groups.containsKey('movie') && groups.containsKey('series');
+    final sideBySide = size.width - insets.horizontal >= 700 && groups.containsKey('movie') && groups.containsKey('series');
 
     return Positioned.fill(
       child: AnimatedBuilder(
@@ -247,7 +248,7 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 1280),
                     child: Padding(
-                      padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 0),
+                      padding: EdgeInsets.fromLTRB(gutter + insets.left, 24 + insets.top, gutter + insets.right, 0),
                       child: Row(
                         children: [
                           Expanded(
@@ -366,7 +367,7 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
                     child: ConstrainedBox(
                       constraints: const BoxConstraints(maxWidth: 1280),
                       child: SingleChildScrollView(
-                        padding: EdgeInsets.fromLTRB(gutter, 20, gutter, 48),
+                        padding: EdgeInsets.fromLTRB(gutter + insets.left, 20, gutter + insets.right, 48 + insets.bottom),
                         child: q.trim().isEmpty
                             ? _buildEmpty(app, gutter)
                             : (_vibeMode ? _buildVibeResults() : _buildStandardResults(top, orderedKinds, groups, sideBySide)),

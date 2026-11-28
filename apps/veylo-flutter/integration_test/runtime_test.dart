@@ -519,6 +519,130 @@ void main() {
       }, settle: const Duration(seconds: 4));
     }
 
+    if (!Platform.isAndroid) {
+      final original = t.view.physicalSize;
+      final originalRatio = t.view.devicePixelRatio;
+      final lastPlayed = app.lastPlayed;
+      addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
+      addTearDown(t.view.resetViewPadding);
+      final viewPadding = t.view.viewPadding;
+      expect([viewPadding.left, viewPadding.top, viewPadding.right, viewPadding.bottom], everyElement(0));
+      app.lastPlayedNotifier.value = SeenItem(
+        media: MediaItem.fromJson(const {
+          'id': 'dock-test',
+          'type': 'movie',
+          'name': 'A feature film with a long title for the Last Played pill',
+        }),
+        at: 0,
+        whenLabel: '',
+      );
+      try {
+        app.closeTitle();
+        app.setTab(VeyloTab.home);
+        for (final (width, scale) in const [
+          (320, 1.0),
+          (390, 1.0),
+          (560, 1.0),
+          (608, 1.0),
+          (760, 1.0),
+          (1280, 1.0),
+          (2560, 1.0),
+          (2560, 1.3),
+          (608, 1.3),
+          (320, 1.3),
+        ]) {
+          final name = 'dock-$width-${scale.toStringAsFixed(1)}';
+          await _step('screen.$name', (tx) async {
+            final before = frameworkErrors.length;
+            t.view.devicePixelRatio = 1.0;
+            t.view.physicalSize = Size(width.toDouble(), 800);
+            t.platformDispatcher.textScaleFactorTestValue = scale;
+            await _settle(t, const Duration(milliseconds: 350));
+
+            Finder tab(VeyloTab tab) => find.byKey(ValueKey('dock-tab-${tab.name}'));
+            List<Rect> controls() => [
+              for (final id in ['last-played', 'shortcuts', 'search'])
+                t.getRect(find.byKey(ValueKey('topbar-$id'))),
+            ];
+            void checkGeometry(List<Rect> trailing) {
+              final rects = [
+                for (final item in VeyloTab.values) t.getRect(tab(item)),
+                ...trailing,
+              ];
+              expect(rects.first.left, greaterThanOrEqualTo(0));
+              expect(rects.last.right, lessThanOrEqualTo(width));
+              for (var i = 1; i < rects.length; i++) {
+                expect(rects[i - 1].right, lessThanOrEqualTo(rects[i].left));
+              }
+            }
+
+            final trailing = controls();
+            checkGeometry(trailing);
+            if (width >= 560) {
+              final active = tab(VeyloTab.home);
+              final label = find.descendant(of: active, matching: find.text('Home'));
+              expect(label, findsOneWidget);
+              expect(t.getRect(label).right, lessThanOrEqualTo(t.getRect(active).right));
+            }
+            await _shot(t, name);
+
+            final mouse = await t.createGesture(kind: ui.PointerDeviceKind.mouse);
+            await mouse.addPointer(location: const Offset(2, 2));
+            try {
+              await mouse.moveTo(t.getCenter(tab(VeyloTab.picks)));
+              await _settle(t, const Duration(milliseconds: 350));
+              expect(controls(), trailing);
+              checkGeometry(trailing);
+              expect(find.text('Picks'), findsOneWidget);
+              await _shot(t, '$name-hover');
+            } finally {
+              await mouse.removePointer();
+            }
+            if (frameworkErrors.length > before) {
+              throw StateError('framework errors: ${frameworkErrors.sublist(before).take(3).join(' | ')}');
+            }
+            return null;
+          });
+        }
+        await screen('dock-608-insets', () async {
+          const insets = FakeViewPadding(top: 32, left: 24, right: 18, bottom: 24);
+          t.view.physicalSize = const Size(608, 800);
+          t.view.viewPadding = insets;
+          t.platformDispatcher.textScaleFactorTestValue = 1.3;
+          await _settle(t, const Duration(milliseconds: 350));
+
+          final active = find.byKey(const ValueKey('dock-tab-home'));
+          final settings = find.byKey(const ValueKey('dock-tab-settings'));
+          final search = find.byKey(const ValueKey('topbar-search'));
+          final activeRect = t.getRect(active);
+          expect(activeRect.center.dy, insets.top + 42);
+          expect(activeRect.left, greaterThan(insets.left));
+          expect(t.getRect(search).right, lessThan(608 - insets.right));
+
+          final strategy = FocusManager.instance.highlightStrategy;
+          FocusManager.instance.highlightStrategy = FocusHighlightStrategy.alwaysTraditional;
+          final button = find.descendant(of: settings, matching: find.byType(GestureDetector));
+          final focus = Focus.of(t.element(button));
+          try {
+            focus.requestFocus();
+            await _settle(t, const Duration(milliseconds: 350));
+            expect(find.text('Settings'), findsOneWidget);
+            await _shot(t, 'dock-608-insets-focus');
+          } finally {
+            focus.unfocus();
+            FocusManager.instance.highlightStrategy = strategy;
+          }
+        }, settle: const Duration(milliseconds: 350));
+      } finally {
+        t.view.resetViewPadding();
+        app.lastPlayedNotifier.value = lastPlayed;
+        t.view.physicalSize = original;
+        t.view.devicePixelRatio = originalRatio;
+        t.platformDispatcher.clearTextScaleFactorTestValue();
+        await _settle(t);
+      }
+    }
+
     // Window/viewport sizes (desktop): phone-ish, laptop, 1080p, 1440p, TV 4K-scaled.
     if (!Platform.isAndroid) {
       final original = t.view.physicalSize;

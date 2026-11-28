@@ -163,7 +163,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final app = AppStateScope.read(context);
     final width = MediaQuery.sizeOf(context).width;
     final gutter = VeyloLayout.gutter(width);
-    final contentWidth = (width - gutter * 2).clamp(240.0, 2400.0);
+    final insets = MediaQuery.viewPaddingOf(context);
+    final horizontalInsets = insets.copyWith(top: 0, bottom: 0);
+    final contentWidth = (width - gutter * 2 - insets.horizontal).clamp(240.0, 2400.0);
     final posterCols = (contentWidth / 156).floor().clamp(2, 10);
     final weekCols = (contentWidth / 340).floor().clamp(1, 4);
 
@@ -216,7 +218,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           slivers: [
             // Header + CSS-faithful Library toolbar (.lib-head + .lib-toolbar)
             SliverPadding(
-              padding: EdgeInsets.fromLTRB(gutter, 96, gutter, 0),
+              padding: EdgeInsets.fromLTRB(gutter, 96 + insets.top, gutter, 0) + horizontalInsets,
               sliver: SliverToBoxAdapter(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -263,7 +265,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             // Downloads section
             if (showDownloads)
               SliverPadding(
-                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0),
+                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0) + horizontalInsets,
                 sliver: SliverToBoxAdapter(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -292,7 +294,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             // Saved section (lazy SliverGrid)
             if (showSaved && filteredSaved.isNotEmpty) ...[
               SliverPadding(
-                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 14),
+                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 14) + horizontalInsets,
                 sliver: SliverToBoxAdapter(
                   child: GroupHead(
                     icon: 'Bookmark',
@@ -313,7 +315,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 ),
               ),
               SliverPadding(
-                padding: EdgeInsets.symmetric(horizontal: gutter),
+                padding: EdgeInsets.symmetric(horizontal: gutter) + horizontalInsets,
                 sliver: SliverGrid.builder(
                   gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: posterCols,
@@ -342,7 +344,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ),
             ] else if (showSaved && _filter == _LibFilter.saved)
               SliverPadding(
-                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0),
+                padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0) + horizontalInsets,
                 sliver: SliverToBoxAdapter(
                   child: _EmptyCard(
                     icon: 'Bookmark',
@@ -370,7 +372,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             if (showHistory) ...[
               if (_error != null)
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 0),
+                  padding: EdgeInsets.fromLTRB(gutter, 24, gutter, 0) + horizontalInsets,
                   sliver: SliverToBoxAdapter(
                     child: Align(
                       alignment: Alignment.centerLeft,
@@ -391,7 +393,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 )
               else if (_history == null)
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0),
+                  padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0) + horizontalInsets,
                   sliver: const SliverToBoxAdapter(
                     child: Wrap(
                       spacing: 18,
@@ -406,7 +408,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 )
               else if (_history!.isEmpty && liveSaved.isEmpty)
                 SliverPadding(
-                  padding: EdgeInsets.fromLTRB(gutter, 80, gutter, 0),
+                  padding: EdgeInsets.fromLTRB(gutter, 80, gutter, 0) + horizontalInsets,
                   sliver: SliverToBoxAdapter(
                     child: Center(
                       child: Column(
@@ -431,7 +433,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               else ...[
                 if (filteredHistory.isEmpty && _history!.isNotEmpty)
                   SliverPadding(
-                    padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0),
+                    padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 0) + horizontalInsets,
                     sliver: SliverToBoxAdapter(
                       child: _EmptyCard(
                         icon: 'Search',
@@ -455,11 +457,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ),
                 if (week.isNotEmpty) ...[
                   SliverPadding(
-                    padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 14),
+                    padding: EdgeInsets.fromLTRB(gutter, 26, gutter, 14) + horizontalInsets,
                     sliver: SliverToBoxAdapter(child: GroupHead(icon: 'Clock', title: 'This week', count: week.length)),
                   ),
                   SliverPadding(
-                    padding: EdgeInsets.symmetric(horizontal: gutter),
+                    padding: EdgeInsets.symmetric(horizontal: gutter) + horizontalInsets,
                     sliver: SliverGrid.builder(
                       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                         crossAxisCount: weekCols,
@@ -485,11 +487,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 ],
                 for (final entry in months.entries) ...[
                   SliverPadding(
-                    padding: EdgeInsets.fromLTRB(gutter, 28, gutter, 14),
+                    padding: EdgeInsets.fromLTRB(gutter, 28, gutter, 14) + horizontalInsets,
                     sliver: SliverToBoxAdapter(child: GroupHead(icon: 'Calendar', title: entry.key, count: entry.value.length)),
                   ),
                   SliverPadding(
-                    padding: EdgeInsets.symmetric(horizontal: gutter),
+                    padding: EdgeInsets.symmetric(horizontal: gutter) + horizontalInsets,
                     sliver: SliverGrid.builder(
                       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                         crossAxisCount: posterCols,
@@ -519,7 +521,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ],
             ],
 
-            const SliverPadding(padding: EdgeInsets.only(bottom: 64)),
+            SliverPadding(padding: EdgeInsets.only(bottom: 64 + insets.bottom)),
           ],
         ),
       ),

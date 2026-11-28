@@ -1245,8 +1245,23 @@ async fn handle_request(req: Value) -> Result<Value> {
             Ok(json!({ "report": report }))
         }
         "account_state" => Ok(account_state_json().await),
+        "account_google_config" => Ok(json!({
+            "available": backend::google_available(),
+            "web_client": backend::config().and_then(|config| config.web_client),
+        })),
         "account_sign_in_google" => {
-            backend::sign_in_google().await?;
+            match backend::sign_in_google().await {
+                Ok(_) => Ok(account_state_json().await),
+                Err(e) if e.to_string() == "Sign-in cancelled." => Ok(json!({ "cancelled": true })),
+                Err(e) => Err(e),
+            }
+        }
+        "account_sign_in_google_token" => {
+            let token = req["id_token"]
+                .as_str()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| anyhow!("Google didn't return an account. Try signing in again."))?;
+            backend::sign_in_google_token(token.to_owned()).await?;
             Ok(account_state_json().await)
         }
         "account_sign_in" => {
@@ -1289,13 +1304,23 @@ async fn handle_request(req: Value) -> Result<Value> {
             backend::delete_account().await?;
             Ok(account_state_json().await)
         }
+        "account_check_link" => {
+            let pending = backend::parse_pending_link(req["code"].as_str().unwrap_or(""))?;
+            Ok(json!({ "check_code": pending.check_code }))
+        }
+        "account_answer_link" => {
+            backend::answer_link(req["code"].as_str().unwrap_or("")).await?;
+            Ok(json!({}))
+        }
         "account_offer_link" => {
-            let seq = LINK_OFFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            if let Ok(mut g) = LINK_OFFER.get_or_init(|| Mutex::new(None)).lock() {
+            let seq = {
+                let mut g = LINK_OFFER.get_or_init(|| Mutex::new(None)).lock()
+                    .map_err(|_| anyhow!("Couldn't create a sign-in code. Try again."))?;
                 if let Some((_, old)) = g.take() {
                     backend::cancel_link_soon(old);
                 }
-            }
+                LINK_OFFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+            };
             let offer = backend::offer_link().await?;
             // If another offer or cancel ran while offer_link() was in flight, cancel immediately.
             if LINK_OFFER_SEQ.load(std::sync::atomic::Ordering::Acquire) != seq {
@@ -1303,14 +1328,7 @@ async fn handle_request(req: Value) -> Result<Value> {
                 return Ok(json!({ "cancelled": true }));
             }
             let check_code = offer.check_code();
-            let svg = qrcode::QrCode::new(offer.code.as_bytes()).ok().map(|code| {
-                code.render::<qrcode::render::svg::Color>()
-                    .min_dimensions(240, 240)
-                    .quiet_zone(true)
-                    .dark_color(qrcode::render::svg::Color("#000000"))
-                    .light_color(qrcode::render::svg::Color("#ffffff"))
-                    .build()
-            });
+            let svg = backend::qr_svg(&offer.code);
             let superseded = if let Ok(mut g) = LINK_OFFER.get_or_init(|| Mutex::new(None)).lock() {
                 if LINK_OFFER_SEQ.load(std::sync::atomic::Ordering::Acquire) != seq {
                     true
@@ -1325,7 +1343,7 @@ async fn handle_request(req: Value) -> Result<Value> {
                 backend::cancel_link_soon(offer);
                 return Ok(json!({ "cancelled": true }));
             }
-            Ok(json!({ "offer_id": seq, "check_code": check_code, "svg": svg }))
+            Ok(json!({ "offer_id": seq, "code": offer.code, "check_code": check_code, "svg": svg }))
         }
         "account_take_link" => {
             let wanted = req["offer_id"].as_u64();
@@ -1355,10 +1373,12 @@ async fn handle_request(req: Value) -> Result<Value> {
         }
         "account_cancel_link" => {
             let wanted = req["offer_id"].as_u64();
-            LINK_OFFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Ok(mut g) = LINK_OFFER.get_or_init(|| Mutex::new(None)).lock() {
                 let matches = wanted.is_none() || g.as_ref().is_some_and(|(id, _)| Some(*id) == wanted);
                 if matches {
+                    if wanted.is_none() {
+                        LINK_OFFER_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
                     if let Some((_, old)) = g.take() {
                         backend::cancel_link_soon(old);
                     }

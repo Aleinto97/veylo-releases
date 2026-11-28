@@ -402,7 +402,7 @@ pub async fn reset_password(email: String) -> Result<()> {
 }
 
 /// Sign in with a Google ID token (from Android's account sheet or the computer's browser).
-async fn sign_in_google_token(id_token: String) -> Result<Account> {
+pub async fn sign_in_google_token(id_token: String) -> Result<Account> {
     let post_body: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("id_token", &id_token)
         .append_pair("providerId", "google.com")
@@ -1656,7 +1656,7 @@ fn link_sas(link: &str, key: &[u8]) -> String {
 fn parse_link_code(code: &str) -> Result<(String, Vec<u8>)> {
     let parts: Vec<&str> = code.trim().split(':').collect();
     let ["veylo-link", "1", link, key] = parts[..] else { anyhow::bail!("That isn't a Veylo sign-in code.") };
-    anyhow::ensure!(link.len() <= 64 && link.bytes().all(|b| b.is_ascii_alphanumeric()), "That isn't a Veylo sign-in code.");
+    anyhow::ensure!(!link.is_empty() && link.len() <= 64 && link.bytes().all(|b| b.is_ascii_alphanumeric()), "That isn't a Veylo sign-in code.");
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(key).ok().filter(|k| k.len() == 32).context("That isn't a Veylo sign-in code.")?;
     Ok((link.to_owned(), key))
 }
@@ -1682,10 +1682,10 @@ pub async fn offer_link() -> Result<LinkOffer> {
         "update":{"name":format!("{base}/links/{link}"),"fields":{"asker":{"stringValue":uid}}},
         "updateTransforms":[{"fieldPath":"created","setToServerValue":"REQUEST_TIME"}],
         "currentDocument":{"exists":false}}]}), Some(token.clone())).await;
-    if let Err(e) = offer_written {
+    if offer_written.is_err() {
         // The passing account was made for nothing: it goes again.
         let _ = identity("delete", json!({"idToken":token})).await;
-        return Err(e);
+        anyhow::bail!("Couldn't create a sign-in code. Try again.");
     }
     let code = format!("veylo-link:1:{link}:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key));
     Ok(LinkOffer { code, link, key, token })
@@ -1721,7 +1721,7 @@ pub async fn take_link(offer: &LinkOffer) -> Result<Option<Account>> {
     let base = documents().context("Accounts aren't set up in this build")?;
     let (url, token) = (format!("https://firestore.googleapis.com/v1/{base}/links/{}", offer.link), offer.token.clone());
     let doc: Value = on_runtime(async move {
-        let blip = |what: &str| anyhow::Error::new(Transient(format!("Couldn't check for the phone ({what}). Trying again…")));
+        let blip = |what: &str| anyhow::Error::new(Transient(format!("Couldn't check for the other device ({what}). Trying again…")));
         let r = backend().http.get(url).bearer_auth(token).timeout(Duration::from_secs(15)).send().await.map_err(|_| blip("no connection"))?;
         let status = r.status();
         if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::REQUEST_TIMEOUT { return Err(blip("the service is busy")); }
@@ -1780,7 +1780,7 @@ pub async fn answer_link(code: &str) -> Result<()> {
     post_session(format!("https://firestore.googleapis.com/v1/{base}:commit"), json!({"writes":[{
         "update":{"name":format!("{base}/links/{link}"),"fields":{"sealed":{"stringValue":sealed}}},
         "updateMask":{"fieldPaths":["sealed"]},"currentDocument":{"exists":true}}]}), &token).await
-        .map_err(|_| anyhow!("That code has expired. Show a new one on the computer."))?;
+        .map_err(|_| anyhow!("That code has expired. Show a new one on the other device."))?;
     Ok(())
 }
 
@@ -2021,6 +2021,8 @@ mod tests {
         assert_eq!(pending.check_code.as_bytes()[3], b'-');
         assert!(parse_pending_link("https://evil.example/qr").is_err());
         assert!(parse_pending_link("veylo-link:1:bad-id:AAAA").is_err());
+        let encoded_key = code.rsplit(':').next().unwrap();
+        assert!(parse_pending_link(&format!("veylo-link:1::{encoded_key}")).is_err());
     }
 
     /// A computer's Google sign-in through the browser page, with your own account: it signs in,

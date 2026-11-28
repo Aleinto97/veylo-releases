@@ -58,7 +58,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final size = MediaQuery.sizeOf(context);
     final gutter = VeyloLayout.gutter(size.width);
     final posterW = VeyloLayout.posterWidth(size.width);
-    final height = _heroHeight(size.width, size.height);
+    final insets = MediaQuery.viewPaddingOf(context);
+    final shelfInsets = insets.copyWith(top: 0, bottom: 0);
+    final height = _heroHeight(size.width, size.height) + insets.top;
     if (app.initialized) {
       if (_showContinue == null) {
         if (app.homeLibraryReady) {
@@ -116,13 +118,16 @@ class _HomeScreenState extends State<HomeScreen> {
         if (app.initialized)
           SliverToBoxAdapter(
             child: _showContinue!
-                ? _ContinueShelf(gutter: gutter, initial: _initialContinue)
+                ? Padding(
+                    padding: shelfInsets,
+                    child: _ContinueShelf(gutter: gutter, initial: _initialContinue),
+                  )
                 : const SizedBox(height: 8),
           ),
         if (app.initialized && rows.isEmpty)
           SliverToBoxAdapter(
             child: Padding(
-              padding: const EdgeInsets.only(bottom: 26),
+              padding: const EdgeInsets.only(bottom: 26) + shelfInsets,
               child: Column(
                 children: [
                   const SizedBox(height: 56),
@@ -142,7 +147,7 @@ class _HomeScreenState extends State<HomeScreen> {
             if (i == _demoAfter) {
               return Padding(
                 key: const ValueKey('home-demo'),
-                padding: EdgeInsets.fromLTRB(gutter, 8, gutter, 56),
+                padding: EdgeInsets.fromLTRB(gutter, 8, gutter, 56) + shelfInsets,
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: _DemoRow(onTap: app.playDemo),
@@ -153,7 +158,7 @@ class _HomeScreenState extends State<HomeScreen> {
             final row = rows[index];
             return Padding(
               key: ValueKey(row.key),
-              padding: const EdgeInsets.only(bottom: 26),
+              padding: const EdgeInsets.only(bottom: 26) + shelfInsets,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -177,6 +182,7 @@ class _HomeScreenState extends State<HomeScreen> {
             );
           },
         ),
+        SliverPadding(padding: EdgeInsets.only(bottom: insets.bottom)),
       ],
     );
   }
@@ -525,10 +531,12 @@ class _HomeHeroState extends State<_HomeHero> {
   Widget build(BuildContext context) {
     final shown = _shown;
     final app = AppStateScope.read(context);
-    final narrow = widget.viewportWidth <= 960;
-    final phone = widget.viewportWidth < 400;
+    final insets = MediaQuery.viewPaddingOf(context);
+    final width = widget.viewportWidth - insets.horizontal;
+    final narrow = width <= 960;
+    final phone = width < 400;
     final railVisible = widget.items.length > 1;
-    final thumbWidth = ((widget.viewportWidth - 2 * widget.gutter - 46) / 4)
+    final thumbWidth = ((width - 2 * widget.gutter - 46) / 4)
         .clamp(32.0, 68.0);
     final railWidth = thumbWidth * 4 + 46;
 
@@ -625,8 +633,8 @@ class _HomeHeroState extends State<_HomeHero> {
             ),
           ),
           Positioned(
-            left: widget.gutter,
-            right: widget.gutter + (narrow ? 0 : railWidth + 32),
+            left: widget.gutter + insets.left,
+            right: widget.gutter + insets.right + (narrow ? 0 : railWidth + 32),
             bottom: narrow ? 170 : 34,
             child: Align(
               alignment: Alignment.bottomLeft,
@@ -648,8 +656,8 @@ class _HomeHeroState extends State<_HomeHero> {
           ),
           if (railVisible)
             Positioned(
-              left: narrow ? widget.gutter : null,
-              right: narrow ? null : widget.gutter,
+              left: narrow ? widget.gutter + insets.left : null,
+              right: narrow ? null : widget.gutter + insets.right,
               bottom: 34,
               child: SizedBox(
                 key: const ValueKey('shift.home.rail'),
@@ -994,8 +1002,9 @@ class _HeroSkeleton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
+    final insets = MediaQuery.viewPaddingOf(context);
     return Container(
-      padding: EdgeInsets.fromLTRB(gutter, 108, gutter, 34),
+      padding: EdgeInsets.fromLTRB(gutter, 108, gutter, 34) + insets.copyWith(bottom: 0),
       decoration: const BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,

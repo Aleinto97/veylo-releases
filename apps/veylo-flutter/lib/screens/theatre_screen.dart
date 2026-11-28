@@ -494,6 +494,7 @@ class _TheatreScreenState extends State<TheatreScreen> {
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
+    final insets = MediaQuery.viewPaddingOf(context);
     final about = widget.session.about;
     final clips = widget.session.clips;
     final clip = clips[_index.clamp(0, clips.length - 1)];
@@ -512,7 +513,9 @@ class _TheatreScreenState extends State<TheatreScreen> {
               builder: (_, constraints) {
                 final winW = constraints.maxWidth;
                 final winH = constraints.maxHeight;
-                final compact = winW < 820;
+                final safeWidth = winW - insets.horizontal;
+                final safeHeight = winH - insets.vertical;
+                final compact = safeWidth < 820;
 
                 // Compute exact deterministic stageRect for both Wayland subsurface & Flutter overlay.
                 late final Rect cardRect;
@@ -525,10 +528,10 @@ class _TheatreScreenState extends State<TheatreScreen> {
                   stageRect = cardRect;
                   sideRect = Rect.zero;
                 } else {
-                  final cardW = math.min(1760.0, math.max(320.0, winW - 24.0));
-                  final cardH = math.max(320.0, winH - 24.0);
-                  final cardL = (winW - cardW) / 2.0;
-                  final cardT = (winH - cardH) / 2.0;
+                  final cardW = math.min(1760.0, math.max(math.min(320.0, safeWidth), safeWidth - 24));
+                  final cardH = math.max(math.min(320.0, safeHeight), safeHeight - 24);
+                  final cardL = insets.left + (safeWidth - cardW) / 2.0;
+                  final cardT = insets.top + (safeHeight - cardH) / 2.0;
                   cardRect = Rect.fromLTWH(cardL, cardT, cardW, cardH);
 
                   const pad = 12.0;
@@ -546,7 +549,7 @@ class _TheatreScreenState extends State<TheatreScreen> {
                       math.max(0.0, cardRect.bottom - pad - (stageRect.bottom + 12.0)),
                     );
                   } else {
-                    final sideW = (winW * 0.24).clamp(260.0, 340.0);
+                    final sideW = (safeWidth * 0.24).clamp(260.0, 340.0);
                     final areaW = math.max(160.0, cardW - pad * 2 - sideW - gap);
                     final areaH = math.max(120.0, cardH - pad * 2);
                     final fw = math.min(areaW, areaH * 16.0 / 9.0);
@@ -727,9 +730,9 @@ class _TheatreScreenState extends State<TheatreScreen> {
 
                               // Subtle transport bar inside the 16:9 stage
                               Positioned(
-                                left: 0,
-                                right: 0,
-                                bottom: 0,
+                                left: _fullscreen ? insets.left : 0,
+                                right: _fullscreen ? insets.right : 0,
+                                bottom: _fullscreen ? insets.bottom : 0,
                                 child: IgnorePointer(
                                   ignoring: !_chromeVisible,
                                   child: AnimatedOpacity(

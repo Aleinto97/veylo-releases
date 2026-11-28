@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_svg/flutter_svg.dart';
@@ -11,7 +12,7 @@ import '../widgets/veylo_icons.dart';
 
 enum _SettingsCat { all, account, playback, addons, display, privacy }
 enum _AddonSetupTab { link, bundle, stremio, directory }
-enum _AccountPanel { choices, email, qr }
+enum _AccountPanel { choices, email, qr, linkSender }
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -53,7 +54,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int? _armRemoveAddon;
   String? _note;
   String? _problem;
-  AppState? _pollingApp;
 
   @override
   void initState() {
@@ -67,7 +67,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _scroll.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _pollingApp = AppStateScope.read(context)..setFastSyncPolling(true);
       unawaited(_load());
     });
   }
@@ -82,7 +81,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _pollingApp?.setFastSyncPolling(false);
     _addonUrlFocus.removeListener(_onFocus);
     _stremioEmailFocus.removeListener(_onFocus);
     _stremioPassFocus.removeListener(_onFocus);
@@ -159,11 +157,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
     final gutter = VeyloLayout.gutter(MediaQuery.sizeOf(context).width);
+    final insets = MediaQuery.viewPaddingOf(context);
     bool shows(_SettingsCat c) => _cat == _SettingsCat.all || _cat == c;
 
     return SingleChildScrollView(
       controller: _scroll,
-      padding: EdgeInsets.fromLTRB(gutter, 92, gutter, 72),
+      padding: EdgeInsets.fromLTRB(gutter, 92, gutter, 72) + insets,
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 860),
@@ -194,14 +193,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 builder: (_, updates, _) => ValueListenableBuilder<bool>(
                   valueListenable: app.syncKeyNeededNotifier,
                   builder: (_, keyNeeded, _) {
-                    final showAcc = (_accountState['accounts_available'] as bool? ?? app.accountsAvailable);
                     return Wrap(
                       spacing: 8,
                       runSpacing: 8,
                       children: [
                         for (final (cat, icon, label) in [
                           (_SettingsCat.all, 'Sliders', 'All'),
-                          if (showAcc) (_SettingsCat.account, 'Users', 'Account'),
+                          (_SettingsCat.account, 'Users', 'Account'),
                           (_SettingsCat.playback, 'Play', 'Playback'),
                           (_SettingsCat.addons, 'Stack', 'Add-ons'),
                           (_SettingsCat.display, 'Tv', 'Display'),
@@ -227,8 +225,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SkeletonBox(height: 180, borderRadius: 22),
               ] else ...[
                 // Account & Sync
-                if ((_accountState['accounts_available'] as bool? ?? app.accountsAvailable) &&
-                    shows(_SettingsCat.account)) ...[
+                if (shows(_SettingsCat.account)) ...[
                   const SizedBox(height: 26),
                   _AccountBlock(
                     initialState: _accountState,
@@ -1475,6 +1472,60 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
+class _AccountPill extends StatelessWidget {
+  const _AccountPill({
+    required this.label,
+    required this.onTap,
+    this.icon,
+    this.active = false,
+    this.accent = false,
+    this.danger = false,
+    this.confirmRed = false,
+    this.disabled = false,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final String? icon;
+  final bool active;
+  final bool accent;
+  final bool danger;
+  final bool confirmRed;
+  final bool disabled;
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusableActionDetector(
+      enabled: !disabled,
+      actions: {
+        ActivateIntent: CallbackAction<ActivateIntent>(onInvoke: (_) => onTap()),
+      },
+      child: Builder(
+        builder: (context) => DecoratedBox(
+          position: DecorationPosition.foreground,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(19),
+            border: Focus.of(context).hasFocus
+                ? Border.all(color: VeyloColors.bone, width: 2)
+                : null,
+          ),
+          child: VeyloPill(
+            label: label,
+            icon: icon,
+            active: active,
+            accent: accent,
+            danger: danger,
+            confirmRed: confirmRed,
+            disabled: disabled,
+            small: true,
+            onTap: onTap,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AccountBlock extends StatefulWidget {
   const _AccountBlock({required this.initialState, required this.onStateChanged});
   final Map<String, dynamic> initialState;
@@ -1488,13 +1539,15 @@ class _AccountBlockState extends State<_AccountBlock> {
   final TextEditingController _emailCtrl = TextEditingController();
   final TextEditingController _passCtrl = TextEditingController();
   final TextEditingController _keyCtrl = TextEditingController();
+  final TextEditingController _linkCtrl = TextEditingController();
   final FocusNode _emailFocus = FocusNode();
   final FocusNode _passFocus = FocusNode();
   final FocusNode _keyFocus = FocusNode();
+  final FocusNode _linkFocus = FocusNode();
 
   late Map<String, dynamic> _state;
   _AccountPanel _panel = _AccountPanel.choices;
-  String? _busy; // 'google' | 'in' | 'up' | 'reset' | 'sync' | 'unlock' | 'delete'
+  String? _busy;
   String? _problem;
   String? _note;
   bool _showKey = false;
@@ -1502,6 +1555,17 @@ class _AccountBlockState extends State<_AccountBlock> {
   bool _confirmDelete = false;
   bool? _keyCopied;
   Timer? _copyTimer;
+  ({String code, String checkCode})? _checkedLink;
+  AppState? _pollingApp;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final app = AppStateScope.read(context);
+    if (_pollingApp == app) return;
+    _pollingApp?.setFastSyncPolling(false);
+    _pollingApp = app..setFastSyncPolling(true);
+  }
 
   @override
   void initState() {
@@ -1511,6 +1575,7 @@ class _AccountBlockState extends State<_AccountBlock> {
     _emailFocus.addListener(_onFocus);
     _passFocus.addListener(_onFocus);
     _keyFocus.addListener(_onFocus);
+    _linkFocus.addListener(_onFocus);
   }
 
   @override
@@ -1526,6 +1591,9 @@ class _AccountBlockState extends State<_AccountBlock> {
         _keyCopied = null;
         _passCtrl.clear();
         _keyCtrl.clear();
+        _linkCtrl.clear();
+        _checkedLink = null;
+        _panel = _AccountPanel.choices;
         _enterKeyOpen = _state['sync_key_needed'] as bool? ?? false;
       }
     }
@@ -1538,15 +1606,19 @@ class _AccountBlockState extends State<_AccountBlock> {
   @override
   void dispose() {
     _copyTimer?.cancel();
+    _pollingApp?.setFastSyncPolling(false);
     _emailFocus.removeListener(_onFocus);
     _passFocus.removeListener(_onFocus);
     _keyFocus.removeListener(_onFocus);
+    _linkFocus.removeListener(_onFocus);
     _emailCtrl.dispose();
     _passCtrl.dispose();
     _keyCtrl.dispose();
+    _linkCtrl.dispose();
     _emailFocus.dispose();
     _passFocus.dispose();
     _keyFocus.dispose();
+    _linkFocus.dispose();
     super.dispose();
   }
 
@@ -1574,6 +1646,10 @@ class _AccountBlockState extends State<_AccountBlock> {
         widget.onStateChanged(nextState, reloadData: reloadData);
       } else {
         setState(() => _note = note);
+      }
+    } on PlatformException catch (e) {
+      if (mounted && e.code != 'cancel') {
+        setState(() => _problem = e.message ?? 'The device could not complete the request.');
       }
     } catch (e) {
       if (mounted) {
@@ -1610,7 +1686,10 @@ class _AccountBlockState extends State<_AccountBlock> {
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
     final account = _state['account'] as Map<String, dynamic>?;
-    final googleAvail = _state['google_available'] as bool? ?? app.googleAvailable;
+    final accountsAvailable =
+        _state['accounts_available'] as bool? ?? app.accountsAvailable;
+    final googleAvailable =
+        _state['google_available'] as bool? ?? app.googleAvailable;
     final keyNeeded = _state['sync_key_needed'] as bool? ?? false;
     final recoveryCode = keyNeeded ? null : _state['recovery_code'] as String?;
 
@@ -1621,7 +1700,15 @@ class _AccountBlockState extends State<_AccountBlock> {
         const SizedBox(height: 10),
         _SettingsGroup(
           children: [
-            if (account != null) ...[
+            if (!accountsAvailable)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: _googleNotConfigured(),
+                ),
+              )
+            else if (account != null) ...[
               // Signed-in hero row
               _buildSignedInHero(app, account, keyNeeded),
               // E2EE Recovery Key row
@@ -1635,19 +1722,17 @@ class _AccountBlockState extends State<_AccountBlock> {
                   runSpacing: 8,
                   children: [
                     if (recoveryCode != null) ...[
-                      VeyloPill(
+                      _AccountPill(
                         label: _showKey ? 'Hide' : 'Reveal',
-                        small: true,
                         onTap: () => setState(() => _showKey = !_showKey),
                       ),
-                      VeyloPill(
+                      _AccountPill(
                         label: switch (_keyCopied) {
                           true => 'Copied',
                           false => "Couldn't copy",
                           null => 'Copy',
                         },
                         icon: 'Copy',
-                        small: true,
                         onTap: () async {
                           try {
                             await Clipboard.setData(ClipboardData(text: recoveryCode));
@@ -1662,10 +1747,9 @@ class _AccountBlockState extends State<_AccountBlock> {
                         },
                       ),
                     ],
-                    VeyloPill(
+                    _AccountPill(
                       label: _enterKeyOpen ? 'Close' : 'Enter key',
                       accent: keyNeeded && !_enterKeyOpen,
-                      small: true,
                       onTap: () => setState(() => _enterKeyOpen = !_enterKeyOpen),
                     ),
                   ],
@@ -1728,11 +1812,10 @@ class _AccountBlockState extends State<_AccountBlock> {
                           onChanged: (_) => setState(() {}),
                         ),
                       ),
-                      VeyloPill(
+                      _AccountPill(
                         label: _busy == 'unlock' ? 'Unlocking…' : 'Unlock & sync',
                         icon: 'Unlock',
                         accent: true,
-                        small: true,
                         disabled: _busy != null || _keyCtrl.text.trim().isEmpty,
                         onTap: () {
                           final code = _keyCtrl.text.trim();
@@ -1754,6 +1837,7 @@ class _AccountBlockState extends State<_AccountBlock> {
                     ],
                   ),
                 ),
+              _buildLinkSender(app, keyNeeded: keyNeeded),
               // Session & cloud data row
               _SettingRow(
                 name: 'Session & cloud data',
@@ -1763,9 +1847,8 @@ class _AccountBlockState extends State<_AccountBlock> {
                   runSpacing: 8,
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    VeyloPill(
+                    _AccountPill(
                       label: 'Sign out',
-                      small: true,
                       disabled: _busy != null,
                       onTap: () => _run('out', () async {
                         final s = await app.bridge.accountSignOut();
@@ -1784,11 +1867,10 @@ class _AccountBlockState extends State<_AccountBlock> {
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          VeyloPill(
+                          _AccountPill(
                             label: _busy == 'delete' ? 'Deleting…' : 'Confirm delete',
                             icon: 'Trash',
                             confirmRed: true,
-                            small: true,
                             disabled: _busy != null,
                             onTap: () {
                               setState(() => _confirmDelete = false);
@@ -1803,11 +1885,10 @@ class _AccountBlockState extends State<_AccountBlock> {
                         ],
                       )
                     else
-                      VeyloPill(
+                      _AccountPill(
                         label: 'Delete account',
                         icon: 'Trash',
                         danger: true,
-                        small: true,
                         disabled: _busy != null,
                         onTap: () => setState(() => _confirmDelete = true),
                       ),
@@ -1815,71 +1896,53 @@ class _AccountBlockState extends State<_AccountBlock> {
                 ),
               ),
             ] else ...[
-              // Signed-out choices row
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Wrap(
-                            spacing: 8,
-                            crossAxisAlignment: WrapCrossAlignment.center,
-                            children: [
-                              Text('Zero-knowledge cloud sync', style: VeyloText.ui(15, weight: 600)),
-                              const _StatusPill(label: 'Optional', tone: 'muted'),
-                            ],
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            'Sign in to end-to-end encrypt and sync your library, progress, likes, preferences and add-ons across devices.',
-                            style: VeyloText.ui(13.5, weight: 400, height: 1.45, color: VeyloColors.dust),
-                          ),
-                        ],
-                      ),
+                    Text(
+                      'Sign in to end-to-end encrypt and sync your library, progress, likes, preferences and add-ons across devices.',
+                      style: VeyloText.ui(13.5, weight: 400, height: 1.45, color: VeyloColors.dust),
                     ),
-                    const SizedBox(width: 16),
+                    if (!googleAvailable) ...[
+                      const SizedBox(height: 8),
+                      _googleNotConfigured(),
+                    ],
+                    const SizedBox(height: 12),
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        if (googleAvail)
-                          VeyloPill(
-                            label: _busy == 'google' ? 'Finish in browser…' : 'Google',
+                        if (googleAvailable)
+                          _AccountPill(
+                            label: _busy == 'google'
+                                ? (Platform.isAndroid ? 'Signing in…' : 'Finish in browser…')
+                                : 'Sign in with Google',
                             icon: 'Globe',
                             accent: true,
-                            small: true,
                             disabled: _busy != null,
                             onTap: () => _run('google', () async {
-                              final s = await app.bridge.accountSignInGoogle();
-                              return (s, 'Signed in with Google.');
+                              if (_panel == _AccountPanel.qr) {
+                                setState(() => _panel = _AccountPanel.choices);
+                              }
+                              final state = await app.bridge.accountSignInGoogle();
+                              return (state, state == null ? null : 'Signed in with Google.');
                             }, reloadData: true),
                           ),
-                        VeyloPill(
+                        _AccountPill(
                           label: 'Email',
                           icon: 'Pen',
                           active: _panel == _AccountPanel.email,
-                          small: true,
                           disabled: _busy != null,
-                          onTap: () => setState(() {
-                            _panel = _panel == _AccountPanel.email ? _AccountPanel.choices : _AccountPanel.email;
-                            _problem = null;
-                            _note = null;
-                          }),
+                          onTap: () => _togglePanel(_AccountPanel.email),
                         ),
-                        VeyloPill(
-                          label: 'Phone QR',
+                        _AccountPill(
+                          label: 'Sign in with a code',
                           icon: 'Grid',
                           active: _panel == _AccountPanel.qr,
-                          small: true,
-                          disabled: _busy != null && _panel != _AccountPanel.qr,
-                          onTap: () => setState(() {
-                            _panel = _panel == _AccountPanel.qr ? _AccountPanel.choices : _AccountPanel.qr;
-                            _problem = null;
-                            _note = null;
-                          }),
+                          disabled: _busy != null,
+                          onTap: () => _togglePanel(_AccountPanel.qr),
                         ),
                       ],
                     ),
@@ -1929,16 +1992,14 @@ class _AccountBlockState extends State<_AccountBlock> {
                             runSpacing: 8,
                             crossAxisAlignment: WrapCrossAlignment.center,
                             children: [
-                              VeyloPill(
+                              _AccountPill(
                                 label: _busy == 'in' ? 'Signing in…' : 'Sign in',
                                 accent: true,
-                                small: true,
                                 disabled: _busy != null || credsEmpty,
                                 onTap: _submitSignIn,
                               ),
-                              VeyloPill(
+                              _AccountPill(
                                 label: _busy == 'up' ? 'Creating…' : 'Create account',
-                                small: true,
                                 disabled: _busy != null || credsEmpty,
                                 onTap: () {
                                   final email = _emailCtrl.text.trim();
@@ -2032,6 +2093,127 @@ class _AccountBlockState extends State<_AccountBlock> {
     );
   }
 
+  Widget _googleNotConfigured() => Text(
+    "Google sign-in isn't set up in this build.",
+    style: VeyloText.ui(13.5, weight: 400, color: VeyloColors.dust),
+  );
+
+  void _togglePanel(_AccountPanel panel) {
+    setState(() {
+      _panel = _panel == panel ? _AccountPanel.choices : panel;
+      _problem = null;
+      _note = null;
+      if (panel == _AccountPanel.linkSender) {
+        _linkCtrl.clear();
+        _checkedLink = null;
+      }
+    });
+  }
+
+  Future<void> _checkLinkCode(VeyloBridge bridge, String code) async {
+    final checkCode = await bridge.accountCheckLink(code);
+    if (mounted && _linkCtrl.text.trim() == code) {
+      setState(() => _checkedLink = (code: code, checkCode: checkCode));
+    }
+  }
+
+  Widget _buildLinkSender(AppState app, {required bool keyNeeded}) {
+    final open = !keyNeeded && _panel == _AccountPanel.linkSender;
+    final checked = _checkedLink;
+    return SizedBox(
+      width: double.infinity,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _AccountPill(
+              label: 'Sign in another device',
+              active: open,
+              disabled: _busy != null || keyNeeded,
+              onTap: () => _togglePanel(_AccountPanel.linkSender),
+            ),
+            if (keyNeeded) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Enter your Recovery Key to sign in another device.',
+                style: VeyloText.ui(13.5, weight: 400, color: VeyloColors.dust),
+              ),
+            ],
+            if (open) ...[
+              const SizedBox(height: 10),
+              Text(
+                checked != null
+                    ? 'Confirm that the other device shows ${checked.checkCode}. This shares your session and encryption key.'
+                    : Platform.isAndroid
+                    ? 'Enter or scan the sign-in code shown on the other device.'
+                    : 'Enter the sign-in code shown on the other device.',
+                style: VeyloText.ui(13.5, weight: 400, height: 1.45, color: VeyloColors.dust),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  ValueListenableBuilder<Color>(
+                    valueListenable: app.lampColorNotifier,
+                    builder: (_, lamp, _) => _SettingsField(
+                      controller: _linkCtrl,
+                      focusNode: _linkFocus,
+                      lamp: lamp,
+                      hintText: 'Sign-in code',
+                      obscureText: true,
+                      onChanged: (_) => setState(() => _checkedLink = null),
+                    ),
+                  ),
+                  if (Platform.isAndroid)
+                    _AccountPill(
+                      label: _busy == 'scan' ? 'Scanning…' : 'Scan code',
+                      icon: 'Grid',
+                      disabled: _busy != null,
+                      onTap: () => _run('scan', () async {
+                        final scanned = await app.bridge.accountScanCode();
+                        if (!mounted || scanned == null) return (null, null);
+                        final code = scanned.trim();
+                        setState(() {
+                          _linkCtrl.text = code;
+                          _checkedLink = null;
+                        });
+                        await _checkLinkCode(app.bridge, code);
+                        return (null, null);
+                      }),
+                    ),
+                  if (checked == null)
+                    _AccountPill(
+                      label: _busy == 'checkLink' ? 'Checking…' : 'Check code',
+                      disabled: _busy != null || _linkCtrl.text.trim().isEmpty,
+                      onTap: () => _run('checkLink', () async {
+                        await _checkLinkCode(app.bridge, _linkCtrl.text.trim());
+                        return (null, null);
+                      }),
+                    )
+                  else
+                    _AccountPill(
+                      label: _busy == 'answerLink' ? 'Confirming…' : 'Confirm',
+                      icon: 'Check',
+                      accent: true,
+                      disabled: _busy != null,
+                      onTap: () => _run('answerLink', () async {
+                        await app.bridge.accountAnswerLink(checked.code);
+                        if (mounted) _togglePanel(_AccountPanel.linkSender);
+                        return (null, 'Sign-in approved. Check the other device.');
+                      }),
+                    ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildSignedInHero(AppState app, Map<String, dynamic> account, bool keyNeeded) {
     final name = account['name']?.toString() ?? '';
     final email = account['email']?.toString() ?? '';
@@ -2087,10 +2269,9 @@ class _AccountBlockState extends State<_AccountBlock> {
             ),
           ),
           const SizedBox(width: 14),
-          VeyloPill(
+          _AccountPill(
             label: _busy == 'sync' ? 'Syncing…' : 'Sync now',
             icon: 'Refresh',
-            small: true,
             disabled: _busy != null,
             onTap: () => _run('sync', () async {
               final s = await app.bridge.accountSyncNow();
@@ -2118,64 +2299,67 @@ class _QrLinkPanelState extends State<_QrLinkPanel> {
   final VeyloBridge _bridge = VeyloBridge.instance;
   int? _offerId;
   String? _svg;
+  String? _code;
   String? _checkCode;
   String? _problem;
   bool _loading = true;
-  bool _disposed = false;
+  bool _showCode = false;
   int _round = 0;
-  AppState? _pollingApp;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _pollingApp = AppStateScope.read(context);
-      unawaited(_startOffer());
-    });
+    unawaited(_startOffer());
   }
 
   @override
   void dispose() {
-    _disposed = true;
-    final id = _offerId;
-    unawaited(_bridge.accountCancelLink(offerId: id).catchError((_) {}));
+    _cancelOffer(_offerId);
     super.dispose();
   }
 
-  Future<void> _startOffer() async {
-    final app = _pollingApp;
-    app?.setFastSyncPolling(true);
-    try {
-      await _runOffer();
-    } finally {
-      app?.setFastSyncPolling(false);
+  void _cancelOffer(int? id) {
+    if (id != null) {
+      unawaited(_bridge.accountCancelLink(offerId: id).catchError((_) {}));
     }
   }
 
-  Future<void> _runOffer() async {
+  Future<void> _startOffer() async {
     final myRound = ++_round;
-    if (mounted) {
-      setState(() {
-        _loading = true;
-        _offerId = null;
-        _svg = null;
-        _checkCode = null;
-        _problem = null;
-      });
-    }
+    setState(() {
+      _loading = true;
+      _offerId = null;
+      _svg = null;
+      _code = null;
+      _checkCode = null;
+      _problem = null;
+      _showCode = false;
+    });
+    late final int offerId;
     try {
       final res = await _bridge.accountOfferLink();
-      if (_disposed || !mounted || myRound != _round || res['cancelled'] == true) return;
       final id = (res['offer_id'] as num?)?.toInt();
+      if (!mounted || myRound != _round) {
+        _cancelOffer(id);
+        return;
+      }
+      if (id == null) {
+        setState(() {
+          _loading = false;
+          _problem = "Couldn't create a sign-in code. Try a new code.";
+        });
+        return;
+      }
+      offerId = id;
       setState(() {
         _loading = false;
         _offerId = id;
         _svg = res['svg'] as String?;
+        _code = res['code'] as String?;
         _checkCode = res['check_code'] as String?;
       });
     } catch (e) {
-      if (_disposed || !mounted || myRound != _round) return;
+      if (!mounted || myRound != _round) return;
       setState(() {
         _loading = false;
         _problem = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
@@ -2183,105 +2367,128 @@ class _QrLinkPanelState extends State<_QrLinkPanel> {
       return;
     }
 
-    final activeId = _offerId;
-    final started = DateTime.now();
-    int hiccups = 0;
-    while (!_disposed && mounted && myRound == _round && DateTime.now().difference(started).inSeconds < 600) {
+    final elapsed = Stopwatch()..start();
+    while (elapsed.elapsed < const Duration(minutes: 10)) {
       await Future<void>.delayed(const Duration(seconds: 2));
-      if (_disposed || !mounted || myRound != _round) return;
+      if (!mounted || myRound != _round) return;
       try {
-        final poll = await _bridge.accountTakeLink(offerId: activeId);
-        if (_disposed || !mounted || myRound != _round) return;
+        final poll = await _bridge.accountTakeLink(offerId: offerId);
+        if (!mounted || myRound != _round) return;
         if (poll['signed_in'] == true && poll['state'] is Map<String, dynamic>) {
           _offerId = null;
           widget.onSignedIn(poll['state'] as Map<String, dynamic>);
           return;
         }
-        if (poll['expired'] == true) {
-          unawaited(_startOffer());
-          return;
-        }
-        final err = poll['error'] as String?;
-        final transient = poll['transient'] as bool? ?? false;
-        if (err != null) {
-          if (transient && hiccups < 90) {
-            hiccups++;
-            setState(() => _problem = err);
-          } else {
-            setState(() => _problem = err);
-            return;
-          }
-        } else {
-          hiccups = 0;
-          if (_problem != null) setState(() => _problem = null);
-        }
+        if (poll['expired'] == true) break;
+        final error = poll['error'] as String?;
+        if (_problem != error) setState(() => _problem = error);
+        if (error != null && poll['transient'] != true) return;
       } catch (e) {
-        if (_disposed || !mounted || myRound != _round) return;
-        setState(() => _problem = e.toString());
+        if (!mounted || myRound != _round) return;
+        setState(() {
+          _problem = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
+        });
         return;
       }
     }
-    if (!_disposed && mounted && myRound == _round) {
-      unawaited(_startOffer());
-    }
+    if (mounted && myRound == _round) unawaited(_startOffer());
   }
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (_svg != null)
-          Container(
+    final svg = _svg;
+    final code = _code;
+    final qr = svg == null
+        ? null
+        : Container(
             width: 176,
             height: 176,
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
               color: const Color(0xFFFFFFFF),
               borderRadius: BorderRadius.circular(16),
-              boxShadow: const [BoxShadow(color: Color.fromRGBO(0, 0, 0, 0.35), blurRadius: 18, offset: Offset(0, 6))],
             ),
-            child: SvgPicture.string(_svg!, fit: BoxFit.contain),
-          )
-        else
-          const SkeletonBox(width: 176, height: 176, borderRadius: 16),
-        const SizedBox(width: 20),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Scan with Veylo on your phone or tablet', style: VeyloText.ui(15.5, weight: 650)),
-              const SizedBox(height: 5),
-              Text(
-                'Open Settings → Account → Scan QR code, verify the code below matches, and approve to transfer your account and E2EE key.',
-                style: VeyloText.ui(13.5, weight: 400, height: 1.45, color: VeyloColors.dust),
-              ),
-              if (_checkCode != null) ...[
-                const SizedBox(height: 10),
-                _StatusPill(label: 'Verification code: $_checkCode', icon: 'Check', tone: 'ok'),
-              ],
-              if (_problem != null) ...[
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    const VeyloIcon('Alert', size: 15, color: Color(0xFFFFD2C8)),
-                    const SizedBox(width: 6),
-                    Expanded(child: Text(_problem!, style: VeyloText.ui(13, weight: 500, color: const Color(0xFFFFD2C8)))),
-                  ],
-                ),
-              ],
-              const SizedBox(height: 14),
-              VeyloPill(
-                label: _loading ? 'Generating…' : 'New code',
-                icon: 'Refresh',
-                small: true,
-                disabled: _loading,
-                onTap: () => unawaited(_startOffer()),
-              ),
-            ],
+            child: SvgPicture.string(svg, fit: BoxFit.contain),
+          );
+    final details = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'On a signed-in device, open Settings → Account → Sign in another device. Enter or scan this code and confirm the verification code matches.',
+          style: VeyloText.ui(13.5, weight: 400, height: 1.45, color: VeyloColors.dust),
+        ),
+        if (_checkCode != null) ...[
+          const SizedBox(height: 10),
+          _StatusPill(
+            label: 'Verification code: $_checkCode',
+            icon: 'Check',
+            tone: 'ok',
           ),
+        ],
+        if (code != null && _showCode) ...[
+          const SizedBox(height: 10),
+          Text(code, style: VeyloText.ui(13.5, weight: 500)),
+        ],
+        if (_problem != null) ...[
+          const SizedBox(height: 10),
+          Text(
+            _problem!,
+            style: VeyloText.ui(13, weight: 500, color: const Color(0xFFFFD2C8)),
+          ),
+        ],
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            if (code != null)
+              _AccountPill(
+                label: _showCode ? 'Hide sign-in code' : 'Show sign-in code',
+                onTap: () => setState(() => _showCode = !_showCode),
+              ),
+            if (code != null && _showCode)
+              _AccountPill(
+                label: 'Copy code',
+                onTap: () async {
+                  try {
+                    await Clipboard.setData(ClipboardData(text: code));
+                    if (context.mounted) {
+                      AppStateScope.read(context).showToast('Sign-in code copied.');
+                    }
+                  } catch (_) {
+                    if (context.mounted) {
+                      AppStateScope.read(context).showToast(
+                        "Couldn't copy the sign-in code.",
+                        isError: true,
+                      );
+                    }
+                  }
+                },
+              ),
+            _AccountPill(
+              label: _loading ? 'Generating…' : 'New code',
+              icon: 'Refresh',
+              disabled: _loading,
+              onTap: () => unawaited(_startOffer()),
+            ),
+          ],
         ),
       ],
+    );
+    if (qr == null) return details;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 440) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [qr, const SizedBox(height: 16), details],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [qr, const SizedBox(width: 20), Expanded(child: details)],
+        );
+      },
     );
   }
 }

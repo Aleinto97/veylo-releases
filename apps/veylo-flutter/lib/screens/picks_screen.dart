@@ -262,6 +262,7 @@ class _PicksScreenState extends State<PicksScreen> {
     final app = AppStateScope.read(context);
     final size = MediaQuery.sizeOf(context);
     final gutter = VeyloLayout.gutter(size.width);
+    final insets = MediaQuery.viewPaddingOf(context);
     final d = _data;
 
     final votes = (d?['votes'] as num?)?.toInt() ?? 0;
@@ -317,7 +318,7 @@ class _PicksScreenState extends State<PicksScreen> {
         fit: StackFit.expand,
         children: [
           Padding(
-            padding: EdgeInsets.fromLTRB(gutter, 88, gutter, 18),
+            padding: EdgeInsets.fromLTRB(gutter, 88, gutter, 18) + insets,
             child: Column(
               children: [
                 // duel-bar
@@ -662,17 +663,22 @@ class _PicksScreenState extends State<PicksScreen> {
                 child: const ColoredBox(color: Color(0x01000000)),
               ),
             ),
-          if (_slot == _PicksSlot.mood)
+          if (_slot != null)
             Positioned(
-              right: gutter,
-              top: 158,
-              child: LiftIn(offsetY: -6, duration: const Duration(milliseconds: 180), child: _buildMoodPopover(app, moods)),
-            ),
-          if (_slot == _PicksSlot.filters)
-            Positioned(
-              right: gutter,
-              top: 158,
-              child: LiftIn(offsetY: -6, duration: const Duration(milliseconds: 180), child: _buildFiltersPopover(app)),
+              left: gutter + insets.left,
+              right: gutter + insets.right,
+              top: 158 + insets.top,
+              bottom: 18 + insets.bottom,
+              child: Align(
+                alignment: Alignment.topRight,
+                child: LiftIn(
+                  offsetY: -6,
+                  duration: const Duration(milliseconds: 180),
+                  child: _slot == _PicksSlot.mood
+                      ? _buildMoodPopover(app, moods)
+                      : _buildFiltersPopover(app),
+                ),
+              ),
             ),
         ],
       ),

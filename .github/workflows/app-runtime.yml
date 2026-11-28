@@ -89,6 +89,10 @@ jobs:
           PY=$(command -v python3 || command -v python)
           "$PY" ../../tools/picks-ai/fetch.py ${{ matrix.picks }}
       - name: Build the Rust core
+        env:
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
         run: cd rust && cargo build --release --locked
       - uses: actions/download-artifact@v4
         with:
@@ -200,6 +204,10 @@ jobs:
       - name: Fetch Picks AI assets (Android)
         run: python3 ../../tools/picks-ai/fetch.py android-arm64 android-armv7 android-x86_64
       - name: Build the Rust core for the emulator (x86_64) into jniLibs
+        env:
+          VEYLO_FIREBASE_API_KEY: ${{ secrets.VEYLO_FIREBASE_API_KEY }}
+          VEYLO_FIREBASE_PROJECT: ${{ secrets.VEYLO_FIREBASE_PROJECT }}
+          VEYLO_GOOGLE_WEB_CLIENT: ${{ secrets.VEYLO_GOOGLE_WEB_CLIENT }}
         run: |
           cargo install cargo-ndk --locked >/dev/null 2>&1 || true
           cd rust && ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" \
@@ -221,11 +229,52 @@ jobs:
           ram-size: 4096M
           disk-size: 6000M
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
+          disable-animations: ${{ matrix.target != 'android-tv' }}
           working-directory: apps/veylo-flutter
-          script: |
-            adb reverse tcp:8765 tcp:8765
-            timeout 1800 flutter drive --profile --no-enable-impeller --driver=test_driver/integration_test.dart --target=integration_test/runtime_test.dart -d emulator-5554 $RUNTIME_DEFINES --dart-define=VEYLO_TARGET=${{ matrix.target }} || { adb devices; adb logcat -d -b crash | tail -150; adb logcat -d | grep -E " (DEBUG|libc|AndroidRuntime|lowmemorykiller|ActivityManager)" | grep -iE "veylo|fatal|signal|backtrace|#[0-9]{2} pc|abort|died|kill" | tail -120; exit 1; }
+          # The action runs each input line in a separate shell, so fold this into one command.
+          script: >-
+            bash -o pipefail -c '
+            serial="emulator-${EMULATOR_PORT:-5554}";
+            wait_for_emulator() {
+            local deadline=$((SECONDS + 180)) state;
+            while (( SECONDS < deadline )); do
+            state=$(timeout 5 adb -s "$serial" get-state 2>&1) || true;
+            if [[ "$state" == *offline* ]]; then
+            timeout 5 adb -s "$serial" reconnect offline || true;
+            fi;
+            if timeout 5 adb -s "$serial" wait-for-device &&
+            [[ $(timeout 5 adb -s "$serial" shell getprop sys.boot_completed | tr -d "\r") == 1 ]] &&
+            timeout 5 adb -s "$serial" shell pm path android | grep -q "^package:"; then
+            sleep 3;
+            if timeout 5 adb -s "$serial" reverse tcp:8765 tcp:8765; then return 0; fi;
+            fi;
+            sleep 2;
+            done;
+            echo "Emulator $serial did not become ready" >&2;
+            return 1;
+            };
+            read -r -a runtime_defines <<< "$RUNTIME_DEFINES";
+            drive_log=$(mktemp) || exit 1;
+            trap "rm -f -- \"$drive_log\"" EXIT;
+            drive() {
+            timeout 1800 flutter drive --profile --no-enable-impeller --driver=test_driver/integration_test.dart
+            --target=integration_test/runtime_test.dart -d "$serial" "${runtime_defines[@]}"
+            --dart-define=VEYLO_TARGET=${{ matrix.target }} 2>&1 | tee "$drive_log";
+            };
+            wait_for_emulator || exit 1;
+            if drive; then exit 0; else status=$?; fi;
+            if ! grep -Eq "(^|[[:space:]])RUNTIME[[:space:]]+(ok|FAIL)([[:space:]]|$)" "$drive_log" &&
+            grep -Eiq "device([[:space:]]+[^[:space:]]+)?[[:space:]]+offline|service has disappeared" "$drive_log"; then
+            echo "Emulator connection dropped before the first runtime result. Retrying once.";
+            if wait_for_emulator; then
+            if drive; then exit 0; else status=$?; fi;
+            fi;
+            fi;
+            timeout 10 adb devices;
+            timeout 10 adb -s "$serial" logcat -d -b crash | tail -150;
+            timeout 10 adb -s "$serial" logcat -d | grep -E " (DEBUG|libc|AndroidRuntime|lowmemorykiller|ActivityManager)" | grep -iE "veylo|fatal|signal|backtrace|#[0-9]{2} pc|abort|died|kill" | tail -120;
+            exit "$status";
+            '
       - name: Upload debug symbols to Sentry
         if: always() && env.SENTRY_AUTH_TOKEN != ''
         run: |

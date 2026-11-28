@@ -7,39 +7,87 @@ import '../theme/veylo_theme.dart';
 import 'glass.dart';
 import 'veylo_icons.dart';
 
-/// Exact 84px Veylo top bar (.topbar) with 32px feathered scroll smoke below (.topbar::before),
-/// physically sliding glass pill inside .dock, and animated LastPlayed ring pill.
-class VeyloTopBar extends StatelessWidget {
+const _barHeight = 84.0;
+const _smokeHeight = 32.0;
+const _dockPadding = 5.0;
+const _dockGap = 4.0;
+const _controlGap = 12.0;
+const _wordmarkGap = 20.0;
+const _iconSize = 22.0;
+const _labelGap = 8.0;
+const _labelLeft = 13.0;
+const _labelRight = 16.0;
+const _lastLeft = 4.0;
+const _lastCompactRight = 4.0;
+const _lastTextRight = 18.0;
+const _lastTextGap = 12.0;
+const _lastMaxWidth = 280.0;
+const _upgradeMargin = 12.0;
+
+TextStyle get _dockLabelStyle => VeyloText.ui(15, weight: 650, height: 1);
+TextStyle get _lastTitleStyle => VeyloText.ui(15, weight: 650, height: 1.15);
+TextStyle get _lastLineStyle => VeyloText.ui(
+  12.5,
+  weight: 500,
+  color: const Color.fromRGBO(255, 255, 255, 0.58),
+  tabular: true,
+  height: 1.15,
+);
+
+String _lastPlayedLine(MediaItem media) {
+  if (media.inProgress) {
+    final line = media.resumeContext;
+    return line.isNotEmpty && line != 'In progress' ? line : 'Carry on';
+  }
+  if (media.kind == 'movie') return 'Watch again';
+  return media.videoWatched ? 'Next episode' : 'Carry on';
+}
+
+enum _DockMode {
+  icons,
+  active,
+  hover,
+  hoverAndLastPlayed;
+
+  bool get showsActive => this != icons;
+  bool get expandsOnHover => index >= hover.index;
+}
+
+class VeyloTopBar extends StatefulWidget {
   const VeyloTopBar({super.key});
+
+  @override
+  State<VeyloTopBar> createState() => _VeyloTopBarState();
+}
+
+class _VeyloTopBarState extends State<VeyloTopBar> {
+  _DockMode? _mode;
+  bool? _showWordmark;
 
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.of(context);
-    final width = MediaQuery.sizeOf(context).width;
-    final gutter = VeyloLayout.gutter(width);
-    final compact = width <= 760;
-    // Four dock tabs, Last Played and both shortcuts share this width.
-    // The dock and the three trailing controls use 54 px for padding and gaps.
-    final controlSize = compact ? ((width - 2 * gutter - 54) / 7).clamp(32.0, 48.0) : 48.0;
+    final insets = MediaQuery.viewPaddingOf(context);
 
     return SizedBox(
-      height: 116, // 84px bar + 32px feathered scroll smoke extension (base.css:133-147)
+      height: insets.top + _barHeight + _smokeHeight,
       child: Stack(
         fit: StackFit.expand,
         children: [
           // Top resting gradient (.topbar)
-          const Positioned(
+          Positioned(
             top: 0,
             left: 0,
             right: 0,
-            height: 84,
+            height: insets.top + _barHeight,
             child: IgnorePointer(
               child: DecoratedBox(
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
-                    colors: [Color.fromRGBO(0, 0, 0, 0.55), Color(0x00000000)],
+                    stops: [insets.top / (insets.top + _barHeight), 1],
+                    colors: const [Color.fromRGBO(0, 0, 0, 0.55), Color(0x00000000)],
                   ),
                 ),
               ),
@@ -65,7 +113,7 @@ class VeyloTopBar extends StatelessWidget {
                       top: 0,
                       left: 0,
                       right: 0,
-                      height: 70,
+                      height: insets.top + 70,
                       child: ClipRect(
                         child: BackdropFilter(
                           filter: ImageFilter.compose(
@@ -77,7 +125,7 @@ class VeyloTopBar extends StatelessWidget {
                       ),
                     ),
                     Positioned(
-                      top: 70,
+                      top: insets.top + 70,
                       left: 0,
                       right: 0,
                       height: 22,
@@ -89,7 +137,7 @@ class VeyloTopBar extends StatelessWidget {
                       ),
                     ),
                     Positioned(
-                      top: 92,
+                      top: insets.top + 92,
                       left: 0,
                       right: 0,
                       height: 24,
@@ -100,13 +148,18 @@ class VeyloTopBar extends StatelessWidget {
                         ),
                       ),
                     ),
-                    const DecoratedBox(
+                    DecoratedBox(
                       decoration: BoxDecoration(
                         gradient: LinearGradient(
                           begin: Alignment.topCenter,
                           end: Alignment.bottomCenter,
-                          stops: [0.0, 0.58, 1.0],
-                          colors: [
+                          stops: [
+                            0.0,
+                            (insets.top + 0.58 * (_barHeight + _smokeHeight)) /
+                                (insets.top + _barHeight + _smokeHeight),
+                            1.0,
+                          ],
+                          colors: const [
                             Color.fromRGBO(0, 0, 0, 0.78),
                             Color.fromRGBO(0, 0, 0, 0.52),
                             Color(0x00000000),
@@ -120,88 +173,21 @@ class VeyloTopBar extends StatelessWidget {
             ),
           ),
 
-          // Foreground 84px controls row in its own BackdropGroup
           Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            height: 84,
+            top: insets.top,
+            left: insets.left,
+            right: insets.right,
+            height: _barHeight,
             child: BackdropGroup(
-              child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: gutter),
-                child: Row(
-                  children: [
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 190),
-                      switchInCurve: VeyloCurves.out,
-                      switchOutCurve: Curves.easeIn,
-                      transitionBuilder: (child, anim) => FadeTransition(
-                        opacity: anim,
-                        child: ScaleTransition(
-                          scale: Tween<double>(begin: 0.94, end: 1.0).animate(anim),
-                          child: child,
-                        ),
-                      ),
-                      child: app.openedTitle != null
-                          ? KeyedSubtree(
-                              key: const ValueKey('topbar-back'),
-                              child: VeyloOrb(
-                                icon: 'ArrowLeft',
-                                tooltip: 'Back (Esc)',
-                                onTap: app.closeTitle,
-                              ),
-                            )
-                          : Row(
-                              key: const ValueKey('topbar-dock'),
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (!compact) ...[
-                                  const Text('Veylo', style: VeyloText.wordmark),
-                                  const SizedBox(width: 20),
-                                ],
-                                ValueListenableBuilder<int>(
-                                  valueListenable: app.addonUpdatesNotifier,
-                                  builder: (_, updates, _) => _SlidingDock(
-                                    activeTab: app.tab,
-                                    compact: compact,
-                                    controlSize: controlSize,
-                                    addonUpdates: updates,
-                                    onSelect: app.setTab,
-                                  ),
-                                ),
-                              ],
-                            ),
-                    ),
-                    const Spacer(),
-                    ValueListenableBuilder<SeenItem?>(
-                      valueListenable: app.lastPlayedNotifier,
-                      builder: (_, last, _) {
-                        if (last == null) return const SizedBox.shrink();
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 12),
-                          child: _LastPlayedPill(
-                            key: ValueKey(last.media.key),
-                            seen: last,
-                            compact: compact,
-                            controlSize: controlSize,
-                          ),
-                        );
-                      },
-                    ),
-                    VeyloOrb(
-                      size: controlSize,
-                      icon: 'Keyboard',
-                      tooltip: 'Page shortcuts (?)',
-                      onTap: () => app.setShortcutsOpen(true),
-                    ),
-                    const SizedBox(width: 12),
-                    VeyloOrb(
-                      size: controlSize,
-                      icon: 'Search',
-                      tooltip: 'Search (Ctrl+K)',
-                      onTap: () => app.openSearch(),
-                    ),
-                  ],
+              child: ValueListenableBuilder<SeenItem?>(
+                valueListenable: app.lastPlayedNotifier,
+                builder: (context, last, _) => LayoutBuilder(
+                  builder: (context, constraints) => _buildControls(
+                    context,
+                    app,
+                    last,
+                    constraints.maxWidth,
+                  ),
                 ),
               ),
             ),
@@ -210,21 +196,210 @@ class VeyloTopBar extends StatelessWidget {
       ),
     );
   }
+
+  Widget _buildControls(
+    BuildContext context,
+    AppState app,
+    SeenItem? last,
+    double width,
+  ) {
+    final tabs = VeyloTab.values;
+    final dockChrome = 2 * _dockPadding + (tabs.length - 1) * _dockGap;
+    final trailingChrome = _controlGap * 2 + _lastLeft + _lastCompactRight;
+    // Keep the existing phone control sizes where possible. Use up the gutters
+    // before shrinking below 32 px on a viewport reduced by display cutouts.
+    final preferredMinimum = dockChrome + trailingChrome + (tabs.length + 3) * 32;
+    final gutter = VeyloLayout.gutter(width).clamp(
+      0.0,
+      math.max(0.0, (width - preferredMinimum) / 2),
+    ).toDouble();
+    final available = width - 2 * gutter;
+    final controlSize = ((available - dockChrome - trailingChrome) /
+            (tabs.length + 3))
+        .clamp(0.0, 48.0);
+    final style = DefaultTextStyle.of(context).style;
+    final scaler = MediaQuery.textScalerOf(context);
+    final boldText = MediaQuery.boldTextOf(context);
+    final locale = Localizations.maybeLocaleOf(context);
+    final direction = Directionality.of(context);
+    double measure(String text, TextStyle textStyle) {
+      final effectiveStyle = style.merge(textStyle);
+      final painter = TextPainter(
+        text: TextSpan(
+          text: text,
+          style: boldText ? effectiveStyle.copyWith(fontWeight: FontWeight.bold) : effectiveStyle,
+        ),
+        maxLines: 1,
+        textScaler: scaler,
+        locale: locale,
+        textDirection: direction,
+      )..layout();
+      final width = painter.width.ceilToDouble();
+      painter.dispose();
+      return width;
+    }
+
+    final labelWidths = [
+      for (final tab in tabs)
+        math.max(
+          0.0,
+          _labelLeft + _iconSize + _labelGap + measure(tab.title, _dockLabelStyle) +
+              _labelRight - controlSize,
+        ),
+    ];
+    final activeExtra = labelWidths[app.tab.index];
+    final hoverExtra = [
+      for (final tab in tabs)
+        if (tab != app.tab) labelWidths[tab.index],
+    ].reduce(math.max);
+    final iconDock = dockChrome + tabs.length * controlSize;
+    final lastIconWidth = controlSize + _lastLeft + _lastCompactRight;
+    final lastTextWidth = last == null
+        ? 0.0
+        : math.min(
+            _lastMaxWidth,
+            controlSize + _lastLeft + _lastTextRight + _lastTextGap +
+                math.max(
+                  measure(last.media.name, _lastTitleStyle),
+                  measure(_lastPlayedLine(last.media), _lastLineStyle),
+                ),
+          );
+    final trailingWidth = 2 * controlSize + _controlGap +
+        (last == null ? 0 : _controlGap + lastIconWidth);
+    final needs = [
+      iconDock + trailingWidth,
+      iconDock + trailingWidth + activeExtra,
+      iconDock + trailingWidth + activeExtra + hoverExtra,
+      iconDock + trailingWidth + activeExtra + hoverExtra +
+          (last == null ? 0 : lastTextWidth - lastIconWidth),
+    ];
+    final previous = _mode;
+    final mode = _DockMode.values.reversed.firstWhere(
+      (mode) =>
+          available >= needs[mode.index] +
+              (previous != null && mode.index > previous.index
+                  ? _upgradeMargin
+                  : 0),
+      orElse: () => _DockMode.icons,
+    );
+    _mode = mode;
+
+    final wordmarkWidth = measure('Veylo', VeyloText.wordmark) + _wordmarkGap;
+    final showWordmark = mode == _DockMode.hoverAndLastPlayed &&
+        available >= needs[mode.index] + wordmarkWidth +
+            (_showWordmark == false ? _upgradeMargin : 0);
+    _showWordmark = showWordmark;
+    final dockWidth = iconDock + (mode.showsActive ? activeExtra : 0) +
+        (mode.expandsOnHover ? hoverExtra : 0);
+
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: gutter),
+      child: Row(
+        textDirection: TextDirection.ltr,
+        children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 190),
+                switchInCurve: VeyloCurves.out,
+                switchOutCurve: Curves.easeIn,
+                layoutBuilder: (current, previous) => Stack(
+                  alignment: Alignment.centerLeft,
+                  children: [...previous, ?current],
+                ),
+                transitionBuilder: (child, anim) => FadeTransition(
+                  opacity: anim,
+                  child: ScaleTransition(
+                    scale: Tween<double>(begin: 0.94, end: 1.0).animate(anim),
+                    child: child,
+                  ),
+                ),
+                child: app.openedTitle != null
+                    ? VeyloOrb(
+                        key: const ValueKey('topbar-back'),
+                        icon: 'ArrowLeft',
+                        tooltip: 'Back (Esc)',
+                        onTap: app.closeTitle,
+                      )
+                    : Row(
+                        key: const ValueKey('topbar-dock'),
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (showWordmark) ...[
+                            const Text('Veylo', style: VeyloText.wordmark),
+                            const SizedBox(width: _wordmarkGap),
+                          ],
+                          Flexible(
+                            child: ValueListenableBuilder<int>(
+                              valueListenable: app.addonUpdatesNotifier,
+                              builder: (_, updates, _) => _SlidingDock(
+                                activeTab: app.tab,
+                                mode: mode,
+                                dockWidth: dockWidth,
+                                controlSize: controlSize,
+                                labelWidths: labelWidths,
+                                addonUpdates: updates,
+                                onSelect: app.setTab,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+              ),
+            ),
+          ),
+          if (last != null) ...[
+            KeyedSubtree(
+              key: const ValueKey('topbar-last-played'),
+              child: _LastPlayedPill(
+                key: ValueKey(last.media.key),
+                seen: last,
+                showText: mode == _DockMode.hoverAndLastPlayed,
+                width: mode == _DockMode.hoverAndLastPlayed ? lastTextWidth : lastIconWidth,
+                controlSize: controlSize,
+              ),
+            ),
+            const SizedBox(width: _controlGap),
+          ],
+          VeyloOrb(
+            key: const ValueKey('topbar-shortcuts'),
+            size: controlSize,
+            icon: 'Keyboard',
+            tooltip: 'Page shortcuts (?)',
+            onTap: () => app.setShortcutsOpen(true),
+          ),
+          const SizedBox(width: _controlGap),
+          VeyloOrb(
+            key: const ValueKey('topbar-search'),
+            size: controlSize,
+            icon: 'Search',
+            tooltip: 'Search (Ctrl+K)',
+            onTap: () => app.openSearch(),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-/// Glass navigation dock with a physically gliding `.slider` pill matching motion.css:9-17.
+/// The hover widths and sliding glass use the same tab positions on every frame.
 class _SlidingDock extends StatefulWidget {
   const _SlidingDock({
     required this.activeTab,
-    required this.compact,
+    required this.mode,
+    required this.dockWidth,
     required this.controlSize,
+    required this.labelWidths,
     required this.addonUpdates,
     required this.onSelect,
   });
 
   final VeyloTab activeTab;
-  final bool compact;
+  final _DockMode mode;
+  final double dockWidth;
   final double controlSize;
+  final List<double> labelWidths;
   final int addonUpdates;
   final ValueChanged<VeyloTab> onSelect;
 
@@ -232,108 +407,182 @@ class _SlidingDock extends StatefulWidget {
   State<_SlidingDock> createState() => _SlidingDockState();
 }
 
-class _SlidingDockState extends State<_SlidingDock> {
-  final GlobalKey _rowKey = GlobalKey();
-  final Map<VeyloTab, GlobalKey> _tabKeys = {for (final t in VeyloTab.values) t: GlobalKey()};
-  double _sliderLeft = 0;
-  double _sliderWidth = 48;
-  bool _measured = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
-  }
+class _SlidingDockState extends State<_SlidingDock>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _layout = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 220),
+    value: 1,
+  );
+  final _caption = OverlayPortalController()..show();
+  final _captionLinks = [for (final _ in VeyloTab.values) LayerLink()];
+  VeyloTab? _hovered;
+  VeyloTab? _focused;
+  VeyloTab? _expanded;
+  VeyloTab? get _highlighted => _hovered ?? _focused;
+  List<double> _previous = List.filled(VeyloTab.values.length, 0.0);
 
   @override
   void didUpdateWidget(covariant _SlidingDock oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.activeTab != widget.activeTab ||
-        oldWidget.compact != widget.compact ||
-        oldWidget.controlSize != widget.controlSize) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _measure());
-    }
-  }
-
-  bool _instant = false;
-
-  /// A hovered tab opens its label (AnimatedSize, 220 ms), which shifts the tabs after it: keep
-  /// the active pill glued to its tab on every frame of that animation.
-  void _followLayout() {
-    var frames = 0;
-    void tick(Duration _) {
-      if (!mounted) return;
-      _instant = true;
-      _measure();
-      if (++frames < 20) {
-        WidgetsBinding.instance.addPostFrameCallback(tick);
-        WidgetsBinding.instance.scheduleFrame();
-      } else {
-        _instant = false;
-      }
-    }
-    WidgetsBinding.instance.addPostFrameCallback(tick);
-    WidgetsBinding.instance.scheduleFrame();
-  }
-
-  void _measure() {
-    if (!mounted) return;
-    final rowBox = _rowKey.currentContext?.findRenderObject() as RenderBox?;
-    final tabBox = _tabKeys[widget.activeTab]?.currentContext?.findRenderObject() as RenderBox?;
-    if (rowBox == null || tabBox == null || !rowBox.hasSize || !tabBox.hasSize) return;
-    final pos = tabBox.localToGlobal(Offset.zero, ancestor: rowBox);
-    if ((pos.dx - _sliderLeft).abs() > 0.5 || (tabBox.size.width - _sliderWidth).abs() > 0.5 || !_measured) {
-      setState(() {
-        _sliderLeft = pos.dx;
-        _sliderWidth = tabBox.size.width;
-        _measured = true;
-      });
+    if (oldWidget.mode != widget.mode || oldWidget.activeTab != widget.activeTab) {
+      _expanded = _highlighted;
+      _layout.value = 1;
     }
   }
 
   @override
+  void dispose() {
+    _layout.dispose();
+    super.dispose();
+  }
+
+  double _hoverFraction(VeyloTab tab) => lerpDouble(
+    _previous[tab.index],
+    _expanded == tab ? 1 : 0,
+    Curves.easeOutCubic.transform(_layout.value),
+  )!;
+
+  void _followLayout() {
+    if (_expanded == _highlighted) return;
+    _previous = [for (final tab in VeyloTab.values) _hoverFraction(tab)];
+    _expanded = _highlighted;
+    _layout.forward(from: 0);
+  }
+
+  void _hover(VeyloTab? tab) {
+    if (tab == _hovered) return;
+    setState(() {
+      _hovered = tab;
+      _followLayout();
+    });
+  }
+
+  void _focus(VeyloTab tab, bool focused) {
+    setState(() {
+      if (focused) {
+        _hovered = null;
+        _focused = tab;
+      } else if (_focused == tab) {
+        _focused = null;
+      }
+      _followLayout();
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return GlassBox(
-      borderRadius: 30,
-      padding: const EdgeInsets.all(5),
-      child: Stack(
-        children: [
-          if (_measured)
-            AnimatedPositioned(
-              duration: _instant ? Duration.zero : const Duration(milliseconds: 260),
-              curve: VeyloCurves.slider,
-              left: _sliderLeft,
-              top: 0,
-              width: _sliderWidth,
-              height: widget.controlSize,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: const Color.fromRGBO(255, 255, 255, 0.14),
-                  borderRadius: BorderRadius.circular(24),
-                  border: const Border(top: BorderSide(color: Color.fromRGBO(255, 255, 255, 0.18), width: 1)),
+    const tabs = VeyloTab.values;
+    final highlighted = _highlighted;
+    final showCaption = highlighted != null &&
+        !widget.mode.expandsOnHover &&
+        !(widget.mode.showsActive && highlighted == widget.activeTab);
+
+    return OverlayPortal(
+      controller: _caption,
+      overlayChildBuilder: (context) => showCaption
+          ? UnconstrainedBox(
+              alignment: Alignment.topLeft,
+              child: CompositedTransformFollower(
+                link: _captionLinks[highlighted.index],
+                showWhenUnlinked: false,
+                targetAnchor: Alignment.bottomCenter,
+                followerAnchor: Alignment.topCenter,
+                offset: const Offset(0, 10),
+                child: IgnorePointer(
+                  child: ExcludeSemantics(
+                    child: GlassBox(
+                      strong: true,
+                      borderRadius: 12,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                      child: Text(highlighted.title, style: _dockLabelStyle),
+                    ),
+                  ),
+                ),
+              ),
+            )
+          : const SizedBox.shrink(),
+      child: AnimatedBuilder(
+        animation: _layout,
+        builder: (context, _) {
+          final fractions = [
+            for (final tab in tabs)
+              if (widget.activeTab == tab)
+                widget.mode.showsActive ? 1.0 : 0.0
+              else
+                widget.mode.expandsOnHover ? _hoverFraction(tab) : 0.0,
+          ];
+          final widths = [
+            for (final tab in tabs)
+              widget.controlSize + widget.labelWidths[tab.index] * fractions[tab.index],
+          ];
+          var left = 0.0;
+          final offsets = <double>[];
+          for (final width in widths) {
+            offsets.add(left);
+            left += width + _dockGap;
+          }
+          final active = widget.activeTab.index;
+
+          return MouseRegion(
+            onExit: (_) => _hover(null),
+            onHover: (event) {
+              final x = event.localPosition.dx - _dockPadding;
+              final tab = tabs.where((tab) =>
+                  x >= offsets[tab.index] &&
+                  x < offsets[tab.index] + widths[tab.index]).firstOrNull;
+              _hover(tab);
+            },
+            child: SizedBox(
+              width: widget.dockWidth,
+              child: GlassBox(
+                borderRadius: 30,
+                padding: const EdgeInsets.all(_dockPadding),
+                child: SizedBox(
+                  height: widget.controlSize,
+                  child: Stack(
+                    children: [
+                      AnimatedPositioned(
+                        duration: _layout.isAnimating ? Duration.zero : const Duration(milliseconds: 260),
+                        curve: VeyloCurves.slider,
+                        left: offsets[active],
+                        top: 0,
+                        width: widths[active],
+                        height: widget.controlSize,
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: const Color.fromRGBO(255, 255, 255, 0.14),
+                            borderRadius: BorderRadius.circular(24),
+                            border: const Border(top: BorderSide(color: Color.fromRGBO(255, 255, 255, 0.18))),
+                          ),
+                        ),
+                      ),
+                      for (final tab in tabs)
+                        Positioned(
+                          left: offsets[tab.index],
+                          width: widths[tab.index],
+                          top: 0,
+                          bottom: 0,
+                          child: _DockTab(
+                            key: ValueKey('dock-tab-${tab.name}'),
+                            tab: tab,
+                            active: tab == widget.activeTab,
+                            highlighted: tab == highlighted,
+                            labelFraction: fractions[tab.index],
+                            controlSize: widget.controlSize,
+                            captionLink: _captionLinks[tab.index],
+                            hasDot: tab == VeyloTab.settings && widget.addonUpdates > 0,
+                            onFocus: (focused) => _focus(tab, focused),
+                            onTap: () => widget.onSelect(tab),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
-          Row(
-            key: _rowKey,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (int i = 0; i < VeyloTab.values.length; i++) ...[
-                if (i > 0) const SizedBox(width: 4),
-                _DockTab(
-                  key: _tabKeys[VeyloTab.values[i]],
-                  tab: VeyloTab.values[i],
-                  active: widget.activeTab == VeyloTab.values[i],
-                  compact: widget.compact,
-                  controlSize: widget.controlSize,
-                  hasDot: VeyloTab.values[i] == VeyloTab.settings && widget.addonUpdates > 0,
-                  onTap: () => widget.onSelect(VeyloTab.values[i]),
-                  onHoverChanged: _followLayout,
-                ),
-              ],
-            ],
-          ),
-        ],
+          );
+        },
       ),
     );
   }
@@ -344,133 +593,119 @@ class _DockTab extends StatefulWidget {
     super.key,
     required this.tab,
     required this.active,
-    required this.compact,
+    required this.highlighted,
+    required this.labelFraction,
     required this.controlSize,
+    required this.captionLink,
     required this.hasDot,
+    required this.onFocus,
     required this.onTap,
-    this.onHoverChanged,
   });
 
   final VeyloTab tab;
   final bool active;
-  final bool compact;
+  final bool highlighted;
+  final double labelFraction;
   final double controlSize;
+  final LayerLink captionLink;
   final bool hasDot;
+  final ValueChanged<bool> onFocus;
   final VoidCallback onTap;
-  final VoidCallback? onHoverChanged;
 
   @override
   State<_DockTab> createState() => _DockTabState();
 }
 
 class _DockTabState extends State<_DockTab> {
-  bool _hovered = false;
   bool _pressed = false;
 
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
-    final fg = (widget.active || _hovered) ? VeyloColors.bone : VeyloColors.dust;
+    final fg = widget.active || widget.highlighted ? VeyloColors.bone : VeyloColors.dust;
+    final iconSize = math.min(_iconSize, widget.controlSize);
+    final left = lerpDouble(
+      (widget.controlSize - iconSize) / 2,
+      _labelLeft,
+      widget.labelFraction,
+    )!;
 
-    final showLabel = (widget.active || _hovered) && !widget.compact;
-    final tab = MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) {
-          setState(() => _hovered = true);
-          widget.onHoverChanged?.call();
-        },
-        onExit: (_) {
-          setState(() {
-            _hovered = false;
-            _pressed = false;
-          });
-          widget.onHoverChanged?.call();
-        },
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTapDown: (_) => setState(() => _pressed = true),
-          onTapUp: (_) => setState(() => _pressed = false),
-          onTapCancel: () => setState(() => _pressed = false),
-          onTap: widget.onTap,
-          child: AnimatedScale(
-            scale: _pressed ? 0.92 : 1.0,
-            duration: Duration(milliseconds: _pressed ? 60 : 180),
-            curve: VeyloCurves.out,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  curve: VeyloCurves.out,
-                  height: widget.controlSize,
-                  constraints: BoxConstraints(minWidth: widget.controlSize),
-                  // Hovering an inactive tab lights the whole tab (icon + label), not just the icon.
-                  decoration: BoxDecoration(
-                    color: _hovered && !widget.active ? const Color.fromRGBO(255, 255, 255, 0.07) : const Color(0x00FFFFFF),
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  padding: EdgeInsets.only(
-                    left: showLabel ? 13 : (widget.controlSize - 22) / 2,
-                    right: showLabel ? 16 : (widget.controlSize - 22) / 2,
-                  ),
-                  child: TweenAnimationBuilder<Color?>(
-                    tween: ColorTween(end: fg),
-                    duration: const Duration(milliseconds: 180),
-                    curve: VeyloCurves.out,
-                    builder: (_, animFg, _) {
-                      final c = animFg ?? fg;
-                      return Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          VeyloIcon(widget.tab.iconName, size: 22, color: c),
-                          AnimatedSize(
-                            duration: const Duration(milliseconds: 220),
-                            curve: VeyloCurves.slider,
-                            alignment: Alignment.centerLeft,
-                            child: showLabel
-                                ? AnimatedOpacity(
-                                    opacity: 1.0,
-                                    duration: const Duration(milliseconds: 200),
-                                    curve: VeyloCurves.out,
-                                    child: Padding(
-                                      padding: const EdgeInsets.only(left: 8),
-                                      child: Text(
-                                        widget.tab.title,
-                                        style: VeyloText.ui(15, weight: 650, color: c, height: 1.0),
-                                      ),
-                                    ),
-                                  )
-                                : const SizedBox.shrink(),
-                          ),
-                        ],
-                      );
-                    },
-                  ),
+    return CompositedTransformTarget(
+      link: widget.captionLink,
+      child: Semantics(
+        label: widget.tab.title,
+        button: true,
+        selected: widget.active,
+        child: FocusableActionDetector(
+          mouseCursor: SystemMouseCursors.click,
+          onShowFocusHighlight: widget.onFocus,
+          actions: {
+            ActivateIntent: CallbackAction<ActivateIntent>(onInvoke: (_) => widget.onTap()),
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (_) => setState(() => _pressed = true),
+            onTapUp: (_) => setState(() => _pressed = false),
+            onTapCancel: () => setState(() => _pressed = false),
+            onTap: widget.onTap,
+            child: AnimatedScale(
+              scale: _pressed ? 0.92 : 1.0,
+              duration: Duration(milliseconds: _pressed ? 60 : 180),
+              curve: VeyloCurves.out,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                decoration: BoxDecoration(
+                  color: widget.highlighted && !widget.active
+                      ? const Color.fromRGBO(255, 255, 255, 0.07)
+                      : const Color(0x00FFFFFF),
+                  borderRadius: BorderRadius.circular(24),
                 ),
-                if (widget.hasDot)
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: ValueListenableBuilder<Color>(
-                      valueListenable: app.lampColorNotifier,
-                      builder: (_, lamp, _) => Container(
-                        width: 9,
-                        height: 9,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: lamp,
-                          border: Border.all(color: const Color.fromRGBO(0, 0, 0, 0.5), width: 1.5),
+                child: Stack(
+                  alignment: Alignment.centerLeft,
+                  children: [
+                    Positioned(
+                      left: left,
+                      child: VeyloIcon(widget.tab.iconName, size: iconSize, color: fg),
+                    ),
+                    if (widget.labelFraction > 0)
+                      Positioned(
+                        left: left + iconSize + _labelGap,
+                        child: ExcludeSemantics(
+                          child: Opacity(
+                            opacity: widget.labelFraction.clamp(0.0, 1.0),
+                            child: Text(
+                              widget.tab.title,
+                              maxLines: 1,
+                              style: _dockLabelStyle.copyWith(color: fg),
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ),
-              ],
+                    if (widget.hasDot)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: ValueListenableBuilder<Color>(
+                          valueListenable: app.lampColorNotifier,
+                          builder: (_, lamp, _) => Container(
+                            width: 9,
+                            height: 9,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: lamp,
+                              border: Border.all(color: const Color.fromRGBO(0, 0, 0, 0.5), width: 1.5),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             ),
           ),
         ),
-      );
-    // With the label shown on hover, the tooltip only helps in compact (icon-only) mode.
-    return widget.compact ? VeyloTooltip(message: widget.tab.title, child: tab) : tab;
+      ),
+    );
   }
 }
 
@@ -478,11 +713,13 @@ class _LastPlayedPill extends StatefulWidget {
   const _LastPlayedPill({
     super.key,
     required this.seen,
-    required this.compact,
+    required this.showText,
+    required this.width,
     required this.controlSize,
   });
   final SeenItem seen;
-  final bool compact;
+  final bool showText;
+  final double width;
   final double controlSize;
 
   @override
@@ -498,9 +735,7 @@ class _LastPlayedPillState extends State<_LastPlayedPill> {
     final m = widget.seen.media;
     final resumes = m.inProgress;
     final frac = resumes ? m.progressFraction.clamp(0.0, 1.0) : 0.0;
-    final line = resumes
-        ? (m.resumeContext.isNotEmpty && m.resumeContext != 'In progress' ? m.resumeContext : 'Carry on')
-        : (m.kind == 'movie' ? 'Watch again' : (m.videoWatched ? 'Next episode' : 'Carry on'));
+    final line = _lastPlayedLine(m);
 
     return VeyloTooltip(
       message: '$line: ${m.name}',
@@ -514,70 +749,71 @@ class _LastPlayedPillState extends State<_LastPlayedPill> {
           child: AnimatedScale(
             scale: _pressed ? 0.96 : 1.0,
             duration: const Duration(milliseconds: 100),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 280),
+            child: SizedBox(
+              width: widget.width,
               child: GlassBox(
                 borderRadius: 28,
-                padding: EdgeInsets.fromLTRB(4, 4, widget.compact ? 4 : 18, 4),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    SizedBox(
-                      width: widget.controlSize,
-                      height: widget.controlSize,
-                      child: TweenAnimationBuilder<double>(
-                        tween: Tween(begin: 0, end: frac),
-                        duration: const Duration(milliseconds: 550),
-                        curve: VeyloCurves.out,
-                        builder: (_, animatedFrac, child) => CustomPaint(
-                          painter: _RingPainter(progress: animatedFrac),
-                          child: child,
-                        ),
-                        child: Container(
-                          decoration: const BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Color.fromRGBO(255, 255, 255, 0.06),
+                child: Padding(
+                  padding: EdgeInsets.fromLTRB(
+                    _lastLeft,
+                    4,
+                    widget.showText ? _lastTextRight : _lastCompactRight,
+                    4,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: widget.controlSize,
+                        height: widget.controlSize,
+                        child: TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 0, end: frac),
+                          duration: const Duration(milliseconds: 550),
+                          curve: VeyloCurves.out,
+                          builder: (_, animatedFrac, child) => CustomPaint(
+                            painter: _RingPainter(progress: animatedFrac),
+                            child: child,
                           ),
-                          alignment: Alignment.center,
-                          child: const Padding(
-                            padding: EdgeInsets.only(left: 2),
-                            child: VeyloIcon('Play', size: 17, color: VeyloColors.bone, filled: true),
+                          child: Container(
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color.fromRGBO(255, 255, 255, 0.06),
+                            ),
+                            alignment: Alignment.center,
+                            child: const Padding(
+                              padding: EdgeInsets.only(left: 2),
+                              child: VeyloIcon('Play', size: 17, color: VeyloColors.bone, filled: true),
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                    if (!widget.compact) ...[
-                      const SizedBox(width: 12),
-                      Flexible(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              m.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: VeyloText.ui(15, weight: 650, height: 1.15),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              line,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: VeyloText.ui(
-                                12.5,
-                                weight: 500,
-                                color: const Color.fromRGBO(255, 255, 255, 0.58),
-                                tabular: true,
-                                height: 1.15,
+                      if (widget.showText) ...[
+                        const SizedBox(width: _lastTextGap),
+                        Flexible(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                m.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: _lastTitleStyle,
                               ),
-                            ),
-                          ],
+                              const SizedBox(height: 2),
+                              Text(
+                                line,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: _lastLineStyle,
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
             ),

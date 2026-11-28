@@ -161,6 +161,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    if (Platform.isAndroid) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
+        }
+      });
+    }
     for (final source in widget.session.sources) {
       if (source.url == widget.session.url) {
         _source = source;
@@ -873,6 +880,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    if (Platform.isAndroid) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
     if (_appRef?.onBeforeClosePlayer == _finishProgress) {
       _appRef?.onBeforeClosePlayer = null;
     }
@@ -1360,6 +1370,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final s = widget.session;
     final visible = _chromeVisible || !_playing || _sheet != null || _scrubValue != null || _error != null || !_loaded;
     final sleepBadge = _sleepBadgeLabel();
+    final insets = MediaQuery.viewPaddingOf(context);
+    final viewport = MediaQuery.sizeOf(context);
+    final safeWidth = viewport.width - insets.horizontal;
+    final compactControls = Platform.isAndroid && safeWidth < 660;
+    final bottomRowOffset = compactControls ? 48.0 : 0.0;
+
+    Widget centerOverlay(Widget child) => Positioned.fill(
+      left: insets.left,
+      top: insets.top,
+      right: insets.right,
+      bottom: insets.bottom,
+      child: Center(child: child),
+    );
+
+    Widget scrollActions(List<Widget> actions) => SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(mainAxisSize: MainAxisSize.min, children: actions),
+    );
+
+    List<Widget> topActions(List<Widget> actions) => compactControls
+        ? [Flexible(flex: 2, child: scrollActions(actions))]
+        : actions;
+
+    Widget bottomControls(Widget timeline, List<Widget> actions) {
+      if (compactControls) {
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [timeline, scrollActions(actions)],
+        );
+      }
+      return Row(children: [Expanded(child: timeline), ...actions]);
+    }
 
     return Focus(
       focusNode: _focus,
@@ -1556,8 +1599,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 // Stats-for-Nerds HUD (toggle with I)
                 if (_showStatsHud)
                   Positioned(
-                    top: 86,
-                    left: 24,
+                    top: 86 + insets.top,
+                    left: 24 + insets.left,
                     child: IgnorePointer(
                       child: ListenableBuilder(
                         listenable: _timelineListenable,
@@ -1588,8 +1631,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // Center error panel
                 if (_error != null)
-                  Center(
-                    child: ConstrainedBox(
+                  centerOverlay(
+                    ConstrainedBox(
                       constraints: const BoxConstraints(maxWidth: 520),
                       child: GlassBox(
                         borderRadius: 24,
@@ -1629,9 +1672,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // OSD pill with smooth enter & exit
                 Positioned(
-                  top: MediaQuery.sizeOf(context).height * 0.18,
-                  left: 0,
-                  right: 0,
+                  top: insets.top + (viewport.height - insets.vertical) * 0.18,
+                  left: insets.left,
+                  right: insets.right,
                   child: IgnorePointer(
                     child: Center(
                       child: AnimatedSwitcher(
@@ -1680,8 +1723,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       children: [
                         if (undo != null || seg != null)
                           Positioned(
-                            right: 24,
-                            bottom: visible ? 86 : 32,
+                            right: 24 + insets.right,
+                            bottom: insets.bottom + (visible ? 86 + bottomRowOffset : 32),
                             child: VeyloPill(
                               label: undo != null ? 'Undo' : seg!['kind'] == 'recap' ? 'Skip recap' : 'Skip intro',
                               icon: undo != null ? 'Undo' : 'Next',
@@ -1690,13 +1733,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ),
                         if (showUpNext)
                           Positioned(
-                            right: 24,
-                            bottom: (visible ? 88.0 : 32.0) + (seg != null || undo != null ? 58.0 : 0.0),
+                            right: 24 + insets.right,
+                            bottom: insets.bottom + (visible ? 88 + bottomRowOffset : 32) + (seg != null || undo != null ? 58.0 : 0.0),
                             child: LiftIn(
                               offsetY: 12,
                               duration: const Duration(milliseconds: 220),
                               child: SizedBox(
-                                width: 336,
+                                width: (safeWidth - 48).clamp(0.0, 336.0),
                                 child: GlassBox(
                                   borderRadius: 20,
                                   strong: true,
@@ -1759,9 +1802,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // Top Chrome (.player-top: edge-slides -12px when hiding)
                 Positioned(
-                  top: 20,
-                  left: 20,
-                  right: 20,
+                  top: 20 + insets.top,
+                  left: 20 + insets.left,
+                  right: 20 + insets.right,
                   child: IgnorePointer(
                     ignoring: !visible,
                     child: AnimatedSlide(
@@ -1803,109 +1846,111 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 ],
                               ),
                             ),
-                            if (sleepBadge != null) ...[
-                              MouseRegion(
-                                cursor: SystemMouseCursors.click,
-                                child: GestureDetector(
-                                  onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
-                                  child: GlassBox(
-                                    borderRadius: 999,
-                                    lamp: lamp,
-                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        BreathingMoonIcon(lamp: lamp, size: 16),
-                                        const SizedBox(width: 6),
-                                        Text(
-                                          sleepBadge,
-                                          style: VeyloText.ui(13, weight: 650, color: VeyloColors.bone, tabular: true),
-                                        ),
-                                      ],
+                            ...topActions([
+                              if (sleepBadge != null) ...[
+                                MouseRegion(
+                                  cursor: SystemMouseCursors.click,
+                                  child: GestureDetector(
+                                    onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
+                                    child: GlassBox(
+                                      borderRadius: 999,
+                                      lamp: lamp,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          BreathingMoonIcon(lamp: lamp, size: 16),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            sleepBadge,
+                                            style: VeyloText.ui(13, weight: 650, color: VeyloColors.bone, tabular: true),
+                                          ),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                            ],
-                            // Top right: what you reach for occasionally — navigation (episodes,
-                            // clips, sources, chapters), then playback settings (speed, sleep, picture), then
-                            // help/info. The bottom bar keeps only what you use while watching.
-                            if (s.episodes.isNotEmpty)
+                                const SizedBox(width: 8),
+                              ],
+                              // Top right: what you reach for occasionally — navigation (episodes,
+                              // clips, sources, chapters), then playback settings (speed, sleep, picture), then
+                              // help/info. The bottom bar keeps only what you use while watching.
+                              if (s.episodes.isNotEmpty)
+                                VeyloOrb(
+                                  icon: 'Stack',
+                                  glass: false,
+                                  active: _sheet == _PlayerSheet.episodes,
+                                  tooltip: 'Episodes',
+                                  onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.episodes ? null : _PlayerSheet.episodes),
+                                ),
+                              if (s.clips.length > 1)
+                                VeyloOrb(
+                                  icon: 'Film',
+                                  glass: false,
+                                  active: _sheet == _PlayerSheet.clips,
+                                  tooltip: 'Trailers & Clips',
+                                  onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.clips ? null : _PlayerSheet.clips),
+                                ),
+                              if (s.sources.length > 1)
+                                VeyloOrb(
+                                  icon: 'Layers',
+                                  glass: false,
+                                  active: _sheet == _PlayerSheet.sources,
+                                  tooltip: 'Switch source',
+                                  onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sources ? null : _PlayerSheet.sources),
+                                ),
+                              if (_chapters.length >= 2)
+                                VeyloOrb(
+                                  icon: 'List',
+                                  glass: false,
+                                  active: _sheet == _PlayerSheet.chapters,
+                                  tooltip: 'Chapters',
+                                  onTap: _toggleChapterSheet,
+                                ),
+                              if (s.episodes.isNotEmpty || s.clips.length > 1 || s.sources.length > 1 || _chapters.length >= 2)
+                                const SizedBox(width: 12),
                               VeyloOrb(
-                                icon: 'Stack',
+                                icon: 'Gauge',
                                 glass: false,
-                                active: _sheet == _PlayerSheet.episodes,
-                                tooltip: 'Episodes',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.episodes ? null : _PlayerSheet.episodes),
+                                active: _sheet == _PlayerSheet.speed,
+                                tooltip: 'Playback speed ([ / ])',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.speed ? null : _PlayerSheet.speed),
                               ),
-                            if (s.clips.length > 1)
                               VeyloOrb(
-                                icon: 'Film',
+                                icon: 'Moon',
                                 glass: false,
-                                active: _sheet == _PlayerSheet.clips,
-                                tooltip: 'Trailers & Clips',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.clips ? null : _PlayerSheet.clips),
+                                active: _sheet == _PlayerSheet.sleep || sleepBadge != null,
+                                tooltip: 'Sleep timer (T)',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
                               ),
-                            if (s.sources.length > 1)
                               VeyloOrb(
-                                icon: 'Layers',
+                                icon: 'Sliders',
                                 glass: false,
-                                active: _sheet == _PlayerSheet.sources,
-                                tooltip: 'Switch source',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sources ? null : _PlayerSheet.sources),
+                                active: _sheet == _PlayerSheet.picture ||
+                                    _brightness != 0 ||
+                                    _contrast != 0 ||
+                                    _saturation != 0 ||
+                                    _gamma != 0,
+                                tooltip: 'Picture',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.picture ? null : _PlayerSheet.picture),
                               ),
-                            if (_chapters.length >= 2)
-                              VeyloOrb(
-                                icon: 'List',
-                                glass: false,
-                                active: _sheet == _PlayerSheet.chapters,
-                                tooltip: 'Chapters',
-                                onTap: _toggleChapterSheet,
-                              ),
-                            if (s.episodes.isNotEmpty || s.clips.length > 1 || s.sources.length > 1 || _chapters.length >= 2)
                               const SizedBox(width: 12),
-                            VeyloOrb(
-                              icon: 'Gauge',
-                              glass: false,
-                              active: _sheet == _PlayerSheet.speed,
-                              tooltip: 'Playback speed ([ / ])',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.speed ? null : _PlayerSheet.speed),
-                            ),
-                            VeyloOrb(
-                              icon: 'Moon',
-                              glass: false,
-                              active: _sheet == _PlayerSheet.sleep || sleepBadge != null,
-                              tooltip: 'Sleep timer (T)',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
-                            ),
-                            VeyloOrb(
-                              icon: 'Sliders',
-                              glass: false,
-                              active: _sheet == _PlayerSheet.picture ||
-                                  _brightness != 0 ||
-                                  _contrast != 0 ||
-                                  _saturation != 0 ||
-                                  _gamma != 0,
-                              tooltip: 'Picture',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.picture ? null : _PlayerSheet.picture),
-                            ),
-                            const SizedBox(width: 12),
-                            VeyloOrb(
-                              icon: 'Keyboard',
-                              glass: false,
-                              active: _sheet == _PlayerSheet.shortcuts,
-                              tooltip: 'Shortcuts (H)',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.shortcuts ? null : _PlayerSheet.shortcuts),
-                            ),
-                            const SizedBox(width: 4),
-                            VeyloOrb(
-                              icon: 'Info',
-                              glass: false,
-                              active: _sheet == _PlayerSheet.info,
-                              tooltip: 'Details & Stats (I)',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.info ? null : _PlayerSheet.info),
-                            ),
+                              VeyloOrb(
+                                icon: 'Keyboard',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.shortcuts,
+                                tooltip: 'Shortcuts (H)',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.shortcuts ? null : _PlayerSheet.shortcuts),
+                              ),
+                              const SizedBox(width: 4),
+                              VeyloOrb(
+                                icon: 'Info',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.info,
+                                tooltip: 'Details & Stats (I)',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.info ? null : _PlayerSheet.info),
+                              ),
+                            ]),
                           ],
                         ),
                       ),
@@ -1915,9 +1960,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // Center transport (.player-mid: scales 0.94 when hiding, icon-turn on play/pause, kick on ±10s)
                 if (_loaded && _error == null)
-                  IgnorePointer(
-                    ignoring: !visible,
-                    child: Center(
+                  centerOverlay(
+                    IgnorePointer(
+                      ignoring: !visible,
                       child: AnimatedScale(
                         scale: visible ? 1.0 : 0.94,
                         duration: const Duration(milliseconds: 240),
@@ -1970,9 +2015,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // Bottom bar (.player-bottom: edge-slides +12px when hiding)
                 Positioned(
-                  left: 24,
-                  right: 20,
-                  bottom: 16,
+                  left: 24 + insets.left,
+                  right: 20 + insets.right,
+                  bottom: 16 + insets.bottom,
                   child: IgnorePointer(
                     ignoring: !visible,
                     child: AnimatedSlide(
@@ -1982,62 +2027,60 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       child: AnimatedOpacity(
                         opacity: visible ? 1.0 : 0.0,
                         duration: const Duration(milliseconds: 240),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: ListenableBuilder(
-                                listenable: _timelineListenable,
-                                builder: (_, _) {
-                                  final durSec = _duration.inMilliseconds / 1000.0;
-                                  final posSec = _scrubValue ?? (_position.inMilliseconds / 1000.0);
-                                  final playedPct = durSec > 0 ? (posSec / durSec).clamp(0.0, 1.0) : 0.0;
-                                  final bufPct = durSec > 0 ? (_buffered.inMilliseconds / 1000.0 / durSec).clamp(0.0, 1.0) : 0.0;
-                                  return Row(
-                                    children: [
-                                      SizedBox(
-                                        width: 58,
-                                        child: Text(
-                                          _clock(Duration(milliseconds: (posSec * 1000).round())),
-                                          textAlign: TextAlign.center,
-                                          style: VeyloText.ui(13, weight: 600, color: VeyloColors.bone, tabular: true),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: _ScrubberBar(
-                                          played: playedPct,
-                                          buffered: bufPct,
-                                          durationSec: durSec,
-                                          segments: _segments,
-                                          chapters: _chapters,
-                                          lamp: lamp,
-                                          formatClock: (sec) => _clock(Duration(seconds: sec.round())),
-                                          onScrub: (pct) {
-                                            setState(() => _scrubValue = pct * durSec);
-                                            _pokeChrome();
-                                          },
-                                          onCommit: (pct) {
-                                            final targetMs = (pct * durSec * 1000).round();
-                                            setState(() => _scrubValue = null);
-                                            _seekTo(Duration(milliseconds: targetMs));
-                                            _pokeChrome();
-                                          },
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      SizedBox(
-                                        width: 62,
-                                        child: Text(
-                                          durSec > 0 ? '-${_clock(Duration(milliseconds: ((durSec - posSec) * 1000).round()))}' : '',
-                                          textAlign: TextAlign.center,
-                                          style: VeyloText.ui(13, weight: 600, color: VeyloColors.dust, tabular: true),
-                                        ),
-                                      ),
-                                    ],
-                                  );
-                                },
-                              ),
-                            ),
+                        child: bottomControls(
+                          ListenableBuilder(
+                            listenable: _timelineListenable,
+                            builder: (_, _) {
+                              final durSec = _duration.inMilliseconds / 1000.0;
+                              final posSec = _scrubValue ?? (_position.inMilliseconds / 1000.0);
+                              final playedPct = durSec > 0 ? (posSec / durSec).clamp(0.0, 1.0) : 0.0;
+                              final bufPct = durSec > 0 ? (_buffered.inMilliseconds / 1000.0 / durSec).clamp(0.0, 1.0) : 0.0;
+                              return Row(
+                                children: [
+                                  SizedBox(
+                                    width: 58,
+                                    child: Text(
+                                      _clock(Duration(milliseconds: (posSec * 1000).round())),
+                                      textAlign: TextAlign.center,
+                                      style: VeyloText.ui(13, weight: 600, color: VeyloColors.bone, tabular: true),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: _ScrubberBar(
+                                      played: playedPct,
+                                      buffered: bufPct,
+                                      durationSec: durSec,
+                                      segments: _segments,
+                                      chapters: _chapters,
+                                      lamp: lamp,
+                                      formatClock: (sec) => _clock(Duration(seconds: sec.round())),
+                                      onScrub: (pct) {
+                                        setState(() => _scrubValue = pct * durSec);
+                                        _pokeChrome();
+                                      },
+                                      onCommit: (pct) {
+                                        final targetMs = (pct * durSec * 1000).round();
+                                        setState(() => _scrubValue = null);
+                                        _seekTo(Duration(milliseconds: targetMs));
+                                        _pokeChrome();
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  SizedBox(
+                                    width: 62,
+                                    child: Text(
+                                      durSec > 0 ? '-${_clock(Duration(milliseconds: ((durSec - posSec) * 1000).round()))}' : '',
+                                      textAlign: TextAlign.center,
+                                      style: VeyloText.ui(13, weight: 600, color: VeyloColors.dust, tabular: true),
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
+                          [
                             const SizedBox(width: 6),
                             VeyloOrb(
                               icon: 'Headphones',
@@ -2125,8 +2168,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                 // Floating glass player sheet (.player-sheet) with smooth enter & exit
                 Positioned(
-                  right: 20,
-                  bottom: 74,
+                  right: 20 + insets.right,
+                  bottom: 74 + insets.bottom + bottomRowOffset,
                   child: AnimatedSwitcher(
                     duration: const Duration(milliseconds: 180),
                     reverseDuration: const Duration(milliseconds: 130),
@@ -2146,7 +2189,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     child: _sheet != null
                         ? ConstrainedBox(
                             key: ValueKey(_sheet),
-                            constraints: BoxConstraints(maxWidth: 420, maxHeight: MediaQuery.sizeOf(context).height - 180),
+                            constraints: BoxConstraints(
+                              maxWidth: (safeWidth - 40).clamp(0.0, 420.0),
+                              maxHeight: (viewport.height - insets.vertical - 180 - bottomRowOffset).clamp(0.0, double.infinity),
+                            ),
                             child: GlassBox(
                               borderRadius: 24,
                               strong: true,

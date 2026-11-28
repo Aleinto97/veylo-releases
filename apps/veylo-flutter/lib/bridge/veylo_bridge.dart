@@ -374,7 +374,39 @@ class VeyloBridge {
   Future<void> flushReports() => call('flush_reports');
 
   Future<Map<String, dynamic>> accountState() => call('account_state');
-  Future<Map<String, dynamic>> accountSignInGoogle() => call('account_sign_in_google');
+  static const _accountChannel = MethodChannel('veylo/account');
+
+  Future<Map<String, dynamic>?> accountSignInGoogle() async {
+    if (!Platform.isAndroid) {
+      final state = await call('account_sign_in_google');
+      return state['cancelled'] == true ? null : state;
+    }
+    final config = await call('account_google_config');
+    final webClient = config['web_client'] as String?;
+    if (config['available'] != true || webClient == null) {
+      throw Exception("Google sign-in isn't set up in this build.");
+    }
+    final token = await _accountChannel.invokeMethod<String>(
+      'googleIdToken',
+      {'webClientId': webClient},
+    );
+    if (token == null || token.isEmpty) {
+      throw Exception("Google didn't return an account. Try signing in again.");
+    }
+    return call('account_sign_in_google_token', {'id_token': token});
+  }
+
+  Future<String?> accountScanCode() =>
+      _accountChannel.invokeMethod<String>('scanCode');
+
+  Future<String> accountCheckLink(String code) async {
+    final result = await call('account_check_link', {'code': code});
+    return result['check_code'] as String;
+  }
+
+  Future<void> accountAnswerLink(String code) =>
+      call('account_answer_link', {'code': code});
+
   Future<Map<String, dynamic>> accountSignIn(String email, String password) =>
       call('account_sign_in', {'email': email, 'password': password});
   Future<Map<String, dynamic>> accountSignUp(String email, String password) =>

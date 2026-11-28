@@ -652,6 +652,8 @@ class _TitleScreenState extends State<TitleScreen> {
     final app = AppStateScope.read(context);
     final size = MediaQuery.sizeOf(context);
     final gutter = VeyloLayout.gutter(size.width);
+    final insets = MediaQuery.viewPaddingOf(context);
+    final horizontalInsets = insets.copyWith(top: 0, bottom: 0);
     final posterW = VeyloLayout.posterWidth(size.width);
     final film = _media.kind == 'movie';
 
@@ -748,13 +750,13 @@ class _TitleScreenState extends State<TitleScreen> {
         ),
         SingleChildScrollView(
           controller: _scroll,
-          padding: const EdgeInsets.only(bottom: 72),
+          padding: EdgeInsets.only(bottom: 72 + insets.bottom),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // Full-bleed hero (.title-hero) with zero-rebuild parallax + KenBurns settle
               SizedBox(
-                height: (size.height * 0.68).clamp(440.0, 680.0),
+                height: (size.height * 0.68).clamp(440.0, 680.0) + insets.top,
                 width: double.infinity,
                 child: Stack(
                   fit: StackFit.expand,
@@ -828,7 +830,7 @@ class _TitleScreenState extends State<TitleScreen> {
                       ),
                     ),
                     Padding(
-                      padding: EdgeInsets.fromLTRB(gutter, 96, gutter, 12),
+                      padding: EdgeInsets.fromLTRB(gutter, 96 + insets.top, gutter, 12) + horizontalInsets,
                       child: Align(
                         alignment: Alignment.bottomLeft,
                         child: ConstrainedBox(
@@ -1154,7 +1156,7 @@ class _TitleScreenState extends State<TitleScreen> {
               // ≤700 ms), so the synopsis landing late can't push the studios/trailers down —
               // it fades in already laid out at its final size.
               Padding(
-                padding: EdgeInsets.fromLTRB(gutter, 12, gutter, 0),
+                padding: EdgeInsets.fromLTRB(gutter, 12, gutter, 0) + horizontalInsets,
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 1180),
                   child: !_revealed
@@ -2259,6 +2261,7 @@ class _SourceBottomSheetState extends State<_SourceBottomSheet> {
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
+    final insets = MediaQuery.viewPaddingOf(context);
     return Positioned.fill(
       child: GestureDetector(
         onTap: widget.onClose,
@@ -2267,6 +2270,7 @@ class _SourceBottomSheetState extends State<_SourceBottomSheet> {
           child: Container(
             color: const Color.fromRGBO(0, 0, 0, 0.62),
             alignment: Alignment.bottomCenter,
+            padding: insets,
             child: GestureDetector(
               onTap: () {},
               child: LiftIn(

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:ui' show PlatformDispatcher;
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
@@ -22,6 +23,16 @@ import 'widgets/veylo_icons.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isAndroid) {
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light.copyWith(
+      statusBarColor: Colors.transparent,
+      systemNavigationBarColor: Colors.transparent,
+      systemNavigationBarDividerColor: Colors.transparent,
+      systemStatusBarContrastEnforced: false,
+      systemNavigationBarContrastEnforced: false,
+    ));
+  }
   _installErrorReporting();
   MediaKit.ensureInitialized();
   runApp(const VeyloApp());
@@ -180,7 +191,7 @@ class _VeyloShell extends StatelessWidget {
                 media: app.pendingPlayerMedia,
                 onCancel: app.cancelPendingPlay,
               ),
-            if (app.toastMessage != null) _buildToast(app),
+            if (app.toastMessage != null) _buildToast(context, app),
           ],
         ),
       );
@@ -318,10 +329,16 @@ class _VeyloShell extends StatelessWidget {
               if (app.searchOpen && app.activeTheatre == null) BackdropGroup(child: const SearchOverlay()),
 
               // Shortcuts modal
-              if (app.shortcutsOpen && app.activeTheatre == null) BackdropGroup(child: const ShortcutsModal()),
+              if (app.shortcutsOpen && app.activeTheatre == null)
+                SafeArea(
+                  maintainBottomViewPadding: true,
+                  child: BackdropGroup(
+                    child: const Stack(children: [ShortcutsModal()]),
+                  ),
+                ),
 
               // Bottom glass toast (.toast)
-              if (app.toastMessage != null) _buildToast(app),
+              if (app.toastMessage != null) _buildToast(context, app),
             ],
           ),
         ),
@@ -329,11 +346,12 @@ class _VeyloShell extends StatelessWidget {
     );
   }
 
-  Widget _buildToast(AppState app) {
+  Widget _buildToast(BuildContext context, AppState app) {
+    final insets = MediaQuery.viewPaddingOf(context);
     return Positioned(
-      left: 16,
-      right: 16,
-      bottom: 24,
+      left: 16 + insets.left,
+      right: 16 + insets.right,
+      bottom: 24 + insets.bottom,
       child: Center(
         child: BackdropGroup(
           child: GlassBox(
@@ -394,6 +412,7 @@ class _PendingOverlayState extends State<_PendingOverlay> with SingleTickerProvi
   @override
   Widget build(BuildContext context) {
     final app = AppStateScope.read(context);
+    final insets = MediaQuery.viewPaddingOf(context);
     return Positioned.fill(
       child: ValueListenableBuilder<Color>(
         valueListenable: app.lampColorNotifier,
@@ -415,13 +434,21 @@ class _PendingOverlayState extends State<_PendingOverlay> with SingleTickerProvi
                 ),
               ),
               Positioned(
-                top: 20,
-                left: 20,
+                top: 20 + insets.top,
+                left: 20 + insets.left,
+                right: 20 + insets.right,
                 child: Row(
                   children: [
                     VeyloOrb(icon: 'ArrowLeft', glass: false, onTap: widget.onCancel),
                     const SizedBox(width: 10),
-                    Text(widget.title, style: VeyloText.display(22, weight: 700)),
+                    Flexible(
+                      child: Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: VeyloText.display(22, weight: 700),
+                      ),
+                    ),
                   ],
                 ),
               ),

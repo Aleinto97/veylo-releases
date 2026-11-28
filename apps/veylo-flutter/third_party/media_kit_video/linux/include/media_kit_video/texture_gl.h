@@ -22,6 +22,9 @@ G_DECLARE_FINAL_TYPE(TextureGL, texture_gl, TEXTURE_GL, TEXTURE_GL, FlTextureGL)
 
 TextureGL* texture_gl_new(VideoOutput* video_output);
 
+// Called while the video output's OpenGL context is current.
+void texture_gl_release_resources(TextureGL* self);
+
 /**
  * @brief Populates texture with video frame.
  */

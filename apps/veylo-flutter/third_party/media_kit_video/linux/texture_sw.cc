@@ -45,8 +45,8 @@ gboolean texture_sw_copy_pixels(FlPixelBufferTexture* texture,
                                 GError** error) {
   TextureSW* self = TEXTURE_SW(texture);
   VideoOutput* video_output = self->video_output;
-  gint32 required_width = (guint32)video_output_get_width(video_output);
-  gint32 required_height = (guint32)video_output_get_height(video_output);
+  guint32 required_width = (guint32)video_output_get_width(video_output);
+  guint32 required_height = (guint32)video_output_get_height(video_output);
   if (required_width > 0 && required_height > 0) {
     guint8* pixel_buffer = video_output_get_pixel_buffer(video_output);
     if (self->current_width != required_width ||
@@ -59,6 +59,11 @@ gboolean texture_sw_copy_pixels(FlPixelBufferTexture* texture,
     *buffer = pixel_buffer;
     *width = required_width;
     *height = required_height;
+  } else {
+    static const guint8 black[] = {0, 0, 0, 255};
+    *buffer = black;
+    *width = 1;
+    *height = 1;
   }
   return TRUE;
 }

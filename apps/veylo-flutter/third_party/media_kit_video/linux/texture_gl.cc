@@ -8,7 +8,6 @@
 
 #include "include/media_kit_video/texture_gl.h"
 
-#include <epoxy/egl.h>
 #include <epoxy/gl.h>
 
 struct _TextureGL {
@@ -30,9 +29,7 @@ static void texture_gl_init(TextureGL* self) {
   self->video_output = NULL;
 }
 
-static void texture_gl_dispose(GObject* object) {
-  TextureGL* self = TEXTURE_GL(object);
-  // Free texture & FBO.
+void texture_gl_release_resources(TextureGL* self) {
   if (self->name != 0) {
     glDeleteTextures(1, &self->name);
     self->name = 0;
@@ -41,15 +38,10 @@ static void texture_gl_dispose(GObject* object) {
     glDeleteFramebuffers(1, &self->fbo);
     self->fbo = 0;
   }
-  self->current_width = 1;
-  self->current_height = 1;
-  self->video_output = NULL;
-  G_OBJECT_CLASS(texture_gl_parent_class)->dispose(object);
 }
 
 static void texture_gl_class_init(TextureGLClass* klass) {
   FL_TEXTURE_GL_CLASS(klass)->populate = texture_gl_populate_texture;
-  G_OBJECT_CLASS(klass)->dispose = texture_gl_dispose;
 }
 
 TextureGL* texture_gl_new(VideoOutput* video_output) {
@@ -67,31 +59,32 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
   TextureGL* self = TEXTURE_GL(texture);
   VideoOutput* video_output = self->video_output;
   if (video_output == NULL) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                        "Video output is closed");
     return FALSE;
   }
   video_output_lock(video_output);
   if (video_output_is_destroyed(video_output)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                        "Video output is closed");
     video_output_unlock(video_output);
     return FALSE;
   }
+  VideoOutputGLContext context(video_output);
+  if (!context.is_current()) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                        "No OpenGL context available for video rendering");
+    context.restore();
+    video_output_unlock(video_output);
+    return FALSE;
+  }
+
   mpv_render_context* render_context =
       video_output_get_render_context(video_output);
-  if (render_context == NULL) {
-    video_output_unlock(video_output);
-    return FALSE;
-  }
-
-  // Save Flutter raster thread's EGL context and switch to mpv's shared EGL context
-  // so mpv's FBO/VAO/shaders execute in their owning context while the shared GL texture
-  // remains directly sampleable by Flutter's Skia compositor.
-  EGLDisplay saved_display = eglGetCurrentDisplay();
-  EGLContext saved_context = eglGetCurrentContext();
-  EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
-  EGLSurface saved_read = eglGetCurrentSurface(EGL_READ);
-  gboolean switched = video_output_make_gl_current(video_output);
-
-  gint32 required_width = (gint32)video_output_get_width(video_output);
-  gint32 required_height = (gint32)video_output_get_height(video_output);
+  gint32 required_width =
+      render_context ? (gint32)video_output_get_width(video_output) : 0;
+  gint32 required_height =
+      render_context ? (gint32)video_output_get_height(video_output) : 0;
   gboolean notify_resize = FALSE;
   if (required_width > 0 && required_height > 0) {
     gboolean first_frame = self->name == 0 || self->fbo == 0;
@@ -155,12 +148,7 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
   *width = self->current_width;
   *height = self->current_height;
 
-  if (switched) {
-    video_output_clear_gl_current(video_output);
-    if (saved_display != EGL_NO_DISPLAY && saved_context != EGL_NO_CONTEXT) {
-      eglMakeCurrent(saved_display, saved_draw, saved_read, saved_context);
-    }
-  }
+  context.restore();
   video_output_unlock(video_output);
 
   if (notify_resize) {

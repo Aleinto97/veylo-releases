@@ -9,6 +9,7 @@
 #ifndef VIDEO_OUTPUT_H_
 #define VIDEO_OUTPUT_H_
 
+#include <epoxy/egl.h>
 #include <flutter_linux/flutter_linux.h>
 
 #include <mpv/client.h>
@@ -89,8 +90,6 @@ void video_output_set_size(VideoOutput* self, gint64 width, gint64 height);
 
 mpv_render_context* video_output_get_render_context(VideoOutput* self);
 
-GdkGLContext* video_output_get_gdk_gl_context(VideoOutput* self);
-
 guint8* video_output_get_pixel_buffer(VideoOutput* self);
 
 gint64 video_output_get_width(VideoOutput* self);
@@ -104,7 +103,27 @@ void video_output_notify_texture_update(VideoOutput* self);
 void video_output_lock(VideoOutput* self);
 void video_output_unlock(VideoOutput* self);
 gboolean video_output_is_destroyed(VideoOutput* self);
-gboolean video_output_make_gl_current(VideoOutput* self);
-void video_output_clear_gl_current(VideoOutput* self);
+// Restores the caller's native context before the video output is unlocked.
+class VideoOutputGLContext {
+ public:
+  explicit VideoOutputGLContext(VideoOutput* output);
+  ~VideoOutputGLContext();
+
+  VideoOutputGLContext(const VideoOutputGLContext&) = delete;
+  VideoOutputGLContext& operator=(const VideoOutputGLContext&) = delete;
+
+  bool is_current() const { return is_current_; }
+  void restore();
+
+ private:
+  VideoOutput* output_;
+  EGLDisplay egl_display_ = EGL_NO_DISPLAY;
+  EGLContext egl_context_ = EGL_NO_CONTEXT;
+  EGLSurface egl_draw_ = EGL_NO_SURFACE;
+  EGLSurface egl_read_ = EGL_NO_SURFACE;
+  bool switched_egl_ = false;
+  bool switched_gdk_ = false;
+  bool is_current_ = false;
+};
 
 #endif  // VIDEO_OUTPUT_H_
