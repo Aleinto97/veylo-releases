@@ -84,6 +84,7 @@ pub(crate) fn pack(vector: &[f32]) -> String {
 }
 pub(crate) fn unpack(text: &str) -> Option<Vec<f32>> {
     let bytes = STANDARD.decode(text).ok()?;
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     (bytes.len() == DIM * 2).then(|| bytes.chunks_exact(2).map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32767.0).collect())
 }
 

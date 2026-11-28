@@ -104,6 +104,22 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../rust/target/release/libveylo_bridg
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
+# Picks AI (on-device synopsis embeddings: model + tokenizer + ONNX Runtime), beside the
+# executable where the shared backend looks for it. Prepared by
+# `python3 tools/picks-ai/fetch.py linux-<arch>` (pinned, hash-checked downloads).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(VEYLO_PICKS_TARGET "linux-aarch64")
+else()
+  set(VEYLO_PICKS_TARGET "linux-x64")
+endif()
+set(VEYLO_PICKS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../veylo-dx/picks-ai")
+if(EXISTS "${VEYLO_PICKS_DIR}/model/model.onnx" AND EXISTS "${VEYLO_PICKS_DIR}/${VEYLO_PICKS_TARGET}")
+  install(DIRECTORY "${VEYLO_PICKS_DIR}/model/" DESTINATION "${CMAKE_INSTALL_PREFIX}/picks-ai" COMPONENT Runtime)
+  install(DIRECTORY "${VEYLO_PICKS_DIR}/${VEYLO_PICKS_TARGET}/" DESTINATION "${CMAKE_INSTALL_PREFIX}/picks-ai/runtime" COMPONENT Runtime)
+else()
+  message(WARNING "Picks AI assets missing: run python3 tools/picks-ai/fetch.py ${VEYLO_PICKS_TARGET} (Picks falls back to rules)")
+endif()
+
 foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
   install(FILES "${bundled_library}"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"

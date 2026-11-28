@@ -83,6 +83,23 @@ static void video_channel_call_cb(FlMethodChannel* channel,
     }
     g_autoptr(FlValue) result = fl_value_new_bool(ok);
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+  } else if (std::strcmp(method, "setRect") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_MAP) {
+      auto get_i = [&](const char* k) -> int {
+        FlValue* v = fl_value_lookup_string(args, k);
+        if (!v) return 0;
+        if (fl_value_get_type(v) == FL_VALUE_TYPE_INT) return static_cast<int>(fl_value_get_int(v));
+        if (fl_value_get_type(v) == FL_VALUE_TYPE_FLOAT) return static_cast<int>(fl_value_get_float(v) + 0.5);
+        return 0;
+      };
+      veylo_wayland_video_set_rect(self->wayland_video, TRUE, get_i("x"),
+                                   get_i("y"), get_i("w"), get_i("h"));
+    } else {
+      veylo_wayland_video_set_rect(self->wayland_video, FALSE, 0, 0, 1, 1);
+    }
+    g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
   } else if (std::strcmp(method, "detach") == 0) {
     veylo_wayland_video_detach(self->wayland_video);
     g_autoptr(FlValue) result = fl_value_new_bool(TRUE);

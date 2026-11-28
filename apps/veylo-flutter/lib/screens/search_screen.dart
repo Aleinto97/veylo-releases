@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
@@ -490,8 +491,22 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
   }
 
   Widget _buildVibeResults() {
+    final app = AppStateScope.read(context);
     if (_searching && (_vibeResults == null || _vibeResults!.isEmpty)) {
-      return _buildSkeletonGrid();
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.only(top: 72),
+          child: ValueListenableBuilder<Color>(
+            valueListenable: app.lampColorNotifier,
+            builder: (_, lamp, _) => FindingRunner(
+              lamp: lamp,
+              scene: CinemaScene.orbit,
+              width: 280,
+              height: 98,
+            ),
+          ),
+        ),
+      );
     }
     if (_error != null) {
       return GlassBox(
@@ -512,17 +527,24 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
       return Center(
         child: Padding(
           padding: const EdgeInsets.only(top: 64),
-          child: GlassBox(
-            borderRadius: 24,
-            padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 28),
-            child: const Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                VeyloIcon('Sparkles', size: 30, color: VeyloColors.dust),
-                SizedBox(height: 10),
-                Text('No matching vibes in your catalog yet', style: VeyloText.body),
-              ],
-            ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ValueListenableBuilder<Color>(
+                valueListenable: app.lampColorNotifier,
+                builder: (_, lamp, _) => FindingRunner(
+                  lamp: lamp,
+                  scene: CinemaScene.noir,
+                  width: 240,
+                  height: 84,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'No matching vibes in your catalog yet',
+                style: VeyloText.ui(15, weight: 500, color: VeyloColors.dust),
+              ),
+            ],
           ),
         ),
       );
@@ -588,17 +610,24 @@ class _SearchOverlayState extends State<SearchOverlay> with SingleTickerProvider
           Center(
             child: Padding(
               padding: const EdgeInsets.only(top: 64),
-              child: GlassBox(
-                borderRadius: 24,
-                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 28),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const VeyloIcon('Search', size: 30, color: VeyloColors.dust),
-                    const SizedBox(height: 10),
-                    Text(_catalogs == 0 ? 'No add-on can search' : 'No results', style: VeyloText.body),
-                  ],
-                ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ValueListenableBuilder<Color>(
+                    valueListenable: AppStateScope.read(context).lampColorNotifier,
+                    builder: (_, lamp, _) => FindingRunner(
+                      lamp: lamp,
+                      scene: CinemaScene.noir,
+                      width: 240,
+                      height: 84,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    _catalogs == 0 ? 'No add-on can search' : 'No results',
+                    style: VeyloText.ui(15, weight: 500, color: VeyloColors.dust),
+                  ),
+                ],
               ),
             ),
           ),

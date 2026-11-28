@@ -7,6 +7,7 @@ import 'package:flutter/widgets.dart';
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
@@ -213,6 +214,33 @@ class _PicksScreenState extends State<PicksScreen> {
     } catch (_) {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  Future<void> _rateCard(MediaItem m, int value) async {
+    final app = AppStateScope.read(context);
+    try {
+      final res = await app.bridge.picksRate(m, value);
+      if (!mounted) return;
+      _applyData(res);
+      app.bumpPicksDirty();
+      if (value > 0) {
+        app.showToast('Liked ${m.name}: more like it from now on');
+      } else if (value == 0) {
+        app.showToast('Removed like from ${m.name}');
+      } else {
+        app.showToast("${m.name} won't come back");
+      }
+    } catch (_) {
+      if (mounted) app.showToast("Couldn't save that. Try again.", isError: true);
+    }
+  }
+
+  Future<void> _playCard(MediaItem m) async {
+    final app = AppStateScope.read(context);
+    unawaited(app.bridge.picksPlayed(m).then((res) {
+      if (mounted && res.containsKey('votes')) _applyData(res);
+    }).catchError((_) {}));
+    await app.autoplayMedia(m);
   }
 
   Future<void> _newNight() async {
@@ -456,31 +484,38 @@ class _PicksScreenState extends State<PicksScreen> {
                         )
                       : (leftCard == null && rightCard == null)
                           ? Center(
-                              child: GlassBox(
-                                borderRadius: 24,
-                                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 28),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    const VeyloIcon('Search', size: 30, color: VeyloColors.dust),
-                                    const SizedBox(height: 10),
-                                    const Text('Nothing matches these filters', style: VeyloText.body),
-                                    const SizedBox(height: 14),
-                                    VeyloPill(
-                                      label: 'Clear filters',
-                                      icon: 'Undo',
-                                      onTap: () => _updateFilters(
-                                        kind: null,
-                                        setKind: true,
-                                        style: 'both',
-                                        genres: [],
-                                        from: '',
-                                        to: '',
-                                        savedOnly: false,
-                                      ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  ValueListenableBuilder<Color>(
+                                    valueListenable: app.lampColorNotifier,
+                                    builder: (_, lamp, _) => FindingRunner(
+                                      lamp: lamp,
+                                      scene: CinemaScene.projector,
+                                      width: 240,
+                                      height: 84,
                                     ),
-                                  ],
-                                ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    'Nothing matches these filters',
+                                    style: VeyloText.ui(15, weight: 600, color: VeyloColors.dust),
+                                  ),
+                                  const SizedBox(height: 16),
+                                  VeyloPill(
+                                    label: 'Clear filters',
+                                    icon: 'Undo',
+                                    onTap: () => _updateFilters(
+                                      kind: null,
+                                      setKind: true,
+                                      style: 'both',
+                                      genres: [],
+                                      from: '',
+                                      to: '',
+                                      savedOnly: false,
+                                    ),
+                                  ),
+                                ],
                               ),
                             )
                           : Row(
@@ -494,11 +529,29 @@ class _PicksScreenState extends State<PicksScreen> {
                                           isLeft: true,
                                           state: _keepingSide == 'left' ? 1 : (_keepingSide == 'right' ? -1 : 0),
                                           onKeep: () => _choose(true),
-                                          onRefresh: () => _load(force: false),
+                                          onRate: _rateCard,
+                                          onPlay: _playCard,
                                         )
-                                      : const GlassBox(
+                                      : GlassBox(
                                           borderRadius: 28,
-                                          child: Center(child: Text('No other match for these filters.', style: VeyloText.meta)),
+                                          child: Center(
+                                            child: Column(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                ValueListenableBuilder<Color>(
+                                                  valueListenable: app.lampColorNotifier,
+                                                  builder: (_, lamp, _) => FindingRunner(
+                                                    lamp: lamp,
+                                                    scene: CinemaScene.projector,
+                                                    width: 200,
+                                                    height: 70,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                const Text('No other match for these filters.', style: VeyloText.meta),
+                                              ],
+                                            ),
+                                          ),
                                         ),
                                 ),
                                 const SizedBox(width: 16),
@@ -512,11 +565,29 @@ class _PicksScreenState extends State<PicksScreen> {
                                           isLeft: false,
                                           state: _keepingSide == 'right' ? 1 : (_keepingSide == 'left' ? -1 : 0),
                                           onKeep: () => _choose(false),
-                                          onRefresh: () => _load(force: false),
+                                          onRate: _rateCard,
+                                          onPlay: _playCard,
                                         )
-                                      : const GlassBox(
+                                      : GlassBox(
                                           borderRadius: 28,
-                                          child: Center(child: Text('No other match for these filters.', style: VeyloText.meta)),
+                                          child: Center(
+                                            child: Column(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                ValueListenableBuilder<Color>(
+                                                  valueListenable: app.lampColorNotifier,
+                                                  builder: (_, lamp, _) => FindingRunner(
+                                                    lamp: lamp,
+                                                    scene: CinemaScene.projector,
+                                                    width: 200,
+                                                    height: 70,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                const Text('No other match for these filters.', style: VeyloText.meta),
+                                              ],
+                                            ),
+                                          ),
                                         ),
                                 ),
                               ],
@@ -564,6 +635,7 @@ class _PicksScreenState extends State<PicksScreen> {
                                 separatorBuilder: (_, _) => const SizedBox(width: 10),
                                 itemBuilder: (_, i) => _ShortItem(
                                   entry: shortlist[i],
+                                  onPlay: _playCard,
                                   onRemove: () async {
                                     final m = MediaItem.fromJson(shortlist[i]['media'] as Map<String, dynamic>);
                                     final res = await app.bridge.picksUnstar(m.key);
@@ -975,14 +1047,16 @@ class _DuelCard extends StatefulWidget {
     required this.isLeft,
     required this.state,
     required this.onKeep,
-    required this.onRefresh,
+    required this.onRate,
+    required this.onPlay,
   });
 
   final Map<String, dynamic> data;
   final bool isLeft;
   final int state; // 1 = kept, -1 = fading out, 0 = idle
   final VoidCallback onKeep;
-  final VoidCallback onRefresh;
+  final Future<void> Function(MediaItem media, int value) onRate;
+  final Future<void> Function(MediaItem media) onPlay;
 
   @override
   State<_DuelCard> createState() => _DuelCardState();
@@ -995,7 +1069,16 @@ class _DuelCardState extends State<_DuelCard> {
   bool _dragging = false;
   late bool _liked;
   late bool _saved;
+  int _likeSpark = 0;
+  int _saveSpark = 0;
   Color? _cardLamp;
+  String? _metaLogo;
+  String? _metaRating;
+  String? _metaRuntime;
+  String? _director;
+  int? _tomatometer;
+  int? _metascore;
+  List<Map<String, dynamic>> _metaTrailers = const [];
 
   @override
   void initState() {
@@ -1003,6 +1086,15 @@ class _DuelCardState extends State<_DuelCard> {
     _liked = widget.data['liked'] as bool? ?? false;
     _saved = widget.data['saved'] as bool? ?? false;
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadCardExtras());
+  }
+
+  @override
+  void didUpdateWidget(covariant _DuelCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final nextLiked = widget.data['liked'] as bool? ?? false;
+    final nextSaved = widget.data['saved'] as bool? ?? false;
+    if (nextLiked != _liked) _liked = nextLiked;
+    if (nextSaved != _saved) _saved = nextSaved;
   }
 
   @override
@@ -1023,12 +1115,102 @@ class _DuelCardState extends State<_DuelCard> {
   Future<void> _loadCardExtras() async {
     final app = AppStateScope.read(context);
     final m = MediaItem.fromJson(widget.data['media'] as Map<String, dynamic>);
-    final art = await app.fetchArtwork(m);
+    final results = await Future.wait<dynamic>([
+      app.fetchArtwork(m).catchError((_) => null),
+      app.bridge.picksCardExtras(m).catchError((_) => <String, dynamic>{}),
+    ]);
+    if (!mounted) return;
+    final art = results[0] as ArtworkModel?;
+    final ex = (results[1] as Map<String, dynamic>?) ?? const {};
+    final scores = (ex['scores'] as Map<String, dynamic>?) ?? const {};
+    setState(() {
+      final logo = ex['logo']?.toString() ?? '';
+      final rating = ex['rating']?.toString() ?? '';
+      final runtime = ex['runtime']?.toString() ?? '';
+      _metaLogo = logo.isNotEmpty ? logo : null;
+      _metaRating = rating.isNotEmpty ? rating : null;
+      _metaRuntime = runtime.isNotEmpty ? runtime : null;
+      _director = (ex['director'] as String?)?.trim().isNotEmpty == true ? ex['director'] as String : null;
+      _tomatometer = (scores['tomatometer'] as num?)?.toInt();
+      _metascore = (scores['metascore'] as num?)?.toInt();
+      _metaTrailers = (ex['trailers'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+    });
     final bg = (art?.backdrop?.isNotEmpty == true) ? art!.backdrop! : m.backdrop;
     if (bg.isNotEmpty) {
       final c = await app.fetchAccent(bg);
       if (mounted && c != null) setState(() => _cardLamp = c);
     }
+  }
+
+  /// Official artwork videos & trailers first, then add-on YouTube/direct trailers (matching DX Picks).
+  List<TrailerClip> _cardClips(ArtworkModel? art) {
+    final clips = <TrailerClip>[];
+    final seenYt = <String>{};
+    final seenUrl = <String>{};
+
+    for (final v in (art?.videos ?? const [])) {
+      final yt = v['youtube']?.toString() ?? v['key']?.toString() ?? v['id']?.toString() ?? '';
+      if (yt.isEmpty || !seenYt.add(yt)) continue;
+      final kind = v['kind']?.toString() ?? v['type']?.toString() ?? 'Trailer';
+      final name = v['name']?.toString() ?? v['title']?.toString() ?? kind;
+      clips.add(TrailerClip(
+        youtube: yt,
+        name: name.isNotEmpty ? name : kind,
+        kind: kind.isNotEmpty ? kind : 'Trailer',
+        official: v['official'] == true,
+      ));
+    }
+
+    int trailerNum = clips.where((c) => c.kind == 'Trailer').length;
+    void addYt(String yt) {
+      if (yt.isEmpty || !seenYt.add(yt)) return;
+      trailerNum++;
+      clips.add(TrailerClip(
+        youtube: yt,
+        name: trailerNum == 1 ? 'Trailer' : 'Trailer $trailerNum',
+        kind: 'Trailer',
+      ));
+    }
+
+    for (final yt in (art?.trailers ?? const <String>[])) {
+      addYt(yt);
+    }
+    for (final t in _metaTrailers) {
+      final yt = t['youtube']?.toString() ?? '';
+      if (yt.isNotEmpty) addYt(yt);
+    }
+    // Direct URL trailer from an add-on only when no YouTube video exists (matches `official_first`).
+    if (clips.isEmpty) {
+      for (final t in _metaTrailers) {
+        final url = t['url']?.toString() ?? '';
+        if (url.isNotEmpty && seenUrl.add(url)) {
+          trailerNum++;
+          clips.add(TrailerClip(
+            url: url,
+            name: trailerNum == 1 ? 'Trailer' : 'Trailer $trailerNum',
+            kind: 'Trailer',
+          ));
+        }
+      }
+    }
+    return clips;
+  }
+
+  String? _directorName(ArtworkModel? art) {
+    if (_director != null && _director!.isNotEmpty) return _director;
+    for (final g in (art?.crew ?? const [])) {
+      final role = g['role']?.toString() ?? '';
+      if (role.startsWith('Directed') || role.startsWith('Created')) {
+        final people = g['people'] as List<dynamic>? ?? const [];
+        if (people.isNotEmpty) {
+          final first = (people.first as Map?)?['name']?.toString() ?? '';
+          if (first.isNotEmpty) return first;
+        }
+      }
+    }
+    return null;
   }
 
   @override
@@ -1057,7 +1239,13 @@ class _DuelCardState extends State<_DuelCard> {
                   if (m.backdrop.isNotEmpty) m.backdrop,
                   if (m.poster.isNotEmpty) m.poster,
                 ];
-                final logo = (art?.logo?.isNotEmpty == true) ? art!.logo! : (m.logo.isNotEmpty ? m.logo : null);
+                final logo = (art?.logo?.isNotEmpty == true)
+                    ? art!.logo!
+                    : (_metaLogo ?? (m.logo.isNotEmpty ? m.logo : null));
+                final imdb = _metaRating ?? m.rating;
+                final runtime = _metaRuntime ?? m.runtime;
+                final director = _directorName(art);
+                final clips = _cardClips(art);
 
                 final loseDx = widget.isLeft ? -36.0 : 36.0;
                 final loseRot = widget.isLeft ? -0.028 : 0.028;
@@ -1254,39 +1442,50 @@ class _DuelCardState extends State<_DuelCard> {
                                   ),
                                   Row(
                                     children: [
-                                      VeyloOrb(
-                                        icon: 'Bookmark',
-                                        size: 44,
-                                        active: _saved,
-                                        tooltip: _saved ? 'Saved to Library' : 'Save to Library',
-                                        onTap: () async {
-                                          setState(() => _saved = !_saved);
-                                          await app.bridge.setSaved(m, _saved);
-                                          app.bumpPicksDirty();
-                                        },
+                                      LampSparkBurst(
+                                        trigger: _saveSpark,
+                                        lamp: lamp,
+                                        child: VeyloOrb(
+                                          icon: 'Bookmark',
+                                          size: 44,
+                                          active: _saved,
+                                          tooltip: _saved ? 'Saved to Library' : 'Save to Library',
+                                          onTap: () async {
+                                            final next = !_saved;
+                                            setState(() {
+                                              _saved = next;
+                                              if (next) _saveSpark++;
+                                            });
+                                            await app.bridge.setSaved(m, _saved);
+                                            app.bumpPicksDirty();
+                                          },
+                                        ),
                                       ),
                                       const SizedBox(width: 8),
-                                      VeyloOrb(
-                                        icon: 'ThumbUp',
-                                        size: 44,
-                                        active: _liked,
-                                        tooltip: _liked ? 'Liked' : 'Like',
-                                        onTap: () async {
-                                          setState(() => _liked = !_liked);
-                                          await app.bridge.feedback(m, _liked ? 1 : 0);
-                                          app.bumpPicksDirty();
-                                        },
+                                      LampSparkBurst(
+                                        trigger: _likeSpark,
+                                        lamp: lamp,
+                                        child: VeyloOrb(
+                                          icon: 'ThumbUp',
+                                          size: 44,
+                                          active: _liked,
+                                          tooltip: _liked ? 'Liked: tap to undo' : 'Like',
+                                          onTap: () {
+                                            final next = !_liked;
+                                            setState(() {
+                                              _liked = next;
+                                              if (next) _likeSpark++;
+                                            });
+                                            unawaited(widget.onRate(m, next ? 1 : 0));
+                                          },
+                                        ),
                                       ),
                                       const SizedBox(width: 8),
                                       VeyloOrb(
                                         icon: 'ThumbDown',
                                         size: 44,
-                                        tooltip: 'Not for me',
-                                        onTap: () async {
-                                          await app.bridge.feedback(m, -1);
-                                          app.bumpPicksDirty();
-                                          widget.onRefresh();
-                                        },
+                                        tooltip: 'Not for me: never show it again',
+                                        onTap: () => unawaited(widget.onRate(m, -1)),
                                       ),
                                     ],
                                   ),
@@ -1339,18 +1538,18 @@ class _DuelCardState extends State<_DuelCard> {
                                     scrollDirection: Axis.horizontal,
                                     child: Row(
                                       children: [
-                                        if (m.rating.isNotEmpty) ...[
-                                          ScoresPill(imdb: m.rating),
+                                        if (imdb.isNotEmpty || _tomatometer != null || _metascore != null) ...[
+                                          ScoresPill(imdb: imdb, tomatometer: _tomatometer, metascore: _metascore),
                                           const SizedBox(width: 8),
                                         ],
-                                        if (m.runtime.isNotEmpty) ...[
+                                        if (runtime.isNotEmpty) ...[
                                           FactPill(
                                             child: Row(
                                               mainAxisSize: MainAxisSize.min,
                                               children: [
                                                 const VeyloIcon('Clock', size: 16, color: VeyloColors.dust),
                                                 const SizedBox(width: 6),
-                                                Text(m.runtime),
+                                                Text(runtime),
                                               ],
                                             ),
                                           ),
@@ -1404,6 +1603,24 @@ class _DuelCardState extends State<_DuelCard> {
                                       ],
                                     ),
                                   ],
+                                  if (director != null) ...[
+                                    const SizedBox(height: 8),
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const VeyloIcon('Clapper', size: 15, color: VeyloColors.dust),
+                                        const SizedBox(width: 6),
+                                        Flexible(
+                                          child: Text(
+                                            director,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: VeyloText.ui(13.5, weight: 500, color: const Color.fromRGBO(242, 239, 234, 0.78)),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
                                   const SizedBox(height: 16),
                                   Wrap(
                                     spacing: 10,
@@ -1420,8 +1637,37 @@ class _DuelCardState extends State<_DuelCard> {
                                       VeyloPill(
                                         label: m.inProgress ? 'Resume' : 'Play',
                                         icon: 'Play',
-                                        onTap: () => app.autoplayMedia(m),
+                                        onTap: () => unawaited(widget.onPlay(m)),
                                       ),
+                                      if (clips.isNotEmpty)
+                                        VeyloOrb(
+                                          icon: 'Clapper',
+                                          tooltip: 'Trailer and videos',
+                                          onTap: () => app.openTheatre(TheatreSession(
+                                            about: TheatreAbout(
+                                              title: m.name,
+                                              backdrop: (art?.backdrop?.isNotEmpty == true) ? art!.backdrop! : m.backdrop,
+                                              logo: logo,
+                                              facts: [
+                                                if (m.year.isNotEmpty) m.year,
+                                                if (runtime.isNotEmpty) runtime,
+                                                if (art?.certificate?.isNotEmpty == true) art!.certificate!,
+                                                if (m.genres.isNotEmpty) m.genres.take(2).join(', '),
+                                              ],
+                                              rating: imdb.isNotEmpty ? imdb : null,
+                                              tagline: art?.tagline,
+                                              directorRole: director != null ? 'Directed by' : null,
+                                              directors: director != null ? [director] : const [],
+                                              cast: (art?.cast ?? const [])
+                                                  .map((p) => p['name']?.toString() ?? '')
+                                                  .where((n) => n.isNotEmpty)
+                                                  .take(4)
+                                                  .toList(),
+                                            ),
+                                            clips: clips,
+                                            initialIndex: 0,
+                                          )),
+                                        ),
                                       VeyloOrb(
                                         icon: 'Info',
                                         tooltip: 'Details',
@@ -1476,8 +1722,9 @@ class _DuelCardState extends State<_DuelCard> {
 }
 
 class _ShortItem extends StatefulWidget {
-  const _ShortItem({required this.entry, required this.onRemove});
+  const _ShortItem({required this.entry, required this.onPlay, required this.onRemove});
   final Map<String, dynamic> entry;
+  final Future<void> Function(MediaItem media) onPlay;
   final VoidCallback onRemove;
 
   @override
@@ -1583,7 +1830,7 @@ class _ShortItemState extends State<_ShortItem> {
               size: 36,
               iconSize: 15,
               backgroundOverride: const Color.fromRGBO(255, 255, 255, 0.09),
-              onTap: () => app.autoplayMedia(m),
+              onTap: () => unawaited(widget.onPlay(m)),
             ),
             const SizedBox(width: 4),
             VeyloOrb(

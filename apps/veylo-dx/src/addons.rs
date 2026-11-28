@@ -67,7 +67,7 @@ pub const LANGUAGES: &[Language] = &[
     lang!("italian", "Italian", "🇮🇹", ["ITA", "ITALIAN", "ITALIANO"], ["it", "ita"]),
     lang!("spanish", "Spanish", "🇪🇸", ["SPA", "ESP", "SPANISH", "CASTELLANO", "ESPANOL"], ["es", "spa"]),
     lang!("latino", "Latino", "🇲🇽", ["LATINO", "LAT"], ["es-419", "es-mx", "es", "spa"]),
-    lang!("french", "French", "🇫🇷", ["FRE", "FRA", "FRENCH", "VFF", "VF", "TRUEFRENCH"], ["fr", "fre", "fra"]),
+    lang!("french", "French", "🇫🇷", ["FRE", "FRA", "FRENCH", "FRANCAIS", "FRANÇAIS", "VFF", "VFQ", "VFI", "VF2", "VF", "TRUEFRENCH"], ["fr", "fre", "fra"]),
     lang!("german", "German", "🇩🇪", ["GER", "DEU", "GERMAN"], ["de", "ger", "deu"]),
     lang!("portuguese", "Portuguese", "🇵🇹", ["POR", "PORTUGUESE", "DUBLADO"], ["pt", "por", "pt-br", "pob"]),
     lang!("dutch", "Dutch", "🇳🇱", ["DUT", "NLD", "DUTCH"], ["nl", "dut", "nld"]),

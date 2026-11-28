@@ -4,6 +4,7 @@ import 'package:flutter/widgets.dart';
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
@@ -747,6 +748,7 @@ class _HeroSkeleton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final app = AppStateScope.read(context);
     final h = (viewportHeight * 0.64).clamp(440.0, 660.0);
     return Container(
       height: h,
@@ -755,30 +757,18 @@ class _HeroSkeleton extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [Color.fromRGBO(255, 255, 255, 0.045), Color.fromRGBO(255, 255, 255, 0.015), Color(0x00000000)],
+          colors: [Color.fromRGBO(255, 255, 255, 0.03), Color.fromRGBO(255, 255, 255, 0.01), Color(0x00000000)],
         ),
       ),
-      alignment: Alignment.bottomLeft,
-      child: const Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SkeletonBox(width: 340, height: 56, borderRadius: 14),
-          SizedBox(height: 14),
-          SkeletonBox(width: 420, height: 18, borderRadius: 9),
-          SizedBox(height: 10),
-          SkeletonBox(width: 260, height: 18, borderRadius: 9),
-          SizedBox(height: 20),
-          Row(
-            children: [
-              SkeletonBox(width: 124, height: 52, borderRadius: 26),
-              SizedBox(width: 10),
-              SkeletonBox(width: 124, height: 52, borderRadius: 26),
-              SizedBox(width: 10),
-              SkeletonBox(width: 52, height: 52, borderRadius: 26),
-            ],
-          ),
-        ],
+      alignment: Alignment.center,
+      child: ValueListenableBuilder<Color>(
+        valueListenable: app.lampColorNotifier,
+        builder: (_, lamp, _) => FindingRunner(
+          lamp: lamp,
+          scene: CinemaScene.projector,
+          width: 300,
+          height: 104,
+        ),
       ),
     );
   }

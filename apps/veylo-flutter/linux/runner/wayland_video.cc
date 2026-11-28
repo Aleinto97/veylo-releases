@@ -122,7 +122,35 @@ struct _VeyloWaylandVideo {
   gulong size_alloc_handler = 0;
   gulong scale_notify_handler = 0;
   bool attached = false;
+  bool has_rect = false;
+  int rect_x = 0;
+  int rect_y = 0;
+  int rect_w = 1;
+  int rect_h = 1;
 };
+
+static void compute_target_geometry(VeyloWaylandVideo* self,
+                                    int* out_x,
+                                    int* out_y,
+                                    int* out_w,
+                                    int* out_h,
+                                    int* out_scale) {
+  int vx = 0, vy = 0, vw = 1, vh = 1, scale = 1;
+  get_view_geometry(GTK_WIDGET(self->view), GTK_WIDGET(self->window), &vx, &vy,
+                    &vw, &vh, &scale);
+  if (self->has_rect && self->rect_w > 1 && self->rect_h > 1) {
+    *out_x = vx + self->rect_x;
+    *out_y = vy + self->rect_y;
+    *out_w = self->rect_w;
+    *out_h = self->rect_h;
+  } else {
+    *out_x = vx;
+    *out_y = vy;
+    *out_w = vw;
+    *out_h = vh;
+  }
+  *out_scale = scale;
+}
 
 static void apply_geometry(VeyloWaylandVideo* self) {
   if (!self->attached || !self->view || !self->window || !self->surface ||
@@ -130,8 +158,7 @@ static void apply_geometry(VeyloWaylandVideo* self) {
     return;
   }
   int x = 0, y = 0, w = 1, h = 1, scale = 1;
-  get_view_geometry(GTK_WIDGET(self->view), GTK_WIDGET(self->window), &x, &y,
-                    &w, &h, &scale);
+  compute_target_geometry(self, &x, &y, &w, &h, &scale);
   wl_subsurface_set_position(self->subsurface, x, y);
   wl_surface_set_buffer_scale(self->surface, scale);
   set_opaque_region(self->compositor, self->surface, w, h);
@@ -148,6 +175,23 @@ static void apply_geometry(VeyloWaylandVideo* self) {
     self->shared->cv.notify_all();
   }
   gtk_widget_queue_draw(GTK_WIDGET(self->window));
+}
+
+void veylo_wayland_video_set_rect(VeyloWaylandVideo* self,
+                                  gboolean active,
+                                  int x,
+                                  int y,
+                                  int width,
+                                  int height) {
+  if (!self) return;
+  self->has_rect = active != FALSE;
+  self->rect_x = x;
+  self->rect_y = y;
+  self->rect_w = width > 1 ? width : 1;
+  self->rect_h = height > 1 ? height : 1;
+  if (self->attached) {
+    apply_geometry(self);
+  }
 }
 
 static void on_size_allocate(GtkWidget*, GtkAllocation*, gpointer user_data) {
@@ -230,8 +274,7 @@ gboolean veylo_wayland_video_attach(VeyloWaylandVideo* self,
   wl_subsurface_set_desync(sub);
 
   int x = 0, y = 0, w = 1, h = 1, scale = 1;
-  get_view_geometry(GTK_WIDGET(self->view), GTK_WIDGET(self->window), &x, &y,
-                    &w, &h, &scale);
+  compute_target_geometry(self, &x, &y, &w, &h, &scale);
   wl_surface_set_buffer_scale(surface, scale);
   wl_subsurface_set_position(sub, x, y);
   set_opaque_region(globals.compositor, surface, w, h);
@@ -442,7 +485,9 @@ gboolean veylo_wayland_video_attach(VeyloWaylandVideo* self,
 }
 
 void veylo_wayland_video_detach(VeyloWaylandVideo* self) {
-  if (!self || !self->attached) return;
+  if (!self) return;
+  self->has_rect = false;
+  if (!self->attached) return;
   self->attached = false;
 
   if (self->size_alloc_handler && self->view) {

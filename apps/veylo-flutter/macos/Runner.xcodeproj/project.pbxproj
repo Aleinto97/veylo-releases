@@ -317,7 +317,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "echo \"$PRODUCT_NAME.app\" > \"$PROJECT_DIR\"/Flutter/ephemeral/.app_filename && \"$FLUTTER_ROOT\"/packages/flutter_tools/bin/macos_assemble.sh embed\n";
+			shellScript = "echo \"$PRODUCT_NAME.app\" > \"$PROJECT_DIR\"/Flutter/ephemeral/.app_filename && \"$FLUTTER_ROOT\"/packages/flutter_tools/bin/macos_assemble.sh embed\nset -e\nSIGN_ID=\"${EXPANDED_CODE_SIGN_IDENTITY:--}\"\nBRIDGE_LIB=\"$PROJECT_DIR/../rust/target/release/libveylo_bridge.dylib\"\nif [ -f \"$BRIDGE_LIB\" ]; then\n  mkdir -p \"$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH\"\n  cp -f \"$BRIDGE_LIB\" \"$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/libveylo_bridge.dylib\"\n  install_name_tool -id @rpath/libveylo_bridge.dylib \"$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/libveylo_bridge.dylib\"\n  codesign --force --sign \"$SIGN_ID\" \"$BUILT_PRODUCTS_DIR/$FRAMEWORKS_FOLDER_PATH/libveylo_bridge.dylib\"\nfi\nPICKS_SRC=\"$PROJECT_DIR/../../veylo-dx/picks-ai\"\nPICKS_DEST=\"$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/picks-ai\"\nif [ -f \"$PICKS_SRC/model/model.onnx\" ] && [ -d \"$PICKS_SRC/macos-arm64\" ]; then\n  rm -rf \"$PICKS_DEST\"\n  mkdir -p \"$PICKS_DEST/runtime\"\n  cp -R \"$PICKS_SRC/model/\" \"$PICKS_DEST/\"\n  cp -R \"$PICKS_SRC/macos-arm64/\" \"$PICKS_DEST/runtime/\"\n  install_name_tool -id @loader_path/libonnxruntime.dylib \"$PICKS_DEST/runtime/libonnxruntime.dylib\"\n  codesign --force --sign \"$SIGN_ID\" \"$PICKS_DEST/runtime/libonnxruntime.dylib\"\nelse\n  echo \"warning: Picks AI assets missing: run python3 tools/picks-ai/fetch.py macos-arm64 (Picks falls back to rules)\"\nfi\n";
 		};
 		33CC111E2044C6BF0003C045 /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;

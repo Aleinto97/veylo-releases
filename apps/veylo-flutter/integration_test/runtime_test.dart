@@ -331,6 +331,18 @@ void main() {
       fail('backend did not start; see Sentry for details');
     }
 
+    await _step('picks.ai', (tx) async {
+      final res = await VeyloBridge.instance.call('picks_ai_check');
+      if (res['ok'] != true || res['ai_failed'] == true) {
+        throw StateError('Picks AI unavailable: $res');
+      }
+      return {
+        'dim': res['dim'],
+        'near': (res['near'] as num?)?.toStringAsFixed(3),
+        'far': (res['far'] as num?)?.toStringAsFixed(3),
+      };
+    });
+
     Future<void> screen(String name, Future<void> Function() go, {Duration settle = const Duration(seconds: 3)}) =>
         _step('screen.$name', (tx) async {
           final before = frameworkErrors.length;
@@ -346,6 +358,15 @@ void main() {
     await screen('home', () async {
       await _until(t, () => app.homeRows.isNotEmpty, const Duration(seconds: 45), 'home rows');
     }, settle: const Duration(seconds: 5));
+
+    // Picks AI on this platform: a vibe (plot) search only works with the on-device model loaded.
+    await _step('ai.vibe-search', (tx) async {
+      final res = await t.runAsync(() => VeyloBridge.instance.search('a crew of thieves plans an elaborate heist', vibe: true));
+      final items = (res?['items'] as List<dynamic>? ?? []);
+      tx.setMeasurement('vibe_results', items.length);
+      if (items.isEmpty) throw StateError('vibe search returned nothing (Picks AI not loaded?)');
+      return {'vibe_results': items.length};
+    });
 
     MediaItem? movie;
     MediaItem? series;

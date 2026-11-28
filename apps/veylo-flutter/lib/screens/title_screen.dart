@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
@@ -472,13 +473,123 @@ class _TitleScreenState extends State<TitleScreen> {
     return nxt.season == 0 ? null : nxt;
   }
 
-  String? _primaryTrailerId() {
-    if (_art?.trailers.isNotEmpty == true) return _art!.trailers.first;
+  /// Every trailer/clip of this title, deduplicated (TMDB/ElfHosted videos first, then add-on trailers).
+  List<TrailerClip> _allClips() {
+    final clips = <TrailerClip>[];
+    final seenYt = <String>{};
+    final seenUrl = <String>{};
+
     for (final v in (_art?.videos ?? const [])) {
-      final k = v['key']?.toString() ?? v['id']?.toString() ?? '';
-      if (k.isNotEmpty) return k;
+      final yt = v['youtube']?.toString() ?? v['key']?.toString() ?? v['id']?.toString() ?? '';
+      if (yt.isEmpty || !seenYt.add(yt)) continue;
+      final kind = v['kind']?.toString() ?? v['type']?.toString() ?? 'Trailer';
+      final name = v['name']?.toString() ?? v['title']?.toString() ?? kind;
+      clips.add(TrailerClip(
+        youtube: yt,
+        name: name.isNotEmpty ? name : kind,
+        kind: kind.isNotEmpty ? kind : 'Trailer',
+        official: v['official'] == true,
+      ));
     }
-    return null;
+
+    int trailerNum = clips.where((c) => c.kind == 'Trailer').length;
+    void addYt(String yt) {
+      if (yt.isEmpty || !seenYt.add(yt)) return;
+      trailerNum++;
+      clips.add(TrailerClip(
+        youtube: yt,
+        name: trailerNum == 1 ? 'Trailer' : 'Trailer $trailerNum',
+        kind: 'Trailer',
+      ));
+    }
+
+    for (final yt in (_art?.trailers ?? const <String>[])) {
+      addYt(yt);
+    }
+
+    final metaTrailers = _meta['trailers'] as List<dynamic>? ?? const [];
+    for (final item in metaTrailers) {
+      if (item is! Map) continue;
+      final yt = item['youtube']?.toString() ?? '';
+      final url = item['url']?.toString() ?? '';
+      if (yt.isNotEmpty) {
+        addYt(yt);
+      } else if (url.isNotEmpty && seenUrl.add(url)) {
+        trailerNum++;
+        clips.add(TrailerClip(
+          url: url,
+          name: trailerNum == 1 ? 'Trailer' : 'Trailer $trailerNum',
+          kind: 'Trailer',
+        ));
+      }
+    }
+    return clips;
+  }
+
+  TheatreAbout _theatreAbout({
+    required String year,
+    required String runtime,
+    required List<String> genres,
+    required String imdb,
+    required String? logo,
+  }) {
+    final facts = <String>[
+      if (year.isNotEmpty) year,
+      if (runtime.isNotEmpty) runtime,
+      if (_art?.certificate?.isNotEmpty == true) _art!.certificate!,
+      if (genres.isNotEmpty) genres.take(2).join(', '),
+    ];
+    String? directorRole;
+    var directors = <String>[];
+    for (final g in (_art?.crew ?? const [])) {
+      final role = g['role']?.toString() ?? '';
+      if (role.startsWith('Directed') || role.startsWith('Created')) {
+        final people = (g['people'] as List<dynamic>? ?? const [])
+            .map((p) => (p as Map?)?['name']?.toString() ?? '')
+            .where((n) => n.isNotEmpty)
+            .toList();
+        if (people.isNotEmpty) {
+          directorRole = role;
+          directors = people.take(2).toList();
+          break;
+        }
+      }
+    }
+    if (directors.isEmpty) {
+      final metaDirs = (_meta['directors'] as List<dynamic>? ?? const [])
+          .map((e) => e.toString())
+          .where((s) => s.isNotEmpty)
+          .take(2)
+          .toList();
+      if (metaDirs.isNotEmpty) {
+        directorRole = 'Directed by';
+        directors = metaDirs;
+      }
+    }
+    final cast = <String>[];
+    for (final p in (_art?.cast ?? const [])) {
+      final name = p['name']?.toString() ?? '';
+      if (name.isNotEmpty) cast.add(name);
+      if (cast.length >= 4) break;
+    }
+    if (cast.isEmpty) {
+      for (final c in (_meta['cast'] as List<dynamic>? ?? const [])) {
+        final name = c.toString();
+        if (name.isNotEmpty) cast.add(name);
+        if (cast.length >= 4) break;
+      }
+    }
+    return TheatreAbout(
+      title: _media.name,
+      backdrop: (_art?.backdrop?.isNotEmpty == true) ? _art!.backdrop! : _media.backdrop,
+      logo: logo,
+      facts: facts,
+      rating: imdb.isNotEmpty ? imdb : null,
+      tagline: _art?.tagline,
+      directorRole: directorRole,
+      directors: directors,
+      cast: cast,
+    );
   }
 
   @override
@@ -525,7 +636,7 @@ class _TitleScreenState extends State<TitleScreen> {
     final currentSeasonEps = _episodes.where((e) => e.season == _selectedSeason).toList();
     final regularEps = _episodes.where((e) => e.season > 0).toList();
     final allSeriesWatched = regularEps.isNotEmpty && regularEps.every((e) => _watchedEps.contains(e.id));
-    final trailerId = _primaryTrailerId();
+    final allClips = _allClips();
 
     return Stack(
       fit: StackFit.expand,
@@ -920,11 +1031,21 @@ class _TitleScreenState extends State<TitleScreen> {
                                         },
                                       ),
                                     ],
-                                    if (trailerId != null)
+                                    if (allClips.isNotEmpty)
                                       VeyloOrb(
-                                        icon: 'Film',
-                                        tooltip: 'Watch trailer',
-                                        onTap: () => app.bridge.openExternal('https://www.youtube.com/watch?v=$trailerId'),
+                                        icon: 'Clapper',
+                                        tooltip: 'Trailer and videos',
+                                        onTap: () => app.openTheatre(TheatreSession(
+                                          about: _theatreAbout(
+                                            year: year,
+                                            runtime: runtime,
+                                            genres: genres,
+                                            imdb: imdb,
+                                            logo: logo,
+                                          ),
+                                          clips: allClips,
+                                          initialIndex: 0,
+                                        )),
                                       ),
                                   ],
                                 ),
@@ -1156,7 +1277,20 @@ class _TitleScreenState extends State<TitleScreen> {
                                 kind: vKind,
                                 onTap: () {
                                   if (ytKey.isNotEmpty) {
-                                    unawaited(app.bridge.openExternal('https://www.youtube.com/watch?v=$ytKey'));
+                                    final idx = allClips.indexWhere((c) => c.youtube == ytKey);
+                                    app.openTheatre(TheatreSession(
+                                      about: _theatreAbout(
+                                        year: year,
+                                        runtime: runtime,
+                                        genres: genres,
+                                        imdb: imdb,
+                                        logo: logo,
+                                      ),
+                                      clips: allClips.isNotEmpty
+                                          ? allClips
+                                          : [TrailerClip(youtube: ytKey, name: vTitle, kind: vKind)],
+                                      initialIndex: idx >= 0 ? idx : 0,
+                                    ));
                                   }
                                 },
                               );
@@ -1256,6 +1390,8 @@ class _TitleScreenState extends State<TitleScreen> {
         if (_chooserVideoId != null)
           _SourceBottomSheet(
             title: _chooserLabel != null ? '${_media.name} · $_chooserLabel' : _media.name,
+            genres: _media.genres,
+            mediaKind: _media.kind,
             loading: _chooserLoading,
             error: _chooserError,
             sources: _chooserSources ?? [],
@@ -1280,6 +1416,9 @@ class _TitleScreenState extends State<TitleScreen> {
                 sources: all,
                 episodes: currentSeasonEps,
                 nextEpisode: _nextAfter(vid),
+                originalLanguage: (_meta['language']?.toString().isNotEmpty == true)
+                    ? _meta['language'].toString()
+                    : null,
               ));
             },
             onDownload: (src) async {
@@ -1997,6 +2136,8 @@ class _EpisodeTileState extends State<_EpisodeTile> {
 class _SourceBottomSheet extends StatefulWidget {
   const _SourceBottomSheet({
     required this.title,
+    this.genres = const [],
+    this.mediaKind = 'movie',
     required this.loading,
     required this.error,
     required this.sources,
@@ -2006,6 +2147,8 @@ class _SourceBottomSheet extends StatefulWidget {
   });
 
   final String title;
+  final List<String> genres;
+  final String mediaKind;
   final bool loading;
   final String? error;
   final List<SourceItem> sources;
@@ -2071,16 +2214,19 @@ class _SourceBottomSheetState extends State<_SourceBottomSheet> {
                           Flexible(
                             child: widget.loading
                                 ? Padding(
-                                    padding: const EdgeInsets.all(20),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: const [
-                                        SkeletonBox(height: 60, borderRadius: 16),
-                                        SizedBox(height: 8),
-                                        SkeletonBox(height: 60, borderRadius: 16),
-                                        SizedBox(height: 8),
-                                        SkeletonBox(height: 60, borderRadius: 16),
-                                      ],
+                                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 34),
+                                    child: Center(
+                                      child: ValueListenableBuilder<Color>(
+                                        valueListenable: app.lampColorNotifier,
+                                        builder: (_, lamp, _) => FindingRunner(
+                                          lamp: lamp,
+                                          genres: widget.genres,
+                                          mediaKind: widget.mediaKind,
+                                          title: widget.title,
+                                          width: 280,
+                                          height: 96,
+                                        ),
+                                      ),
                                     ),
                                   )
                                 : widget.error != null
@@ -2089,9 +2235,24 @@ class _SourceBottomSheetState extends State<_SourceBottomSheet> {
                                         child: Text(widget.error!, style: VeyloText.ui(15, color: VeyloColors.amber)),
                                       )
                                     : widget.sources.isEmpty
-                                        ? const Padding(
-                                            padding: EdgeInsets.all(32),
-                                            child: Text('No sources found for this title.', style: VeyloText.meta),
+                                        ? Padding(
+                                            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 34),
+                                            child: Column(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                ValueListenableBuilder<Color>(
+                                                  valueListenable: app.lampColorNotifier,
+                                                  builder: (_, lamp, _) => FindingRunner(
+                                                    lamp: lamp,
+                                                    scene: CinemaScene.noir,
+                                                    width: 220,
+                                                    height: 78,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 10),
+                                                const Text('No sources found for this title.', style: VeyloText.meta),
+                                              ],
+                                            ),
                                           )
                                         : ValueListenableBuilder<Color>(
                                             valueListenable: app.lampColorNotifier,

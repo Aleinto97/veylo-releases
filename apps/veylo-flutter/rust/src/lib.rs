@@ -19,6 +19,7 @@ pub mod tracks;
 mod crash;
 mod studios;
 mod title_store;
+mod youtube;
 
 pub fn is_tv() -> bool { false }
 
@@ -129,7 +130,11 @@ pub mod android {
     }
 
     pub fn screen() -> Result<crate::engine::Screen> { Err(anyhow!("screen capabilities unavailable in the Flutter shell")) }
-    pub fn picks_ai_paths() -> Result<(PathBuf, PathBuf)> { Err(anyhow!("Picks model not bundled in the Flutter shell")) }
+    /// (model dir, libonnxruntime.so) unpacked/located by MainActivity (Kotlin), set from Dart.
+    pub static PICKS_AI: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    pub fn picks_ai_paths() -> Result<(PathBuf, PathBuf)> {
+        PICKS_AI.get().cloned().ok_or_else(|| anyhow!("Picks model not unpacked yet"))
+    }
     pub fn google_id_token(_web_client: &str) -> Result<()> { Err(anyhow!("Google sign-in isn't available in this build")) }
     pub fn scan_code() -> Result<()> { Err(anyhow!("Code scanning isn't available in this build")) }
     pub fn account_result() -> Option<String> { None }
@@ -488,6 +493,13 @@ impl PicksSession {
 async fn handle_request(req: Value) -> Result<Value> {
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     match op {
+        "set_picks_ai_paths" => {
+            #[cfg(target_os = "android")]
+            if let (Some(model), Some(runtime)) = (req["model"].as_str(), req["runtime"].as_str()) {
+                let _ = android::PICKS_AI.set((model.into(), runtime.into()));
+            }
+            Ok(json!({}))
+        }
         "set_data_dir" => {
             #[cfg(target_os = "android")]
             if let Some(dir) = req["path"].as_str() { let _ = android::DATA_DIR.set(dir.into()); }
@@ -504,6 +516,25 @@ async fn handle_request(req: Value) -> Result<Value> {
                 "accounts_available": backend::accounts_available(),
                 "google_available": backend::google_available(),
                 "sync_key_needed": backend::sync_key_needed(),
+            }))
+        }
+        "picks_ai_check" => {
+            let (space, galaxy, baking) = tokio::try_join!(
+                picks_ai::embed_query("space adventure"),
+                picks_ai::embed_query("astronauts explore a distant galaxy"),
+                picks_ai::embed_query("a cooking show about baking bread"),
+            )?;
+            let near = picks_ai::cosine(&space, &galaxy);
+            let far = picks_ai::cosine(&space, &baking);
+            if space.len() != picks_ai::DIM || near <= far {
+                return Err(anyhow!("unexpected Picks AI embedding (dim={}, near={near:.3}, far={far:.3})", space.len()));
+            }
+            Ok(json!({
+                "ok": true,
+                "dim": space.len(),
+                "near": near,
+                "far": far,
+                "ai_failed": picks_ai::failed(),
             }))
         }
         "home_rows" => {
@@ -873,12 +904,33 @@ async fn handle_request(req: Value) -> Result<Value> {
                     }
                 }));
             }
-            let ctx = backend::autoplay_context_for_media(&m, &video, pack);
+            let mut ctx = backend::autoplay_context_for_media(&m, &video, pack);
+            // If metadata wasn't in memory yet (e.g. direct Play from Home/Picks/Search), briefly
+            // fetch title_meta so `original_language` (e.g. Korean for Parasite) & runtime are known
+            // both for MKV audio-track ranking and for libmpv's `alang` fallback.
+            if ctx.original_language.is_none() || ctx.expected_seconds.is_none() {
+                if let Ok(Ok(tm)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    backend::title_meta(&m),
+                ).await {
+                    if ctx.original_language.is_none() {
+                        ctx.original_language = backend::language_key_of(&tm.language).map(str::to_owned);
+                    }
+                    if ctx.expected_seconds.is_none() {
+                        ctx.expected_seconds = tm.runtime.split_whitespace().next()
+                            .and_then(|n| n.parse::<f64>().ok())
+                            .filter(|&mins| (1.0..=600.0).contains(&mins))
+                            .map(|mins| mins * 60.0);
+                    }
+                }
+            }
+            let original_language = ctx.original_language.clone();
             let pick = backend::autoplay_for(&m.kind, &video, ctx).await;
             Ok(json!({
                 "best": pick.best.as_ref().map(source_to_json),
                 "rest": pick.rest.iter().take(15).map(source_to_json).collect::<Vec<_>>(),
                 "debrid": pick.debrid,
+                "original_language": original_language,
                 "message": if pick.best.is_none() { Some(backend::no_source_message(pick.debrid.as_deref())) } else { None },
             }))
         }
@@ -1301,6 +1353,28 @@ async fn handle_request(req: Value) -> Result<Value> {
             if !picks_ai::failed() {
                 let anchors = brain::anchors().await;
                 if !anchors.is_empty() { b.set_anchors(anchors); }
+                // Warm local synopsis embeddings in the background (same bounded strategy as DX Picks):
+                // taste history first (liked/watched), then unembedded pool candidates.
+                let mut to_embed: Vec<backend::Media> = pool.iter()
+                    .filter(|m| (m.liked != 0 || m.watched) && picks_ai::embedding(m).is_none())
+                    .take(24)
+                    .cloned()
+                    .collect();
+                let seen_keys: HashSet<String> = to_embed.iter().map(backend::Media::key).collect();
+                to_embed.extend(
+                    pool.iter()
+                        .filter(|m| !seen_keys.contains(&m.key()) && picks_ai::embedding(m).is_none())
+                        .take(24)
+                        .cloned(),
+                );
+                if !to_embed.is_empty() {
+                    tokio::spawn(async move {
+                        for m in to_embed {
+                            if picks_ai::failed() { break; }
+                            let _ = picks_ai::enrich_and_embed(&m).await;
+                        }
+                    });
+                }
             }
             let mut sess = PicksSession {
                 night, brain: b, pool, pair: (None, None), shown: Vec::new(), kept: Vec::new(), starred: Vec::new(),
@@ -1480,9 +1554,89 @@ async fn handle_request(req: Value) -> Result<Value> {
                 })?;
             Ok(out)
         }
+        "picks_card_extras" => {
+            let m = media_from_arg(&req["media"])?;
+            let (meta_res, scores) = tokio::join!(
+                backend::title_meta(&m),
+                backend::review_scores(&m),
+            );
+            let meta = meta_res.ok();
+            let director = meta.as_ref().and_then(|tm| tm.directors.first().cloned());
+            let trailers: Vec<Value> = meta.as_ref().map(|tm| {
+                tm.trailers.iter().map(|t| json!({"youtube": t.youtube, "url": t.url})).collect()
+            }).unwrap_or_default();
+            Ok(json!({
+                "logo": meta.as_ref().map(|tm| tm.logo.as_str()).unwrap_or(""),
+                "rating": meta.as_ref().map(|tm| tm.rating.as_str()).unwrap_or(""),
+                "runtime": meta.as_ref().map(|tm| tm.runtime.as_str()).unwrap_or(""),
+                "director": director,
+                "trailers": trailers,
+                "scores": { "tomatometer": scores.tomatometer, "metascore": scores.metascore },
+            }))
+        }
+        "picks_played" => {
+            let m = media_from_arg(&req["media"])?;
+            let out = PICKS_SESSION.get_or_init(|| Mutex::new(None)).lock()
+                .map_err(|_| anyhow!("lock"))?
+                .as_mut()
+                .map(|s| {
+                    let ev = s.brain.play(&m);
+                    brain::persist(&mut s.brain, Some(&ev));
+                    s.to_json()
+                });
+            Ok(out.unwrap_or_else(|| json!({"ok": true})))
+        }
+        "picks_rate" => {
+            let m = media_from_arg(&req["media"])?;
+            let value = req["value"].as_i64().unwrap_or(0);
+            backend::feedback(&m, value).await?;
+            let id = brain::id(&m);
+            let key = m.key();
+            let out = PICKS_SESSION.get_or_init(|| Mutex::new(None)).lock()
+                .map_err(|_| anyhow!("lock"))?
+                .as_mut()
+                .ok_or_else(|| anyhow!("no picks session"))
+                .map(|s| {
+                    if value > 0 {
+                        s.liked.insert(id.clone());
+                        s.disliked.remove(&id);
+                        if !s.starred.iter().any(|x| x.key() == key) {
+                            s.starred.insert(0, m.clone());
+                        }
+                    } else if value == 0 {
+                        s.liked.remove(&id);
+                        s.starred.retain(|x| x.key() != key);
+                    } else {
+                        s.liked.remove(&id);
+                        s.disliked.insert(id.clone());
+                        s.kept.retain(|x| x.key() != key);
+                        s.starred.retain(|x| x.key() != key);
+                        let is_left = s.pair.0.as_ref().is_some_and(|x| x.key() == key);
+                        let is_right = s.pair.1.as_ref().is_some_and(|x| x.key() == key);
+                        if is_left || is_right {
+                            s.streak = 0;
+                            let list = s.filtered();
+                            let ex = s.avoid();
+                            let other = if is_left { s.pair.1.clone() } else { s.pair.0.clone() };
+                            let next = match other.as_ref() {
+                                Some(o) => s.brain.challenger(&list, &ex, o),
+                                None => s.brain.opening_pair(&list, &ex).0,
+                            };
+                            s.mark_shown(&next);
+                            if is_left { s.pair.0 = next; } else { s.pair.1 = next; }
+                        }
+                    }
+                    s.to_json()
+                })?;
+            Ok(out)
+        }
         "open_external" => {
             if let Some(url) = req["url"].as_str() { open_external(url); }
             Ok(json!({"ok": true}))
+        }
+        "youtube_stream" => {
+            let id = req["id"].as_str().unwrap_or("");
+            youtube::resolve(id).await
         }
         _ => Err(anyhow!("unknown op: {op}")),
     }
@@ -1549,8 +1703,13 @@ async fn run_op(v: Value) -> Value {
     }
 }
 
+/// Dispatch an asynchronous JSON bridge request from Dart.
+///
+/// # Safety
+/// `req_json` must be either null or a valid, NUL-terminated C string readable for the duration of
+/// this call. `cb` must be a valid function pointer safe to invoke from a Tokio worker thread.
 #[no_mangle]
-pub extern "C" fn veylo_call_async(req_id: u64, req_json: *const c_char, cb: AsyncCallback) {
+pub unsafe extern "C" fn veylo_call_async(req_id: u64, req_json: *const c_char, cb: AsyncCallback) {
     let req_str = if req_json.is_null() {
         "{}".to_owned()
     } else {
@@ -1565,8 +1724,13 @@ pub extern "C" fn veylo_call_async(req_id: u64, req_json: *const c_char, cb: Asy
     });
 }
 
+/// Free a C string previously returned by `veylo_call_async`.
+///
+/// # Safety
+/// `ptr` must be either null or a pointer returned by `to_cstring_ptr` that has not already been
+/// freed.
 #[no_mangle]
-pub extern "C" fn veylo_free_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn veylo_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe { drop(CString::from_raw(ptr)); }
     }

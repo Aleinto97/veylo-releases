@@ -17,6 +17,9 @@ if [[ -z "${VEYLO_FIREBASE_API_KEY:-}" && -r "$HOME/.config/veylo/firebase.env" 
 fi
 [[ -n "${VEYLO_FIREBASE_API_KEY:-}" ]] || echo "note: no Firebase config; sign-in will be unavailable in this build" >&2
 [[ -n "$VEYLO_SENTRY_DSN" ]] || echo "note: no Sentry DSN; crash reporting will be inert in this build" >&2
+# Picks AI assets (pinned, hash-checked), installed beside the executable by linux/CMakeLists.txt.
+case "$(uname -m)" in aarch64|arm64) picks=linux-aarch64 ;; *) picks=linux-x64 ;; esac
+python3 ../../tools/picks-ai/fetch.py "$picks"
 (cd rust && cargo build --release)
 flutter build linux --release
 so="build/linux/$(uname -m | sed 's/aarch64/arm64/;s/x86_64/x64/')/release/bundle/lib/libveylo_bridge.so"

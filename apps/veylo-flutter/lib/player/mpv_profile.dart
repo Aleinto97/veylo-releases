@@ -111,7 +111,10 @@ bool isFatalPlayerError(String message) {
     'cannot seek', 'seek',
     // Hardware decoding unavailable: mpv falls back to software decoding.
     'avhwdevicecontext', 'hwdec', 'hardware decod', 'vaapi', 'vdpau', 'cuda', 'nvdec',
-    'd3d11va', 'dxva', 'videotoolbox', 'mediacodec', 'vulkan',
+    'd3d11va', 'dxva', 'videotoolbox', 'mediacodec', 'vulkan', 'imgutils',
+    'picture size 0x0', 'failed to initialize decoder',
+    // HLS keepalive / transient transport chatter while playback continues.
+    'keepalive', 'packet corrupt', 'pes packet', 'tls packet', 'error reading http response',
     // Subtitles/fonts: the picture is unaffected.
     'subtitle', 'libass', 'font',
   ];

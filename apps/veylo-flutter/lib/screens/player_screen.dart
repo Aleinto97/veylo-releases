@@ -8,10 +8,11 @@ import '../bridge/veylo_bridge.dart';
 import '../player/mpv_profile.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
-enum _PlayerSheet { audio, subtitles, sources, episodes, speed, sleep, picture, info, shortcuts }
+enum _PlayerSheet { audio, subtitles, sources, episodes, clips, speed, sleep, picture, info, shortcuts }
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key, required this.session});
@@ -35,7 +36,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   final FocusNode _focus = FocusNode();
 
   bool _playing = true;
-  bool _buffering = true;
   bool _loaded = false;
   bool _fullscreen = false;
   final ValueNotifier<Duration> _posN = ValueNotifier<Duration>(Duration.zero);
@@ -54,10 +54,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   List<AudioTrack> _audioTracks = [];
   AudioTrack _activeAudio = AudioTrack.auto();
+  String _preferredAudioLang = 'english';
+  bool _preferredAudioApplied = false;
   List<SubtitleTrack> _subTracks = [];
   SubtitleTrack _activeSub = SubtitleTrack.auto();
   List<Map<String, dynamic>> _onlineSubs = [];
   bool _loadingOnlineSubs = false;
+  bool _externalAudioAttached = false;
   List<Map<String, dynamic>> _segments = [];
   bool _segmentsRequested = false;
 
@@ -104,6 +107,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    _onlineSubs = List<Map<String, dynamic>>.from(widget.session.initialSubtitles);
     _player = Player(
       configuration: const PlayerConfiguration(
         title: 'Veylo',
@@ -128,15 +132,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _watchedAccumMs += now.difference(_playingSince!).inMilliseconds.clamp(0, 600000);
         _playingSince = null;
       }
+      if (p) _attachExternalAudio();
       if (_playing != p || (p && !_loaded)) {
         setState(() {
           _playing = p;
           if (p) _loaded = true;
         });
       }
-    }));
-    _subs.add(_player.stream.buffering.listen((b) {
-      if (mounted && _buffering != b) setState(() => _buffering = b);
     }));
     _subs.add(_player.stream.position.listen((p) {
       if (!mounted || _scrubValue != null) return;
@@ -153,6 +155,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _subs.add(_player.stream.duration.listen((d) {
       if (!mounted) return;
       _durN.value = d;
+      if (d > Duration.zero) _attachExternalAudio();
       if (d > Duration.zero && !_loaded) {
         setState(() => _loaded = true);
       }
@@ -177,6 +180,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
           videoId: s.nextEpisode!.id,
           episodeLabel: s.nextEpisode!.label,
           seasonEpisodes: s.episodes,
+        ));
+      } else if (_autoNext && s.clips.length > 1 && s.clipIndex + 1 < s.clips.length) {
+        final app = AppStateScope.read(context);
+        unawaited(app.playTrailer(
+          title: s.clipContextTitle ?? s.title,
+          clips: s.clips,
+          startIndex: s.clipIndex + 1,
         ));
       }
     }));
@@ -203,6 +213,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _audioTracks = t.audio;
           _subTracks = t.subtitle;
         });
+        _ensurePreferredAudioTrack(t.audio);
       }
     }));
     _subs.add(_player.stream.track.listen((t) {
@@ -211,6 +222,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _activeAudio = t.audio;
           _activeSub = t.subtitle;
         });
+        if (!_preferredAudioApplied && _audioTracks.isNotEmpty) {
+          _ensurePreferredAudioTrack(_audioTracks);
+        }
       }
     }));
     _subs.add(_player.stream.error.listen((e) {
@@ -233,37 +247,104 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
-  static String? _langCodes(String? lang) => switch (lang?.toLowerCase()) {
-        'english' => 'en,eng',
-        'italian' => 'it,ita',
-        'spanish' => 'es,spa',
-        'french' => 'fr,fre,fra',
-        'german' => 'de,ger,deu',
-        'portuguese' => 'pt,por',
-        'japanese' => 'ja,jpn',
-        'korean' => 'ko,kor',
-        'chinese' => 'zh,chi,zho',
-        'russian' => 'ru,rus',
-        'dutch' => 'nl,dut,nld',
-        'polish' => 'pl,pol',
-        'turkish' => 'tr,tur',
-        'arabic' => 'ar,ara',
-        'hindi' => 'hi,hin',
-        _ => null,
+  static List<String> _langCodeList(String? lang) => switch (lang?.toLowerCase().trim()) {
+        'english' || 'en' || 'eng' => const ['en', 'eng', 'english'],
+        'italian' || 'it' || 'ita' => const ['it', 'ita', 'italian', 'italiano'],
+        'spanish' || 'es' || 'spa' => const ['es', 'spa', 'spanish', 'castellano'],
+        'latino' => const ['es-419', 'es-mx', 'es', 'spa', 'latino'],
+        'french' || 'fr' || 'fre' || 'fra' => const ['fr', 'fre', 'fra', 'french', 'français', 'francais'],
+        'german' || 'de' || 'ger' || 'deu' => const ['de', 'ger', 'deu', 'german', 'deutsch'],
+        'portuguese' || 'pt' || 'por' => const ['pt', 'por', 'pt-br', 'pob', 'portuguese'],
+        'dutch' || 'nl' || 'dut' || 'nld' => const ['nl', 'dut', 'nld', 'dutch'],
+        'polish' || 'pl' || 'pol' => const ['pl', 'pol', 'polish'],
+        'russian' || 'ru' || 'rus' => const ['ru', 'rus', 'russian'],
+        'ukrainian' || 'uk' || 'ukr' => const ['uk', 'ukr', 'ukrainian'],
+        'turkish' || 'tr' || 'tur' => const ['tr', 'tur', 'turkish'],
+        'greek' || 'el' || 'gre' || 'ell' => const ['el', 'gre', 'ell', 'greek'],
+        'swedish' || 'sv' || 'swe' => const ['sv', 'swe', 'swedish'],
+        'danish' || 'da' || 'dan' => const ['da', 'dan', 'danish'],
+        'norwegian' || 'no' || 'nor' => const ['no', 'nor', 'nob', 'nb', 'norwegian'],
+        'finnish' || 'fi' || 'fin' => const ['fi', 'fin', 'finnish'],
+        'czech' || 'cs' || 'cze' || 'ces' => const ['cs', 'cze', 'ces', 'czech'],
+        'hungarian' || 'hu' || 'hun' => const ['hu', 'hun', 'hungarian'],
+        'romanian' || 'ro' || 'rum' || 'ron' => const ['ro', 'rum', 'ron', 'romanian'],
+        'arabic' || 'ar' || 'ara' => const ['ar', 'ara', 'arabic'],
+        'hebrew' || 'he' || 'heb' => const ['he', 'heb', 'hebrew'],
+        'hindi' || 'hi' || 'hin' => const ['hi', 'hin', 'hindi'],
+        'japanese' || 'ja' || 'jpn' => const ['ja', 'jpn', 'japanese'],
+        'korean' || 'ko' || 'kor' => const ['ko', 'kor', 'korean'],
+        'chinese' || 'zh' || 'chi' || 'zho' => const ['zh', 'chi', 'zho', 'chinese', 'mandarin'],
+        _ => const [],
       };
+
+  static bool _isExtraAudioTrack(AudioTrack t) {
+    final hay = (t.title ?? '').toLowerCase();
+    if (hay.isEmpty) return false;
+    const markers = [
+      'commentary', 'commento', 'comentario', 'commentaire', 'kommentar',
+      'audio description', 'audio-description', 'audiodescription', 'descriptive',
+      'visually impaired', 'isolated score', 'music only',
+    ];
+    return markers.any(hay.contains);
+  }
+
+  static bool _trackMatchesLang(AudioTrack t, String langKey) {
+    final codes = _langCodeList(langKey);
+    if (codes.isEmpty) return false;
+    final rawLang = (t.language ?? '').trim().toLowerCase().replaceAll('_', '-');
+    final baseLang = rawLang.split('-').first;
+    if (rawLang.isNotEmpty && codes.any((c) => c == rawLang || (!c.contains('-') && c == baseLang))) {
+      return true;
+    }
+    final title = (t.title ?? '').toLowerCase();
+    if (title.isEmpty) return false;
+    final words = title.split(RegExp(r'[^a-z0-9à-ÿ]+')).where((w) => w.isNotEmpty).toList();
+    return words.any((w) => codes.contains(w));
+  }
+
+  /// Ensures libmpv lands on the user's preferred audio language (e.g. English), or the film's
+  /// original language (e.g. Korean for Parasite) when no preferred track exists — instead of
+  /// falling back to a foreign dub marked default (e.g. French VFF in a MULTI release).
+  void _ensurePreferredAudioTrack(List<AudioTrack> tracks) {
+    if (_preferredAudioApplied) return;
+    final real = tracks.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    if (real.isEmpty) return;
+    _preferredAudioApplied = true;
+    final main = real.where((t) => !_isExtraAudioTrack(t)).toList();
+    final pool = main.isNotEmpty ? main : real;
+
+    AudioTrack? pickFor(String? lang) {
+      if (lang == null || lang.isEmpty) return null;
+      for (final t in pool) {
+        if (_trackMatchesLang(t, lang)) return t;
+      }
+      return null;
+    }
+
+    final want = pickFor(_preferredAudioLang) ?? pickFor(widget.session.originalLanguage);
+    if (want != null && want.id != _activeAudio.id) {
+      unawaited(_player.setAudioTrack(want));
+    } else if (_isExtraAudioTrack(_activeAudio) && main.isNotEmpty && main.first.id != _activeAudio.id) {
+      unawaited(_player.setAudioTrack(main.first));
+    }
+  }
 
   Future<void> _configureAndOpen() async {
     String hwdecMode = 'auto';
     bool passthrough = false;
     bool nightMode = false;
-    String? streamLang;
+    String streamLang = 'english';
     try {
       final res = await VeyloBridge.instance.settingsGet();
       final st = (res['settings'] as Map<String, dynamic>?) ?? {};
       hwdecMode = st['hwdec_mode']?.toString() ?? 'auto';
       passthrough = st['audio_passthrough'] as bool? ?? false;
       nightMode = st['audio_night_mode'] as bool? ?? false;
-      streamLang = st['stream_language']?.toString();
+      final savedLang = st['stream_language']?.toString();
+      if (savedLang != null && savedLang.isNotEmpty) {
+        streamLang = savedLang;
+      }
+      _preferredAudioLang = streamLang;
       if (mounted) {
         setState(() {
           _subScale = (st['sub_scale'] as num?)?.toDouble().clamp(0.6, 2.0) ?? 1.0;
@@ -310,19 +391,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
         } catch (_) {}
       }
 
-      // Audio policy.
+      // Audio policy: prefer configured language, then fall back to the film's original language
+      // (so a Korean film with French+Korean tracks plays Korean rather than a French default dub).
       await setProp('audio-spdif', passthrough ? 'ac3,eac3,dts,dts-hd,truehd' : '');
       if (nightMode) {
         await setProp('af', 'lavfi=[dynaudnorm=f=150:g=15:p=0.9]');
       }
-      final codes = _langCodes(streamLang);
-      if (codes != null) {
-        await setProp('alang', codes);
+      final alangParts = <String>[
+        ..._langCodeList(streamLang).where((c) => c.length <= 6),
+        ..._langCodeList(widget.session.originalLanguage).where((c) => c.length <= 6),
+      ];
+      final uniqueAlang = <String>{...alangParts}.toList();
+      if (uniqueAlang.isNotEmpty) {
+        await setProp('alang', uniqueAlang.join(','));
       }
       if (widget.session.startMs > 5000) {
         await setProp('start', '+${(widget.session.startMs / 1000.0).toStringAsFixed(1)}');
       } else {
         await setProp('start', 'none');
+      }
+      final ua = widget.session.headers['User-Agent'] ?? widget.session.headers['user-agent'];
+      if (ua != null && ua.isNotEmpty) {
+        await setProp('user-agent', ua);
+      }
+      final isHls = widget.session.url.contains('.m3u8') || widget.session.url.contains('/hls_variant/');
+      if (isHls) {
+        // FFmpeg's HLS demuxer deadlocks when `reconnect_streamed=1` is set in `stream-lavf-o`.
+        await setProp('stream-lavf-o', '');
       }
     }
 
@@ -330,11 +425,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _openStream();
   }
 
+  void _attachExternalAudio() {
+    final audioUrl = widget.session.audioUrl;
+    if (_externalAudioAttached || audioUrl == null || audioUrl.isEmpty) return;
+    _externalAudioAttached = true;
+    unawaited(
+      _player.setAudioTrack(AudioTrack.uri(audioUrl, title: 'Original')).catchError((_) {}),
+    );
+  }
+
   Future<void> _openStream() async {
     if (!mounted) return;
+    _externalAudioAttached = false;
+    _preferredAudioApplied = false;
     setState(() {
       _error = null;
-      _buffering = true;
     });
     try {
       await _player.open(
@@ -344,7 +449,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          _buffering = false;
           _error = 'Failed to open stream: $e';
         });
       }
@@ -869,7 +973,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
                   ),
 
-                // Center spinner or error panel
+                // Center error panel
                 if (_error != null)
                   Center(
                     child: ConstrainedBox(
@@ -918,6 +1022,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                         sources: s.sources,
                                         episodes: s.episodes,
                                         nextEpisode: s.nextEpisode,
+                                        originalLanguage: s.originalLanguage,
                                       ));
                                     },
                                   ),
@@ -927,14 +1032,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ],
                         ),
                       ),
-                    ),
-                  )
-                else if (_buffering || !_loaded)
-                  Center(
-                    child: SizedBox(
-                      width: 52,
-                      height: 52,
-                      child: _Spinner(color: lamp),
                     ),
                   ),
 
@@ -1049,16 +1146,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                         spacing: 8,
                                         runSpacing: 8,
                                         children: [
-                                          VeyloPill(
-                                            label: 'Play now',
-                                            icon: 'Play',
-                                            accent: true,
-                                            small: true,
-                                            onTap: () => app.autoplayMedia(
-                                              s.media!,
-                                              videoId: s.nextEpisode!.id,
-                                              episodeLabel: s.nextEpisode!.label,
-                                              seasonEpisodes: s.episodes,
+                                          LampCountdownBorder(
+                                            progress: _autoNext ? ((durSec - posSec) / 25.0).clamp(0.0, 1.0) : 0.0,
+                                            lamp: lamp,
+                                            child: VeyloPill(
+                                              label: 'Play now',
+                                              icon: 'Play',
+                                              accent: true,
+                                              small: true,
+                                              onTap: () => app.autoplayMedia(
+                                                s.media!,
+                                                videoId: s.nextEpisode!.id,
+                                                episodeLabel: s.nextEpisode!.label,
+                                                seasonEpisodes: s.episodes,
+                                              ),
                                             ),
                                           ),
                                           VeyloPill(
@@ -1126,12 +1227,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               ),
                             ),
                             if (sleepBadge != null) ...[
-                              VeyloPill(
-                                label: sleepBadge,
-                                icon: 'Moon',
-                                small: true,
-                                active: true,
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
+                              MouseRegion(
+                                cursor: SystemMouseCursors.click,
+                                child: GestureDetector(
+                                  onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
+                                  child: GlassBox(
+                                    borderRadius: 999,
+                                    lamp: lamp,
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        BreathingMoonIcon(lamp: lamp, size: 16),
+                                        const SizedBox(width: 6),
+                                        Text(
+                                          sleepBadge,
+                                          style: VeyloText.ui(13, weight: 650, color: VeyloColors.bone, tabular: true),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
                               ),
                               const SizedBox(width: 8),
                             ],
@@ -1291,6 +1407,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 tooltip: 'Episodes',
                                 onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.episodes ? null : _PlayerSheet.episodes),
                               ),
+                            if (s.clips.length > 1)
+                              VeyloOrb(
+                                icon: 'Film',
+                                glass: false,
+                                size: 42,
+                                active: _sheet == _PlayerSheet.clips,
+                                tooltip: 'Trailers & Clips',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.clips ? null : _PlayerSheet.clips),
+                              ),
                             if (s.sources.length > 1)
                               VeyloOrb(
                                 icon: 'Layers',
@@ -1392,6 +1517,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   seasonEpisodes: s.episodes,
                                 ),
                               ),
+                            ] else if (s.clips.length > 1 && s.clipIndex + 1 < s.clips.length) ...[
+                              const SizedBox(width: 8),
+                              VeyloPill(
+                                label: 'Next clip',
+                                icon: 'Next',
+                                small: true,
+                                onTap: () => app.playTrailer(
+                                  title: s.clipContextTitle ?? s.title,
+                                  clips: s.clips,
+                                  startIndex: s.clipIndex + 1,
+                                ),
+                              ),
                             ],
                           ],
                         ),
@@ -1477,6 +1614,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _PlayerSheet.subtitles => 'Subtitles',
         _PlayerSheet.sources => 'Sources',
         _PlayerSheet.episodes => 'Episodes',
+        _PlayerSheet.clips => 'Trailers & Clips',
         _PlayerSheet.speed => 'Speed',
         _PlayerSheet.sleep => 'Sleep timer',
         _PlayerSheet.picture => 'Picture',
@@ -1761,6 +1899,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     title: s.title,
                     subtitle: s.subtitle,
                     url: src.url,
+                    audioUrl: src.audioUrl,
                     headers: src.headers,
                     startMs: _position.inMilliseconds,
                     size: src.size,
@@ -1773,6 +1912,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     sources: s.sources,
                     episodes: s.episodes,
                     nextEpisode: s.nextEpisode,
+                    initialSubtitles: s.initialSubtitles,
+                    clips: s.clips,
+                    clipIndex: s.clipIndex,
+                    clipContextTitle: s.clipContextTitle,
+                    originalLanguage: s.originalLanguage,
                   ));
                 },
               ),
@@ -1790,6 +1934,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   if (s.media != null) {
                     unawaited(app.autoplayMedia(s.media!, videoId: ep.id, episodeLabel: ep.label, seasonEpisodes: s.episodes));
                   }
+                },
+              ),
+          ],
+        ),
+      _PlayerSheet.clips => Column(
+          children: [
+            for (int i = 0; i < s.clips.length; i++)
+              _PlayerOptionRow(
+                label: s.clips[i].name.isNotEmpty ? s.clips[i].name : s.clips[i].label,
+                about: s.clips[i].label,
+                selected: i == s.clipIndex,
+                onTap: () {
+                  setState(() => _sheet = null);
+                  if (i == s.clipIndex) return;
+                  unawaited(app.playTrailer(
+                    title: s.clipContextTitle ?? s.title,
+                    clips: s.clips,
+                    startIndex: i,
+                  ));
                 },
               ),
           ],
@@ -2456,54 +2619,4 @@ class _ScrubberTrackPainter extends CustomPainter {
       old.trackHeight != trackHeight ||
       old.lamp != lamp ||
       old.segments != segments;
-}
-
-class _Spinner extends StatefulWidget {
-  const _Spinner({required this.color});
-  final Color color;
-
-  @override
-  State<_Spinner> createState() => _SpinnerState();
-}
-
-class _SpinnerState extends State<_Spinner> with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat();
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return RotationTransition(
-      turns: _ctrl,
-      child: CustomPaint(painter: _SpinnerPainter(widget.color)),
-    );
-  }
-}
-
-class _SpinnerPainter extends CustomPainter {
-  _SpinnerPainter(this.color);
-  final Color color;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final rect = Offset.zero & size;
-    final bg = Paint()
-      ..color = const Color.fromRGBO(255, 255, 255, 0.18)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 4;
-    final fg = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round;
-    canvas.drawArc(rect.deflate(2), 0, 6.283, false, bg);
-    canvas.drawArc(rect.deflate(2), -1.57, 1.7, false, fg);
-  }
-
-  @override
-  bool shouldRepaint(_SpinnerPainter old) => old.color != color;
 }

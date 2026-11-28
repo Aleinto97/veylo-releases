@@ -64,7 +64,7 @@ pub fn put(key: &str, part: &'static str, value: &Value) {
         let path = file(&key);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
         if std::fs::write(&tmp, doc.to_string()).is_ok() { let _ = std::fs::rename(&tmp, &path); } else { let _ = std::fs::remove_file(&tmp); }
-        if WRITES.fetch_add(1, Ordering::Relaxed) % 64 == 0 { prune(&d); }
+        if WRITES.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) { prune(&d); }
     });
 }
 

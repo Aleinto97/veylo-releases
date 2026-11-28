@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:path_provider/path_provider.dart';
 import 'package:ffi/ffi.dart';
 
@@ -118,6 +119,13 @@ class VeyloBridge {
       // The shared backend keeps its store in the app's private files folder.
       final dir = await getApplicationSupportDirectory();
       await call('set_data_dir', {'path': dir.path});
+      // Picks AI: model unpacked from the APK + ONNX Runtime from the native libs (MainActivity).
+      try {
+        final p = await const MethodChannel('veylo/picks').invokeMapMethod<String, String>('paths');
+        if (p != null) await call('set_picks_ai_paths', {'model': p['model'], 'runtime': p['runtime']});
+      } catch (_) {
+        // Rules-only Picks when the model can't be unpacked (e.g. an emulator ABI without ONNX).
+      }
     }
     return call('init');
   }
@@ -384,7 +392,14 @@ class VeyloBridge {
   Future<Map<String, dynamic>> picksNewNight() => call('picks_new_night');
   Future<void> picksResetTaste() => call('picks_reset_taste');
   Future<Map<String, dynamic>> picksUnstar(String key) => call('picks_unstar', {'key': key});
+  Future<Map<String, dynamic>> picksCardExtras(MediaItem media) =>
+      call('picks_card_extras', {'media': media.toArg()});
+  Future<Map<String, dynamic>> picksPlayed(MediaItem media) =>
+      call('picks_played', {'media': media.toArg()});
+  Future<Map<String, dynamic>> picksRate(MediaItem media, int value) =>
+      call('picks_rate', {'media': media.toArg(), 'value': value});
   Future<void> openExternal(String url) => call('open_external', {'url': url});
+  Future<Map<String, dynamic>> youtubeStream(String id) => call('youtube_stream', {'id': id});
 }
 
 class MediaItem {
@@ -642,6 +657,7 @@ class SourceItem {
     required this.name,
     required this.description,
     required this.url,
+    this.audioUrl,
     required this.filename,
     this.size,
     this.sizeBytes,
@@ -656,6 +672,7 @@ class SourceItem {
   final String name;
   final String description;
   final String url;
+  final String? audioUrl;
   final String filename;
   final String? size;
   final int? sizeBytes;
@@ -677,6 +694,7 @@ class SourceItem {
       name: j['name'] as String? ?? '',
       description: j['description'] as String? ?? '',
       url: j['url'] as String? ?? '',
+      audioUrl: (j['audio_url'] as String?)?.isNotEmpty == true ? j['audio_url'] as String : null,
       filename: j['filename'] as String? ?? '',
       size: j['size'] as String?,
       sizeBytes: (j['size_bytes'] as num?)?.toInt(),
@@ -725,11 +743,76 @@ class EpisodeItem {
       );
 }
 
+class TrailerClip {
+  const TrailerClip({
+    this.youtube,
+    this.url,
+    required this.name,
+    this.kind = 'Trailer',
+    this.official = false,
+  });
+
+  final String? youtube;
+  final String? url;
+  final String name;
+  final String kind;
+  final bool official;
+
+  String get id => youtube ?? url ?? name;
+
+  String get label {
+    final k = kind == 'Behind the Scenes'
+        ? 'Behind the scenes'
+        : (kind.isEmpty ? 'Video' : kind);
+    if (official && (kind == 'Trailer' || kind == 'Teaser')) {
+      return 'Official ${k.toLowerCase()}';
+    }
+    return k;
+  }
+}
+
+class TheatreAbout {
+  const TheatreAbout({
+    required this.title,
+    this.backdrop = '',
+    this.logo,
+    this.facts = const [],
+    this.rating,
+    this.tagline,
+    this.directorRole,
+    this.directors = const [],
+    this.cast = const [],
+  });
+
+  final String title;
+  final String backdrop;
+  final String? logo;
+  final List<String> facts;
+  final String? rating;
+  final String? tagline;
+  final String? directorRole;
+  final List<String> directors;
+  final List<String> cast;
+}
+
+class TheatreSession {
+  const TheatreSession({
+    required this.about,
+    required this.clips,
+    this.initialIndex = 0,
+  });
+
+  final TheatreAbout about;
+  final List<TrailerClip> clips;
+  final int initialIndex;
+}
+
 class PlaySession {
   const PlaySession({
     required this.title,
     required this.subtitle,
     required this.url,
+    this.audioUrl,
     this.headers = const {},
     this.startMs = 0,
     this.size,
@@ -742,11 +825,17 @@ class PlaySession {
     this.sources = const [],
     this.episodes = const [],
     this.nextEpisode,
+    this.initialSubtitles = const [],
+    this.clips = const [],
+    this.clipIndex = 0,
+    this.clipContextTitle,
+    this.originalLanguage,
   });
 
   final String title;
   final String subtitle;
   final String url;
+  final String? audioUrl;
   final Map<String, String> headers;
   final int startMs;
   final String? size;
@@ -759,4 +848,9 @@ class PlaySession {
   final List<SourceItem> sources;
   final List<EpisodeItem> episodes;
   final EpisodeItem? nextEpisode;
+  final List<Map<String, dynamic>> initialSubtitles;
+  final List<TrailerClip> clips;
+  final int clipIndex;
+  final String? clipContextTitle;
+  final String? originalLanguage;
 }

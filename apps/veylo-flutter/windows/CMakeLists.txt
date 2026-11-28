@@ -87,6 +87,16 @@ if(EXISTS "${VEYLO_BRIDGE_DLL}")
   install(FILES "${VEYLO_BRIDGE_DLL}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
 endif()
 
+# Picks AI beside the exe (model + tokenizer, ONNX Runtime + its VC runtime under runtime/),
+# prepared by `python3 tools/picks-ai/fetch.py windows-x64`.
+set(VEYLO_PICKS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../veylo-dx/picks-ai")
+if(EXISTS "${VEYLO_PICKS_DIR}/model/model.onnx" AND EXISTS "${VEYLO_PICKS_DIR}/windows-x64")
+  install(DIRECTORY "${VEYLO_PICKS_DIR}/model/" DESTINATION "${CMAKE_INSTALL_PREFIX}/picks-ai" COMPONENT Runtime)
+  install(DIRECTORY "${VEYLO_PICKS_DIR}/windows-x64/" DESTINATION "${CMAKE_INSTALL_PREFIX}/picks-ai/runtime" COMPONENT Runtime)
+else()
+  message(WARNING "Picks AI assets missing: run python3 tools/picks-ai/fetch.py windows-x64 (Picks falls back to rules)")
+endif()
+
 if(PLUGIN_BUNDLED_LIBRARIES)
   install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"

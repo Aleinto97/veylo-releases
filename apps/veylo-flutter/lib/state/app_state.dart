@@ -64,9 +64,11 @@ class AppState extends ChangeNotifier {
   // Player & toast state
   String? pendingPlayerTitle;
   String pendingPlayerStep = 'Finding a source';
+  MediaItem? pendingPlayerMedia;
   String? _inflightPlayKey;
   int _playTicket = 0;
   PlaySession? activePlayer;
+  TheatreSession? activeTheatre;
   Future<void> Function()? onBeforeClosePlayer;
   String? toastMessage;
   bool toastIsError = false;
@@ -390,6 +392,7 @@ class AppState extends ChangeNotifier {
     _playTicket++;
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
+    pendingPlayerMedia = null;
     notifyListeners();
   }
 
@@ -397,7 +400,24 @@ class AppState extends ChangeNotifier {
     _playTicket++;
     _inflightPlayKey = null;
     pendingPlayerTitle = null;
+    pendingPlayerMedia = null;
+    activeTheatre = null;
     activePlayer = session;
+    notifyListeners();
+  }
+
+  void openTheatre(TheatreSession session) {
+    if (session.clips.isEmpty) return;
+    _playTicket++;
+    _inflightPlayKey = null;
+    pendingPlayerTitle = null;
+    activeTheatre = session;
+    notifyListeners();
+  }
+
+  void closeTheatre() {
+    if (activeTheatre == null) return;
+    activeTheatre = null;
     notifyListeners();
   }
 
@@ -435,6 +455,94 @@ class AppState extends ChangeNotifier {
     ));
   }
 
+  /// Play a trailer or extra clip directly inside Veylo's own PlayerScreen (never an external browser).
+  /// Leaves `media: null` so watching trailers never affects Continue Watching or watch history.
+  Future<void> playTrailer({
+    required String title,
+    required List<TrailerClip> clips,
+    int startIndex = 0,
+  }) async {
+    if (clips.isEmpty) return;
+    final idx = startIndex.clamp(0, clips.length - 1);
+    final clip = clips[idx];
+    final requestKey = 'trailer|$title|${clip.id}';
+    if (pendingPlayerTitle != null && _inflightPlayKey == requestKey) return;
+
+    _inflightPlayKey = requestKey;
+    dismissToast();
+    final ticket = ++_playTicket;
+
+    final displayName = clip.name.isNotEmpty && clip.name.toLowerCase() != clip.label.toLowerCase()
+        ? clip.name
+        : '$title · ${clip.label}';
+    final subtitle = clips.length > 1
+        ? '$title · ${clip.label} (${idx + 1}/${clips.length})'
+        : '$title · ${clip.label}';
+
+    // Direct stream URL from an add-on needs no YouTube resolution.
+    if ((clip.youtube == null || clip.youtube!.isEmpty) && clip.url != null && clip.url!.isNotEmpty) {
+      startPlaySession(PlaySession(
+        title: displayName,
+        subtitle: subtitle,
+        url: clip.url!,
+        clips: clips,
+        clipIndex: idx,
+        clipContextTitle: title,
+      ));
+      return;
+    }
+
+    final ytId = clip.youtube ?? '';
+    if (ytId.isEmpty) {
+      _inflightPlayKey = null;
+      showToast('Trailer stream is unavailable.', isError: true);
+      return;
+    }
+
+    pendingPlayerTitle = displayName;
+    pendingPlayerStep = 'Loading ${clip.label.toLowerCase()}';
+    notifyListeners();
+
+    try {
+      final res = await bridge.youtubeStream(ytId);
+      if (_playTicket != ticket) return;
+
+      final bestMap = res['best'] as Map<String, dynamic>?;
+      if (bestMap == null) {
+        throw Exception('No playable stream returned');
+      }
+      final best = SourceItem.fromJson(bestMap);
+      final sources = (res['sources'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .map(SourceItem.fromJson)
+          .toList();
+      final captions = (res['captions'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+
+      startPlaySession(PlaySession(
+        title: displayName,
+        subtitle: subtitle,
+        url: best.url,
+        audioUrl: best.audioUrl,
+        headers: best.headers,
+        size: best.size,
+        hdr: best.hdr,
+        quality: best.quality,
+        sources: sources.isNotEmpty ? sources : [best],
+        initialSubtitles: captions,
+        clips: clips,
+        clipIndex: idx,
+        clipContextTitle: title,
+      ));
+    } catch (e) {
+      if (_playTicket != ticket) return;
+      _inflightPlayKey = null;
+      pendingPlayerTitle = null;
+      showToast('Could not load trailer: $e', isError: true, durationMs: 6000);
+    }
+  }
+
   Future<void> autoplayMedia(
     MediaItem media, {
     String? videoId,
@@ -452,6 +560,7 @@ class AppState extends ChangeNotifier {
 
     final ticket = ++_playTicket;
     pendingPlayerTitle = episodeLabel != null ? '${media.name} $episodeLabel' : media.name;
+    pendingPlayerMedia = media;
     pendingPlayerStep = (videoId == null && media.kind != 'movie') ? 'Resolving episode' : 'Finding a source';
     notifyListeners();
 
@@ -534,10 +643,12 @@ class AppState extends ChangeNotifier {
           sources: allSources,
           episodes: resolvedEpisodes,
           nextEpisode: resolvedNext,
+          originalLanguage: res['original_language'] as String?,
         ));
       } else {
         _inflightPlayKey = null;
         pendingPlayerTitle = null;
+        pendingPlayerMedia = null;
         final msg = res['message'] as String? ?? 'No playable source found';
         showToast(msg, isError: true, durationMs: 7000);
         if (activePlayer == null && openedTitle?.key != media.key) {
@@ -548,6 +659,7 @@ class AppState extends ChangeNotifier {
       if (_playTicket != ticket) return;
       _inflightPlayKey = null;
       pendingPlayerTitle = null;
+      pendingPlayerMedia = null;
       showToast(e.toString(), isError: true, durationMs: 7000);
     }
   }

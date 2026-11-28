@@ -14,6 +14,12 @@ VeyloWaylandVideo* veylo_wayland_video_new(GtkWindow* window, FlView* view);
 gboolean veylo_wayland_video_attach(VeyloWaylandVideo* self,
                                     int64_t mpv_handle_ptr,
                                     char** error_out);
+void veylo_wayland_video_set_rect(VeyloWaylandVideo* self,
+                                  gboolean active,
+                                  int x,
+                                  int y,
+                                  int width,
+                                  int height);
 void veylo_wayland_video_detach(VeyloWaylandVideo* self);
 void veylo_wayland_video_free(VeyloWaylandVideo* self);
 

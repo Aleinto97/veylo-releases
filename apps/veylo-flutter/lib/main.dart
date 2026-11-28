@@ -10,9 +10,11 @@ import 'screens/picks_screen.dart';
 import 'screens/player_screen.dart';
 import 'screens/search_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/theatre_screen.dart';
 import 'screens/title_screen.dart';
 import 'state/app_state.dart';
 import 'theme/veylo_theme.dart';
+import 'widgets/finding_runner.dart';
 import 'widgets/glass.dart';
 import 'widgets/shortcuts_modal.dart';
 import 'widgets/top_bar.dart';
@@ -169,7 +171,7 @@ class _VeyloShell extends StatelessWidget {
             if (app.pendingPlayerTitle != null)
               _PendingOverlay(
                 title: app.pendingPlayerTitle!,
-                step: app.pendingPlayerStep,
+                media: app.pendingPlayerMedia,
                 onCancel: app.cancelPendingPlay,
               ),
             if (app.toastMessage != null) _buildToast(app),
@@ -233,6 +235,7 @@ class _VeyloShell extends StatelessWidget {
       autofocus: true,
       onKeyEvent: (node, event) {
         if (event is! KeyDownEvent) return KeyEventResult.ignored;
+        if (app.activeTheatre != null) return KeyEventResult.ignored;
         final ctrl = HardwareKeyboard.instance.isControlPressed || HardwareKeyboard.instance.isMetaPressed;
         final k = event.logicalKey;
 
@@ -280,32 +283,48 @@ class _VeyloShell extends StatelessWidget {
         return KeyEventResult.ignored;
       },
       child: ColoredBox(
-        color: VeyloColors.screen,
+        color: app.activeTheatre != null ? const Color(0x00000000) : VeyloColors.screen,
         child: DefaultTextStyle(
           style: VeyloText.body,
           child: Stack(
             fit: StackFit.expand,
             children: [
-              const AmbientBackground(),
+              // Keep the underlying page mounted (preserving Picks duel & scroll state)
+              // while painting zero opaque pixels behind the Wayland video cutout when Theatre is open.
+              Offstage(
+                offstage: app.activeTheatre != null,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    const AmbientBackground(),
 
-              activePage,
+                    activePage,
 
-              // Floating TopBar (owns its own BackdropGroup and 116px feathered frosted scroll smoke)
-              const Positioned(top: 0, left: 0, right: 0, child: VeyloTopBar()),
+                    // Floating TopBar (owns its own BackdropGroup and 116px feathered frosted scroll smoke)
+                    const Positioned(top: 0, left: 0, right: 0, child: VeyloTopBar()),
+                  ],
+                ),
+              ),
+
+              if (app.activeTheatre != null)
+                TheatreScreen(
+                  key: ValueKey(app.activeTheatre),
+                  session: app.activeTheatre!,
+                ),
 
               // Breathing PendingPlayer overlay (motion.css:83-85)
               if (app.pendingPlayerTitle != null)
                 _PendingOverlay(
                   title: app.pendingPlayerTitle!,
-                  step: app.pendingPlayerStep,
+                  media: app.pendingPlayerMedia,
                   onCancel: app.cancelPendingPlay,
                 ),
 
               // Search overlay
-              if (app.searchOpen) BackdropGroup(child: const SearchOverlay()),
+              if (app.searchOpen && app.activeTheatre == null) BackdropGroup(child: const SearchOverlay()),
 
               // Shortcuts modal
-              if (app.shortcutsOpen) BackdropGroup(child: const ShortcutsModal()),
+              if (app.shortcutsOpen && app.activeTheatre == null) BackdropGroup(child: const ShortcutsModal()),
 
               // Bottom glass toast (.toast)
               if (app.toastMessage != null) _buildToast(app),
@@ -357,9 +376,9 @@ class _VeyloShell extends StatelessWidget {
 }
 
 class _PendingOverlay extends StatefulWidget {
-  const _PendingOverlay({required this.title, required this.step, required this.onCancel});
+  const _PendingOverlay({required this.title, this.media, required this.onCancel});
   final String title;
-  final String step;
+  final MediaItem? media;
   final VoidCallback onCancel;
 
   @override
@@ -416,9 +435,14 @@ class _PendingOverlayState extends State<_PendingOverlay> with SingleTickerProvi
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(widget.step, style: VeyloText.bodyStrong),
-                    const SizedBox(height: 18),
-                    VeyloPill(label: 'Cancel', icon: 'Close', onTap: widget.onCancel),
+                    FindingRunner(
+                      lamp: lamp,
+                      genres: widget.media?.genres ?? const [],
+                      mediaKind: widget.media?.kind ?? 'movie',
+                      title: widget.title,
+                    ),
+                    const SizedBox(height: 20),
+                    VeyloPill(label: 'Cancel', icon: 'Close', small: true, onTap: widget.onCancel),
                   ],
                 ),
               ),

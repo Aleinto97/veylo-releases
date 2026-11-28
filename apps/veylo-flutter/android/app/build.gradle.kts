@@ -29,6 +29,12 @@ android {
         versionName = flutter.versionName
     }
 
+    // Picks AI (on-device synopsis embeddings), from the pinned assets prepared by
+    // `python3 tools/picks-ai/fetch.py android-arm64 android-armv7` (same files as the DX app):
+    // the model + tokenizer as APK assets (unpacked by MainActivity), ONNX Runtime as a native lib.
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("picks-ai/assets"))
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("picks-ai/jni"))
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.
@@ -47,3 +53,26 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+val picksAiRoot = rootProject.file("../../veylo-dx/picks-ai")
+val stagePicksAi by tasks.registering(Sync::class) {
+    description = "Stage Picks AI model assets and ONNX Runtime for the APK"
+    into(layout.buildDirectory.dir("picks-ai"))
+    from(File(picksAiRoot, "model")) {
+        include("model.onnx", "tokenizer.json", "LICENSE", "NOTICE")
+        into("assets/picks-ai")
+    }
+    from(File(picksAiRoot, "android-arm64")) {
+        include("LICENSE", "ThirdPartyNotices.txt")
+        into("assets/picks-ai/runtime")
+    }
+    from(File(picksAiRoot, "android-arm64")) { include("libonnxruntime.so"); into("jni/arm64-v8a") }
+    from(File(picksAiRoot, "android-armv7")) { include("libonnxruntime.so"); into("jni/armeabi-v7a") }
+    from(File(picksAiRoot, "android-x86_64")) { include("libonnxruntime.so"); into("jni/x86_64") }
+    doFirst {
+        if (!File(picksAiRoot, "model/model.onnx").isFile) {
+            logger.warn("Picks AI assets missing: run python3 tools/picks-ai/fetch.py android-arm64 android-armv7 android-x86_64 (Picks falls back to rules)")
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(stagePicksAi) }

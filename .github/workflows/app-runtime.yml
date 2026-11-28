@@ -10,7 +10,7 @@ name: app-runtime
 on:
   workflow_dispatch:
   push:
-    paths: ["apps/veylo-flutter/**", "apps/veylo-dx/src/**", "crates/**", ".github/workflows/app-runtime.yml"]
+    paths: ["apps/veylo-flutter/**", "apps/veylo-dx/src/**", "crates/**", "tools/picks-ai/**", ".github/workflows/app-runtime.yml"]
 permissions:
   contents: read
 concurrency:
@@ -51,9 +51,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: linux, os: ubuntu-24.04, device: linux, lib: libveylo_bridge.so }
-          - { target: macos, os: macos-15, device: macos, lib: libveylo_bridge.dylib }
-          - { target: windows, os: windows-2022, device: windows, lib: veylo_bridge.dll }
+          - { target: linux, os: ubuntu-24.04, device: linux, lib: libveylo_bridge.so, picks: linux-x64 }
+          - { target: macos, os: macos-15, device: macos, lib: libveylo_bridge.dylib, picks: macos-arm64 }
+          - { target: windows, os: windows-2022, device: windows, lib: veylo_bridge.dll, picks: windows-x64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     defaults:
@@ -80,6 +80,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libmpv-dev \
             libwayland-dev libegl-dev xvfb libgl1-mesa-dri mesa-utils
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - name: Fetch Picks AI assets
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" ../../tools/picks-ai/fetch.py ${{ matrix.picks }}
       - name: Build the Rust core
         run: cd rust && cargo build --release --locked
       - uses: actions/download-artifact@v4
@@ -108,8 +116,23 @@ jobs:
             # ReportCrash writes the .ips a few seconds after the process dies.
             for i in $(seq 1 12); do ls ~/Library/Logs/DiagnosticReports/*.ips >/dev/null 2>&1 && break; sleep 5; done
             ls -la ~/Library/Logs/DiagnosticReports/ /Library/Logs/DiagnosticReports/ 2>/dev/null | tail -20
-            for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips /Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -2); do
-              echo "=== $f"; head -c 80000 "$f"; echo
+            for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips /Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -1); do
+              echo "=== $f"
+              python3 - "$f" <<'PY'
+          import json, sys
+          raw = open(sys.argv[1]).read()
+          body = json.loads(raw[raw.index("\n") + 1:])
+          imgs = body.get("usedImages", [])
+          print("exception:", body.get("exception"), "| termination:", body.get("termination", {}).get("indicator"))
+          for key in ("asi", "lastExceptionBacktrace"):
+              if body.get(key): print(key, json.dumps(body[key])[:3000])
+          for t in body.get("threads", []):
+              if not t.get("triggered"): continue
+              print("crashed thread:", t.get("name"), t.get("queue"))
+              for fr in t.get("frames", [])[:40]:
+                  im = imgs[fr["imageIndex"]] if fr.get("imageIndex", -1) < len(imgs) else {}
+                  print("  %-28s %s +%s %s:%s" % (im.get("name", "?"), fr.get("symbol", "?"), fr.get("symbolLocation", ""), fr.get("sourceFile", ""), fr.get("sourceLine", "")))
+          PY
             done
             log show --last 5m --style compact --predicate 'process == "veylo_flutter" AND (messageType == error OR messageType == fault)' 2>/dev/null | tail -60 || true
           fi
@@ -170,6 +193,12 @@ jobs:
         with:
           workspaces: "apps/veylo-flutter/rust -> target"
           key: runtime-android
+      - uses: actions/cache@v4
+        with:
+          path: apps/veylo-dx/picks-ai/downloads
+          key: picks-ai-downloads-${{ hashFiles('tools/picks-ai/pins.json') }}
+      - name: Fetch Picks AI assets (Android)
+        run: python3 ../../tools/picks-ai/fetch.py android-arm64 android-armv7 android-x86_64
       - name: Build the Rust core for the emulator (x86_64) into jniLibs
         run: |
           cargo install cargo-ndk --locked >/dev/null 2>&1 || true

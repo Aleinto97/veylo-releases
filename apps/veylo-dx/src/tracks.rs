@@ -280,6 +280,51 @@ fn elements(b: &[u8]) -> EbmlIter<'_> {
     EbmlIter { b, at: 0, left: 4096, done: false }
 }
 
+fn infer_lang_from_name(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() { return None; }
+    let mut found: Option<&'static str> = None;
+    for l in crate::addons::LANGUAGES {
+        if l.matches(name) {
+            if found.is_some() { return None; } // Ambiguous multi-language title
+            found = l.codes.first().copied();
+        }
+    }
+    found
+}
+
+fn parse_tracks_entries(tracks_payload: &[u8]) -> Vec<AudioTrack> {
+    elements(tracks_payload).filter(|e| e.0 == 0xAE && e.3).filter_map(|(_, s, e, _)| {
+        let entry = &tracks_payload[s..e];
+        let mut audio = false;
+        let mut commentary = false;
+        let (mut lang, mut bcp47, mut name) = (None::<String>, None::<String>, String::new());
+        for (id, s, e, _) in elements(entry) {
+            let v = &entry[s..e];
+            match id {
+                0x83 => audio = v.iter().fold(0u64, |a, x| (a << 8) | *x as u64) == 2,
+                0x22B59C => lang = Some(text(v)),
+                0x22B59D => bcp47 = Some(text(v)),
+                0x536E => name = text(v),
+                // RFC 9559: FlagCommentary (0x55AF) and FlagVisualImpaired (0x55AC); 0x55EE is MaxBlockAdditionID.
+                0x55AF | 0x55AC if uint(v) != 0 => commentary = true,
+                _ => {}
+            }
+        }
+        // RFC 9559: LanguageBCP47 takes precedence when present (even if "und"). When a muxer
+        // omits the language element or writes "und", check TrackName first so a track titled
+        // "French VFF" or "Français" is never misclassified as English by the Matroska default.
+        let explicit = bcp47.filter(|l| !l.is_empty()).or_else(|| lang.filter(|l| !l.is_empty()));
+        let resolved = match explicit {
+            Some(l) if l.eq_ignore_ascii_case("und") => {
+                infer_lang_from_name(&name).map(str::to_owned).unwrap_or_default()
+            }
+            Some(l) => l,
+            None => infer_lang_from_name(&name).unwrap_or("eng").to_owned(),
+        };
+        audio.then_some(AudioTrack { lang: resolved, name, commentary })
+    }).collect()
+}
+
 fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
     const SEGMENT: u64 = 0x1853_8067;
     const TRACKS: u64 = 0x1654_AE6B;
@@ -291,36 +336,127 @@ fn matroska(head: &[u8]) -> Option<Vec<AudioTrack>> {
         if id != TRACKS { continue; }
         // A cut Tracks element would hide tracks.
         if !whole { return None; }
-        return Some(elements(&segment[start..end]).filter(|e| e.0 == 0xAE && e.3).filter_map(|(_, s, e, _)| {
-            let entry = &segment[start + s..start + e];
-            let mut audio = false;
-            let mut commentary = false;
-            let (mut lang, mut bcp47, mut name) = (None::<String>, None::<String>, String::new());
-            for (id, s, e, _) in elements(entry) {
-                let v = &entry[s..e];
-                match id {
-                    0x83 => audio = v.iter().fold(0u64, |a, x| (a << 8) | *x as u64) == 2,
-                    0x22B59C => lang = Some(text(v)),
-                    0x22B59D => bcp47 = Some(text(v)),
-                    0x536E => name = text(v),
-                    // RFC 9559: FlagCommentary (0x55AF) and FlagVisualImpaired (0x55AC); 0x55EE is MaxBlockAdditionID.
-                    0x55AF | 0x55AC if uint(v) != 0 => commentary = true,
+        return Some(parse_tracks_entries(&segment[start..end]));
+    }
+    None
+}
+
+/// Inspect Matroska `SeekHead` (`0x114D9B74`) in `head` and return absolute file offsets for
+/// `(Tracks, Info)` when present. Lets the prober jump straight to tail-placed or post-attachment
+/// headers with one targeted range request instead of guessing from the filename.
+pub fn matroska_seek_offsets(head: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
+    if !head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) { return None; }
+    const SEGMENT: u64 = 0x1853_8067;
+    const SEEK_HEAD: u64 = 0x114D_9B74;
+    const SEEK: u64 = 0x4DBB;
+    const SEEK_ID: u64 = 0x53AB;
+    const SEEK_POS: u64 = 0x53AC;
+    const CLUSTER: u64 = 0x1F43_B675;
+    let (_, seg_start, seg_end, _) = elements(head).find(|e| e.0 == SEGMENT)?;
+    let segment = &head[seg_start..seg_end];
+    let mut tracks_off = None;
+    let mut info_off = None;
+    for (id, start, end, whole) in elements(segment) {
+        if id == CLUSTER { break; }
+        if id != SEEK_HEAD || !whole { continue; }
+        let sh = &segment[start..end];
+        for (sid, ss, se, swhole) in elements(sh) {
+            if sid != SEEK || !swhole { continue; }
+            let entry = &sh[ss..se];
+            let mut target_id = None;
+            let mut pos = None;
+            for (fid, fs, fe, _) in elements(entry) {
+                match fid {
+                    SEEK_ID => target_id = Some(uint(&entry[fs..fe])),
+                    SEEK_POS => pos = Some(uint(&entry[fs..fe])),
                     _ => {}
                 }
             }
-            // RFC 9559: LanguageBCP47 takes precedence when present (even if "und"); only absent
-            // language elements default to English.
-            let lang = bcp47.filter(|l| !l.is_empty())
-                .or_else(|| lang.filter(|l| !l.is_empty()))
-                .unwrap_or_else(|| "eng".into());
-            audio.then(|| AudioTrack {
-                lang: if lang.eq_ignore_ascii_case("und") { String::new() } else { lang },
-                name,
-                commentary,
-            })
-        }).collect());
+            if let (Some(tid), Some(rel)) = (target_id, pos) {
+                if let Some(abs) = (seg_start as u64).checked_add(rel) {
+                    if tid == 0x1654_AE6B && tracks_off.is_none() { tracks_off = Some(abs); }
+                    if tid == 0x1549_A966 && info_off.is_none() { info_off = Some(abs); }
+                }
+            }
+        }
     }
-    None
+    (tracks_off.is_some() || info_off.is_some()).then_some((tracks_off, info_off))
+}
+
+/// Parse a targeted Matroska range starting at a `SeekHead` offset (containing `Tracks` and/or
+/// `Info`) into real audio tracks, picture metadata, and video codec.
+pub fn parse_matroska_slice(buf: &[u8]) -> (Option<Vec<AudioTrack>>, Option<Picture>, Option<&'static str>) {
+    const INFO: u64 = 0x1549_A966;
+    const TRACKS: u64 = 0x1654_AE6B;
+    let mut seconds = None;
+    let mut audio = None;
+    let mut pic: Option<Picture> = None;
+    let mut codec = None;
+    for (id, start, end, whole) in elements(buf) {
+        if !whole { break; }
+        match id {
+            INFO => {
+                let info = &buf[start..end];
+                let (mut scale, mut duration) = (1_000_000u64, None);
+                for (iid, s, e, _) in elements(info) {
+                    match iid { 0x2AD7B1 => scale = uint(&info[s..e]).max(1), 0x4489 => duration = float(&info[s..e]), _ => {} }
+                }
+                seconds = duration.and_then(|d| plausible(d * scale as f64 / 1e9));
+                if let Some(ref mut p) = pic { if p.seconds.is_none() { p.seconds = seconds; } }
+            }
+            TRACKS => {
+                let payload = &buf[start..end];
+                audio = Some(parse_tracks_entries(payload));
+                for (_, s, e, _) in elements(payload).filter(|e| e.0 == 0xAE && e.3) {
+                    let entry = &payload[s..e];
+                    let mut video = false;
+                    let mut picture = Picture { seconds, ..Picture::default() };
+                    let mut codec_id = None;
+                    for (tid, ts, te, _) in elements(entry) {
+                        let v = &entry[ts..te];
+                        match tid {
+                            0x83 => video = uint(v) == 1,
+                            0x86 => codec_id = Some(text(v)),
+                            0xE0 => for (vid, vs, ve, _) in elements(v) {
+                                match vid {
+                                    0xB0 => picture.width = uint(&v[vs..ve]) as u32,
+                                    0xBA => picture.height = uint(&v[vs..ve]) as u32,
+                                    0x55B0 => if let Some((_, cs, ce, _)) = elements(&v[vs..ve]).find(|c| c.0 == 0x55BA) {
+                                        picture.transfer = Transfer::of(uint(&v[vs..ve][cs..ce]));
+                                    },
+                                    _ => {}
+                                }
+                            },
+                            0x41E4 => {
+                                let (mut kind, mut profile) = (None, None);
+                                for (mid, ms, me, _) in elements(v) {
+                                    match mid {
+                                        0x41E7 => kind = Some(uint(&v[ms..me])),
+                                        0x41ED => profile = dv_profile(&v[ms..me]),
+                                        _ => {}
+                                    }
+                                }
+                                if matches!(kind, Some(0x6476_6343 | 0x6476_7643)) { picture.dolby_vision = profile; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if video {
+                        if picture.width > 0 && picture.height > 0 { pic = Some(picture); }
+                        codec = match codec_id.as_deref() {
+                            Some(c) if c.contains("AV1") => Some("av1"),
+                            Some(c) if c.contains("HEVC") => Some("hevc"),
+                            Some(c) if c.contains("AVC") => Some("avc"),
+                            _ => None,
+                        };
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (audio, pic, codec)
 }
 
 fn text(v: &[u8]) -> String { String::from_utf8_lossy(v).trim_end_matches('\0').trim().to_owned() }
@@ -570,6 +706,42 @@ mod tests {
         // Cut before the tracks end: unknown, not "no audio".
         assert_eq!(audio_tracks(&file[..60]), None);
         assert_eq!(audio_tracks(b"\x47\x40\x00\x10 m2ts"), None);
+    }
+
+    #[test]
+    fn matroska_omitted_lang_respects_track_name_and_seekhead() {
+        // French mux that omitted MKV Language element (RFC 9559 default "eng") but named track "French VFF".
+        let fre_file = mkv(&[(2, None, "French VFF 5.1"), (2, Some("kor"), "Korean Original")]);
+        let tracks = audio_tracks(&fre_file).unwrap();
+        assert_eq!(tracks[0].lang, "fr");
+        assert_eq!(in_language(&tracks, "english"), Some(false));
+        assert_eq!(in_language(&tracks, "korean"), Some(true));
+
+        // Undetermined language tag with explicit English track name.
+        let eng_und = mkv(&[(2, Some("und"), "English DTS-HD MA 5.1")]);
+        let tracks = audio_tracks(&eng_und).unwrap();
+        assert_eq!(tracks[0].lang, "en");
+        assert_eq!(in_language(&tracks, "english"), Some(true));
+
+        // Tail-placed Tracks referenced by SeekHead.
+        let tracks_el = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &[
+            el(&[0x83], &[2]),
+            el(&[0x22, 0xB5, 0x9C], b"kor"),
+        ].concat()));
+        let seek_entry = el(&[0x4D, 0xBB], &[
+            el(&[0x53, 0xAB], &[0x16, 0x54, 0xAE, 0x6B]),
+            el(&[0x53, 0xAC], &1200u64.to_be_bytes()),
+        ].concat());
+        let seek_head = el(&[0x11, 0x4D, 0x9B, 0x74], &seek_entry);
+        let mut head = el(&[0x1A, 0x45, 0xDF, 0xA3], b"header");
+        let seg_payload_start = head.len() + 12;
+        head.extend([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        head.extend(&seek_head);
+        head.extend(el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 32]));
+        let (tracks_off, _) = matroska_seek_offsets(&head).unwrap();
+        assert_eq!(tracks_off, Some(seg_payload_start as u64 + 1200));
+        let (parsed_audio, _, _) = parse_matroska_slice(&tracks_el);
+        assert_eq!(parsed_audio.unwrap(), [AudioTrack { lang: "kor".into(), name: "".into(), commentary: false }]);
     }
 
     fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {

@@ -1444,8 +1444,12 @@ pub(super) async fn file_header_with_client_full(
                 parsed = Some((tracks, crate::tracks::picture(&head), crate::tracks::video_codec(&head)));
                 break;
             }
-            // Non-fast-start MP4 (`ftyp` + `mdat` with no `moov` in head): don't waste bandwidth reading 1 MiB of video data!
+            // Non-fast-start MP4 (`ftyp` + `mdat` with no `moov` in head) or MKV with SeekHead
+            // pointing Tracks past HEAD_BYTES: don't waste bandwidth reading 1 MiB of video data!
             if crate::tracks::mp4_moov_at_end(&head) { break; }
+            if let Some((Some(toff), _)) = crate::tracks::matroska_seek_offsets(&head) {
+                if toff >= crate::tracks::HEAD_BYTES as u64 { break; }
+            }
             next_parse = (next_parse * 2).min(crate::tracks::HEAD_BYTES);
         }
     }
@@ -1483,6 +1487,39 @@ pub(super) async fn file_header_with_client_full(
     let codec = crate::tracks::video_codec(&head);
     if tracks.is_some() || pic.is_some() {
         return (tracks, pic, codec, resolved, speed_sample);
+    }
+
+    // Tail-placed or post-attachment Matroska fallback: jump directly to `SeekHead`'s `Tracks`
+    // offset with one small range request to read real audio tracks, video codec, and HDR/size.
+    if let Some((Some(tracks_off), _)) = crate::tracks::matroska_seek_offsets(&head) {
+        if tracks_off >= head.len() as u64 && total_bytes.is_none_or(|b| tracks_off < b) {
+            const MKV_SEEK_CAP: u64 = 131_072;
+            let end_byte = total_bytes.map_or(tracks_off + MKV_SEEK_CAP - 1, |b| (tracks_off + MKV_SEEK_CAP - 1).min(b.saturating_sub(1)));
+            let seek_target = resolved.as_deref().unwrap_or(&src.url);
+            let mut sreq = http.get(seek_target).header("range", format!("bytes={tracks_off}-{end_byte}"));
+            if same_origin(&src.url, seek_target) {
+                for (k, v) in &src.headers { sreq = sreq.header(k.as_str(), v.as_str()); }
+            }
+            if let Ok(Ok(mut resp)) = tokio::time::timeout(Duration::from_millis(600), sreq.send()).await {
+                if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                    let mut slice = Vec::with_capacity(32768);
+                    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+                    while let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) {
+                        match tokio::time::timeout(rem, resp.chunk()).await {
+                            Ok(Ok(Some(chunk))) => {
+                                if slice.len().saturating_add(chunk.len()) > MKV_SEEK_CAP as usize { break; }
+                                slice.extend_from_slice(&chunk);
+                            }
+                            _ => break,
+                        }
+                    }
+                    let (s_tracks, s_pic, s_codec) = crate::tracks::parse_matroska_slice(&slice);
+                    if s_tracks.is_some() || s_pic.is_some() {
+                        return (s_tracks, s_pic, s_codec.or(codec), resolved, speed_sample);
+                    }
+                }
+            }
+        }
     }
 
     // Non-fast-start MP4 fallback: read the last 1 MiB from the resolved URL to parse tail `moov`.

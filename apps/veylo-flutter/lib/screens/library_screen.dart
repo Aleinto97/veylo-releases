@@ -6,6 +6,7 @@ import 'package:material_ui/material_ui.dart' show InputDecoration, TextField;
 import '../bridge/veylo_bridge.dart';
 import '../state/app_state.dart';
 import '../theme/veylo_theme.dart';
+import '../widgets/finding_runner.dart';
 import '../widgets/glass.dart';
 import '../widgets/veylo_icons.dart';
 
@@ -272,6 +273,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       if (dlList.isEmpty && actList.isEmpty)
                         const _EmptyCard(
                           icon: 'Download',
+                          scene: CinemaScene.glider,
                           title: 'No offline downloads yet',
                           subtitle: 'Open any title\'s Sources list and tap Download to save it for offline playback.',
                         )
@@ -344,6 +346,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 sliver: SliverToBoxAdapter(
                   child: _EmptyCard(
                     icon: 'Bookmark',
+                    scene: CinemaScene.noir,
                     title: q.isEmpty ? 'No saved titles yet' : 'No saved titles match',
                     subtitle: q.isEmpty
                         ? 'Bookmark any film or series to build your watchlist.'
@@ -406,17 +409,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   padding: EdgeInsets.fromLTRB(gutter, 80, gutter, 0),
                   sliver: SliverToBoxAdapter(
                     child: Center(
-                      child: GlassBox(
-                        borderRadius: 24,
-                        padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 28),
-                        child: const Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            VeyloIcon('Stack', size: 30, color: VeyloColors.dust),
-                            SizedBox(height: 10),
-                            Text('Nothing watched yet', style: VeyloText.body),
-                          ],
-                        ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ValueListenableBuilder<Color>(
+                            valueListenable: app.lampColorNotifier,
+                            builder: (_, lamp, _) => FindingRunner(
+                              lamp: lamp,
+                              scene: CinemaScene.projector,
+                              width: 240,
+                              height: 84,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text('Nothing watched yet', style: VeyloText.ui(15, weight: 500, color: VeyloColors.dust)),
+                        ],
                       ),
                     ),
                   ),
@@ -428,6 +435,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     sliver: SliverToBoxAdapter(
                       child: _EmptyCard(
                         icon: 'Search',
+                        scene: CinemaScene.noir,
                         title: 'No titles match this filter',
                         subtitle: 'Reset the filter or search query to see your full library.',
                         action: VeyloPill(
@@ -920,14 +928,16 @@ class _FilterPillState extends State<_FilterPill> {
 }
 
 class _EmptyCard extends StatelessWidget {
-  const _EmptyCard({required this.icon, required this.title, required this.subtitle, this.action});
+  const _EmptyCard({required this.icon, required this.title, required this.subtitle, this.action, this.scene});
   final String icon;
   final String title;
   final String subtitle;
   final Widget? action;
+  final CinemaScene? scene;
 
   @override
   Widget build(BuildContext context) {
+    final app = AppStateScope.read(context);
     return CustomPaint(
       foregroundPainter: const SpecularRimPainter(
         radius: 22,
@@ -936,14 +946,25 @@ class _EmptyCard extends StatelessWidget {
       ),
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 36),
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 34),
         decoration: BoxDecoration(
           color: const Color.fromRGBO(255, 255, 255, 0.04),
           borderRadius: BorderRadius.circular(22),
         ),
         child: Column(
           children: [
-            VeyloIcon(icon, size: 30, color: VeyloColors.dust),
+            if (scene != null)
+              ValueListenableBuilder<Color>(
+                valueListenable: app.lampColorNotifier,
+                builder: (_, lamp, _) => FindingRunner(
+                  lamp: lamp,
+                  scene: scene,
+                  width: 230,
+                  height: 80,
+                ),
+              )
+            else
+              VeyloIcon(icon, size: 30, color: VeyloColors.dust),
             const SizedBox(height: 10),
             Text(title, style: VeyloText.bodyStrong),
             const SizedBox(height: 4),
