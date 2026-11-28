@@ -239,7 +239,16 @@ Future<Map<String, Object?>> _play(
     if (expectW != null && m['width'] != expectW) throw StateError('decoded width ${m['width']} != $expectW');
     if (expectH != null && m['height'] != expectH) throw StateError('decoded height ${m['height']} != $expectH');
     if (advanced.inMilliseconds < 500) throw StateError('playback stalled (advanced ${advanced.inMilliseconds} ms in 3 s)');
-    if (m['frame_varied'] == false) throw StateError('decoded frame is blank');
+    // Android decodes straight onto the display surface (MediaCodec): mpv's screenshot can't read
+    // those frames and returns black, so there the pixel check is informational — first frame,
+    // decoded size and advancing playback above still prove the video plays.
+    if (m['frame_varied'] == false) {
+      if (Platform.isAndroid) {
+        m['frame_check'] = 'unavailable (hardware surface)';
+      } else {
+        throw StateError('decoded frame is blank');
+      }
+    }
     return m;
   } catch (e) {
     // The last mpv log lines say *why* (TLS, demuxer, decoder…): keep them with the failure.
