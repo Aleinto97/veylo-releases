@@ -242,8 +242,12 @@ Future<Map<String, Object?>> _play(
     // Android decodes straight onto the display surface (MediaCodec): mpv's screenshot can't read
     // those frames and returns black, so there the pixel check is informational — first frame,
     // decoded size and advancing playback above still prove the video plays.
+    final hw = '${m['hwdec']}';
+    final hardwareFrames = Platform.isAndroid || (hw.isNotEmpty && hw != 'no');
     if (m['frame_varied'] == false) {
-      if (Platform.isAndroid) {
+      // Hardware-decoded frames (MediaCodec surfaces, VA-API dma-bufs) can't be read back by
+      // mpv's screenshot ("Input image format vaapi not supported by libswscale").
+      if (hardwareFrames) {
         m['frame_check'] = 'unavailable (hardware surface)';
       } else {
         throw StateError('decoded frame is blank');

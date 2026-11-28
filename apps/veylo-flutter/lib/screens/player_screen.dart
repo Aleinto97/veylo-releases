@@ -1251,6 +1251,61 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               ),
                               const SizedBox(width: 8),
                             ],
+                            // Top right: what you reach for occasionally — navigation (episodes,
+                            // clips, sources), then playback settings (speed, sleep, picture), then
+                            // help/info. The bottom bar keeps only what you use while watching.
+                            if (s.episodes.isNotEmpty)
+                              VeyloOrb(
+                                icon: 'Stack',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.episodes,
+                                tooltip: 'Episodes',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.episodes ? null : _PlayerSheet.episodes),
+                              ),
+                            if (s.clips.length > 1)
+                              VeyloOrb(
+                                icon: 'Film',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.clips,
+                                tooltip: 'Trailers & Clips',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.clips ? null : _PlayerSheet.clips),
+                              ),
+                            if (s.sources.length > 1)
+                              VeyloOrb(
+                                icon: 'Layers',
+                                glass: false,
+                                active: _sheet == _PlayerSheet.sources,
+                                tooltip: 'Switch source',
+                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sources ? null : _PlayerSheet.sources),
+                              ),
+                            if (s.episodes.isNotEmpty || s.clips.length > 1 || s.sources.length > 1)
+                              const SizedBox(width: 12),
+                            VeyloOrb(
+                              icon: 'Gauge',
+                              glass: false,
+                              active: _sheet == _PlayerSheet.speed,
+                              tooltip: 'Playback speed ([ / ])',
+                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.speed ? null : _PlayerSheet.speed),
+                            ),
+                            VeyloOrb(
+                              icon: 'Moon',
+                              glass: false,
+                              active: _sheet == _PlayerSheet.sleep || sleepBadge != null,
+                              tooltip: 'Sleep timer (T)',
+                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
+                            ),
+                            VeyloOrb(
+                              icon: 'Sliders',
+                              glass: false,
+                              active: _sheet == _PlayerSheet.picture ||
+                                  _brightness != 0 ||
+                                  _contrast != 0 ||
+                                  _saturation != 0 ||
+                                  _gamma != 0,
+                              tooltip: 'Picture',
+                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.picture ? null : _PlayerSheet.picture),
+                            ),
+                            const SizedBox(width: 12),
                             VeyloOrb(
                               icon: 'Keyboard',
                               glass: false,
@@ -1398,33 +1453,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               ),
                             ),
                             const SizedBox(width: 6),
-                            if (s.episodes.isNotEmpty)
-                              VeyloOrb(
-                                icon: 'Stack',
-                                glass: false,
-                                size: 42,
-                                active: _sheet == _PlayerSheet.episodes,
-                                tooltip: 'Episodes',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.episodes ? null : _PlayerSheet.episodes),
-                              ),
-                            if (s.clips.length > 1)
-                              VeyloOrb(
-                                icon: 'Film',
-                                glass: false,
-                                size: 42,
-                                active: _sheet == _PlayerSheet.clips,
-                                tooltip: 'Trailers & Clips',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.clips ? null : _PlayerSheet.clips),
-                              ),
-                            if (s.sources.length > 1)
-                              VeyloOrb(
-                                icon: 'Layers',
-                                glass: false,
-                                size: 42,
-                                active: _sheet == _PlayerSheet.sources,
-                                tooltip: 'Switch source',
-                                onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sources ? null : _PlayerSheet.sources),
-                              ),
                             VeyloOrb(
                               icon: 'Headphones',
                               glass: false,
@@ -1444,34 +1472,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 setState(() => _sheet = next);
                                 if (next == _PlayerSheet.subtitles) unawaited(_fetchOnlineSubs());
                               },
-                            ),
-                            VeyloOrb(
-                              icon: 'Gauge',
-                              glass: false,
-                              size: 42,
-                              active: _sheet == _PlayerSheet.speed,
-                              tooltip: 'Playback speed ([ / ])',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.speed ? null : _PlayerSheet.speed),
-                            ),
-                            VeyloOrb(
-                              icon: 'Moon',
-                              glass: false,
-                              size: 42,
-                              active: _sheet == _PlayerSheet.sleep || sleepBadge != null,
-                              tooltip: 'Sleep timer (T)',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.sleep ? null : _PlayerSheet.sleep),
-                            ),
-                            VeyloOrb(
-                              icon: 'Sliders',
-                              glass: false,
-                              size: 42,
-                              active: _sheet == _PlayerSheet.picture ||
-                                  _brightness != 0 ||
-                                  _contrast != 0 ||
-                                  _saturation != 0 ||
-                                  _gamma != 0,
-                              tooltip: 'Picture',
-                              onTap: () => setState(() => _sheet = _sheet == _PlayerSheet.picture ? null : _PlayerSheet.picture),
                             ),
                             VeyloOrb(
                               icon: 'Resize',

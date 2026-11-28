@@ -69,8 +69,12 @@ Future<void> applyMpvProfile(
 
   // Match apps/veylo-dx/src/engine.rs buffering & resilient HTTP streaming.
   await setProp('cache', 'yes');
-  await setProp('demuxer-max-bytes', '256MiB');
-  await setProp('demuxer-max-back-bytes', '64MiB');
+  // In-memory cache only, like the DX app: media_kit turns on mpv's cache-on-disk without a
+  // writable cache dir, so every playback logged "Failed to create file cache".
+  await setProp('cache-on-disk', 'no');
+  // Phones/TVs (as little as 1.8 GB RAM) get DX's Android budget instead of the desktop's.
+  await setProp('demuxer-max-bytes', mobile ? '96MiB' : '256MiB');
+  await setProp('demuxer-max-back-bytes', mobile ? '32MiB' : '64MiB');
   await setProp('demuxer-readahead-secs', '60');
   await setProp('network-timeout', '20');
   await setProp(
